@@ -2,18 +2,12 @@
 //!
 //!   pgmask <config.toml>
 
-mod catalog;
-mod mask;
-mod protocol;
-mod session;
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 
-use catalog::{Catalog, Config};
-use session::Policy;
+use pgmask::{Catalog, Config, Policy};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,7 +47,7 @@ async fn main() -> Result<()> {
         let policy = policy.clone();
         let backend = backend.clone();
         tokio::spawn(async move {
-            if let Err(err) = session::handle_connection(client, &backend, policy).await {
+            if let Err(err) = pgmask::handle_connection(client, &backend, policy).await {
                 eprintln!("connection from {peer} ended: {err:#}");
             }
         });

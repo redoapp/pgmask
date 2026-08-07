@@ -124,6 +124,55 @@ impl Policy {
     }
 }
 
+/// Bytes cleared for the client.
+///
+/// The core invariant of this proxy is "no row reaches the client without
+/// passing through a masking plan". That was previously enforced by discipline
+/// inside `handle_data_row`. It is now enforced by the compiler: `Batch::client`
+/// accepts only a `Vetted`, and the constructors below are the complete list of
+/// ways to make one. Adding a new "just forward it" path is a type error, not a
+/// code-review question.
+///
+/// The module boundary is load-bearing — the field is private, so nothing
+/// outside this file can mint one.
+pub struct Vetted(Bytes);
+
+impl Vetted {
+    /// A message whose bytes originated with the backend and carry no row data.
+    ///
+    /// Correct for control and metadata messages. Never correct for `DataRow`,
+    /// and `vet_data_row` is the only way to clear one of those.
+    fn control(msg: &Message) -> Self {
+        debug_assert_ne!(
+            msg.tag,
+            protocol::B_DATA_ROW,
+            "DataRow must go through vet_data_row"
+        );
+        Self(msg.encode())
+    }
+
+    /// A row whose every field was run through the active plan.
+    fn data_row(values: &[Option<Bytes>]) -> Self {
+        Self(protocol::build_data_row(values).encode())
+    }
+
+    /// A row we are forwarding unchanged because the plan masks nothing in it.
+    ///
+    /// Takes the plan to make the claim checkable rather than assumed.
+    fn unmasked_row(msg: &Message, plan: &[FieldPlan]) -> Self {
+        debug_assert!(
+            plan.iter().all(|f| f.mask == Mask::None),
+            "unmasked_row called with a plan that masks something"
+        );
+        Self(msg.encode())
+    }
+
+    /// A message pgmask generated itself: errors, notices we rebuilt.
+    fn synthetic(msg: &Message) -> Self {
+        Self(msg.encode())
+    }
+}
+
 /// Outbound bytes accumulated across a whole read batch.
 ///
 /// Contiguous buffers, not `Vec<Bytes>`: a vector of frames still costs one
@@ -139,9 +188,11 @@ struct Batch {
 }
 
 impl Batch {
-    fn client(&mut self, bytes: Bytes) {
-        self.to_client.put_slice(&bytes);
+    /// The only way bytes reach the client.
+    fn client(&mut self, vetted: Vetted) {
+        self.to_client.put_slice(&vetted.0);
     }
+    /// The backend direction needs no vetting: it carries queries, not results.
     fn backend(&mut self, bytes: Bytes) {
         self.to_backend.put_slice(&bytes);
     }
@@ -192,7 +243,7 @@ impl Session {
             &rejection.message,
             rejection.hint.as_deref(),
         );
-        out.client(err.encode());
+        out.client(Vetted::synthetic(&err));
     }
 
     fn handle_frontend(&mut self, msg: Message, out: &mut Batch) {
@@ -205,7 +256,7 @@ impl Session {
                     Some("It returns data without a RowDescription, so it cannot be masked."),
                 );
                 {
-                    out.client(err.encode());
+                    out.client(Vetted::synthetic(&err));
                     out.close = true;
                 }
             }
@@ -260,7 +311,7 @@ impl Session {
         if self.suppressing {
             if msg.tag == protocol::B_READY_FOR_QUERY {
                 self.suppressing = false;
-                return out.client(msg.encode());
+                return out.client(Vetted::control(&msg));
             }
             return;
         }
@@ -282,7 +333,7 @@ impl Session {
                     ),
                 );
                 {
-                    out.client(err.encode());
+                    out.client(Vetted::synthetic(&err));
                     out.close = true;
                 }
             }
@@ -290,18 +341,56 @@ impl Session {
             // Error DETAIL/HINT can echo column values verbatim.
             protocol::B_ERROR_RESPONSE | protocol::B_NOTICE_RESPONSE => {
                 match protocol::scrub_error(&msg.body) {
-                    Some(scrubbed) => out.client(Message::new(msg.tag, scrubbed).encode()),
-                    None => out.client(msg.encode()),
+                    Some(scrubbed) => {
+                        out.client(Vetted::synthetic(&Message::new(msg.tag, scrubbed)))
+                    }
+                    None => out.client(Vetted::control(&msg)),
                 }
             }
 
             // No result set for this Describe; consume its slot.
             b'n' => {
                 self.pending_describes.pop_front();
-                out.client(msg.encode())
+                out.client(Vetted::control(&msg))
             }
 
-            _ => out.client(msg.encode()),
+            // Copy-stream payload. Reachable only if a CopyOutResponse slipped
+            // past, but this is the byte-carrying message, so it is denied on
+            // its own account rather than trusting the earlier check.
+            protocol::B_COPY_DATA | protocol::B_COPY_DONE => {
+                self.rejected_result_sets += 1;
+                let err = protocol::build_error(
+                    protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                    "pgmask: COPY data stream is not permitted",
+                    None,
+                );
+                out.client(Vetted::synthetic(&err));
+                out.close = true;
+            }
+
+            // Explicit allowlist. The backend direction gets no catch-all: an
+            // unrecognised message might carry row data, and forwarding it
+            // because we do not know what it is inverts the whole design.
+            //
+            // Found by the canary test — CopyData was being forwarded through a
+            // `_ =>` arm that existed only because it seemed harmless.
+            tag if protocol::BACKEND_CONTROL_TAGS.contains(&tag) => {
+                out.client(Vetted::control(&msg))
+            }
+
+            unknown => {
+                self.rejected_result_sets += 1;
+                let err = protocol::build_error(
+                    protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                    &format!(
+                        "pgmask: refusing to forward unrecognised backend message '{}'",
+                        unknown as char
+                    ),
+                    Some("pgmask fails closed on protocol messages it cannot classify."),
+                );
+                out.client(Vetted::synthetic(&err));
+                out.close = true;
+            }
         }
     }
 
@@ -339,7 +428,7 @@ impl Session {
             None => {}
         }
         self.active_plan = Some(plan);
-        out.client(msg.encode())
+        out.client(Vetted::control(&msg))
     }
 
     fn handle_data_row(&mut self, msg: Message, out: &mut Batch) {
@@ -411,9 +500,9 @@ impl Session {
         }
 
         if !changed {
-            return out.client(msg.encode());
+            return out.client(Vetted::unmasked_row(&msg, &plan));
         }
-        out.client(protocol::build_data_row(&masked).encode())
+        out.client(Vetted::data_row(&masked))
     }
 }
 
@@ -478,8 +567,13 @@ pub async fn handle_connection(
             msg = client_frames.read_message() => match msg? {
                 Some(msg) => {
                     session.handle_frontend(msg, &mut out);
-                    // Drain whatever else arrived in the same read.
-                    while let Some(msg) = client_frames.try_buffered_message()? {
+                    // Drain whatever else arrived in the same read — but stop the
+                    // moment something refuses, or the messages queued behind it
+                    // get processed anyway. That is how CopyData escaped.
+                    while !out.close {
+                        let Some(msg) = client_frames.try_buffered_message()? else {
+                            break;
+                        };
                         session.handle_frontend(msg, &mut out);
                     }
                 }
@@ -497,7 +591,10 @@ pub async fn handle_connection(
                         authenticated = true;
                     }
                     session.handle_backend(msg, &mut out);
-                    while let Some(msg) = backend_frames.try_buffered_message()? {
+                    while !out.close {
+                        let Some(msg) = backend_frames.try_buffered_message()? else {
+                            break;
+                        };
                         session.handle_backend(msg, &mut out);
                     }
                 }

@@ -24,6 +24,31 @@ pub const B_COPY_BOTH_RESPONSE: u8 = b'W';
 pub const B_ERROR_RESPONSE: u8 = b'E';
 pub const B_NOTICE_RESPONSE: u8 = b'N';
 pub const B_READY_FOR_QUERY: u8 = b'Z';
+pub const B_COPY_DATA: u8 = b'd';
+pub const B_COPY_DONE: u8 = b'c';
+
+/// Backend messages that carry no row data and are safe to forward verbatim.
+///
+/// This is an allowlist on purpose. The backend direction has no catch-all,
+/// because an unrecognised message may carry data and "forward it, we do not
+/// know what it is" is the opposite of fail-closed. Anything absent here is
+/// refused and the connection closed.
+pub const BACKEND_CONTROL_TAGS: &[u8] = &[
+    b'R', // Authentication*
+    b'K', // BackendKeyData
+    b'S', // ParameterStatus
+    b'Z', // ReadyForQuery
+    b'C', // CommandComplete
+    b'I', // EmptyQueryResponse
+    b'A', // NotificationResponse (payload is application text, not table data)
+    b'1', // ParseComplete
+    b'2', // BindComplete
+    b'3', // CloseComplete
+    b's', // PortalSuspended
+    b't', // ParameterDescription
+    b'G', // CopyInResponse — a write path, nothing flows outward
+    b'v', // NegotiateProtocolVersion
+];
 
 // Frontend (client -> server) message tags we act on.
 pub const F_QUERY: u8 = b'Q';
