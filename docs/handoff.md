@@ -217,8 +217,24 @@ Shipped 2026-08-07: rejections are bucketed by cause and reported as
 predictably enough that `?column?`, `count`, `lower` and a preserved column name
 land in different buckets — and confined to counters, never enforcement.
 
-Run in shadow mode for a week before deciding on Phase 6. If the share is high,
-build the **two-rule** version rather than general lineage:
+**Measured 2026-08-07 against a real Neon branch (383k CRM rows, 31 query
+shapes) — the guess was wrong.** Set operations are 7% of rejections.
+Expressions are 47% and aggregates 33%. Full write-up in
+`examples/neon/README.md`. Revised priority, by frequency:
+
+1. **Value-suppressing aggregates** — `count`/`avg`/`sum` emit no source value
+   and can be allowed; `string_agg`/`array_agg`/`json_agg` dump every value and
+   must not be. A parse tree separates them by function name alone, and it
+   unblocks `GROUP BY x, count(*)`.
+2. **Zero-column expressions** — fixes `SELECT 1` health checks.
+3. **Per-field opaque handling** rather than refusing the whole result set.
+4. **Set operations** — last, on this evidence.
+
+Note also that `opaque = "mask"` does not rescue an analytical workload: it nulls
+the aggregate and serves a useless answer, which is worse than a refusal.
+
+The original two-rule plan below would have covered 20% of real rejections.
+Kept for the reasoning, not the priority:
 
 1. **Zero-column expressions.** If a target-list entry references no `ColumnRef`
    at all, it cannot leak a column. Sound, roughly 100 lines, and it fixes

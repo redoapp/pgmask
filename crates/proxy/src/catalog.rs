@@ -542,6 +542,43 @@ fn classify(rule: &ColumnRule, types: &HashMap<String, SemanticType>) -> Result<
     })
 }
 
+/// Make a libpq connection string usable by the catalog connection.
+///
+/// Managed providers hand out DSNs with `channel_binding=require` — Neon does
+/// it by default. Channel binding ties authentication to the TLS certificate of
+/// the endpoint the client is talking to, and pgmask terminates TLS by design,
+/// so the requirement can never be satisfied and the driver fails with the
+/// wonderfully unhelpful "server did not use channel binding".
+///
+/// Rather than make every operator discover that, rewrite it to `disable` and
+/// say so once. The proxy-to-backend leg is still encrypted; what is given up is
+/// the ability to *detect* an endpoint that re-originates TLS, which is exactly
+/// what this process is. See `docs/phase4.md`.
+pub fn sanitize_catalog_dsn(dsn: &str) -> (String, Option<&'static str>) {
+    if !dsn.contains("channel_binding") {
+        return (dsn.to_string(), None);
+    }
+    let rewritten = dsn
+        .split('&')
+        .map(|part| {
+            let key = part.rsplit('?').next().unwrap_or(part);
+            if key.starts_with("channel_binding=") {
+                part.replace(key, "channel_binding=disable")
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    (
+        rewritten,
+        Some(
+            "catalog_dsn requested channel_binding; rewritten to disable — pgmask \
+             terminates TLS, so channel binding can never be satisfied through it",
+        ),
+    )
+}
+
 async fn resolve_snapshot(
     rules: &[ColumnRule],
     types: &HashMap<String, SemanticType>,
@@ -550,7 +587,19 @@ async fn resolve_snapshot(
     if rules.is_empty() {
         return Ok(Snapshot::default());
     }
-    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+    // TLS-capable, because managed Postgres generally refuses plaintext. A
+    // NoTls connector here meant the catalog could not be resolved against Neon
+    // (or RDS with rds.force_ssl, or Cloud SQL) at all — the proxy would fail to
+    // start against exactly the databases it is most useful in front of.
+    let connector =
+        tokio_postgres_rustls::MakeRustlsConnect::new(crate::tls::backend_client_config());
+    let (dsn, note) = sanitize_catalog_dsn(dsn);
+    if let Some(note) = note {
+        // Once per resolve is noisy; once per process would need state. The
+        // refresh interval is minutes, so this is fine and stays visible.
+        eprintln!("catalog: {note}");
+    }
+    let (client, connection) = tokio_postgres::connect(&dsn, connector)
         .await
         .context("connecting with catalog_dsn to resolve column OIDs")?;
     let handle = tokio::spawn(async move {
@@ -656,6 +705,39 @@ by_role = { analyst = "partial" }
             "by_role on column"
         );
         assert_eq!(cfg.column[0].semantic_type.as_deref(), Some("email"));
+    }
+
+    #[test]
+    fn channel_binding_is_rewritten_not_dropped() {
+        let (out, note) = sanitize_catalog_dsn(
+            "postgresql://u:p@h/db?sslmode=require&channel_binding=require&options=-c%20x",
+        );
+        assert!(out.contains("channel_binding=disable"), "got: {out}");
+        assert!(
+            out.contains("sslmode=require"),
+            "other params survive: {out}"
+        );
+        assert!(
+            out.contains("options=-c%20x"),
+            "other params survive: {out}"
+        );
+        assert!(note.is_some(), "the rewrite must be announced");
+    }
+
+    #[test]
+    fn a_dsn_without_channel_binding_is_untouched() {
+        let dsn = "postgresql://u:p@h/db?sslmode=require";
+        let (out, note) = sanitize_catalog_dsn(dsn);
+        assert_eq!(out, dsn);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn channel_binding_as_the_first_parameter_is_handled() {
+        let (out, _) =
+            sanitize_catalog_dsn("postgresql://u:p@h/db?channel_binding=require&sslmode=require");
+        assert!(out.contains("channel_binding=disable"), "got: {out}");
+        assert!(out.contains("sslmode=require"), "got: {out}");
     }
 
     #[test]

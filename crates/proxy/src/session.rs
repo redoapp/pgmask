@@ -428,10 +428,40 @@ impl Session {
         }
 
         match msg.tag {
-            // Channel binding cannot survive TLS termination. Detect the
-            // unworkable combination and say so plainly, rather than letting
-            // the client hit an opaque "channel binding negotiation error" that
-            // gives no hint about the proxy in the middle.
+            // A plaintext client cannot be offered channel binding at all:
+            // libpq aborts with "server offered SCRAM-SHA-256-PLUS
+            // authentication over a non-SSL connection" rather than falling
+            // back. Strip it, and the client sends the gs2 flag `n`, which the
+            // server accepts. This is what makes pgmask usable in front of a
+            // TLS-only managed Postgres such as Neon.
+            protocol::B_AUTHENTICATION
+                if !self.client_tls
+                    && protocol::sasl_mechanisms(&msg.body)
+                        .iter()
+                        .any(|m| m.ends_with("-PLUS")) =>
+            {
+                match protocol::strip_channel_binding(&msg.body) {
+                    Some(filtered) if protocol::sasl_mechanisms(&filtered).is_empty() => {
+                        self.policy.metrics.record(Cause::ChannelBinding);
+                        let err = protocol::build_error(
+                            protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                            "pgmask: the server offers only channel-binding SASL mechanisms",
+                            Some("Enable plain SCRAM-SHA-256 on the server."),
+                        );
+                        out.client(Vetted::synthetic(&err));
+                        out.close = true;
+                    }
+                    Some(filtered) => {
+                        out.client(Vetted::synthetic(&Message::new(msg.tag, filtered)));
+                    }
+                    None => out.client(Vetted::control(&msg)),
+                }
+            }
+
+            // With TLS on both legs there is no fix: stripping makes the client
+            // send `y`, which the server correctly reads as a downgrade attack.
+            // Say so plainly rather than letting the client hit an opaque
+            // protocol error that gives no hint about the proxy in the middle.
             protocol::B_AUTHENTICATION
                 if self.client_tls
                     && protocol::sasl_mechanisms(&msg.body)
@@ -744,7 +774,13 @@ pub async fn handle_connection(
     backend.set_nodelay(true).ok();
     let mut backend_stream: BoxStream = match policy.backend_tls {
         BackendTls::Disable => Box::new(backend),
-        BackendTls::Require => crate::tls::upgrade_backend(backend).await?,
+        BackendTls::Require => {
+            // Strip the port: SNI carries a hostname, never host:port.
+            let host = backend_addr
+                .rsplit_once(':')
+                .map_or(backend_addr, |(h, _)| h);
+            crate::tls::upgrade_backend(backend, host).await?
+        }
     };
 
     backend_stream.write_all(&startup.encode()).await?;

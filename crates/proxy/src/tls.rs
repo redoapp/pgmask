@@ -66,12 +66,17 @@ pub fn load_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-pub fn backend_connector() -> TlsConnector {
-    let config = ClientConfig::builder()
+/// Shared by the proxy's backend leg and by catalog resolution, so both trust
+/// the same thing and neither can be TLS-capable while the other is not.
+pub fn backend_client_config() -> ClientConfig {
+    ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-        .with_no_client_auth();
-    TlsConnector::from(Arc::new(config))
+        .with_no_client_auth()
+}
+
+pub fn backend_connector() -> TlsConnector {
+    TlsConnector::from(Arc::new(backend_client_config()))
 }
 
 /// Encryption without authentication, matching `sslmode=require`.
@@ -131,7 +136,15 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 ///
 /// The `SSLRequest` packet is `[len=8][code=80877103]`, answered by exactly one
 /// byte before any TLS bytes flow.
-pub async fn upgrade_backend(mut stream: tokio::net::TcpStream) -> Result<BoxStream> {
+///
+/// `hostname` becomes the TLS SNI. That is not cosmetic: managed Postgres that
+/// multiplexes many databases behind one address — Neon among them — routes the
+/// connection by SNI, so a placeholder name means the handshake never reaches
+/// the right endpoint.
+pub async fn upgrade_backend(
+    mut stream: tokio::net::TcpStream,
+    hostname: &str,
+) -> Result<BoxStream> {
     let mut request = [0u8; 8];
     request[..4].copy_from_slice(&8i32.to_be_bytes());
     request[4..].copy_from_slice(&crate::protocol::SSL_REQUEST_CODE.to_be_bytes());
@@ -149,8 +162,8 @@ pub async fn upgrade_backend(mut stream: tokio::net::TcpStream) -> Result<BoxStr
         other => bail!("unexpected reply {:?} to SSLRequest", other as char),
     }
 
-    // The name is unused by `AcceptAnyServerCert` but rustls requires one.
-    let server_name = ServerName::try_from("postgres").expect("static name is valid");
+    let server_name = ServerName::try_from(hostname.to_string())
+        .with_context(|| format!("{hostname} is not a valid TLS server name"))?;
     let tls = backend_connector()
         .connect(server_name, stream)
         .await

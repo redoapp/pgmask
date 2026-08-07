@@ -381,6 +381,32 @@ pub const AUTH_SASL: i32 = 10;
 /// so with a plaintext backend leg it offers plain `SCRAM-SHA-256`, the client
 /// authenticates normally, and the client-to-pgmask hop is still encrypted. Put
 /// the proxy next to the database and secure that hop by placement.
+/// Remove channel-binding mechanisms from an `AuthenticationSASL` message.
+///
+/// Correct **only** when the client leg is plaintext. In that case the client
+/// will send the gs2 flag `n` ("I do not support channel binding"), which a
+/// server accepts even though it offered `-PLUS`.
+///
+/// It is *wrong* when the client leg is TLS: such a client sends `y` ("I support
+/// it, you did not offer it"), and a server that did offer it treats that as the
+/// downgrade attack it is.
+///
+/// Returns `None` when nothing needed changing.
+pub fn strip_channel_binding(body: &Bytes) -> Option<Bytes> {
+    let mechanisms = sasl_mechanisms(body);
+    if mechanisms.is_empty() || !mechanisms.iter().any(|m| m.ends_with("-PLUS")) {
+        return None;
+    }
+    let mut out = BytesMut::new();
+    out.put_i32(AUTH_SASL);
+    for mechanism in mechanisms.iter().filter(|m| !m.ends_with("-PLUS")) {
+        out.put_slice(mechanism.as_bytes());
+        out.put_u8(0);
+    }
+    out.put_u8(0);
+    Some(out.freeze())
+}
+
 pub fn sasl_mechanisms(body: &Bytes) -> Vec<String> {
     let mut buf = body.clone();
     if buf.len() < 4 || buf.get_i32() != AUTH_SASL {

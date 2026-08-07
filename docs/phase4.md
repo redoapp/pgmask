@@ -106,6 +106,14 @@ Stripping `-PLUS` from the mechanism list does not rescue it: SCRAM carries a
 and a server that *did* offer it treats that as the downgrade attack it is. We
 tried it; the failure just moves from "check failed" to "negotiation error".
 
+**Corrected 2026-08-07 by the Neon experiment.** The rule is conditional, not
+absolute — see `examples/neon/README.md`. A *plaintext* client leg in front of a
+TLS backend both can and must strip `-PLUS`, because libpq aborts outright on
+"SCRAM-SHA-256-PLUS authentication over a non-SSL connection" rather than
+falling back. Stripping is now implemented, gated on the client leg being
+plaintext. Only the both-TLS case is unfixable, and the original text below
+generalised from testing that one branch alone.
+
 The workable configuration is **client TLS, plaintext backend leg**. Postgres
 only advertises `-PLUS` on a TLS connection of its own, so a plaintext backend
 leg means it offers plain `SCRAM-SHA-256`, the client authenticates normally, and

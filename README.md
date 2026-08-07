@@ -241,6 +241,16 @@ explained rather than failing opaquely. Full reasoning in
 that mattered was coalescing writes into one buffer, replacing a syscall per row.
 Full numbers and methodology in [`docs/benchmarks.md`](docs/benchmarks.md).
 
+## Against a real database
+
+`examples/neon/` runs pgmask read-only in front of a live Neon branch of a real
+internal-tools database (383k rows) under three policies. It found four bugs —
+hardcoded TLS SNI, a `NoTls` catalog connection, `channel_binding=require` in the
+provider's own DSN, and libpq refusing `-PLUS` over a plaintext link — and it
+refuted the assumption behind our Phase 6 plan: set operations are 7% of
+rejections, expressions and aggregates are 80%. Write-up in
+[`examples/neon/README.md`](examples/neon/README.md).
+
 ## Known limits
 
 - **`SELECT 1` is rejected**, and so is `SELECT pg_sleep(30)` and anything else

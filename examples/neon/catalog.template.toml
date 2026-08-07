@@ -1,0 +1,158 @@
+# pgmask against a real Neon branch of the Redo internal-tools database.
+#
+# `__DSN__`, `__BACKEND__`, `__LISTEN__`, `__UNCLASSIFIED__` and `__OPAQUE__`
+# are substituted by run.sh, so no credential is ever written to the repo.
+#
+# Neon requires TLS on the backend leg. The client leg stays plaintext on
+# purpose: Postgres only advertises SCRAM-SHA-256-PLUS on a TLS connection of
+# its own, and channel binding cannot survive a proxy that terminates TLS.
+
+listen        = "__LISTEN__"
+backend       = "__BACKEND__"
+catalog_dsn   = "__DSN__"
+pseudonym_key = "neon-experiment-key"
+
+unclassified      = "__UNCLASSIFIED__"
+unclassified_mask = "null"
+opaque            = "__OPAQUE__"
+backend_tls       = "require"
+
+catalog_refresh_seconds  = 300
+metrics_interval_seconds = 5
+
+# --- Roles ------------------------------------------------------------------
+
+[[role]]
+name    = "analyst"
+members = ["analyst_ann"]
+
+[[role]]
+name    = "support"
+members = ["support_sam"]
+
+# --- Semantic types ---------------------------------------------------------
+
+[[semantic_type]]
+name    = "work_email"
+mask    = "pseudonym"
+by_role = { support = "inner" }
+keep    = 3
+
+[[semantic_type]]
+name    = "person_name"
+mask    = "redact"
+by_role = { support = "none" }
+
+[[semantic_type]]
+name = "company_name"
+# Company names are commercially sensitive but not personal: analysts need to
+# tell accounts apart, so a stable pseudonym beats redaction.
+mask    = "pseudonym"
+by_role = { analyst = "none" }
+
+[[semantic_type]]
+name = "internal_id"
+mask = "pseudonym"
+# Its own domain: a redo_id that happens to equal some other identifier must not
+# pseudonymise alike, or the two columns could be linked.
+
+[[semantic_type]]
+name    = "signup_date"
+mask    = "date-month"
+by_role = { analyst = "none" }
+
+[[semantic_type]]
+name    = "revenue"
+mask    = "numeric-bucket"
+bucket  = 50000
+by_role = { analyst = "numeric-bucket" }
+
+[[semantic_type]]
+name   = "deal_count"
+mask   = "numeric-bucket"
+bucket = 5
+
+# --- crm.companies ----------------------------------------------------------
+
+[[column]]
+relation = "crm.companies"
+column   = "id"
+type     = "internal_id"
+
+[[column]]
+relation = "crm.companies"
+column   = "name"
+type     = "company_name"
+
+[[column]]
+relation = "crm.companies"
+column   = "domain"
+mask     = "pseudonym"
+domain   = "company_name"   # same domain as the name, so the two stay joinable
+
+[[column]]
+relation = "crm.companies"
+column   = "owner_email"
+type     = "work_email"
+
+[[column]]
+relation = "crm.companies"
+column   = "owner_name"
+type     = "person_name"
+
+[[column]]
+relation = "crm.companies"
+column   = "redo_id"
+type     = "internal_id"
+
+[[column]]
+relation = "crm.companies"
+column   = "created_at"
+type     = "signup_date"
+
+[[column]]
+relation = "crm.companies"
+column   = "estimated_monthly_sales"
+type     = "revenue"
+
+[[column]]
+relation = "crm.companies"
+column   = "num_open_deals"
+type     = "deal_count"
+
+[[column]]
+relation = "crm.companies"
+column   = "lifecycle_stage"
+mask     = "none"           # explicitly allowed: needed for every segmentation
+
+[[column]]
+relation = "crm.companies"
+column   = "hubspot_company_id"
+mask     = "none"
+
+# --- auth.user --------------------------------------------------------------
+
+[[column]]
+relation = "auth.user"
+column   = "id"
+type     = "internal_id"
+
+[[column]]
+relation = "auth.user"
+column   = "email"
+type     = "work_email"
+
+[[column]]
+relation = "auth.user"
+column   = "name"
+type     = "person_name"
+
+[[column]]
+relation = "auth.user"
+column   = "created_at"
+type     = "signup_date"
+
+[[column]]
+relation = "auth.user"
+column   = "role"
+mask     = "none"
