@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/spike"]
+members = ["crates/spike", "crates/proxy", "crates/bench"]
 
 [workspace.package]
 version = "0.0.0"
@@ -10,5 +10,10 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+bytes = "1"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
+toml = "0.8"
