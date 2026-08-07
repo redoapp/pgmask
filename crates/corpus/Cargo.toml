@@ -1,0 +1,12 @@
+[package]
+name = "corpus"
+description = "Measure pgmask's rejection rate and causes against a directory of SQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true

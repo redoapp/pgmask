@@ -276,6 +276,18 @@ refuted the assumption behind our Phase 6 plan: set operations are 7% of
 rejections, expressions and aggregates are 80%. Write-up in
 [`examples/neon/README.md`](examples/neon/README.md).
 
+## Measured against real workloads
+
+| corpus | refused | note |
+|---|---|---|
+| 31 hand-written queries, real Neon branch | 32% | [write-up](examples/neon/README.md) |
+| **TPC-DS, 99 queries** | **90%** | [write-up](examples/tpcds/README.md) |
+
+`crates/corpus` measures this against any directory of SQL, using `Parse` +
+`Describe` so it needs **no data** — only the DDL. The gap between the two rows
+is the point: pgmask is usable today for row-level lookup workloads and not for
+analytical ones, and which you have decides whether Phase 6 is optional.
+
 ## Known limits
 
 - **Expressions over a column are rejected** — `lower(email)`, `email || ''`,

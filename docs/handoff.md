@@ -243,6 +243,12 @@ shapes) — the guess was wrong.** Set operations are 7% of rejections.
 Expressions are 47% and aggregates 33%. Full write-up in
 `examples/neon/README.md`. Revised priority, by frequency:
 
+**TPC-DS, 2026-08-07: 90% refused** (69 of 77 judged), essentially all of it
+aggregates over columns. Set operations scored 0%. Our own 31-query corpus
+measured 32% and was far too easy. See `examples/tpcds/README.md`. The aggregate
+rule is not optional for analytical workloads — it is the whole difference
+between usable and not.
+
 0. **Shipped 2026-08-07**: zero-argument safe shapes (`SELECT 1`, `now()`,
    `count(*)`) as an allowlist, not a column-reference search. False-rejection
    rate 23% -> 6% on the Neon corpus. Everything below is still open.

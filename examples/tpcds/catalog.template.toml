@@ -1,0 +1,103 @@
+# pgmask over the TPC-DS schema.
+#
+# TPC-DS models a retail chain and carries exactly the columns a real masking
+# policy has to deal with: customer names, email addresses, birth dates, street
+# addresses. Classified here as a plausible production policy would.
+#
+# The measurement runs on an EMPTY database. Queries are submitted with
+# Parse+Describe and never executed, so no dsdgen run and no data load.
+
+listen        = "127.0.0.1:6450"
+backend       = "127.0.0.1:55440"
+catalog_dsn   = "__DSN__"
+pseudonym_key = "tpcds-experiment"
+
+unclassified      = "__UNCLASSIFIED__"
+unclassified_mask = "null"
+opaque            = "__OPAQUE__"
+
+catalog_refresh_seconds  = 300
+metrics_interval_seconds = 5
+
+[[semantic_type]]
+name = "person_name"
+mask = "redact"
+
+[[semantic_type]]
+name = "email"
+mask = "pseudonym"
+
+[[semantic_type]]
+name = "street_address"
+mask = "redact"
+
+[[semantic_type]]
+name = "birth_date"
+mask = "date-year"
+
+[[semantic_type]]
+name = "customer_id"
+mask = "pseudonym"
+
+# --- customer ---------------------------------------------------------------
+[[column]]
+relation = "public.customer"
+column   = "c_email_address"
+type     = "email"
+
+[[column]]
+relation = "public.customer"
+column   = "c_first_name"
+type     = "person_name"
+
+[[column]]
+relation = "public.customer"
+column   = "c_last_name"
+type     = "person_name"
+
+[[column]]
+relation = "public.customer"
+column   = "c_customer_id"
+type     = "customer_id"
+
+[[column]]
+relation = "public.customer"
+column   = "c_birth_day"
+mask     = "null"
+
+[[column]]
+relation = "public.customer"
+column   = "c_birth_month"
+mask     = "null"
+
+[[column]]
+relation = "public.customer"
+column   = "c_birth_year"
+mask     = "none"
+
+# --- customer_address -------------------------------------------------------
+[[column]]
+relation = "public.customer_address"
+column   = "ca_street_number"
+type     = "street_address"
+
+[[column]]
+relation = "public.customer_address"
+column   = "ca_street_name"
+type     = "street_address"
+
+[[column]]
+relation = "public.customer_address"
+column   = "ca_zip"
+mask     = "partial"
+keep     = 3
+
+[[column]]
+relation = "public.customer_address"
+column   = "ca_city"
+mask     = "none"
+
+[[column]]
+relation = "public.customer_address"
+column   = "ca_state"
+mask     = "none"
