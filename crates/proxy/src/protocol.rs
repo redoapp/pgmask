@@ -155,6 +155,7 @@ impl StartupPacket {
 pub struct FrameReader<R> {
     inner: R,
     buf: BytesMut,
+    eof: bool,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -162,7 +163,15 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         Self {
             inner,
             buf: BytesMut::with_capacity(16 * 1024),
+            eof: false,
         }
+    }
+
+    /// Whether the peer has closed. Lets the pump distinguish "no more messages
+    /// buffered right now" from "this connection is over" with a single call
+    /// site per direction.
+    pub fn saw_eof(&self) -> bool {
+        self.eof
     }
 
     /// Read one tagged message. `Ok(None)` on clean EOF.
@@ -172,6 +181,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 return Ok(Some(msg));
             }
             if self.inner.read_buf(&mut self.buf).await? == 0 {
+                self.eof = true;
                 if self.buf.is_empty() {
                     return Ok(None);
                 }

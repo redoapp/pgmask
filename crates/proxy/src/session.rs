@@ -817,32 +817,40 @@ pub async fn handle_connection(
 
     'pump: loop {
         tokio::select! {
-            msg = client_frames.read_message() => match msg? {
-                Some(msg) => {
+            // One `handle_frontend` call site, deliberately. The obvious
+            // shape — handle the first message, then loop over the rest — gives
+            // each handler *two* call sites, and anything added to only one of
+            // them silently applies to a subset of messages. That mistake was
+            // made twice here: CopyData escaped through the drain after a
+            // refusal, and AuthenticationOk went unseen because it usually
+            // shares a TCP segment with the SASL final message, so no session
+            // ever resolved a principal. Neither was caught by a type; both were
+            // caught by luck. Do not reintroduce the asymmetry.
+            msg = client_frames.read_message() => {
+                let mut current = msg?;
+                while let Some(msg) = current {
                     session.handle_frontend(msg, &mut out);
-                    // Drain whatever else arrived in the same read — but stop the
-                    // moment something refuses, or the messages queued behind it
-                    // get processed anyway. That is how CopyData escaped.
-                    while !out.close {
-                        let Some(msg) = client_frames.try_buffered_message()? else {
-                            break;
-                        };
-                        session.handle_frontend(msg, &mut out);
+                    if out.close {
+                        break;
                     }
+                    current = client_frames.try_buffered_message()?;
                 }
-                None => break 'pump,
+                if client_frames.saw_eof() {
+                    break 'pump;
+                }
             },
-            msg = backend_frames.read_message() => match msg? {
-                Some(msg) => {
+            msg = backend_frames.read_message() => {
+                let mut current = msg?;
+                while let Some(msg) = current {
                     session.handle_backend(msg, &mut out);
-                    while !out.close {
-                        let Some(msg) = backend_frames.try_buffered_message()? else {
-                            break;
-                        };
-                        session.handle_backend(msg, &mut out);
+                    if out.close {
+                        break;
                     }
+                    current = backend_frames.try_buffered_message()?;
                 }
-                None => break 'pump,
+                if backend_frames.saw_eof() {
+                    break 'pump;
+                }
             },
         }
 
