@@ -16,7 +16,9 @@ Phases 2 and 3 of [`handoff.md`](handoff.md), scoped to one deliverable.
 4. `COPY ... TO STDOUT` and the legacy `FunctionCall` message are refused — the only two
    paths that emit rows without a `RowDescription`.
 5. A `DataRow` reaching the client with no active masking plan is impossible: the
-   connection is killed instead.
+   result set is suppressed and the client gets an error. (The design sketch said
+   "kill the connection"; suppressing is equally fail-closed on data and leaves a
+   recoverable session, so that is what shipped.)
 6. Error-message `DETAIL`/`HINT` carrying classified values is scrubbed.
 7. Both the simple and extended query protocols work, including prepared statements
    re-executed many times against one `Describe`.

@@ -1,8 +1,26 @@
 # Postgres Masking Proxy — Build Handoff
 
-**Status:** design accepted, Phase 0 spike not yet run
+**Status:** built. This is the original plan, kept because several of its
+predictions turned out to be wrong and the corrections are the useful part.
 **Shape:** Rust, 1:1 pgwire interceptor, fail-closed column masking
-**Rough size:** ~9–10 weeks of proxy work, plus a parallel classification track that never fully ends
+**Estimated:** ~9–10 weeks of proxy work, plus a classification track that never ends
+
+## How to read this
+
+The plan is preserved as written. Where reality disagreed, the correction is
+inline and dated. For current state start at [`../README.md`](../README.md); the
+four places this document was wrong:
+
+| § | Predicted | Actual |
+|---|---|---|
+| 4 — Phase 0 | provenance might collapse through CTEs/subqueries | survives far further; **GO**. 22/37 shapes full provenance |
+| 4 — Phase 6 | set operations dominate rejections | **7%**. Expressions 47%, aggregates 33% ([Neon run](../examples/neon/README.md)) |
+| 6 — catalog | OID staleness noted as required behaviour | shipped only after it was demonstrated silently nulling a recreated view |
+| 9 / [phase4](phase4.md) | channel binding unfixable through a terminating proxy | true only when *both* legs are TLS; a plaintext client leg both can and must strip `-PLUS` |
+
+The estimate held up better than the predictions: the proxy took roughly the
+predicted effort, and the parts that ran long were the ones called out as
+open-ended.
 
 ---
 
@@ -55,7 +73,10 @@ Both are **blocked outright**. That is the entire bypass surface, and it is smal
 to close on day one.
 
 Corollary, and it must be enforced in code: **a `DataRow` arriving with no active plan is
-a bug or an attack.** Kill the connection with an error. Never pass it through.
+a bug or an attack.** Never pass it through. *(Shipped as: suppress the result
+set and return an error, which is equally fail-closed on data and leaves the
+session usable. `COPY` still closes the connection, being unrecoverable
+mid-stream.)*
 
 ---
 

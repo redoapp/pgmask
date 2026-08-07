@@ -15,11 +15,13 @@ Two shapes, because they answer different questions:
 
 ## Current
 
+Three runs, so the figure is a range rather than false precision.
+
 | | direct | pgmask | overhead |
 |---|---|---|---|
 | latency, 1 row (mean) | 0.184 ms | 0.182 ms | within noise |
 | throughput, 10k rows (mean) | 1.99 ms | 4.90 ms | +2.91 ms |
-| per masked row | — | — | **0.29 µs** |
+| per masked row | — | — | **0.22–0.29 µs** |
 | rows/sec | 5.0 M | 2.0 M | 2.4× slower |
 
 Interactive latency is free. Bulk scans cost roughly 2.4× — acceptable for the
@@ -36,7 +38,7 @@ optimisation work, which is the only reason these were found rather than shipped
 | first working version | 3.98 | — |
 | batch the flush; cheap hex; zero-copy passthrough | 2.39 | −40% |
 | pre-keyed HMAC; direct frame build; no per-message `Vec` | 2.13 | −11% |
-| **coalesce writes into one buffer** | **0.29** | **−86%** |
+| **coalesce writes into one buffer** | **~0.25** | **−88%** |
 
 The last row is the whole story. The first fix batched the *flush* but still
 issued one `write_all` per message — a syscall per row. Copying each frame into
@@ -45,6 +47,15 @@ one, and beat every algorithmic optimisation combined by a wide margin.
 
 Worth remembering when the next performance question comes up: measure syscalls
 before micro-optimising the work between them.
+
+## Re-measuring
+
+```bash
+DIRECT_URL=... PROXY_URL=... cargo run -p bench --release -- 10000 200
+```
+
+Run it more than once. Single-run numbers on a laptop vary by ~30%, which is
+wider than several of the optimisations above.
 
 ## What is not measured yet
 

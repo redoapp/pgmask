@@ -24,10 +24,27 @@ HINT:  Select the underlying column directly. Expressions, set operations
        all erase provenance.
 ```
 
-**Status: Phase 4 complete — a security boundary, not a demo.** 77 assertions
-across five suites, including a canary property test driven from a raw wire
-client that asserts no sentinel byte ever crosses the boundary. TLS on both legs.
-See [`docs/phase4.md`](docs/phase4.md). The limits below are still real.
+## Where this stands
+
+| | |
+|---|---|
+| Phase 0 — provenance spike | done, **GO** ([results](docs/phase0-results.md)) |
+| MVP — masking, fail-closed | done ([goal](docs/mvp.md)) |
+| Phase 4 — security boundary | done ([what it found](docs/phase4.md)) |
+| Catalog freshness + rejection metrics | done |
+| Per-principal policy, semantic types, type-aware masks | done |
+| Validated against a real database | done ([Neon run](examples/neon/README.md)) |
+| **Phase 1 — classification catalog + CI gate** | **open, and the largest item left** |
+| Phase 6 — parser rules | open; priority revised by measurement, not guesswork |
+
+117 assertions across five suites: 55 unit, 18 adversarial, 8 resilience, 7 TLS,
+29 demo. The adversarial suite drives a raw wire client and asserts no sentinel
+byte ever crosses the boundary.
+
+**What to do next, in order.** Phase 1 is the gate on this being useful — the
+enforcement mechanism is in good shape and the policy it enforces still has to
+be written. Then decide Phase 6 from the measured causes (aggregates first, not
+set operations). The limits below are real and unchanged.
 
 ## How it works
 
@@ -236,10 +253,11 @@ explained rather than failing opaquely. Full reasoning in
 
 ## Performance
 
-0.29 µs per masked row; interactive latency overhead within noise; bulk scans
-~2.4× slower than direct. The first working version was 3.98 µs/row — the fix
-that mattered was coalescing writes into one buffer, replacing a syscall per row.
-Full numbers and methodology in [`docs/benchmarks.md`](docs/benchmarks.md).
+0.22–0.29 µs per masked row across three runs; interactive latency overhead
+within noise; bulk scans ~2.4× slower than direct. The first working version was
+3.98 µs/row, and the fix that mattered was not algorithmic — it was coalescing
+writes into one buffer, replacing a `write` syscall per row. Methodology and the
+full optimisation trail in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Against a real database
 
