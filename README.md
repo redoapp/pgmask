@@ -30,18 +30,28 @@ does, further than expected. **Verdict: GO.** Results in
 [`docs/handoff.md` §4](docs/handoff.md).
 
 ```bash
-npm install
-npm run pg:up          # Postgres 17 in podman on :55432
-DATABASE_URL='postgres://postgres:spike@localhost:55432/spike' npm run spike:md
-npm run pg:down
+# a throwaway Postgres to point at
+podman run -d --name pgmask-spike \
+  -e POSTGRES_PASSWORD=spike -e POSTGRES_DB=spike \
+  -p 55432:5432 docker.io/library/postgres:17
+
+DATABASE_URL='postgres://postgres:spike@localhost:55432/spike' \
+  cargo run -p spike -- --md docs/phase0-results.md
+
+podman rm -f pgmask-spike
 ```
 
 Rerun against any database by pointing `DATABASE_URL` elsewhere. **Rerun it against the
-target major version before Phase 3** — provenance behaviour is a planner property and is
-not guaranteed stable across releases.
+target major version before Phase 3** — provenance behaviour is a planner property, not a
+documented guarantee, and is not promised stable across releases.
 
-Adding a shape: append to `spike/shapes.mjs`. Set `expect` to your prior (`provenance`,
-`opaque`, or `unknown`) and the runner flags anything that disagrees.
+Adding a shape: append to `crates/spike/src/shapes.rs`. Set `expect` to your prior
+(`Provenance`, `Opaque`, or `Unknown`) and the runner flags anything that disagrees.
+
+The spike reads provenance via `Statement::columns()` — Parse + Describe with no Execute,
+the same path the proxy uses for pre-execution rejection. This also verified the Rust
+dependency the design rests on: `tokio_postgres::Column` does expose `table_oid()` and
+`column_id()`, so no lower-level `postgres-protocol` access is needed.
 
 ### Headline results
 
@@ -56,15 +66,15 @@ separately in shadow mode.
 ## Layout
 
 ```
-docs/handoff.md            build plan — read this first
-docs/phase0-results.md     generated spike output
-spike/fixture.sql          relation kinds under test
-spike/shapes.mjs           the query-shape matrix
-spike/run.mjs              runner; prints a summary and the GO/NO-GO inputs
+docs/handoff.md                build plan — read this first
+docs/phase0-results.md         generated spike output
+crates/spike/fixture.sql       relation kinds under test
+crates/spike/src/shapes.rs     the query-shape matrix
+crates/spike/src/main.rs       runner; prints a summary and the GO/NO-GO inputs
 ```
 
-The spike is Node because it answers a question about *Postgres*, not about Rust. The
-proxy itself is Rust (`pgwire` + `tokio-postgres`), starting in Phase 2.
+Cargo workspace, no other toolchains. The proxy crate arrives in Phase 2 (`pgwire` +
+`tokio-postgres`).
 
 ## What this is not
 

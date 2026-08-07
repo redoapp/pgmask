@@ -1,0 +1,12 @@
+[package]
+name = "spike"
+description = "Phase 0: does RowDescription provenance survive real query shapes?"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true

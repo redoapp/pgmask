@@ -176,6 +176,31 @@ It is lost on:
 - functions returning `SETOF <table>` or `TABLE(...)`
 - ordinary expressions, as expected: `lower()`, `||`, `COALESCE`, `CASE`, aggregates
 
+Cross-validated on two independent client stacks (node-postgres and
+tokio-postgres) with identical results, which also confirms the Rust dependency:
+**`tokio_postgres::Column` exposes `table_oid()` and `column_id()`** as
+`Option<u32>` / `Option<i16>`. No lower-level `postgres-protocol` access needed
+for the backend leg.
+
+### Every shape was describable without executing
+
+All 37 shapes — including `FETCH ALL FROM <cursor>` — returned their full column
+list from `Parse`+`Describe` alone, with no `Execute`. That is stronger than §5
+assumed, and it opens a design option:
+
+> For simple-query-protocol clients, the proxy can issue its **own** `Parse` +
+> `Describe` on the backend before forwarding the `Query`, and reject
+> pre-execution.
+
+That buys uniform pre-execution rejection for *all* clients rather than only
+extended-protocol ones, at the cost of one extra backend round trip per
+statement. Worth prototyping in Phase 3 and measuring; if the latency is
+acceptable it removes the simple-vs-extended asymmetry from the design entirely.
+
+Caveat to test: a synthesized `Parse` of a multi-statement simple `Query` will
+fail (`Parse` accepts one statement), so the proxy would need to either split
+them or fall back to post-execution masking for that case.
+
 ### Decisions this resolves
 
 | Question | Answer | Consequence |
