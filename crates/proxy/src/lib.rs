@@ -4,6 +4,7 @@
 //! version: Postgres's `RowDescription` tells us which stored column each output
 //! field came from, so we mask what we can identify and refuse what we cannot.
 
+pub mod analysis;
 pub mod catalog;
 pub mod mask;
 pub mod metrics;

@@ -404,3 +404,117 @@ async fn no_canary_escapes_across_every_path() -> Result<()> {
     assert_no_canary(&client, "full sweep");
     Ok(())
 }
+
+// --- The rescue path --------------------------------------------------------
+//
+// analysis.rs turns refusals into passthroughs for expressions positively
+// identified as carrying no column value. That direction is the dangerous one:
+// a wrong rule here is a leak, not a false pass. These tests exist to make sure
+// nothing can ride through it.
+
+#[tokio::test]
+async fn provably_column_free_expressions_are_served() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    for sql in [
+        "SELECT 1",
+        "SELECT now()",
+        "SELECT current_database()",
+        "SELECT count(*) FROM canary.subjects",
+        "SELECT city, count(*) FROM canary.subjects GROUP BY city",
+    ] {
+        let msgs = client.simple_query(sql).await?;
+        assert!(
+            msgs.iter().any(|m| m.tag == b'D'),
+            "{sql} should now be served, not refused"
+        );
+        assert_no_canary(&client, sql);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_rescue_path_cannot_be_tricked() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    // Every one of these is an expression that either emits a stored value or
+    // reveals something about one. None may be rescued.
+    for sql in [
+        "SELECT max(email) FROM canary.subjects",
+        "SELECT min(email) FROM canary.subjects",
+        "SELECT count(email) FROM canary.subjects",
+        "SELECT string_agg(email, ',') FROM canary.subjects",
+        "SELECT array_agg(email) FROM canary.subjects",
+        "SELECT count(*) FILTER (WHERE email = 'CANARY_EMAIL_a1b2c3') FROM canary.subjects",
+        "SELECT row_number() OVER (ORDER BY email) FROM canary.subjects",
+        "SELECT (SELECT email FROM canary.subjects LIMIT 1)",
+        "SELECT coalesce(email, '') FROM canary.subjects",
+        "SELECT 1, email FROM canary.subjects",
+        "SELECT 1 UNION ALL SELECT 1",
+    ] {
+        client.simple_query(sql).await?;
+        assert_no_canary(&client, sql);
+    }
+    Ok(())
+}
+
+/// The position mapping is the subtle part: target-list index i must really be
+/// described field i, or a literal could claim a classified column's slot.
+#[tokio::test]
+async fn a_star_expansion_cannot_shift_a_literal_onto_a_column() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+    for sql in [
+        "SELECT *, 1 FROM canary.subjects",
+        "SELECT 1, * FROM canary.subjects",
+        "SELECT s.*, count(*) OVER () FROM canary.subjects s",
+    ] {
+        client.simple_query(sql).await?;
+        assert_no_canary(&client, sql);
+    }
+    Ok(())
+}
+
+/// The extended protocol carries SQL in `Parse`, not in `Query`, so the
+/// analysis has to find it by a different route.
+#[tokio::test]
+async fn the_rescue_path_works_and_holds_over_the_extended_protocol() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    // Safe: should come back with rows.
+    client
+        .send(parse_msg("s1", "SELECT count(*) FROM canary.subjects"))
+        .await?;
+    client.send(describe_statement("s1")).await?;
+    client.send(bind_msg("p1", "s1")).await?;
+    client.send(execute_msg("p1", 0)).await?;
+    client.send(sync_msg()).await?;
+    let msgs = client.read_until_ready().await?;
+    assert!(
+        msgs.iter().any(|m| m.tag == b'D'),
+        "count(*) should be served"
+    );
+
+    // Unsafe: must not be rescued just because a safe statement preceded it.
+    client
+        .send(parse_msg("s2", "SELECT max(email) FROM canary.subjects"))
+        .await?;
+    client.send(describe_statement("s2")).await?;
+    client.send(bind_msg("p2", "s2")).await?;
+    client.send(execute_msg("p2", 0)).await?;
+    client.send(sync_msg()).await?;
+    client.read_until_ready_or_eof().await?;
+    assert_no_canary(&client, "extended protocol rescue path");
+    Ok(())
+}

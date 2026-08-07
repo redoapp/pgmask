@@ -313,9 +313,17 @@ async fn rejections_are_bucketed_by_cause() -> Result<()> {
     client
         .simple_query("SELECT lower(email) FROM canary.subjects")
         .await?;
-    // A literal is anonymous.
+    // A literal and count(*) are now *rescued* rather than rejected, so use
+    // shapes that still cannot be proven safe for the anonymous and aggregate
+    // buckets: a concatenation is anonymous, and max() emits a stored value.
+    client
+        .simple_query("SELECT email || '' FROM canary.subjects")
+        .await?;
+    client
+        .simple_query("SELECT max(email) FROM canary.subjects")
+        .await?;
+    // And the ones that should no longer count as rejections at all.
     client.simple_query("SELECT 1").await?;
-    // An aggregate is named after the aggregate.
     client
         .simple_query("SELECT count(*) FROM canary.subjects")
         .await?;
@@ -332,6 +340,8 @@ async fn rejections_are_bucketed_by_cause() -> Result<()> {
         "opaque_aggregate=1",
         "copy_stream=1",
         "set_op_like_share=",
+        // SELECT 1 and count(*) are served now, not refused.
+        "fields_rescued=2",
     ] {
         assert!(
             report.contains(expected),

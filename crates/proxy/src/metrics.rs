@@ -130,11 +130,18 @@ pub struct Metrics {
     counters: [AtomicU64; 11],
     result_sets_masked: AtomicU64,
     fields_masked: AtomicU64,
+    /// Opaque fields passed through because they were positively identified as
+    /// carrying no column value. Each one is a rejection that did not happen.
+    fields_rescued: AtomicU64,
 }
 
 impl Metrics {
     pub fn record(&self, cause: Cause) {
         self.counters[cause.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_rescued(&self) {
+        self.fields_rescued.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_masked_result_set(&self, fields: u64) {
@@ -163,6 +170,10 @@ impl Metrics {
                 self.fields_masked.load(Ordering::Relaxed)
             ),
             format!("rejections={total}"),
+            format!(
+                "fields_rescued={}",
+                self.fields_rescued.load(Ordering::Relaxed)
+            ),
         ];
         for cause in Cause::ALL {
             let n = self.counters[cause.index()].load(Ordering::Relaxed);

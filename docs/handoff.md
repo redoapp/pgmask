@@ -243,6 +243,9 @@ shapes) — the guess was wrong.** Set operations are 7% of rejections.
 Expressions are 47% and aggregates 33%. Full write-up in
 `examples/neon/README.md`. Revised priority, by frequency:
 
+0. **Shipped 2026-08-07**: zero-argument safe shapes (`SELECT 1`, `now()`,
+   `count(*)`) as an allowlist, not a column-reference search. False-rejection
+   rate 23% -> 6% on the Neon corpus. Everything below is still open.
 1. **Value-suppressing aggregates** — `count`/`avg`/`sum` emit no source value
    and can be allowed; `string_agg`/`array_agg`/`json_agg` dump every value and
    must not be. A parse tree separates them by function name alone, and it

@@ -26,6 +26,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::analysis::{self, Safety};
 use crate::catalog::{Catalog, Config, Opaque, Unclassified};
 use crate::mask::{Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
@@ -99,29 +100,40 @@ impl Policy {
         &self,
         fields: &[protocol::FieldDescription],
         roles: &HashSet<String>,
+        safety: &[Safety],
     ) -> Result<Plan, Rejection> {
         let snapshot = self.catalog.snapshot();
         let mut plan = Vec::with_capacity(fields.len());
-        for field in fields {
+        for (index, field) in fields.iter().enumerate() {
+            let provably_safe = safety.get(index).copied() == Some(Safety::ProvablyColumnFree);
             let spec = if !field.has_provenance() {
-                match self.opaque {
-                    Opaque::Reject => {
-                        return Err(Rejection {
-                            cause: Cause::classify_opaque(&field.name, &snapshot),
-                            message: format!(
-                                "pgmask: output column \"{}\" has no column provenance, so it \
+                // An expression we positively identified as carrying no column
+                // value — `SELECT 1`, `now()`, `count(*)`. Passing it through is
+                // the point of the analysis; see analysis.rs for why the rule is
+                // an allowlist of shapes rather than a search for column refs.
+                if provably_safe {
+                    self.metrics.record_rescued();
+                    MaskSpec::new(Mask::None)
+                } else {
+                    match self.opaque {
+                        Opaque::Reject => {
+                            return Err(Rejection {
+                                cause: Cause::classify_opaque(&field.name, &snapshot),
+                                message: format!(
+                                    "pgmask: output column \"{}\" has no column provenance, so it \
                                  cannot be classified",
-                                field.name
-                            ),
-                            hint: Some(
-                                "Select the underlying column directly. Expressions, set \
+                                    field.name
+                                ),
+                                hint: Some(
+                                    "Select the underlying column directly. Expressions, set \
                                  operations (UNION/INTERSECT/EXCEPT), recursive CTEs and \
                                  SETOF-returning functions all erase provenance."
-                                    .into(),
-                            ),
-                        })
+                                        .into(),
+                                ),
+                            })
+                        }
+                        Opaque::Mask => MaskSpec::new(Mask::Null),
                     }
-                    Opaque::Mask => MaskSpec::new(Mask::Null),
                 }
             } else {
                 match snapshot.lookup(field.table_oid, field.column_id) {
@@ -266,6 +278,15 @@ pub struct Session {
     policy: Arc<Policy>,
     /// Plans keyed by prepared-statement name, populated by `Describe('S')`.
     statement_plans: HashMap<String, Plan>,
+    /// SQL text per prepared statement, so the analysis can run when the result
+    /// set is described. Bounded by how many statements a client prepares.
+    statement_sql: HashMap<String, String>,
+    /// Portal -> statement, so an `Execute` can find its SQL.
+    portal_statement: HashMap<String, String>,
+    /// SQL of the most recent simple query.
+    simple_sql: Option<String>,
+    /// The SQL the next `RowDescription` belongs to.
+    described_sql: Option<String>,
     /// Plans keyed by portal name, copied from the statement at `Bind`.
     portal_plans: HashMap<String, Plan>,
     /// The plan the next `DataRow` will be masked with.
@@ -293,6 +314,10 @@ impl Session {
         Self {
             policy,
             statement_plans: HashMap::new(),
+            statement_sql: HashMap::new(),
+            portal_statement: HashMap::new(),
+            simple_sql: None,
+            described_sql: None,
             portal_plans: HashMap::new(),
             active_plan: None,
             pending_describes: VecDeque::new(),
@@ -375,11 +400,22 @@ impl Session {
             protocol::F_QUERY => {
                 self.active_plan = None;
                 self.pending_describes.clear();
+                self.simple_sql = protocol::parse_simple_query(&msg.body);
+                self.described_sql = self.simple_sql.clone();
+                out.backend(msg.encode())
+            }
+
+            protocol::F_PARSE => {
+                if let Some((name, sql)) = protocol::parse_parse(&msg.body) {
+                    self.statement_sql.insert(name, sql);
+                }
                 out.backend(msg.encode())
             }
 
             protocol::F_BIND => {
                 if let Some((portal, statement)) = protocol::parse_bind(&msg.body) {
+                    self.portal_statement
+                        .insert(portal.clone(), statement.clone());
                     match self.statement_plans.get(&statement) {
                         Some(plan) => {
                             self.portal_plans.insert(portal, plan.clone());
@@ -394,6 +430,16 @@ impl Session {
 
             protocol::F_DESCRIBE => {
                 if let Some(target) = protocol::parse_describe(&msg.body) {
+                    // Remember which statement's SQL the coming RowDescription
+                    // belongs to, so the analysis looks at the right text.
+                    self.described_sql = match &target {
+                        DescribeTarget::Statement(name) => self.statement_sql.get(name).cloned(),
+                        DescribeTarget::Portal(portal) => self
+                            .portal_statement
+                            .get(portal)
+                            .and_then(|stmt| self.statement_sql.get(stmt))
+                            .cloned(),
+                    };
                     self.pending_describes.push_back(target);
                 }
                 out.backend(msg.encode())
@@ -579,7 +625,13 @@ impl Session {
             }
         };
 
-        let plan = match self.policy.plan_for(&fields, &self.roles) {
+        // Only consulted for fields with no provenance, and only ever able to
+        // turn a refusal into a passthrough for a positively-identified shape.
+        let safety = match &self.described_sql {
+            Some(sql) => analysis::analyze(sql, fields.len()),
+            None => vec![Safety::Unknown; fields.len()],
+        };
+        let plan = match self.policy.plan_for(&fields, &self.roles, &safety) {
             Ok(plan) => plan,
             Err(rejection) => {
                 self.pending_describes.pop_front();
@@ -917,7 +969,7 @@ mod tests {
     fn opaque_field_is_rejected_by_default() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let err = p
-            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new())
+            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[])
             .expect_err("must reject");
         assert!(err.message.contains("no column provenance"));
     }
@@ -926,7 +978,7 @@ mod tests {
     fn opaque_field_can_be_masked_instead() {
         let p = policy(Unclassified::Allow, Opaque::Mask);
         let plan = p
-            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new())
+            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[])
             .ok()
             .expect("must allow");
         assert_eq!(plan[0].spec.kind, Mask::Null);
@@ -936,7 +988,7 @@ mod tests {
     fn unclassified_columns_are_masked_by_default() {
         let p = policy(Unclassified::Mask, Opaque::Reject);
         let plan = p
-            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new())
+            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new(), &[])
             .ok()
             .unwrap();
         assert_eq!(plan[0].spec.kind, Mask::Null, "default-deny");
@@ -946,7 +998,7 @@ mod tests {
     fn allow_mode_passes_unclassified_columns() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let plan = p
-            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new())
+            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new(), &[])
             .ok()
             .unwrap();
         assert_eq!(plan[0].spec.kind, Mask::None);
@@ -969,7 +1021,7 @@ mod tests {
         });
         // int4, not a text type: pseudonym rewrites values as text.
         let err = p
-            .plan_for(&[field("id", 16391, 1, 23)], &HashSet::new())
+            .plan_for(&[field("id", 16391, 1, 23)], &HashSet::new(), &[])
             .expect_err("must reject");
         assert!(
             err.message.contains("cannot be applied to type OID 23"),

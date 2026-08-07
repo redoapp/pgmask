@@ -131,3 +131,33 @@ By measured frequency, not by guess:
 One case worth noticing: `date_trunc('month', created_at)` is refused, while
 pgmask's own `date-month` mask does exactly that transformation. A caller
 coarsening data *for* us still gets refused, because provenance cannot see intent.
+
+
+## Follow-up: the rescue rule (same branch, same corpus)
+
+The measurement above drove one change — an allowlist of expression shapes
+positively known to carry no column value (`analysis.rs`). Re-run against the
+same branch:
+
+| | before | after |
+|---|---|---|
+| rejections over 31 shapes | 15 (48%) | 10 (32%) |
+| of those, *false* rejections | 7 (23%) | **2 (6%)** |
+| correct refusals | 5 | 5 — unchanged |
+
+Now served: `SELECT 1`, `now()`, `current_database()`, `count(*)`, and
+`GROUP BY x, count(*)` — which returns real counts (364,947 leads / 8,277
+opportunities / 6,619 customers) while the pseudonymised columns beside it stay
+masked.
+
+Still refused, correctly: `lower(email)`, `coalesce(domain, …)`, `to_json(row)`,
+`string_agg(name, ',')`. Still refused conservatively: `avg(deals)` and
+`date_trunc('month', created_at)` — both take a column argument, and admitting
+arguments means classifying functions, where `max(email)` returns a real email
+address.
+
+The rule deliberately does *not* try to prove "this expression references no
+column". `pg_query`'s own tree walker documents that it does not visit every
+node type, and proving absence across an incomplete traversal would be unsound
+in the leak direction. Matching known-safe shapes puts the burden the right way
+round: forgetting a shape costs utility, never safety.

@@ -26,6 +26,7 @@ toml.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio-postgres-rustls.workspace = true
+pg_query.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

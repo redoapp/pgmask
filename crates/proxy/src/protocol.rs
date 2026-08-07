@@ -52,6 +52,7 @@ pub const BACKEND_CONTROL_TAGS: &[u8] = &[
 
 // Frontend (client -> server) message tags we act on.
 pub const F_QUERY: u8 = b'Q';
+pub const F_PARSE: u8 = b'P';
 pub const F_BIND: u8 = b'B';
 pub const F_DESCRIBE: u8 = b'D';
 pub const F_EXECUTE: u8 = b'E';
@@ -525,6 +526,20 @@ pub fn parse_bind(body: &Bytes) -> Option<(String, String)> {
     let portal = read_cstring(&mut buf)?;
     let statement = read_cstring(&mut buf)?;
     Some((portal, statement))
+}
+
+/// A simple `Query` is a single cstring.
+pub fn parse_simple_query(body: &Bytes) -> Option<String> {
+    let mut buf = body.clone();
+    read_cstring(&mut buf)
+}
+
+/// `Parse` is `[statement: cstring][query: cstring][...]`.
+pub fn parse_parse(body: &Bytes) -> Option<(String, String)> {
+    let mut buf = body.clone();
+    let name = read_cstring(&mut buf)?;
+    let sql = read_cstring(&mut buf)?;
+    Some((name, sql))
 }
 
 /// `Execute` starts `[portal: cstring]`.

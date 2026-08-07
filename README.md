@@ -62,6 +62,13 @@ both are refused. A `DataRow` arriving with no active plan is never forwarded.
 We decode only four message types and forward everything else byte-for-byte.
 Bytes we never interpret are bytes we cannot misinterpret.
 
+Fields with no provenance are refused — except for a short allowlist of
+expression shapes positively known to carry no column value (`SELECT 1`,
+`now()`, `count(*)`). That rule is an allowlist rather than a search for column
+references because it converts refusals into acceptances, so unsoundness there
+means a leak; see [`crates/proxy/src/analysis.rs`](crates/proxy/src/analysis.rs).
+It cut the false-rejection rate on a real workload from 23% to 6%.
+
 ## Try it
 
 ```bash
@@ -271,11 +278,15 @@ rejections, expressions and aggregates are 80%. Write-up in
 
 ## Known limits
 
-- **`SELECT 1` is rejected**, and so is `SELECT pg_sleep(30)` and anything else
-  whose target list is a bare expression. A literal has no table, so it has no
-  provenance, and a constant is indistinguishable from `lower(email)` at the
-  protocol level. Health checks using `SELECT 1` will fail. Fixing this properly
-  needs Phase 6 parsing.
+- **Expressions over a column are rejected** — `lower(email)`, `email || ''`,
+  `coalesce(domain, …)`, `to_json(row)`. Each emits the real value, so these are
+  correct refusals, but they are also the largest source of friction.
+  `SELECT 1`, `now()` and `count(*)` used to be refused too; they are now served
+  (see below).
+- **Anything taking a column as an argument is refused conservatively**, even
+  when it is harmless — `avg(deals)`, `date_trunc('month', created_at)`. Opening
+  that door means classifying functions, and `max(email)` returns a real email
+  address.
 - **Set operations, recursive CTEs and `SETOF` functions are rejected** — Phase 0
   measured that they erase provenance. Expected to be the main source of
   rejections in practice; instrument by cause before deciding on Phase 6.

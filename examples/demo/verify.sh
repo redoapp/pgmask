@@ -97,12 +97,20 @@ echo "-----------------------"
 check "1. psql connects and queries through the proxy" \
   "Denver" "$(proxied 'SELECT city FROM demo.customers WHERE id = 1;')"
 
-# 1b — a constant has no table, so it has no provenance. Rejecting it is correct
-# and unavoidable: `SELECT 1` and `SELECT lower(email)` are indistinguishable at
-# the protocol level. Worth asserting so the behaviour is deliberate, not a
-# surprise the first time a health check fails.
-check "1b. literal-only SELECT is rejected (expected; breaks SELECT 1 health checks)" \
-  "no column provenance" "$(proxied 'SELECT 1;')"
+# 1b — a constant has no provenance, but it is positively identifiable as
+# carrying no column value, so it is served rather than refused. This used to
+# fail and break SELECT 1 health checks; see crates/proxy/src/analysis.rs.
+check "1b. literal-only SELECT is served (health checks work)" \
+  "1" "$(proxied 'SELECT 1;')"
+check "1c. count(*) is served" \
+  "50" "$(proxied 'SELECT count(*) FROM demo.customers;')"
+# The count must be a real number, not a nulled placeholder: 50k rows over
+# four cities is 12500 each.
+check "1d. GROUP BY with a count returns real counts" \
+  "12500" "$(proxied 'SELECT city, count(*) FROM demo.customers GROUP BY city ORDER BY 1 LIMIT 2;')"
+# ...and the rescue must not extend to anything touching a column.
+check "1e. an aggregate that emits a stored value is still refused" \
+  "no column provenance" "$(proxied 'SELECT max(email) FROM demo.customers;')"
 
 # 2 — classified masked, allowed passthrough, unclassified default-denied.
 row="$(proxied 'SELECT email, name, phone, city, internal_note FROM demo.customers WHERE id = 1;')"
