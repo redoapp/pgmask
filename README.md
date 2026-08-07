@@ -269,7 +269,7 @@ full optimisation trail in [`docs/benchmarks.md`](docs/benchmarks.md).
 ## Against a real database
 
 `examples/neon/` runs pgmask read-only in front of a live Neon branch of a real
-internal-tools database (383k rows) under three policies. It found four bugs —
+internal-tools database (~380k rows) under three policies. It found four bugs —
 hardcoded TLS SNI, a `NoTls` catalog connection, `channel_binding=require` in the
 provider's own DSN, and libpq refusing `-PLUS` over a plaintext link — and it
 refuted the assumption behind our Phase 6 plan: set operations are 7% of

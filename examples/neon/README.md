@@ -1,7 +1,7 @@
 # Experiment: pgmask in front of a real Neon branch
 
 pgmask pointed at a non-production branch of a real internal-tools database
-(383k CRM companies, 482 users), read-only, under three policy configurations.
+(~380k CRM companies, ~500 users), read-only, under three policy configurations.
 The point was to find out what breaks against real schema and real workload
 rather than against a demo we wrote ourselves.
 
@@ -146,8 +146,8 @@ same branch:
 | correct refusals | 5 | 5 — unchanged |
 
 Now served: `SELECT 1`, `now()`, `current_database()`, `count(*)`, and
-`GROUP BY x, count(*)` — which returns real counts (364,947 leads / 8,277
-opportunities / 6,619 customers) while the pseudonymised columns beside it stay
+`GROUP BY x, count(*)` — which returns real counts (~365k leads / ~8k
+opportunities / ~7k customers — real magnitudes, not nulls) while the pseudonymised columns beside it stay
 masked.
 
 Still refused, correctly: `lower(email)`, `coalesce(domain, …)`, `to_json(row)`,

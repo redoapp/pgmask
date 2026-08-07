@@ -1,4 +1,17 @@
-node_modules/
-.env
-*.log
 /target
+node_modules/
+*.log
+
+# Credentials and keys. Belt and braces: nothing here should ever be written
+# into the repo, the DSN lives outside it, and the TLS test scripts generate
+# their certs into a mktemp dir. This is the net under all of that.
+.env
+.env.*
+*.dsn
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+
+.DS_Store

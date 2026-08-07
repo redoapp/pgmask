@@ -238,7 +238,7 @@ Shipped 2026-08-07: rejections are bucketed by cause and reported as
 predictably enough that `?column?`, `count`, `lower` and a preserved column name
 land in different buckets — and confined to counters, never enforcement.
 
-**Measured 2026-08-07 against a real Neon branch (383k CRM rows, 31 query
+**Measured 2026-08-07 against a real Neon branch (~380k CRM rows, 31 query
 shapes) — the guess was wrong.** Set operations are 7% of rejections.
 Expressions are 47% and aggregates 33%. Full write-up in
 `examples/neon/README.md`. Revised priority, by frequency:
