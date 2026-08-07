@@ -1,0 +1,16 @@
+{
+  "name": "pgmask",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fail-closed column masking proxy for Postgres",
+  "scripts": {
+    "spike": "node spike/run.mjs",
+    "spike:md": "node spike/run.mjs --md docs/phase0-results.md",
+    "pg:up": "podman run -d --name pgmask-spike -e POSTGRES_PASSWORD=spike -e POSTGRES_DB=spike -p 55432:5432 docker.io/library/postgres:17",
+    "pg:down": "podman rm -f pgmask-spike"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
