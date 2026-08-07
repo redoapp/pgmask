@@ -143,6 +143,19 @@ pub async fn start_proxy_with(
     opaque: Opaque,
 ) -> Result<ProxyHandle> {
     let backend = backend_addr().context("PGMASK_TEST_PG")?;
+    start_proxy_at(&backend, db, rules, unclassified, opaque).await
+}
+
+/// Same, but forwarding to an arbitrary address — used to point the proxy at a
+/// backend that misbehaves.
+pub async fn start_proxy_at(
+    backend: &str,
+    db: &str,
+    rules: Vec<ColumnRule>,
+    unclassified: Unclassified,
+    opaque: Opaque,
+) -> Result<ProxyHandle> {
+    let backend = backend.to_string();
     let config = Config {
         listen: "127.0.0.1:0".into(),
         backend: backend.clone(),
@@ -152,9 +165,12 @@ pub async fn start_proxy_with(
         opaque,
         unclassified_mask: Mask::Null,
         column: rules,
+        tls_cert: None,
+        tls_key: None,
+        backend_tls: pgmask::tls::BackendTls::Disable,
     };
     let catalog = Arc::new(Catalog::resolve(&config.column, &config.catalog_dsn).await?);
-    let policy = Arc::new(Policy::from_config(&config, catalog));
+    let policy = Arc::new(Policy::from_config(&config, catalog)?);
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

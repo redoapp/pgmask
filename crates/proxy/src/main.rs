@@ -24,19 +24,28 @@ async fn main() -> Result<()> {
             .context("resolving the column catalog")?,
     );
 
-    let policy = Arc::new(Policy::from_config(&config, catalog.clone()));
+    let policy = Arc::new(Policy::from_config(&config, catalog.clone())?);
     let listener = TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
 
     eprintln!(
-        "pgmask listening on {} -> {} | {} classified column(s) | unclassified={:?} opaque={:?}",
+        "pgmask listening on {} -> {} | {} classified column(s) | \
+         unclassified={:?} opaque={:?} tls={} backend_tls={:?}",
         config.listen,
         config.backend,
         catalog.len(),
         config.unclassified,
         config.opaque,
+        if policy.tls.is_some() { "on" } else { "OFF" },
+        config.backend_tls,
     );
+    if policy.tls.is_none() {
+        eprintln!(
+            "warning: no tls_cert/tls_key — clients connect in plaintext, and a masking \
+             proxy reachable in plaintext is not a security boundary"
+        );
+    }
     if catalog.is_empty() {
         eprintln!("warning: the catalog is empty — every column will be treated as unclassified");
     }

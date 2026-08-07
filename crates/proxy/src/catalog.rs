@@ -35,6 +35,7 @@ pub enum Opaque {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnRule {
     /// Schema-qualified, e.g. `demo.customers`.
     pub relation: String,
@@ -42,7 +43,12 @@ pub struct ColumnRule {
     pub mask: Mask,
 }
 
+/// `deny_unknown_fields` is a security control, not tidiness. TOML puts any key
+/// written after a `[[column]]` block *inside* that block, so an appended
+/// `tls_cert` silently became a ColumnRule field and the proxy came up in
+/// plaintext with no complaint. Found while writing the TLS test.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -61,6 +67,14 @@ pub struct Config {
     pub unclassified_mask: Mask,
     #[serde(default)]
     pub column: Vec<ColumnRule>,
+    /// PEM certificate chain served to clients. Requires `tls_key`.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    #[serde(default)]
+    pub tls_key: Option<String>,
+    /// Whether to encrypt the proxy-to-Postgres leg.
+    #[serde(default)]
+    pub backend_tls: crate::tls::BackendTls,
 }
 
 fn default_listen() -> String {

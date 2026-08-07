@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod mask;
 pub mod protocol;
 pub mod session;
+pub mod tls;
 
 pub use catalog::{Catalog, Config};
 pub use session::{handle_connection, Policy};

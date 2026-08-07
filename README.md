@@ -24,9 +24,10 @@ HINT:  Select the underlying column directly. Expressions, set operations
        all erase provenance.
 ```
 
-**Status: MVP working.** All 18 acceptance criteria pass end-to-end against a real
-Postgres — see [`docs/mvp.md`](docs/mvp.md) and `examples/demo/verify.sh`. Not yet
-production-ready: no TLS, and the limits below are real.
+**Status: Phase 4 complete — a security boundary, not a demo.** 77 assertions
+across five suites, including a canary property test driven from a raw wire
+client that asserts no sentinel byte ever crosses the boundary. TLS on both legs.
+See [`docs/phase4.md`](docs/phase4.md). The limits below are still real.
 
 ## How it works
 
@@ -47,7 +48,9 @@ Bytes we never interpret are bytes we cannot misinterpret.
 ## Try it
 
 ```bash
-./examples/demo/verify.sh     # postgres in podman, 50k rows, all 18 assertions
+./examples/demo/verify.sh        # acceptance criteria, 50k rows, 18 assertions
+./scripts/test-integration.sh    # canary + adversarial + resilience, 23 tests
+./scripts/test-tls.sh            # TLS on both legs via a real psql, 7 assertions
 ```
 
 Or by hand:
@@ -80,6 +83,10 @@ unclassified      = "mask"   # mask | allow    — default-deny
 unclassified_mask = "null"
 opaque            = "reject" # reject | mask   — fields with no provenance
 
+tls_cert    = "/path/proxy.crt"   # omit both to serve plaintext
+tls_key     = "/path/proxy.key"
+backend_tls = "disable"           # disable | require — see the note below
+
 [[column]]
 relation = "demo.customers"
 column   = "email"
@@ -95,7 +102,30 @@ query can rename. Views need their own entries: Phase 0 found that Postgres
 reports the *view's* OID, not the base table's.
 
 If a configured column does not exist, the proxy refuses to start. A half-loaded
-catalog is a catalog with unknown coverage.
+catalog is a catalog with unknown coverage. Unknown config keys are also a
+startup failure: TOML puts any key written after a `[[column]]` block *inside*
+that block, so a misplaced `tls_cert` would otherwise silently leave you running
+in plaintext.
+
+### TLS, and one constraint worth knowing
+
+Postgres negotiates TLS with an `SSLRequest` packet rather than ALPN or a
+separate port; pgmask handles that on both legs.
+
+**Use `backend_tls = "disable"` if your clients authenticate with SCRAM.**
+`SCRAM-SHA-256-PLUS` binds authentication to the TLS certificate of the endpoint
+the client is talking to, and pgmask terminates TLS and re-originates — so the
+client binds to our certificate and the backend checks its own. That is channel
+binding working as designed; catching an endpoint that re-originates TLS is
+exactly its purpose. Stripping the mechanism does not help either, because SCRAM
+detects the downgrade.
+
+Postgres only advertises `-PLUS` on a TLS connection of its own, so a plaintext
+backend leg means plain `SCRAM-SHA-256`, clients authenticate normally, and the
+client-to-pgmask hop is still encrypted. Put pgmask next to the database and
+secure that hop by placement. The unworkable combination is detected and
+explained rather than failing opaquely. Full reasoning in
+[`docs/phase4.md`](docs/phase4.md).
 
 ## Performance
 
@@ -106,9 +136,11 @@ Full numbers and methodology in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Known limits
 
-- **`SELECT 1` is rejected.** A literal has no table, so it has no provenance, and
-  a constant is indistinguishable from `lower(email)` at the protocol level.
-  Health checks that use it will fail. Fixing this properly needs Phase 6 parsing.
+- **`SELECT 1` is rejected**, and so is `SELECT pg_sleep(30)` and anything else
+  whose target list is a bare expression. A literal has no table, so it has no
+  provenance, and a constant is indistinguishable from `lower(email)` at the
+  protocol level. Health checks using `SELECT 1` will fail. Fixing this properly
+  needs Phase 6 parsing.
 - **Set operations, recursive CTEs and `SETOF` functions are rejected** — Phase 0
   measured that they erase provenance. Expected to be the main source of
   rejections in practice; instrument by cause before deciding on Phase 6.
@@ -116,7 +148,9 @@ Full numbers and methodology in [`docs/benchmarks.md`](docs/benchmarks.md).
   data never reaches the client, but the work was done, and inside an explicit
   transaction the client and server disagree about whether the statement
   succeeded.
-- **No TLS.** `SSLRequest` is answered `N`; use `sslmode=disable`.
+- **SCRAM channel binding is unsupported**, unavoidably — see above.
+- **Backend TLS does not verify the server certificate** (matching libpq's
+  `sslmode=require`): it stops a passive listener, not an active one.
 - **Non-text types accept only `mask = "null"`.** Text-family types are
   byte-identical in text and binary formats so they mask correctly either way;
   anything else is refused rather than guessed at.
@@ -134,14 +168,28 @@ docs/mvp.md                MVP goal, acceptance criteria, scope boundaries
 docs/benchmarks.md         performance methodology and results
 docs/phase0-results.md     generated provenance spike output
 
-crates/proxy/protocol.rs   wire framing and the four message types we decode
-crates/proxy/session.rs    the per-connection state machine
+crates/proxy/protocol.rs   wire framing and the message types we decode
+crates/proxy/session.rs    the per-connection state machine, and Vetted
 crates/proxy/catalog.rs    config and (OID, attnum) resolution
 crates/proxy/mask.rs       masking algorithms
+crates/proxy/tls.rs        TLS on both legs
+crates/proxy/tests/        canary, adversarial and resilience suites
 crates/spike/              Phase 0 provenance spike
 crates/bench/              latency and throughput harness
 examples/demo/             schema, catalog, and the acceptance script
+scripts/                   integration and TLS test drivers
 ```
+
+## How the guarantee is enforced
+
+`Batch::client` — the only route to the client socket — accepts a `Vetted`, and
+its four constructors are the complete list of ways bytes can get there. Adding a
+"just forward it" path is a compile error rather than a code-review question.
+
+The backend direction has **no catch-all**: control messages are allowlisted and
+anything unrecognised is refused, because a message we cannot classify may carry
+row data. That arm exists because the canary test caught `CopyData` escaping
+through a `_ =>` that looked harmless.
 
 ## Phase 0
 

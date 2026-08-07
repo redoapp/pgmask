@@ -23,12 +23,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::catalog::{Catalog, Config, Opaque, Unclassified};
 use crate::mask::{Mask, Masker};
 use crate::protocol::{self, DescribeTarget, FrameReader, Message};
+use crate::tls::{BackendTls, BoxStream};
 
 /// What to do with one output field.
 #[derive(Debug, Clone, Copy)]
@@ -51,17 +52,28 @@ pub struct Policy {
     pub unclassified: Unclassified,
     pub unclassified_mask: Mask,
     pub opaque: Opaque,
+    /// Present when `tls_cert`/`tls_key` are configured. Absent means we answer
+    /// `SSLRequest` with `N` and clients using `sslmode=prefer` fall back.
+    pub tls: Option<tokio_rustls::TlsAcceptor>,
+    pub backend_tls: BackendTls,
 }
 
 impl Policy {
-    pub fn from_config(config: &Config, catalog: Arc<Catalog>) -> Self {
-        Self {
+    pub fn from_config(config: &Config, catalog: Arc<Catalog>) -> Result<Self> {
+        let tls = match (&config.tls_cert, &config.tls_key) {
+            (Some(cert), Some(key)) => Some(crate::tls::load_acceptor(cert, key)?),
+            (None, None) => None,
+            _ => anyhow::bail!("tls_cert and tls_key must be set together"),
+        };
+        Ok(Self {
             catalog,
             masker: Arc::new(Masker::new(config.pseudonym_key.clone().into_bytes())),
             unclassified: config.unclassified,
             unclassified_mask: config.unclassified_mask,
             opaque: config.opaque,
-        }
+            tls,
+            backend_tls: config.backend_tls,
+        })
     }
 
     /// Decide the plan for a described result set, or refuse it.
@@ -215,6 +227,9 @@ pub struct Session {
     suppressing: bool,
     pub masked_fields: u64,
     pub rejected_result_sets: u64,
+    /// Whether this client connection is itself TLS. Decides whether channel
+    /// binding is even in play.
+    client_tls: bool,
 }
 
 impl Session {
@@ -228,7 +243,13 @@ impl Session {
             suppressing: false,
             masked_fields: 0,
             rejected_result_sets: 0,
+            client_tls: false,
         }
+    }
+
+    pub fn with_client_tls(mut self, client_tls: bool) -> Self {
+        self.client_tls = client_tls;
+        self
     }
 
     /// Refuse the in-flight result set: tell the client, swallow the backend's
@@ -317,6 +338,31 @@ impl Session {
         }
 
         match msg.tag {
+            // Channel binding cannot survive TLS termination. Detect the
+            // unworkable combination and say so plainly, rather than letting
+            // the client hit an opaque "channel binding negotiation error" that
+            // gives no hint about the proxy in the middle.
+            protocol::B_AUTHENTICATION
+                if self.client_tls
+                    && protocol::sasl_mechanisms(&msg.body)
+                        .iter()
+                        .any(|m| m.ends_with("-PLUS")) =>
+            {
+                let err = protocol::build_error(
+                    protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                    "pgmask: the server offers SCRAM channel binding, which cannot work \
+                     through a proxy that terminates TLS",
+                    Some(
+                        "Set backend_tls = \"disable\" so Postgres advertises plain \
+                         SCRAM-SHA-256, and place pgmask on a trusted segment next to the \
+                         database. See protocol::sasl_mechanisms for why stripping the \
+                         mechanism does not work.",
+                    ),
+                );
+                out.client(Vetted::synthetic(&err));
+                out.close = true;
+            }
+
             protocol::B_ROW_DESCRIPTION => self.handle_row_description(msg, out),
             protocol::B_DATA_ROW => self.handle_data_row(msg, out),
 
@@ -506,45 +552,105 @@ impl Session {
     }
 }
 
-/// Startup negotiation, then the message pump.
+/// Read one untagged startup packet straight off the socket.
+///
+/// Startup cannot go through `FrameReader`, because answering `SSLRequest`
+/// means replacing the whole stream with a TLS session — a buffered reader that
+/// already owned the socket would strand any bytes it had read ahead. Clients
+/// wait for the single-byte reply before sending anything more, so reading
+/// exactly one packet at a time here is safe.
+async fn read_startup_packet<S: AsyncReadExt + Unpin>(
+    stream: &mut S,
+) -> Result<Option<protocol::StartupPacket>> {
+    let mut len_bytes = [0u8; 4];
+    match stream.read_exact(&mut len_bytes).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    let len = i32::from_be_bytes(len_bytes);
+    if !(8..=1_048_576).contains(&len) {
+        anyhow::bail!("implausible startup packet length {len}");
+    }
+    let mut rest = vec![0u8; len as usize - 4];
+    stream.read_exact(&mut rest).await?;
+    let code = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    Ok(Some(protocol::StartupPacket {
+        code,
+        body: Bytes::from(rest).slice(4..),
+    }))
+}
+
+/// Startup negotiation on both legs, then the message pump.
 pub async fn handle_connection(
     client: TcpStream,
     backend_addr: &str,
     policy: Arc<Policy>,
 ) -> Result<()> {
     client.set_nodelay(true).ok();
-    let (client_read, mut client_write) = client.into_split();
-    let mut client_frames = FrameReader::new(client_read);
+    let mut client_stream: BoxStream = Box::new(client);
 
-    // --- Startup ------------------------------------------------------------
-    // TLS is out of scope for the MVP: answer SSLRequest with 'N' so clients
-    // using sslmode=prefer fall back to plaintext.
+    // --- Client-side TLS negotiation ----------------------------------------
+    // Postgres has no ALPN and no separate TLS port: the client asks with an
+    // SSLRequest packet and we answer with one byte before any TLS bytes flow.
+    let mut client_tls = false;
     let startup = loop {
-        let Some(packet) = client_frames.read_startup().await? else {
+        let Some(packet) = read_startup_packet(&mut client_stream).await? else {
             return Ok(());
         };
         match packet.code {
-            protocol::SSL_REQUEST_CODE | protocol::GSSENC_REQUEST_CODE => {
-                client_write.write_all(b"N").await?;
+            protocol::SSL_REQUEST_CODE => match policy.tls.clone() {
+                Some(acceptor) => {
+                    client_stream.write_all(b"S").await?;
+                    client_stream.flush().await?;
+                    // `TlsAcceptor` needs a concrete stream, and we still hold a
+                    // box; downcasting is not available, so the acceptor is
+                    // applied to the boxed stream directly.
+                    let tls = acceptor
+                        .accept(client_stream)
+                        .await
+                        .context("client TLS handshake failed")?;
+                    client_stream = Box::new(tls);
+                    client_tls = true;
+                }
+                None => {
+                    client_stream.write_all(b"N").await?;
+                    client_stream.flush().await?;
+                }
+            },
+            // We never offer GSSAPI encryption.
+            protocol::GSSENC_REQUEST_CODE => {
+                client_stream.write_all(b"N").await?;
+                client_stream.flush().await?;
             }
             _ => break packet,
         }
     };
 
+    // --- Backend connection -------------------------------------------------
     let backend = TcpStream::connect(backend_addr)
         .await
         .with_context(|| format!("connecting to backend {backend_addr}"))?;
     backend.set_nodelay(true).ok();
-    let (backend_read, mut backend_write) = backend.into_split();
-    let mut backend_frames = FrameReader::new(backend_read);
+    let mut backend_stream: BoxStream = match policy.backend_tls {
+        BackendTls::Disable => Box::new(backend),
+        BackendTls::Require => crate::tls::upgrade_backend(backend).await?,
+    };
 
-    backend_write.write_all(&startup.encode()).await?;
-    backend_write.flush().await?;
+    backend_stream.write_all(&startup.encode()).await?;
+    backend_stream.flush().await?;
 
-    // A CancelRequest is its own short-lived connection: forward and hang up.
+    // A CancelRequest is its own short-lived connection carrying the backend's
+    // own key (we forward BackendKeyData verbatim, so the client holds the real
+    // one). Forward and hang up.
     if startup.code == protocol::CANCEL_REQUEST_CODE {
         return Ok(());
     }
+
+    let (client_read, mut client_write) = tokio::io::split(client_stream);
+    let (backend_read, mut backend_write) = tokio::io::split(backend_stream);
+    let mut client_frames = FrameReader::new(client_read);
+    let mut backend_frames = FrameReader::new(backend_read);
 
     let user = startup
         .parameters()
@@ -554,7 +660,7 @@ pub async fn handle_connection(
         .unwrap_or_else(|| "<unknown>".into());
 
     // --- Message pump -------------------------------------------------------
-    let mut session = Session::new(policy);
+    let mut session = Session::new(policy).with_client_tls(client_tls);
     let mut authenticated = false;
 
     // Accumulate a whole batch before touching the sockets. One `read_buf`
@@ -641,6 +747,8 @@ mod tests {
             unclassified,
             unclassified_mask: Mask::Null,
             opaque,
+            tls: None,
+            backend_tls: BackendTls::Disable,
         })
     }
 
@@ -697,6 +805,8 @@ mod tests {
             unclassified: Unclassified::Allow,
             unclassified_mask: Mask::Null,
             opaque: Opaque::Reject,
+            tls: None,
+            backend_tls: BackendTls::Disable,
         });
         // int4, not a text type.
         let err = p

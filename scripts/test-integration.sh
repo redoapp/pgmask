@@ -33,4 +33,9 @@ done
 
 echo "==> running adversarial suite"
 # Serially: each test rebuilds the canary schema in the same database.
-PGMASK_TEST_PG="127.0.0.1:$PORT" cargo test --test adversarial -- --test-threads=1 "$@"
+export PGMASK_TEST_PG="127.0.0.1:$PORT"
+cargo test --test adversarial -- --test-threads=1 "$@"
+
+echo
+echo "==> running resilience suite"
+cargo test --test resilience -- --test-threads=1 "$@"

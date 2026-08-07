@@ -353,6 +353,49 @@ pub fn build_data_row(values: &[Option<Bytes>]) -> Message {
     Message::from_frame(frame.freeze())
 }
 
+// --- SASL mechanism negotiation ---------------------------------------------
+
+/// `AuthenticationSASL` sub-code inside an `Authentication` message.
+pub const AUTH_SASL: i32 = 10;
+
+/// The SASL mechanisms a server is offering.
+///
+/// # Channel binding and TLS-terminating proxies
+///
+/// `SCRAM-SHA-256-PLUS` ties the authentication exchange to the TLS certificate
+/// of the endpoint the client is talking to. pgmask terminates TLS and
+/// re-originates the connection, so the client binds to *our* certificate while
+/// the backend verifies against *its own*. The check fails.
+///
+/// That is channel binding working exactly as designed — detecting an endpoint
+/// that intercepts and re-originates TLS is the entire point, and pgmask is such
+/// an endpoint.
+///
+/// Stripping `-PLUS` from this list does not help: SCRAM carries a `gs2` flag
+/// that says "I support channel binding but the server did not offer it", and a
+/// server that *did* offer it treats that as the downgrade attack it is. Both
+/// paths fail, by design, and neither can be fixed from inside the proxy.
+///
+/// The workable configuration is therefore to leave the **backend** leg
+/// plaintext: Postgres only advertises `-PLUS` on a TLS connection of its own,
+/// so with a plaintext backend leg it offers plain `SCRAM-SHA-256`, the client
+/// authenticates normally, and the client-to-pgmask hop is still encrypted. Put
+/// the proxy next to the database and secure that hop by placement.
+pub fn sasl_mechanisms(body: &Bytes) -> Vec<String> {
+    let mut buf = body.clone();
+    if buf.len() < 4 || buf.get_i32() != AUTH_SASL {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    while let Some(m) = read_cstring(&mut buf) {
+        if m.is_empty() {
+            break;
+        }
+        out.push(m);
+    }
+    out
+}
+
 // --- ErrorResponse ----------------------------------------------------------
 
 /// Insufficient privilege. The right SQLSTATE for "policy refused this", and one
