@@ -130,6 +130,7 @@ pub fn rule(relation: &str, column: &str, mask: Mask) -> ColumnRule {
 
 pub struct ProxyHandle {
     pub addr: SocketAddr,
+    pub metrics: Arc<pgmask::metrics::Metrics>,
 }
 
 pub async fn start_proxy(db: &str, rules: Vec<ColumnRule>) -> Result<ProxyHandle> {
@@ -168,9 +169,18 @@ pub async fn start_proxy_at(
         tls_cert: None,
         tls_key: None,
         backend_tls: pgmask::tls::BackendTls::Disable,
+        // Tight intervals so tests can observe a refresh without waiting.
+        catalog_refresh_seconds: 1,
+        catalog_refresh_min_seconds: 1,
+        metrics_interval_seconds: 0,
     };
     let catalog = Arc::new(Catalog::resolve(&config.column, &config.catalog_dsn).await?);
+    tokio::spawn(catalog.clone().run_refresher(
+        std::time::Duration::from_secs(config.catalog_refresh_seconds),
+        std::time::Duration::from_secs(config.catalog_refresh_min_seconds),
+    ));
     let policy = Arc::new(Policy::from_config(&config, catalog)?);
+    let metrics = policy.metrics.clone();
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -186,7 +196,7 @@ pub async fn start_proxy_at(
             });
         }
     });
-    Ok(ProxyHandle { addr })
+    Ok(ProxyHandle { addr, metrics })
 }
 
 // --- Raw wire client --------------------------------------------------------

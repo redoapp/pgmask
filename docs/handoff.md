@@ -158,7 +158,7 @@ Shapes to test:
 ### Results — run 2026-08-07, PostgreSQL 17.10
 
 **Verdict: GO as designed.** 22 shapes full provenance, 3 partial (per-field, handled
-natively), 12 opaque. Full table in `docs/phase0-results.md`; rerun with `npm run spike:md`.
+natively), 12 opaque. Full table in `docs/phase0-results.md`; rerun with `cargo run -p spike -- --md docs/phase0-results.md`.
 
 Provenance survives **much** further than the design assumed. It holds through:
 
@@ -209,6 +209,31 @@ them or fall back to post-execution masking for that case.
 | Partitioned parent: parent or child OID? | **Parent** (`p`) | No hierarchy walking needed. Direct partition queries report the child, so catalog both |
 | Do CTEs/subqueries survive? | **Yes, both** | Phase 6 stays deferred |
 | Temp tables? | Resolve to `pg_temp_N.*` | Per-session OIDs, uncatalogable → fail-closed, as designed |
+
+### Measuring it, rather than guessing
+
+Shipped 2026-08-07: rejections are bucketed by cause and reported as
+`set_op_like_share`. The bucketing is heuristic — Postgres names output columns
+predictably enough that `?column?`, `count`, `lower` and a preserved column name
+land in different buckets — and confined to counters, never enforcement.
+
+Run in shadow mode for a week before deciding on Phase 6. If the share is high,
+build the **two-rule** version rather than general lineage:
+
+1. **Zero-column expressions.** If a target-list entry references no `ColumnRef`
+   at all, it cannot leak a column. Sound, roughly 100 lines, and it fixes
+   `SELECT 1`, `SELECT now()` and every health check.
+2. **Set operations, without name resolution.** Do not try to resolve each
+   branch's columns yourself — that is where the full lineage engine hides.
+   Split the statement at the set operator and `Parse`+`Describe` each branch as
+   its own statement; Postgres returns real provenance per branch, and arity is
+   guaranteed to match, so merge positionally and take the most restrictive mask.
+   This reuses the primitive Phase 0 already validated instead of adding a second
+   source of truth.
+
+Both rules turn rejections into acceptances, so a wrong merge is a leak rather
+than a false pass. Add set-operation cases to the canary suite *before* the rule,
+not after.
 
 ### The one real gap: set operations
 

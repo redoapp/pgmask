@@ -3,6 +3,7 @@
 //!   pgmask <config.toml>
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
@@ -48,6 +49,29 @@ async fn main() -> Result<()> {
     }
     if catalog.is_empty() {
         eprintln!("warning: the catalog is empty — every column will be treated as unclassified");
+    }
+
+    // Keep the catalog current. OIDs are not stable across DDL: DROP+CREATE of
+    // a view hands it a new OID, and a catalog pinned at boot then silently
+    // stops classifying those columns.
+    tokio::spawn(catalog.clone().run_refresher(
+        Duration::from_secs(config.catalog_refresh_seconds),
+        Duration::from_secs(config.catalog_refresh_min_seconds),
+    ));
+
+    // Rejection counters, bucketed by cause. These are the numbers that decide
+    // whether the Phase 6 parser is worth building; see docs/handoff.md.
+    if config.metrics_interval_seconds > 0 {
+        let metrics = policy.metrics.clone();
+        let interval = Duration::from_secs(config.metrics_interval_seconds);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Some(line) = metrics.report() {
+                    eprintln!("pgmask metrics: {line}");
+                }
+            }
+        });
     }
 
     let backend = Arc::new(config.backend.clone());

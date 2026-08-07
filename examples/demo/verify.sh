@@ -63,7 +63,18 @@ for _ in $(seq 1 30); do
 done
 
 echo "==> loading demo schema (50k rows)"
-psql -h localhost -p "$PG_PORT" -U postgres -d demo -q -f examples/demo/schema.sql >/dev/null 2>&1
+# Wait for the forwarded port, not just for the server inside the container:
+# podman's port forwarding can lag pg_isready, and a silently failed schema load
+# turns into a confusing wall of "relation does not exist".
+for _ in $(seq 1 30); do
+  psql -h localhost -p "$PG_PORT" -U postgres -d demo -tAc 'SELECT 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+if ! psql -h localhost -p "$PG_PORT" -U postgres -d demo -q -v ON_ERROR_STOP=1 \
+     -f examples/demo/schema.sql; then
+  echo "FATAL: could not load the demo schema"
+  exit 1
+fi
 
 echo "==> building and starting pgmask"
 cargo build --release -q

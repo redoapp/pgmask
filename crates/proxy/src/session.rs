@@ -28,6 +28,7 @@ use tokio::net::TcpStream;
 
 use crate::catalog::{Catalog, Config, Opaque, Unclassified};
 use crate::mask::{Mask, Masker};
+use crate::metrics::{Cause, Metrics};
 use crate::protocol::{self, DescribeTarget, FrameReader, Message};
 use crate::tls::{BackendTls, BoxStream};
 
@@ -40,10 +41,12 @@ struct FieldPlan {
 
 type Plan = Arc<Vec<FieldPlan>>;
 
-/// Why a result set was refused, in the words the client will see.
+/// Why a result set was refused: the words the client sees, plus the bucket the
+/// counters see.
 struct Rejection {
     message: String,
     hint: Option<String>,
+    cause: Cause,
 }
 
 pub struct Policy {
@@ -52,6 +55,7 @@ pub struct Policy {
     pub unclassified: Unclassified,
     pub unclassified_mask: Mask,
     pub opaque: Opaque,
+    pub metrics: Arc<Metrics>,
     /// Present when `tls_cert`/`tls_key` are configured. Absent means we answer
     /// `SSLRequest` with `N` and clients using `sslmode=prefer` fall back.
     pub tls: Option<tokio_rustls::TlsAcceptor>,
@@ -71,6 +75,7 @@ impl Policy {
             unclassified: config.unclassified,
             unclassified_mask: config.unclassified_mask,
             opaque: config.opaque,
+            metrics: Arc::new(Metrics::default()),
             tls,
             backend_tls: config.backend_tls,
         })
@@ -78,12 +83,14 @@ impl Policy {
 
     /// Decide the plan for a described result set, or refuse it.
     fn plan_for(&self, fields: &[protocol::FieldDescription]) -> Result<Plan, Rejection> {
+        let snapshot = self.catalog.snapshot();
         let mut plan = Vec::with_capacity(fields.len());
         for field in fields {
             let mask = if !field.has_provenance() {
                 match self.opaque {
                     Opaque::Reject => {
                         return Err(Rejection {
+                            cause: Cause::classify_opaque(&field.name, &snapshot),
                             message: format!(
                                 "pgmask: output column \"{}\" has no column provenance, so it \
                                  cannot be classified",
@@ -100,23 +107,31 @@ impl Policy {
                     Opaque::Mask => Mask::Null,
                 }
             } else {
-                match self.catalog.lookup(field.table_oid, field.column_id) {
+                match snapshot.lookup(field.table_oid, field.column_id) {
                     Some(mask) => mask,
-                    None => match self.unclassified {
-                        Unclassified::Mask => self.unclassified_mask,
-                        Unclassified::Allow => Mask::None,
-                    },
+                    None => {
+                        // A relation we have never resolved may mean the catalog
+                        // has gone stale — a recreated view gets a new OID. Nudge
+                        // the refresher; it enforces its own rate floor.
+                        if !snapshot.knows_relation(field.table_oid) {
+                            self.catalog.note_unknown_relation();
+                        }
+                        match self.unclassified {
+                            Unclassified::Mask => self.unclassified_mask,
+                            Unclassified::Allow => Mask::None,
+                        }
+                    }
                 }
             };
 
             // Catch type/mask mismatches once here rather than per row.
             if mask.needs_text_family() && !protocol::is_text_family(field.type_oid) {
-                let name = self
-                    .catalog
+                let name = snapshot
                     .name_of(field.table_oid, field.column_id)
                     .unwrap_or(&field.name)
                     .to_string();
                 return Err(Rejection {
+                    cause: Cause::MaskTypeMismatch,
                     message: format!(
                         "pgmask: mask {mask:?} on {name} rewrites values as text, but its type \
                          (OID {}, wire format {}) is not a text type",
@@ -259,6 +274,7 @@ impl Session {
         self.suppressing = true;
         self.active_plan = None;
         self.rejected_result_sets += 1;
+        self.policy.metrics.record(rejection.cause);
         let err = protocol::build_error(
             protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
             &rejection.message,
@@ -271,6 +287,7 @@ impl Session {
         match msg.tag {
             // Emits rows with no RowDescription. One of exactly two such paths.
             protocol::F_FUNCTION_CALL => {
+                self.policy.metrics.record(Cause::FunctionCallMessage);
                 let err = protocol::build_error(
                     protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
                     "pgmask: the legacy FunctionCall protocol message is not permitted",
@@ -348,6 +365,7 @@ impl Session {
                         .iter()
                         .any(|m| m.ends_with("-PLUS")) =>
             {
+                self.policy.metrics.record(Cause::ChannelBinding);
                 let err = protocol::build_error(
                     protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
                     "pgmask: the server offers SCRAM channel binding, which cannot work \
@@ -370,6 +388,7 @@ impl Session {
             // mid-stream, so the connection goes down rather than the data out.
             protocol::B_COPY_OUT_RESPONSE | protocol::B_COPY_BOTH_RESPONSE => {
                 self.rejected_result_sets += 1;
+                self.policy.metrics.record(Cause::CopyStream);
                 let err = protocol::build_error(
                     protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
                     "pgmask: COPY ... TO is not permitted",
@@ -405,6 +424,7 @@ impl Session {
             // its own account rather than trusting the earlier check.
             protocol::B_COPY_DATA | protocol::B_COPY_DONE => {
                 self.rejected_result_sets += 1;
+                self.policy.metrics.record(Cause::CopyStream);
                 let err = protocol::build_error(
                     protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
                     "pgmask: COPY data stream is not permitted",
@@ -426,6 +446,7 @@ impl Session {
 
             unknown => {
                 self.rejected_result_sets += 1;
+                self.policy.metrics.record(Cause::UnknownBackendMessage);
                 let err = protocol::build_error(
                     protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
                     &format!(
@@ -446,6 +467,7 @@ impl Session {
             Err(err) => {
                 return self.reject(
                     Rejection {
+                        cause: Cause::Malformed,
                         message: format!("pgmask: could not parse RowDescription: {err}"),
                         hint: None,
                     },
@@ -461,6 +483,13 @@ impl Session {
                 return self.reject(rejection, out);
             }
         };
+
+        // Successful result sets are the denominator: a rejection share is
+        // meaningless without knowing how much traffic sails through.
+        let masking = plan.iter().filter(|f| f.mask != Mask::None).count();
+        if masking > 0 {
+            self.policy.metrics.record_masked_result_set(masking as u64);
+        }
 
         // Bind the plan to whatever this RowDescription answers, and make it
         // active — which also covers pipelined Bind-before-Describe ordering.
@@ -482,6 +511,7 @@ impl Session {
             // Rows we were never given the shape of. Refuse rather than guess.
             return self.reject(
                 Rejection {
+                    cause: Cause::NoActivePlan,
                     message: "pgmask: received a data row with no described result set".into(),
                     hint: Some(
                         "The statement produced rows without a RowDescription, so no masking plan \
@@ -498,6 +528,7 @@ impl Session {
             Err(err) => {
                 return self.reject(
                     Rejection {
+                        cause: Cause::Malformed,
                         message: format!("pgmask: could not parse DataRow: {err}"),
                         hint: None,
                     },
@@ -509,6 +540,7 @@ impl Session {
         if values.len() != plan.len() {
             return self.reject(
                 Rejection {
+                    cause: Cause::Malformed,
                     message: format!(
                         "pgmask: row has {} fields but the described result set has {}",
                         values.len(),
@@ -536,6 +568,7 @@ impl Session {
                 Err(err) => {
                     return self.reject(
                         Rejection {
+                            cause: Cause::MaskTypeMismatch,
                             message: format!("pgmask: {err}"),
                             hint: None,
                         },
@@ -747,6 +780,7 @@ mod tests {
             unclassified,
             unclassified_mask: Mask::Null,
             opaque,
+            metrics: Arc::new(Metrics::default()),
             tls: None,
             backend_tls: BackendTls::Disable,
         })
@@ -797,14 +831,15 @@ mod tests {
 
     #[test]
     fn text_mask_on_a_non_text_column_is_refused_at_plan_time() {
-        let mut catalog = Catalog::default();
-        catalog.insert_for_test(16391, 1, Mask::Pseudonym, "demo.t.id");
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_for_test(16391, 1, Mask::Pseudonym, "demo.t.id");
         let p = Arc::new(Policy {
-            catalog: Arc::new(catalog),
+            catalog: Arc::new(Catalog::from_snapshot_for_test(snapshot)),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified: Unclassified::Allow,
             unclassified_mask: Mask::Null,
             opaque: Opaque::Reject,
+            metrics: Arc::new(Metrics::default()),
             tls: None,
             backend_tls: BackendTls::Disable,
         });

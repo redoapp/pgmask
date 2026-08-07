@@ -208,3 +208,135 @@ async fn many_concurrent_sessions_all_stay_masked() -> Result<()> {
     }
     Ok(())
 }
+
+// --- Catalog staleness ------------------------------------------------------
+
+/// `DROP VIEW; CREATE VIEW` — what a lot of migration tooling emits — gives the
+/// view a new pg_class OID. A catalog pinned at boot silently stops classifying
+/// those columns: with default-deny they turn to NULL, and with
+/// `unclassified = "allow"` they stop being masked at all.
+#[tokio::test]
+async fn a_recreated_view_is_reclassified_after_refresh() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+    client
+        .simple_query("SELECT email, name, city FROM canary.subject_view WHERE id = 1")
+        .await?;
+    let before = client.received_text();
+    assert!(before.contains("Portland"), "allowed column should pass");
+    assert!(before.contains("***"), "name should be redacted");
+    assert_no_canary(&client, "before recreation");
+
+    // Recreate the view out from under the running proxy.
+    let (admin, connection) =
+        tokio_postgres::connect(&backend_dsn(DB), tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    admin
+        .batch_execute(
+            "DROP VIEW canary.subject_view; \
+             CREATE VIEW canary.subject_view AS \
+               SELECT id, email, name, city FROM canary.subjects;",
+        )
+        .await?;
+
+    // Give the refresher a beat. The hot path also nudges it on the first
+    // unrecognised relation OID, so this converges quickly.
+    let mut recovered = false;
+    for _ in 0..30 {
+        let mut probe = RawClient::connect(proxy.addr, DB).await?;
+        probe
+            .simple_query("SELECT email, name, city FROM canary.subject_view WHERE id = 1")
+            .await?;
+        assert_no_canary(&probe, "after recreation");
+        if probe.received_text().contains("Portland") {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(
+        recovered,
+        "classification never recovered after the view was recreated — the catalog \
+         is pinned at boot"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dropped_relation_is_reported_not_silent() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+
+    let (admin, connection) =
+        tokio_postgres::connect(&backend_dsn(DB), tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    admin.batch_execute("DROP VIEW canary.subject_view").await?;
+
+    // Whatever else happens, the classified base table must keep working and no
+    // canary may escape while coverage is degraded.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+    client
+        .simple_query("SELECT email, name, city FROM canary.subjects WHERE id = 1")
+        .await?;
+    assert!(client.received_text().contains("Portland"));
+    assert_no_canary(&client, "while coverage is degraded");
+    Ok(())
+}
+
+// --- Rejection instrumentation ----------------------------------------------
+
+/// The counters exist to answer one question: is the Phase 6 parser worth it?
+/// That turns on how much of the rejection volume is set-operation-shaped.
+#[tokio::test]
+async fn rejections_are_bucketed_by_cause() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    // A set operation preserves the column name while losing provenance.
+    client
+        .simple_query(
+            "SELECT email FROM canary.subjects UNION ALL SELECT email FROM canary.subjects",
+        )
+        .await?;
+    // A function call is named after the function.
+    client
+        .simple_query("SELECT lower(email) FROM canary.subjects")
+        .await?;
+    // A literal is anonymous.
+    client.simple_query("SELECT 1").await?;
+    // An aggregate is named after the aggregate.
+    client
+        .simple_query("SELECT count(*) FROM canary.subjects")
+        .await?;
+    // And a refused COPY.
+    client
+        .simple_query("COPY canary.subjects TO STDOUT")
+        .await?;
+
+    let report = proxy.metrics.report().expect("expected counters");
+    for expected in [
+        "opaque_named_like_column=1",
+        "opaque_function=1",
+        "opaque_anonymous=1",
+        "opaque_aggregate=1",
+        "copy_stream=1",
+        "set_op_like_share=",
+    ] {
+        assert!(
+            report.contains(expected),
+            "missing {expected} in report: {report}"
+        );
+    }
+    Ok(())
+}

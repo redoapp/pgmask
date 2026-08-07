@@ -87,6 +87,10 @@ tls_cert    = "/path/proxy.crt"   # omit both to serve plaintext
 tls_key     = "/path/proxy.key"
 backend_tls = "disable"           # disable | require — see the note below
 
+catalog_refresh_seconds     = 30  # OIDs are not stable across DDL
+catalog_refresh_min_seconds = 5   # floor on miss-triggered refreshes
+metrics_interval_seconds    = 60  # 0 disables
+
 [[column]]
 relation = "demo.customers"
 column   = "email"
@@ -106,6 +110,56 @@ catalog is a catalog with unknown coverage. Unknown config keys are also a
 startup failure: TOML puts any key written after a `[[column]]` block *inside*
 that block, so a misplaced `tls_cert` would otherwise silently leave you running
 in plaintext.
+
+### Catalog drift
+
+pg_class OIDs are **not stable across DDL**. `CREATE OR REPLACE VIEW` keeps a
+relation's OID; `DROP VIEW; CREATE VIEW` — what a lot of migration tooling emits
+— does not. A catalog pinned at boot silently stops classifying those columns:
+under default-deny they turn to NULL, and under `unclassified = "allow"` they
+stop being masked at all.
+
+So the catalog re-resolves on a timer, and sooner when the hot path sees a
+relation OID it does not recognise (rate-limited by
+`catalog_refresh_min_seconds`). Every difference is logged:
+
+```
+catalog: demo.customer_directory.email moved (oid.attnum 16393.2 -> 16397.2)
+         — relation recreated, classification restored
+catalog: COVERAGE LOST for demo.customers.ssn (was oid.attnum 16385.7)
+         — the relation or column no longer exists; those values are now unclassified
+```
+
+If a refresh fails, the previous snapshot is kept rather than cleared — clearing
+would be fail-closed in the narrow sense and would mask every column in the
+database the moment Postgres blinked. Failures are logged and counted.
+
+### Rejection metrics
+
+Every refusal is bucketed by cause, because the numbers decide whether the
+Phase 6 parser is worth building:
+
+```
+pgmask metrics: result_sets_masked=2 fields_masked=3 rejections=3 \
+  opaque_named_like_column=1 opaque_anonymous=1 opaque_function=1 \
+  set_op_like_share=33%
+```
+
+`tableID = 0` says "not a stored column" and nothing else, so the cause cannot be
+recovered exactly without parsing. But Postgres names output columns predictably,
+and the name buckets them well enough to steer a decision: `?column?` is a
+literal or operator, `count`/`string_agg` an aggregate, `lower` a function — and
+an opaque field named exactly like a column we classify is very likely a set
+operation, recursive CTE or `SETOF` function, because all three preserve the
+source name while losing provenance.
+
+**`set_op_like_share` is the number to watch.** If a week of real traffic puts it
+low, the parser is not worth a quarter. If it is high, build the two-rule version
+in `docs/handoff.md` rather than a general lineage engine.
+
+This inference is deliberately confined to counters. Matching on a column name
+would be unsound for enforcement — any query can alias anything to anything — so
+nothing here changes what gets masked.
 
 ### TLS, and one constraint worth knowing
 
@@ -172,6 +226,7 @@ crates/proxy/protocol.rs   wire framing and the message types we decode
 crates/proxy/session.rs    the per-connection state machine, and Vetted
 crates/proxy/catalog.rs    config and (OID, attnum) resolution
 crates/proxy/mask.rs       masking algorithms
+crates/proxy/metrics.rs    rejection causes and counters
 crates/proxy/tls.rs        TLS on both legs
 crates/proxy/tests/        canary, adversarial and resilience suites
 crates/spike/              Phase 0 provenance spike

@@ -84,7 +84,14 @@ openssl req -new -x509 -days 1 -nodes \
   -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
 
 echo "==> loading demo schema"
-psql -h localhost -p "$PG_PORT" -U postgres -d demo -q -f examples/demo/schema.sql >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  psql -h localhost -p "$PG_PORT" -U postgres -d demo -tAc 'SELECT 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+if ! psql -h localhost -p "$PG_PORT" -U postgres -d demo -q -v ON_ERROR_STOP=1 \
+     -f examples/demo/schema.sql >/dev/null; then
+  echo "FATAL: could not load the demo schema"; exit 1
+fi
 
 echo "==> starting pgmask with TLS on both legs"
 # TLS keys must go at the TOP level. Anything written after a [[column]] block
