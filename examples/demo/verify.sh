@@ -76,6 +76,13 @@ if ! psql -h localhost -p "$PG_PORT" -U postgres -d demo -q -v ON_ERROR_STOP=1 \
   exit 1
 fi
 
+echo "==> creating demo principals"
+psql -h localhost -p "$PG_PORT" -U postgres -d demo -q -c "
+  CREATE ROLE analyst_ann LOGIN PASSWORD 'demo';
+  CREATE ROLE support_sam LOGIN PASSWORD 'demo';
+  GRANT USAGE ON SCHEMA demo TO analyst_ann, support_sam;
+  GRANT SELECT ON ALL TABLES IN SCHEMA demo TO analyst_ann, support_sam;" >/dev/null 2>&1
+
 echo "==> building and starting pgmask"
 cargo build --release -q
 ./target/release/pgmask examples/demo/catalog.toml >/tmp/pgmask-verify.log 2>&1 &
@@ -127,9 +134,11 @@ check "4. COPY TO STDOUT is refused" \
   "$(proxied 'COPY (SELECT email FROM demo.customers LIMIT 2) TO STDOUT;')"
 
 # 6 — error DETAIL echoes column values verbatim.
-leak="$(direct "INSERT INTO demo.customers (id,email,name,city) VALUES (1,'x@y.z','n','c');")"
+conflict="INSERT INTO demo.customers (id,email,name,city,birth_date,annual_salary,last_ip,account_uuid) \
+  VALUES (1,'x@y.z','n','c',DATE '1980-01-01',1,'1.2.3.4','00000000-0000-4000-8000-000000000001');"
+leak="$(direct "$conflict")"
 check  "6a. Postgres really does leak the value in DETAIL" "Key (id)=(1)" "$leak"
-scrubbed="$(proxied "INSERT INTO demo.customers (id,email,name,city) VALUES (1,'x@y.z','n','c');")"
+scrubbed="$(proxied "$conflict")"
 refute "6b. pgmask scrubs it"                              "Key (id)=(1)" "$scrubbed"
 check  "6c. ...but keeps the useful message"               "duplicate key" "$scrubbed"
 
@@ -142,6 +151,32 @@ check "7. session survives a rejection and keeps serving" "Denver" "$after"
 # 7b — extended protocol: one Describe, many Executes.
 check "7b. views are masked through their own OID" \
   "***" "$(proxied 'SELECT name FROM demo.customer_directory WHERE id = 1;')"
+
+# 8 — type-aware masks on non-text columns.
+as_role() { psql -h localhost -p "$PROXY_PORT" -U "$1" -d demo -tAq -c "$2" 2>&1; }
+row8="$(proxied 'SELECT birth_date, annual_salary, last_ip, account_uuid FROM demo.customers WHERE id = 100;')"
+check "8a. date truncated to its year"        "1970-01-01"  "$row8"
+check "8b. salary floored to its bucket"      "50000"       "$row8"
+check "8c. IP keeps only the network prefix"  "203.0.113.0" "$row8"
+refute "8d. uuid is pseudonymised"            "00000000-0000-4000-8000-000000000100" "$row8"
+check  "8e. ...but stays a valid uuid"        "-4"          "$row8"
+
+# 9 — per-principal policy. Same column, different people, different views.
+check  "9a. support sees the name in the clear" "Customer 1" \
+  "$(as_role support_sam 'SELECT name FROM demo.customers WHERE id = 1;')"
+refute "9b. ...while everyone else does not"    "Customer 1" \
+  "$(proxied 'SELECT name FROM demo.customers WHERE id = 1;')"
+check  "9c. analyst gets month precision"       "1970-04-01" \
+  "$(as_role analyst_ann 'SELECT birth_date FROM demo.customers WHERE id = 100;')"
+check  "9d. ...where the default is year only"  "1970-01-01" \
+  "$(proxied 'SELECT birth_date FROM demo.customers WHERE id = 100;')"
+check  "9e. support gets a partial email, not a pseudonym" "use" \
+  "$(as_role support_sam 'SELECT email FROM demo.customers WHERE id = 1;')"
+
+# 10 — semantic type domains keep the right things joinable.
+e1="$(proxied 'SELECT email FROM demo.customers WHERE id = 1;')"
+e2="$(proxied 'SELECT email FROM demo.customer_directory WHERE id = 1;')"
+check "10. same semantic type pseudonymises alike across relations" "$e1" "$e2"
 
 echo
 echo "-----------------------"

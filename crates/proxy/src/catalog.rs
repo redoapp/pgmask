@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::mask::Mask;
+use crate::mask::{Mask, MaskSpec};
 
 /// What to do with a field that HAS provenance but no catalog entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -41,13 +41,84 @@ pub enum Opaque {
     Mask,
 }
 
+/// Parameters shared by column rules and semantic types.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaskParams {
+    /// Characters kept by `partial` / `inner` / `outer`.
+    pub keep: Option<u16>,
+    /// Bounds for `range`.
+    pub start: Option<u16>,
+    pub end: Option<u16>,
+    /// Bucket size for `numeric-bucket`.
+    pub bucket: Option<i64>,
+    /// Pseudonym domain. Columns sharing a domain stay joinable; columns in
+    /// different domains cannot be linked by comparing masked values. Defaults
+    /// to the semantic type's name.
+    pub domain: Option<String>,
+}
+
+impl MaskParams {
+    fn apply_to(&self, spec: &mut MaskSpec) {
+        if let Some(v) = self.keep {
+            spec.keep = v;
+        }
+        if let Some(v) = self.start {
+            spec.start = v;
+        }
+        if let Some(v) = self.end {
+            spec.end = v;
+        }
+        if let Some(v) = self.bucket {
+            spec.bucket = v;
+        }
+        if let Some(v) = &self.domain {
+            spec.domain = Some(v.as_str().into());
+        }
+    }
+}
+
+/// A named classification with a default mask, so `email` is described once and
+/// referenced everywhere. Borrowed from Bytebase's semantic types, and the thing
+/// that keeps a real catalog from being thousands of hand-written rules.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticType {
+    pub name: String,
+    pub mask: Mask,
+    #[serde(flatten)]
+    pub params: MaskParams,
+    /// Per-role overrides, e.g. `{ analyst = "partial", oncall = "none" }`.
+    #[serde(default)]
+    pub by_role: HashMap<String, Mask>,
+}
+
+/// Maps principals to roles. The principal is the username Postgres verified
+/// during authentication, never one the client merely claimed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Role {
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnRule {
     /// Schema-qualified, e.g. `demo.customers`.
     pub relation: String,
     pub column: String,
-    pub mask: Mask,
+    /// Name of a `[[semantic_type]]`. Supplies the mask unless `mask` overrides.
+    #[serde(rename = "type", default)]
+    pub semantic_type: Option<String>,
+    /// Overrides the semantic type's mask.
+    #[serde(default)]
+    pub mask: Option<Mask>,
+    #[serde(flatten)]
+    pub params: MaskParams,
+    #[serde(default)]
+    pub by_role: HashMap<String, Mask>,
 }
 
 impl ColumnRule {
@@ -57,6 +128,54 @@ impl ColumnRule {
 
     fn display(&self) -> String {
         format!("{}.{}", self.relation, self.column)
+    }
+}
+
+/// Everything needed to mask one classified column, per role.
+#[derive(Debug, Clone)]
+pub struct Classification {
+    /// Applied when the principal holds none of the roles below.
+    pub default: MaskSpec,
+    /// Role name -> mask. Most restrictive wins when a principal holds several.
+    pub by_role: HashMap<String, MaskSpec>,
+}
+
+impl Classification {
+    /// Resolve for a principal's roles.
+    ///
+    /// **Most restrictive wins.** A principal in both `analyst` and `support`
+    /// gets the tighter of the two, because the alternative — widening access by
+    /// adding a role — is the kind of surprise a security control must not have.
+    pub fn for_roles(&self, roles: &HashSet<String>) -> &MaskSpec {
+        let mut chosen: Option<&MaskSpec> = None;
+        for role in roles {
+            if let Some(spec) = self.by_role.get(role) {
+                chosen = Some(match chosen {
+                    Some(current)
+                        if restrictiveness(current.kind) >= restrictiveness(spec.kind) =>
+                    {
+                        current
+                    }
+                    _ => spec,
+                });
+            }
+        }
+        chosen.unwrap_or(&self.default)
+    }
+}
+
+/// How much a mask withholds. Used only to break ties between a principal's
+/// roles; higher means less is revealed.
+fn restrictiveness(mask: Mask) -> u8 {
+    match mask {
+        Mask::None => 0,
+        Mask::Partial | Mask::Inner | Mask::Outer | Mask::Range => 1,
+        Mask::DateMonth | Mask::IpPrefix | Mask::NumericBucket => 2,
+        Mask::DateYear => 3,
+        Mask::Pseudonym => 4,
+        Mask::Hash => 5,
+        Mask::Redact => 6,
+        Mask::Null => 7,
     }
 }
 
@@ -84,6 +203,10 @@ pub struct Config {
     pub unclassified_mask: Mask,
     #[serde(default)]
     pub column: Vec<ColumnRule>,
+    #[serde(default)]
+    pub semantic_type: Vec<SemanticType>,
+    #[serde(default)]
+    pub role: Vec<Role>,
     /// PEM certificate chain served to clients. Requires `tls_key`.
     #[serde(default)]
     pub tls_cert: Option<String>,
@@ -136,7 +259,7 @@ impl Config {
 /// One consistent view of the classification, swapped atomically on refresh.
 #[derive(Debug, Default)]
 pub struct Snapshot {
-    by_column: HashMap<(u32, i16), Mask>,
+    by_column: HashMap<(u32, i16), Classification>,
     names: HashMap<(u32, i16), String>,
     /// Relation OIDs we know about, so an unknown one can be told apart from a
     /// relation we resolved whose column is merely unclassified.
@@ -146,8 +269,8 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn lookup(&self, table_oid: u32, column_id: i16) -> Option<Mask> {
-        self.by_column.get(&(table_oid, column_id)).copied()
+    pub fn lookup(&self, table_oid: u32, column_id: i16) -> Option<&Classification> {
+        self.by_column.get(&(table_oid, column_id))
     }
 
     pub fn name_of(&self, table_oid: u32, column_id: i16) -> Option<&str> {
@@ -178,7 +301,13 @@ impl Snapshot {
 
     #[cfg(test)]
     pub fn insert_for_test(&mut self, table_oid: u32, column_id: i16, mask: Mask, name: &str) {
-        self.by_column.insert((table_oid, column_id), mask);
+        self.by_column.insert(
+            (table_oid, column_id),
+            Classification {
+                default: MaskSpec::new(mask),
+                by_role: HashMap::new(),
+            },
+        );
         self.names.insert((table_oid, column_id), name.to_string());
         self.relations.insert(table_oid);
     }
@@ -187,6 +316,7 @@ impl Snapshot {
 /// The live catalog: a swappable snapshot plus the machinery to keep it current.
 pub struct Catalog {
     rules: Vec<ColumnRule>,
+    types: HashMap<String, SemanticType>,
     dsn: String,
     snapshot: RwLock<Arc<Snapshot>>,
     /// Woken when the hot path sees a relation OID we do not recognise.
@@ -199,6 +329,7 @@ impl Default for Catalog {
     fn default() -> Self {
         Self {
             rules: Vec::new(),
+            types: HashMap::new(),
             dsn: String::new(),
             snapshot: RwLock::new(Arc::new(Snapshot::default())),
             refresh_wanted: Notify::new(),
@@ -211,8 +342,16 @@ impl Default for Catalog {
 impl Catalog {
     /// Resolve for the first time. Fails if any rule names a column that does
     /// not exist: a catalog that silently half-loaded has unknown coverage.
-    pub async fn resolve(rules: &[ColumnRule], dsn: &str) -> Result<Self> {
-        let resolved = resolve_snapshot(rules, dsn).await?;
+    pub async fn resolve(
+        rules: &[ColumnRule],
+        semantic_types: &[SemanticType],
+        dsn: &str,
+    ) -> Result<Self> {
+        let types: HashMap<String, SemanticType> = semantic_types
+            .iter()
+            .map(|t| (t.name.clone(), t.clone()))
+            .collect();
+        let resolved = resolve_snapshot(rules, &types, dsn).await?;
         if !resolved.unresolved.is_empty() {
             bail!(
                 "catalog references {} column(s) that do not exist: {}. \
@@ -223,6 +362,7 @@ impl Catalog {
         }
         Ok(Self {
             rules: rules.to_vec(),
+            types,
             dsn: dsn.to_string(),
             snapshot: RwLock::new(Arc::new(resolved)),
             ..Default::default()
@@ -240,10 +380,6 @@ impl Catalog {
     /// A stable view for the duration of one `RowDescription`.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot.read().expect("catalog lock poisoned").clone()
-    }
-
-    pub fn lookup(&self, table_oid: u32, column_id: i16) -> Option<Mask> {
-        self.snapshot().lookup(table_oid, column_id)
     }
 
     pub fn name_of(&self, table_oid: u32, column_id: i16) -> Option<String> {
@@ -272,7 +408,7 @@ impl Catalog {
     /// coverage is the exact failure this mechanism exists to prevent.
     pub async fn refresh(&self) -> Result<()> {
         let previous = self.snapshot();
-        let next = match resolve_snapshot(&self.rules, &self.dsn).await {
+        let next = match resolve_snapshot(&self.rules, &self.types, &self.dsn).await {
             Ok(next) => next,
             Err(err) => {
                 self.failed_refreshes.fetch_add(1, Ordering::Relaxed);
@@ -322,7 +458,8 @@ impl Catalog {
             }
         }
 
-        let changed = next.by_column != previous.by_column;
+        let changed =
+            next.by_column.len() != previous.by_column.len() || next.names != previous.names;
         let count = next.len();
         *self.snapshot.write().expect("catalog lock poisoned") = Arc::new(next);
         self.refreshes.fetch_add(1, Ordering::Relaxed);
@@ -352,7 +489,64 @@ impl Catalog {
     }
 }
 
-async fn resolve_snapshot(rules: &[ColumnRule], dsn: &str) -> Result<Snapshot> {
+/// Fold a semantic type and a column rule into one classification.
+///
+/// Precedence, most specific first:
+///   1. the column rule's `by_role` entry
+///   2. the column rule's `mask`
+///   3. the semantic type's `by_role` entry
+///   4. the semantic type's `mask`
+fn classify(rule: &ColumnRule, types: &HashMap<String, SemanticType>) -> Result<Classification> {
+    let semantic = match &rule.semantic_type {
+        Some(name) => Some(types.get(name).with_context(|| {
+            format!(
+                "{} references unknown semantic type \"{name}\"",
+                rule.display()
+            )
+        })?),
+        None => None,
+    };
+
+    let base_kind = match (rule.mask, semantic) {
+        (Some(mask), _) => mask,
+        (None, Some(t)) => t.mask,
+        (None, None) => bail!("{} needs either `mask` or `type`", rule.display()),
+    };
+
+    // Build the default spec: semantic parameters first, column parameters win.
+    let build = |kind: Mask| {
+        let mut spec = MaskSpec::new(kind);
+        if let Some(t) = semantic {
+            // A semantic type names its own pseudonym domain, so every column
+            // of that type stays joinable without anyone configuring it.
+            spec.domain = Some(t.name.as_str().into());
+            t.params.apply_to(&mut spec);
+        }
+        rule.params.apply_to(&mut spec);
+        spec
+    };
+
+    let mut by_role: HashMap<String, MaskSpec> = HashMap::new();
+    if let Some(t) = semantic {
+        for (role, kind) in &t.by_role {
+            by_role.insert(role.clone(), build(*kind));
+        }
+    }
+    for (role, kind) in &rule.by_role {
+        by_role.insert(role.clone(), build(*kind));
+    }
+
+    Ok(Classification {
+        default: build(base_kind),
+        by_role,
+    })
+}
+
+async fn resolve_snapshot(
+    rules: &[ColumnRule],
+    types: &HashMap<String, SemanticType>,
+    dsn: &str,
+) -> Result<Snapshot> {
     if rules.is_empty() {
         return Ok(Snapshot::default());
     }
@@ -405,7 +599,9 @@ async fn resolve_snapshot(rules: &[ColumnRule], dsn: &str) -> Result<Snapshot> {
     for rule in rules {
         match resolved.get(&rule.key()) {
             Some(&(oid, attnum)) => {
-                snapshot.by_column.insert((oid, attnum), rule.mask);
+                snapshot
+                    .by_column
+                    .insert((oid, attnum), classify(rule, types)?);
                 snapshot.names.insert((oid, attnum), rule.display());
                 snapshot.relations.insert(oid);
             }
@@ -418,6 +614,49 @@ async fn resolve_snapshot(rules: &[ColumnRule], dsn: &str) -> Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn config_parses_semantic_types_roles_and_params() {
+        let toml_src = r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "k"
+
+[[role]]
+name = "support"
+members = ["sam"]
+
+[[semantic_type]]
+name = "email"
+mask = "pseudonym"
+keep = 3
+by_role = { support = "inner" }
+
+[[column]]
+relation = "s.t"
+column = "email"
+type = "email"
+by_role = { analyst = "partial" }
+"#;
+        let cfg: crate::catalog::Config = toml::from_str(toml_src).expect("should parse");
+        assert_eq!(cfg.semantic_type.len(), 1, "semantic types");
+        assert_eq!(cfg.role.len(), 1, "roles");
+        assert_eq!(
+            cfg.semantic_type[0].params.keep,
+            Some(3),
+            "flattened params on semantic type"
+        );
+        assert_eq!(
+            cfg.semantic_type[0].by_role.get("support"),
+            Some(&crate::mask::Mask::Inner),
+            "by_role on semantic type"
+        );
+        assert_eq!(
+            cfg.column[0].by_role.get("analyst"),
+            Some(&crate::mask::Mask::Partial),
+            "by_role on column"
+        );
+        assert_eq!(cfg.column[0].semantic_type.as_deref(), Some("email"));
+    }
 
     #[test]
     fn classified_column_names_strips_the_relation() {
@@ -434,7 +673,7 @@ mod tests {
         snapshot.insert_for_test(42, 1, Mask::Redact, "public.t.email");
         // Same relation, a column we did not classify: known relation.
         assert!(snapshot.knows_relation(42));
-        assert_eq!(snapshot.lookup(42, 2), None);
+        assert!(snapshot.lookup(42, 2).is_none());
         // A relation we have never resolved at all.
         assert!(!snapshot.knows_relation(99));
     }

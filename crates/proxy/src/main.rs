@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     // Resolving the catalog before binding is deliberate: a proxy that starts
     // with a half-loaded catalog is a proxy with unknown coverage.
     let catalog = Arc::new(
-        Catalog::resolve(&config.column, &config.catalog_dsn)
+        Catalog::resolve(&config.column, &config.semantic_type, &config.catalog_dsn)
             .await
             .context("resolving the column catalog")?,
     );
@@ -40,6 +40,12 @@ async fn main() -> Result<()> {
         config.opaque,
         if policy.tls.is_some() { "on" } else { "OFF" },
         config.backend_tls,
+    );
+    eprintln!(
+        "  {} semantic type(s), {} role(s), {} principal(s) with a role",
+        config.semantic_type.len(),
+        config.role.len(),
+        policy.roles.len(),
     );
     if policy.tls.is_none() {
         eprintln!(

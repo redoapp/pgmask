@@ -18,7 +18,7 @@
 //! Corollary, enforced below: a `DataRow` with no active plan is a bug or an
 //! attack. It is never forwarded.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -27,16 +27,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::catalog::{Catalog, Config, Opaque, Unclassified};
-use crate::mask::{Mask, Masker};
+use crate::mask::{Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
 use crate::protocol::{self, DescribeTarget, FrameReader, Message};
 use crate::tls::{BackendTls, BoxStream};
 
 /// What to do with one output field.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct FieldPlan {
-    mask: Mask,
+    spec: MaskSpec,
     type_oid: u32,
+    format: i16,
 }
 
 type Plan = Arc<Vec<FieldPlan>>;
@@ -56,6 +57,8 @@ pub struct Policy {
     pub unclassified_mask: Mask,
     pub opaque: Opaque,
     pub metrics: Arc<Metrics>,
+    /// Principal -> roles, from `[[role]]`.
+    pub roles: HashMap<String, HashSet<String>>,
     /// Present when `tls_cert`/`tls_key` are configured. Absent means we answer
     /// `SSLRequest` with `N` and clients using `sslmode=prefer` fall back.
     pub tls: Option<tokio_rustls::TlsAcceptor>,
@@ -76,17 +79,31 @@ impl Policy {
             unclassified_mask: config.unclassified_mask,
             opaque: config.opaque,
             metrics: Arc::new(Metrics::default()),
+            roles: roles_by_principal(&config.role),
             tls,
             backend_tls: config.backend_tls,
         })
     }
 
+    /// Roles held by a verified principal.
+    pub fn roles_of(&self, principal: &str) -> HashSet<String> {
+        self.roles.get(principal).cloned().unwrap_or_default()
+    }
+
     /// Decide the plan for a described result set, or refuse it.
-    fn plan_for(&self, fields: &[protocol::FieldDescription]) -> Result<Plan, Rejection> {
+    ///
+    /// Takes the principal's roles because the same column can resolve to
+    /// different masks for different people — so a plan is only ever valid for
+    /// the session that built it.
+    fn plan_for(
+        &self,
+        fields: &[protocol::FieldDescription],
+        roles: &HashSet<String>,
+    ) -> Result<Plan, Rejection> {
         let snapshot = self.catalog.snapshot();
         let mut plan = Vec::with_capacity(fields.len());
         for field in fields {
-            let mask = if !field.has_provenance() {
+            let spec = if !field.has_provenance() {
                 match self.opaque {
                     Opaque::Reject => {
                         return Err(Rejection {
@@ -104,11 +121,11 @@ impl Policy {
                             ),
                         })
                     }
-                    Opaque::Mask => Mask::Null,
+                    Opaque::Mask => MaskSpec::new(Mask::Null),
                 }
             } else {
                 match snapshot.lookup(field.table_oid, field.column_id) {
-                    Some(mask) => mask,
+                    Some(classification) => classification.for_roles(roles).clone(),
                     None => {
                         // A relation we have never resolved may mean the catalog
                         // has gone stale — a recreated view gets a new OID. Nudge
@@ -116,16 +133,18 @@ impl Policy {
                         if !snapshot.knows_relation(field.table_oid) {
                             self.catalog.note_unknown_relation();
                         }
-                        match self.unclassified {
+                        MaskSpec::new(match self.unclassified {
                             Unclassified::Mask => self.unclassified_mask,
                             Unclassified::Allow => Mask::None,
-                        }
+                        })
                     }
                 }
             };
 
-            // Catch type/mask mismatches once here rather than per row.
-            if mask.needs_text_family() && !protocol::is_text_family(field.type_oid) {
+            // Catch type/format mismatches once here rather than per row, so a
+            // misconfiguration refuses the result set instead of dying halfway
+            // through a stream.
+            if !spec.supports(field.type_oid, field.format) {
                 let name = snapshot
                     .name_of(field.table_oid, field.column_id)
                     .unwrap_or(&field.name)
@@ -133,22 +152,37 @@ impl Policy {
                 return Err(Rejection {
                     cause: Cause::MaskTypeMismatch,
                     message: format!(
-                        "pgmask: mask {mask:?} on {name} rewrites values as text, but its type \
-                         (OID {}, wire format {}) is not a text type",
+                        "pgmask: mask {:?} on {name} cannot be applied to type OID {} in {} \
+                         format",
+                        spec.kind,
                         field.type_oid,
                         if field.format == 1 { "binary" } else { "text" },
                     ),
-                    hint: Some("Use mask = \"null\" for this column.".into()),
+                    hint: Some(spec.unsupported_hint().into()),
                 });
             }
 
             plan.push(FieldPlan {
-                mask,
+                spec,
                 type_oid: field.type_oid,
+                format: field.format,
             });
         }
         Ok(Arc::new(plan))
     }
+}
+
+/// Invert `[[role]]` declarations into principal -> roles.
+fn roles_by_principal(roles: &[crate::catalog::Role]) -> HashMap<String, HashSet<String>> {
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    for role in roles {
+        for member in &role.members {
+            out.entry(member.clone())
+                .or_default()
+                .insert(role.name.clone());
+        }
+    }
+    out
 }
 
 /// Bytes cleared for the client.
@@ -188,7 +222,7 @@ impl Vetted {
     /// Takes the plan to make the claim checkable rather than assumed.
     fn unmasked_row(msg: &Message, plan: &[FieldPlan]) -> Self {
         debug_assert!(
-            plan.iter().all(|f| f.mask == Mask::None),
+            plan.iter().all(|f| f.spec.is_passthrough()),
             "unmasked_row called with a plan that masks something"
         );
         Self(msg.encode())
@@ -245,6 +279,13 @@ pub struct Session {
     /// Whether this client connection is itself TLS. Decides whether channel
     /// binding is even in play.
     client_tls: bool,
+    /// Roles held by the verified principal. Empty until `AuthenticationOk`, so
+    /// an unauthenticated session can only ever get the default (most
+    /// restrictive) classification.
+    roles: HashSet<String>,
+    /// The username from `StartupMessage`. Claimed until Postgres vouches.
+    principal: String,
+    pub authenticated: bool,
 }
 
 impl Session {
@@ -259,7 +300,37 @@ impl Session {
             masked_fields: 0,
             rejected_result_sets: 0,
             client_tls: false,
+            roles: HashSet::new(),
+            principal: String::new(),
+            authenticated: false,
         }
+    }
+
+    /// The username the client claimed at startup. Not trusted until
+    /// `AuthenticationOk`; see `note_backend_auth`.
+    pub fn with_principal(mut self, principal: &str) -> Self {
+        self.principal = principal.to_string();
+        self
+    }
+
+    /// Postgres has vouched for the username — only now may it select a policy.
+    ///
+    /// This lives in `handle_backend` rather than in the pump loop because the
+    /// pump drains several messages per read, and `AuthenticationOk` usually
+    /// arrives in the same TCP segment as the SASL final message. Detecting it
+    /// only on the first message of a read silently skipped it, so every session
+    /// ran with no roles. Same shape as the CopyData bug: logic in the outer
+    /// read that the drain loop never saw.
+    fn note_backend_auth(&mut self, msg: &Message) {
+        if self.authenticated
+            || msg.tag != protocol::B_AUTHENTICATION
+            || msg.body.len() < 4
+            || i32::from_be_bytes([msg.body[0], msg.body[1], msg.body[2], msg.body[3]]) != 0
+        {
+            return;
+        }
+        self.authenticated = true;
+        self.roles = self.policy.roles_of(&self.principal);
     }
 
     pub fn with_client_tls(mut self, client_tls: bool) -> Self {
@@ -345,6 +416,8 @@ impl Session {
     }
 
     fn handle_backend(&mut self, msg: Message, out: &mut Batch) {
+        self.note_backend_auth(&msg);
+
         // While suppressing, everything is dropped until the cycle ends.
         if self.suppressing {
             if msg.tag == protocol::B_READY_FOR_QUERY {
@@ -476,7 +549,7 @@ impl Session {
             }
         };
 
-        let plan = match self.policy.plan_for(&fields) {
+        let plan = match self.policy.plan_for(&fields, &self.roles) {
             Ok(plan) => plan,
             Err(rejection) => {
                 self.pending_describes.pop_front();
@@ -486,7 +559,7 @@ impl Session {
 
         // Successful result sets are the denominator: a rejection share is
         // meaningless without knowing how much traffic sails through.
-        let masking = plan.iter().filter(|f| f.mask != Mask::None).count();
+        let masking = plan.iter().filter(|f| !f.spec.is_passthrough()).count();
         if masking > 0 {
             self.policy.metrics.record_masked_result_set(masking as u64);
         }
@@ -555,11 +628,15 @@ impl Session {
         let mut masked = Vec::with_capacity(values.len());
         let mut changed = false;
         for (value, field) in values.into_iter().zip(plan.iter()) {
-            if field.mask == Mask::None {
+            if field.spec.is_passthrough() {
                 masked.push(value);
                 continue;
             }
-            match self.policy.masker.apply(field.mask, field.type_oid, value) {
+            match self
+                .policy
+                .masker
+                .apply(&field.spec, field.type_oid, field.format, value)
+            {
                 Ok(new_value) => {
                     changed = true;
                     self.masked_fields += 1;
@@ -693,8 +770,9 @@ pub async fn handle_connection(
         .unwrap_or_else(|| "<unknown>".into());
 
     // --- Message pump -------------------------------------------------------
-    let mut session = Session::new(policy).with_client_tls(client_tls);
-    let mut authenticated = false;
+    let mut session = Session::new(policy)
+        .with_client_tls(client_tls)
+        .with_principal(&user);
 
     // Accumulate a whole batch before touching the sockets. One `read_buf`
     // typically carries hundreds of DataRows; flushing per message turned that
@@ -720,15 +798,6 @@ pub async fn handle_connection(
             },
             msg = backend_frames.read_message() => match msg? {
                 Some(msg) => {
-                    // Postgres just vouched for the username; only now is it
-                    // safe to treat as verified identity.
-                    if !authenticated
-                        && msg.tag == protocol::B_AUTHENTICATION
-                        && msg.body.len() >= 4
-                        && i32::from_be_bytes([msg.body[0], msg.body[1], msg.body[2], msg.body[3]]) == 0
-                    {
-                        authenticated = true;
-                    }
                     session.handle_backend(msg, &mut out);
                     while !out.close {
                         let Some(msg) = backend_frames.try_buffered_message()? else {
@@ -760,9 +829,12 @@ pub async fn handle_connection(
 
     if session.masked_fields > 0 || session.rejected_result_sets > 0 {
         eprintln!(
-            "session closed user={user} authenticated={authenticated} \
+            "session closed user={user} authenticated={} roles={} \
              masked_fields={} rejected_result_sets={}",
-            session.masked_fields, session.rejected_result_sets
+            session.authenticated,
+            session.roles.len(),
+            session.masked_fields,
+            session.rejected_result_sets
         );
     }
     Ok(())
@@ -780,6 +852,7 @@ mod tests {
             unclassified,
             unclassified_mask: Mask::Null,
             opaque,
+            roles: HashMap::new(),
             metrics: Arc::new(Metrics::default()),
             tls: None,
             backend_tls: BackendTls::Disable,
@@ -800,7 +873,7 @@ mod tests {
     fn opaque_field_is_rejected_by_default() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let err = p
-            .plan_for(&[field("lower", 0, 0, 25)])
+            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new())
             .expect_err("must reject");
         assert!(err.message.contains("no column provenance"));
     }
@@ -809,24 +882,30 @@ mod tests {
     fn opaque_field_can_be_masked_instead() {
         let p = policy(Unclassified::Allow, Opaque::Mask);
         let plan = p
-            .plan_for(&[field("lower", 0, 0, 25)])
+            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new())
             .ok()
             .expect("must allow");
-        assert_eq!(plan[0].mask, Mask::Null);
+        assert_eq!(plan[0].spec.kind, Mask::Null);
     }
 
     #[test]
     fn unclassified_columns_are_masked_by_default() {
         let p = policy(Unclassified::Mask, Opaque::Reject);
-        let plan = p.plan_for(&[field("email", 16391, 2, 25)]).ok().unwrap();
-        assert_eq!(plan[0].mask, Mask::Null, "default-deny");
+        let plan = p
+            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new())
+            .ok()
+            .unwrap();
+        assert_eq!(plan[0].spec.kind, Mask::Null, "default-deny");
     }
 
     #[test]
     fn allow_mode_passes_unclassified_columns() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
-        let plan = p.plan_for(&[field("email", 16391, 2, 25)]).ok().unwrap();
-        assert_eq!(plan[0].mask, Mask::None);
+        let plan = p
+            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new())
+            .ok()
+            .unwrap();
+        assert_eq!(plan[0].spec.kind, Mask::None);
     }
 
     #[test]
@@ -840,14 +919,129 @@ mod tests {
             unclassified_mask: Mask::Null,
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
+            roles: HashMap::new(),
             tls: None,
             backend_tls: BackendTls::Disable,
         });
-        // int4, not a text type.
+        // int4, not a text type: pseudonym rewrites values as text.
         let err = p
-            .plan_for(&[field("id", 16391, 1, 23)])
+            .plan_for(&[field("id", 16391, 1, 23)], &HashSet::new())
             .expect_err("must reject");
-        assert!(err.message.contains("not a text type"));
+        assert!(
+            err.message.contains("cannot be applied to type OID 23"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            err.hint.as_deref().unwrap_or("").contains("null"),
+            "the hint should say what to do instead"
+        );
+    }
+
+    #[test]
+    fn per_role_masks_resolve_most_restrictive_first() {
+        use crate::catalog::{Classification, Role};
+        use std::collections::HashMap as Map;
+
+        let mut by_role = Map::new();
+        by_role.insert("analyst".to_string(), MaskSpec::new(Mask::Partial));
+        by_role.insert("support".to_string(), MaskSpec::new(Mask::Null));
+        let classification = Classification {
+            default: MaskSpec::new(Mask::Pseudonym),
+            by_role,
+        };
+
+        // No role: the default.
+        assert_eq!(
+            classification.for_roles(&HashSet::new()).kind,
+            Mask::Pseudonym
+        );
+        // One role: that role's mask.
+        let analyst: HashSet<String> = ["analyst".to_string()].into_iter().collect();
+        assert_eq!(classification.for_roles(&analyst).kind, Mask::Partial);
+        // Both roles: the tighter one, because adding a role must never widen
+        // access.
+        let both: HashSet<String> = ["analyst".to_string(), "support".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(classification.for_roles(&both).kind, Mask::Null);
+
+        // And principals with no declared role get no roles at all.
+        let roles = roles_by_principal(&[Role {
+            name: "analyst".into(),
+            members: vec!["alice".into()],
+        }]);
+        assert!(roles.get("alice").unwrap().contains("analyst"));
+        assert!(!roles.contains_key("mallory"));
+    }
+
+    /// Regression: AuthenticationOk usually shares a TCP segment with the SASL
+    /// final message, so it reaches `handle_backend` via the drain loop rather
+    /// than as the first message of a read. Detecting it only in the pump meant
+    /// no session ever resolved a principal, and every user silently got the
+    /// default policy.
+    #[test]
+    fn authentication_ok_is_detected_even_when_it_is_not_the_first_message() {
+        use crate::catalog::Role;
+
+        let mut p = policy(Unclassified::Allow, Opaque::Reject);
+        Arc::get_mut(&mut p).unwrap().roles = roles_by_principal(&[Role {
+            name: "support".into(),
+            members: vec!["sam".into()],
+        }]);
+
+        let mut session = Session::new(p).with_principal("sam");
+        let mut out = Batch::default();
+
+        // SASLFinal (Authentication sub-code 12) — not AuthenticationOk.
+        let mut sasl_final = bytes::BytesMut::new();
+        bytes::BufMut::put_i32(&mut sasl_final, 12);
+        session.handle_backend(
+            Message::new(protocol::B_AUTHENTICATION, sasl_final.freeze()),
+            &mut out,
+        );
+        assert!(!session.authenticated, "12 is not AuthenticationOk");
+        assert!(session.roles.is_empty());
+
+        // AuthenticationOk arriving second, as it does on the wire.
+        let mut ok = bytes::BytesMut::new();
+        bytes::BufMut::put_i32(&mut ok, 0);
+        session.handle_backend(
+            Message::new(protocol::B_AUTHENTICATION, ok.freeze()),
+            &mut out,
+        );
+        assert!(session.authenticated, "AuthenticationOk must be seen");
+        assert!(
+            session.roles.contains("support"),
+            "the verified principal's roles must be resolved"
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_principal_gets_no_roles() {
+        use crate::catalog::Role;
+        let mut p = policy(Unclassified::Allow, Opaque::Reject);
+        Arc::get_mut(&mut p).unwrap().roles = roles_by_principal(&[Role {
+            name: "support".into(),
+            members: vec!["sam".into()],
+        }]);
+        let mut session = Session::new(p).with_principal("mallory");
+        let mut ok = bytes::BytesMut::new();
+        bytes::BufMut::put_i32(&mut ok, 0);
+        session.handle_backend(
+            Message::new(protocol::B_AUTHENTICATION, ok.freeze()),
+            &mut Batch::default(),
+        );
+        assert!(session.authenticated);
+        assert!(session.roles.is_empty(), "unknown principals get nothing");
+    }
+
+    #[test]
+    fn an_unauthenticated_session_gets_the_default_classification() {
+        // Roles are only ever populated from a username Postgres verified, so a
+        // session that never authenticated cannot pick up a looser mask.
+        let session = Session::new(policy(Unclassified::Mask, Opaque::Reject));
+        assert!(session.roles.is_empty());
     }
 
     #[test]
@@ -913,8 +1107,9 @@ mod tests {
     fn a_simple_query_invalidates_the_previous_plan() {
         let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
         session.active_plan = Some(Arc::new(vec![FieldPlan {
-            mask: Mask::None,
+            spec: MaskSpec::new(Mask::None),
             type_oid: 25,
+            format: 0,
         }]));
         let query = Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1\0"));
         session.handle_frontend(query, &mut Batch::default());
@@ -928,8 +1123,9 @@ mod tests {
     fn bind_carries_the_statement_plan_to_the_portal() {
         let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
         let plan: Plan = Arc::new(vec![FieldPlan {
-            mask: Mask::None,
+            spec: MaskSpec::new(Mask::None),
             type_oid: 25,
+            format: 0,
         }]);
         session.statement_plans.insert("s1".into(), plan);
 

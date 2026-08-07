@@ -76,7 +76,7 @@ PROXY_URL=postgres://postgres:demo@localhost:6432/demo \
 ```toml
 listen  = "127.0.0.1:6432"
 backend = "127.0.0.1:55432"
-catalog_dsn   = "postgres://..."   # used once at startup to resolve OIDs
+catalog_dsn   = "postgres://..."   # resolves names to OIDs, at boot and refresh
 pseudonym_key = "..."              # rotating invalidates every pseudonym issued
 
 unclassified      = "mask"   # mask | allow    — default-deny
@@ -91,15 +91,68 @@ catalog_refresh_seconds     = 30  # OIDs are not stable across DDL
 catalog_refresh_min_seconds = 5   # floor on miss-triggered refreshes
 metrics_interval_seconds    = 60  # 0 disables
 
+# Who is who. Members are usernames Postgres verified, never merely claimed.
+[[role]]
+name    = "support"
+members = ["support_sam"]
+
+# Describe a kind of data once, reference it from every column that holds it.
+[[semantic_type]]
+name    = "email"
+mask    = "pseudonym"
+keep    = 3
+by_role = { support = "inner" }
+
 [[column]]
 relation = "demo.customers"
 column   = "email"
-mask     = "pseudonym"   # none | null | redact | partial | hash | pseudonym
+type     = "email"          # or an inline `mask =`, which overrides the type
 ```
 
-Masks: `pseudonym` is keyed, deterministic and shape-preserving, so joins still
-work and an email still looks like an email. That determinism is also an
-equality-and-frequency oracle — usually the point, but choose it deliberately.
+### Masks
+
+| Mask | Effect | Applies to |
+|---|---|---|
+| `none` | passthrough — an explicit decision | any |
+| `null` | type-correct NULL | **any type, any format** |
+| `redact` | constant `***` | text |
+| `partial` | keep the last `keep` chars — `****0101` | text |
+| `inner` | keep `keep` at each end — `12**56` | text |
+| `outer` | keep the middle — `**34**` | text |
+| `range` | mask `[start, end)` | text |
+| `hash` | HMAC-SHA256, hex | text |
+| `pseudonym` | keyed, deterministic, shape-preserving | text, uuid |
+| `date-year` | truncate to 1 January | date, timestamp, timestamptz |
+| `date-month` | truncate to the 1st | date, timestamp, timestamptz |
+| `numeric-bucket` | floor to a multiple of `bucket` | int2/4/8, float4/8, numeric (text) |
+| `ip-prefix` | keep the network — `203.0.113.0` | text, inet/cidr (text) |
+
+Type and format compatibility is checked once when the result set is described,
+so a misconfiguration refuses cleanly instead of dying halfway through a stream.
+Negative numbers floor *downward* (`-37` with bucket 10 → `-40`), because
+rounding toward zero would reveal more than the bucket size promises.
+
+`pseudonym` is deterministic, so joins still work and an email still looks like
+an email. That determinism is also an equality-and-frequency oracle — usually
+the point, but choose it deliberately.
+
+### Semantic types and pseudonym domains
+
+A semantic type names a kind of data once and supplies its mask, parameters and
+per-role overrides. It also becomes the default **pseudonym domain**, which
+decides what stays linkable: two columns of the same type pseudonymise
+identically so joins keep working, while an `account_id` that happens to equal a
+`phone` will not, so the two columns cannot be linked by comparing masked values.
+
+### Per-principal policy
+
+`by_role` on a column or a semantic type gives the same column different
+treatment for different people — support sees a partial email, everyone else a
+pseudonym. Roles come from the username **Postgres verified**, never one the
+client claimed, and a session that has not authenticated holds no roles at all.
+
+When a principal holds several roles with different masks, **the most
+restrictive wins**. Adding a role must never widen access.
 
 The catalog is keyed on `(OID, attnum)`, never on output column name, which any
 query can rename. Views need their own entries: Phase 0 found that Postgres
@@ -225,7 +278,7 @@ docs/phase0-results.md     generated provenance spike output
 crates/proxy/protocol.rs   wire framing and the message types we decode
 crates/proxy/session.rs    the per-connection state machine, and Vetted
 crates/proxy/catalog.rs    config and (OID, attnum) resolution
-crates/proxy/mask.rs       masking algorithms
+crates/proxy/mask.rs       masking algorithms, semantic-type domains
 crates/proxy/metrics.rs    rejection causes and counters
 crates/proxy/tls.rs        TLS on both legs
 crates/proxy/tests/        canary, adversarial and resilience suites

@@ -122,7 +122,10 @@ pub fn rule(relation: &str, column: &str, mask: Mask) -> ColumnRule {
     ColumnRule {
         relation: relation.into(),
         column: column.into(),
-        mask,
+        semantic_type: None,
+        mask: Some(mask),
+        params: Default::default(),
+        by_role: Default::default(),
     }
 }
 
@@ -166,6 +169,8 @@ pub async fn start_proxy_at(
         opaque,
         unclassified_mask: Mask::Null,
         column: rules,
+        semantic_type: Vec::new(),
+        role: Vec::new(),
         tls_cert: None,
         tls_key: None,
         backend_tls: pgmask::tls::BackendTls::Disable,
@@ -174,7 +179,9 @@ pub async fn start_proxy_at(
         catalog_refresh_min_seconds: 1,
         metrics_interval_seconds: 0,
     };
-    let catalog = Arc::new(Catalog::resolve(&config.column, &config.catalog_dsn).await?);
+    let catalog = Arc::new(
+        Catalog::resolve(&config.column, &config.semantic_type, &config.catalog_dsn).await?,
+    );
     tokio::spawn(catalog.clone().run_refresher(
         std::time::Duration::from_secs(config.catalog_refresh_seconds),
         std::time::Duration::from_secs(config.catalog_refresh_min_seconds),
