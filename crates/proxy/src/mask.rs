@@ -38,6 +38,9 @@ pub const OID_UUID: u32 = 2950;
 pub const OID_INET: u32 = 869;
 pub const OID_CIDR: u32 = 650;
 
+/// Fixed pseudonym width, in hex characters. 64 bits.
+const PSEUDONYM_HEX_CHARS: usize = 16;
+
 pub const FORMAT_TEXT: i16 = 0;
 pub const FORMAT_BINARY: i16 = 1;
 
@@ -88,6 +91,11 @@ pub struct MaskSpec {
     pub end: u16,
     /// Bucket size for `numeric-bucket`.
     pub bucket: i64,
+    /// Keep the domain of an email address rather than pseudonymising it.
+    ///
+    /// Off by default: for business data the domain identifies the company, and
+    /// with one contact there it identifies the person.
+    pub keep_domain: bool,
     /// Domain separator for `hash` / `pseudonym`.
     ///
     /// Two columns sharing a domain pseudonymise identically, so joins across
@@ -105,6 +113,7 @@ impl Default for MaskSpec {
             start: 0,
             end: 0,
             bucket: 1,
+            keep_domain: false,
             domain: None,
         }
     }
@@ -262,8 +271,14 @@ impl Masker {
         mac.finalize().into_bytes().into()
     }
 
-    /// Deterministic and shaped like the input, so an email still looks like an
-    /// email and downstream parsing keeps working.
+    /// Deterministic, fixed width, and by default revealing nothing of the
+    /// input — not even its length.
+    ///
+    /// Width is constant at 16 hex characters (64 bits). Deriving it from the
+    /// input leaked the original's length, and short inputs got as few as 32
+    /// bits, where 380k values collide about sixteen times by the birthday
+    /// bound. Collisions here are not merely a privacy problem: two people
+    /// sharing a pseudonym corrupts joins and counts.
     fn pseudonym(
         &self,
         spec: &MaskSpec,
@@ -283,18 +298,33 @@ impl Masker {
 
         let text = String::from_utf8_lossy(bytes);
         Ok(Bytes::from(match text.split_once('@') {
+            // The local part alone is not the identifying half of a work
+            // address. `alice@tinystartup.io` names a company, and with one
+            // contact there it names a person — so the domain is pseudonymised
+            // too unless `keep_domain` is set. Domains map deterministically, so
+            // "group by employer" still works without naming the employer.
+            Some((_, domain)) if !spec.keep_domain => {
+                let mut out = String::with_capacity(PSEUDONYM_HEX_CHARS + 14);
+                hex_into(&digest[..PSEUDONYM_HEX_CHARS / 2], &mut out);
+                out.push('@');
+                let mut mac = self.mac.clone();
+                mac.update(b"domain\x00");
+                mac.update(domain.as_bytes());
+                let dd: [u8; 32] = mac.finalize().into_bytes().into();
+                hex_into(&dd[..4], &mut out);
+                out.push_str(".invalid");
+                out
+            }
             Some((_, domain)) => {
-                let mut out = String::with_capacity(12 + 1 + domain.len());
-                hex_into(&digest[..6], &mut out);
+                let mut out = String::with_capacity(PSEUDONYM_HEX_CHARS + 1 + domain.len());
+                hex_into(&digest[..PSEUDONYM_HEX_CHARS / 2], &mut out);
                 out.push('@');
                 out.push_str(domain);
                 out
             }
             None => {
-                let want = text.len().clamp(8, 32);
-                let mut out = String::with_capacity(32);
-                hex_into(&digest[..16], &mut out);
-                out.truncate(want);
+                let mut out = String::with_capacity(PSEUDONYM_HEX_CHARS);
+                hex_into(&digest[..PSEUDONYM_HEX_CHARS / 2], &mut out);
                 out
             }
         }))
@@ -346,28 +376,42 @@ fn range(text: &str, start: usize, end: usize) -> String {
     out
 }
 
-/// Keep the network portion: /24 for v4, the first three groups for v6.
+/// Keep the network portion: /24 for v4, /48 for v6.
+///
+/// Parsed rather than split on separators. The string approach produced invalid
+/// addresses for compressed IPv6 — `2001:db8::1` became `2001:db8:::` and `::1`
+/// became `::1::` — and passed zone identifiers straight through. Anything that
+/// does not parse is fully masked rather than half-transformed.
 fn ip_prefix(text: &str) -> String {
-    let (addr, suffix) = match text.split_once('/') {
+    let stars = || "*".repeat(text.chars().count());
+    let (addr, had_prefix) = match text.split_once('/') {
         Some((a, _)) => (a, true),
         None => (text, false),
     };
-    if addr.contains(':') {
-        let groups: Vec<&str> = addr.split(':').collect();
-        let kept: Vec<&str> = groups.into_iter().take(3).collect();
-        let base = format!("{}::", kept.join(":"));
-        return if suffix { format!("{base}/48") } else { base };
+    // Zone identifiers (`fe80::1%eth0`) are not part of the address and std
+    // will not parse them.
+    let addr = addr.split('%').next().unwrap_or(addr).trim();
+
+    if let Ok(v4) = addr.parse::<std::net::Ipv4Addr>() {
+        let o = v4.octets();
+        let base = std::net::Ipv4Addr::new(o[0], o[1], o[2], 0);
+        return if had_prefix {
+            format!("{base}/24")
+        } else {
+            base.to_string()
+        };
     }
-    let octets: Vec<&str> = addr.split('.').collect();
-    if octets.len() != 4 {
-        return "*".repeat(text.chars().count());
+    if let Ok(v6) = addr.parse::<std::net::Ipv6Addr>() {
+        let mut octets = v6.octets();
+        octets[6..].fill(0); // keep the first 48 bits
+        let base = std::net::Ipv6Addr::from(octets);
+        return if had_prefix {
+            format!("{base}/48")
+        } else {
+            base.to_string()
+        };
     }
-    let base = format!("{}.{}.{}.0", octets[0], octets[1], octets[2]);
-    if suffix {
-        format!("{base}/24")
-    } else {
-        base
-    }
+    stars()
 }
 
 // --- Date truncation --------------------------------------------------------
@@ -740,12 +784,12 @@ mod tests {
     // --- Pseudonyms and domains ---------------------------------------------
 
     #[test]
-    fn pseudonym_is_deterministic_and_keeps_the_domain() {
+    fn pseudonym_is_deterministic() {
         let a = apply_text(&spec(Mask::Pseudonym), "alice@example.com");
         let b = apply_text(&spec(Mask::Pseudonym), "alice@example.com");
         assert_eq!(a, b, "joins depend on determinism");
-        assert!(a.ends_with("@example.com"));
-        assert!(!a.starts_with("alice"));
+        assert!(!a.contains("alice"));
+        // Domain handling is covered by email_domains_are_pseudonymised_by_default.
     }
 
     #[test]
@@ -918,5 +962,106 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&out[..], b"187000");
+    }
+
+    // --- Regressions for defects found by attacking the masks directly -----
+
+    /// A pseudonym must reveal nothing of the input, including its length, and
+    /// must be wide enough that 380k values do not collide.
+    #[test]
+    fn pseudonyms_are_fixed_width_regardless_of_input() {
+        let widths: Vec<usize> = ["a", "ab", "abcdefgh", &"x".repeat(64)]
+            .iter()
+            .map(|v| apply_text(&spec(Mask::Pseudonym), v).len())
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w == PSEUDONYM_HEX_CHARS),
+            "input length must not show through: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn pseudonyms_do_not_collide_across_many_values() {
+        use std::collections::HashSet;
+        let m = masker();
+        let seen: HashSet<String> = (0..50_000)
+            .map(|i| {
+                let v = format!("subject-{i}");
+                String::from_utf8(
+                    m.apply(
+                        &spec(Mask::Pseudonym),
+                        TEXT,
+                        FORMAT_TEXT,
+                        Some(Bytes::from(v)),
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .to_vec(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(seen.len(), 50_000, "collisions corrupt joins and counts");
+    }
+
+    /// For business data the domain names the company, and with one contact
+    /// there it names the person. Domains map deterministically so grouping by
+    /// employer still works without naming the employer.
+    #[test]
+    fn email_domains_are_pseudonymised_by_default() {
+        let out = apply_text(&spec(Mask::Pseudonym), "alice@tinystartup.io");
+        assert!(!out.contains("tinystartup"), "domain leaked: {out}");
+        assert!(
+            out.contains('@'),
+            "should still look like an address: {out}"
+        );
+
+        // Same domain, different people -> same masked domain.
+        let a = apply_text(&spec(Mask::Pseudonym), "alice@acme.com");
+        let b = apply_text(&spec(Mask::Pseudonym), "bob@acme.com");
+        assert_ne!(a, b);
+        assert_eq!(
+            a.split('@').nth(1),
+            b.split('@').nth(1),
+            "colleagues must still group together"
+        );
+
+        // Opt back in explicitly.
+        let mut keep = spec(Mask::Pseudonym);
+        keep.keep_domain = true;
+        let kept = masker()
+            .apply(
+                &keep,
+                TEXT,
+                FORMAT_TEXT,
+                Some(Bytes::from_static(b"alice@acme.com")),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8(kept.to_vec())
+            .unwrap()
+            .ends_with("@acme.com"));
+    }
+
+    /// Splitting on `:` produced invalid addresses for compressed forms and let
+    /// zone identifiers through. Parse, mask, re-emit.
+    #[test]
+    fn ip_prefix_emits_valid_addresses() {
+        for (input, want) in [
+            ("203.0.113.7", "203.0.113.0"),
+            ("203.0.113.7/32", "203.0.113.0/24"),
+            ("2001:db8:1:2:3:4:5:6", "2001:db8:1::"),
+            ("2001:db8::1", "2001:db8::"),
+            ("::1", "::"),
+            ("fe80::1%eth0", "fe80::"),
+        ] {
+            assert_eq!(
+                apply_text(&spec(Mask::IpPrefix), input),
+                want,
+                "input {input}"
+            );
+        }
+        // Anything that does not parse is fully masked, not half-transformed.
+        assert_eq!(apply_text(&spec(Mask::IpPrefix), "not-an-ip"), "*********");
     }
 }

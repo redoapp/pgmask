@@ -115,7 +115,8 @@ check "1e. an aggregate that emits a stored value is still refused" \
 # 2 — classified masked, allowed passthrough, unclassified default-denied.
 row="$(proxied 'SELECT email, name, phone, city, internal_note FROM demo.customers WHERE id = 1;')"
 refute "2a. classified email is not emitted verbatim" "user1@example.com" "$row"
-check  "2b. pseudonym keeps the domain (joins still work)" "@example.com" "$row"
+check  "2b. pseudonym still looks like an address"         "@"            "$row"
+refute "2b2. ...but the domain is pseudonymised too"       "@example.com" "$row"
 check  "2c. redact replaces the name"                      "***"          "$row"
 check  "2d. partial keeps the last four of the phone"      "0101"         "$row"
 check  "2e. explicitly allowed column passes through"      "Denver"       "$row"

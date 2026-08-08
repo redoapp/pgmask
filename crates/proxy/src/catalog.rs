@@ -60,8 +60,10 @@ pub struct MaskParams {
     /// Bounds for `range`.
     pub start: Option<u16>,
     pub end: Option<u16>,
-    /// Bucket size for `numeric-bucket`.
+    /// Bucket size for `numeric-bucket`. Must be >= 2.
     pub bucket: Option<i64>,
+    /// Keep an email's domain rather than pseudonymising it. Off by default.
+    pub keep_domain: Option<bool>,
     /// Pseudonym domain. Columns sharing a domain stay joinable; columns in
     /// different domains cannot be linked by comparing masked values. Defaults
     /// to the semantic type's name.
@@ -81,6 +83,9 @@ impl MaskParams {
         }
         if let Some(v) = self.bucket {
             spec.bucket = v;
+        }
+        if let Some(v) = self.keep_domain {
+            spec.keep_domain = v;
         }
         if let Some(v) = &self.domain {
             spec.domain = Some(v.as_str().into());
@@ -559,10 +564,18 @@ fn classify(rule: &ColumnRule, types: &HashMap<String, SemanticType>) -> Result<
         by_role.insert(role.clone(), build(*kind));
     }
 
-    Ok(Classification {
+    let classification = Classification {
         default: build(base_kind),
         by_role,
-    })
+    };
+    // A mask whose parameters leave the value unchanged is worse than no mask:
+    // it looks configured. Refuse at startup, where the catalog already refuses
+    // to half-load.
+    validate_spec(&classification.default, &rule.display())?;
+    for (role, spec) in &classification.by_role {
+        validate_spec(spec, &format!("{} for role {role}", rule.display()))?;
+    }
+    Ok(classification)
 }
 
 /// Make a libpq connection string usable by the catalog connection.
@@ -600,6 +613,24 @@ pub fn sanitize_catalog_dsn(dsn: &str) -> (String, Option<&'static str>) {
              terminates TLS, so channel binding can never be satisfied through it",
         ),
     )
+}
+
+/// Reject parameter combinations that silently do nothing.
+fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
+    match spec.kind {
+        Mask::NumericBucket if spec.bucket < 2 => bail!(
+            "{what}: numeric-bucket needs `bucket` >= 2, got {}. A bucket of 1 \
+             floors every value to itself and masks nothing.",
+            spec.bucket
+        ),
+        Mask::Range if spec.end <= spec.start => bail!(
+            "{what}: range needs `end` > `start`, got start={} end={}. An empty \
+             range returns the value unchanged.",
+            spec.start,
+            spec.end
+        ),
+        _ => Ok(()),
+    }
 }
 
 async fn resolve_snapshot(

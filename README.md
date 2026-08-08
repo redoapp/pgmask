@@ -156,9 +156,19 @@ so a misconfiguration refuses cleanly instead of dying halfway through a stream.
 Negative numbers floor *downward* (`-37` with bucket 10 → `-40`), because
 rounding toward zero would reveal more than the bucket size promises.
 
-`pseudonym` is deterministic, so joins still work and an email still looks like
-an email. That determinism is also an equality-and-frequency oracle — usually
-the point, but choose it deliberately.
+`pseudonym` is deterministic, fixed-width (64 bits), and pseudonymises an
+email's **domain** as well as its local part — for business data the domain
+names the company, and with one contact there it names the person. Domains map
+deterministically, so colleagues still group together without the employer being
+named; `keep_domain = true` opts back in.
+
+Determinism is also an equality-and-frequency oracle: an analyst can count
+distinct subjects, join them across tables, and spot the outlier. Usually the
+point, but choose it deliberately.
+
+Parameters that would leave a value unchanged are refused at startup —
+`numeric-bucket` with `bucket = 1` and `range` with `end <= start` both used to
+pass the value through while looking configured.
 
 ### Semantic types and pseudonym domains
 
