@@ -101,7 +101,12 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 # disclosure. Each is a different route through plan_for, and the oracle is
 # identical for all of them.
 echo "==> replaying ($PARALLEL concurrent sessions) across policy combinations"
-CONFIGS=("lineage=allow opaque=reject" "lineage=refuse opaque=reject" "lineage=allow opaque=mask")
+# The fourth is a different question. The first three ask "did anything leak";
+# mirror masks nothing and asks "did the proxy change anything it should not
+# have" — masking the wrong column, losing a row, mangling an encoding. A
+# canary oracle is structurally blind to all of those.
+CONFIGS=("lineage=allow opaque=reject" "lineage=refuse opaque=reject" \
+         "lineage=allow opaque=mask" "mirror")
 port=$PROXY_PORT
 metrics=$METRICS_PORT
 declare -a PROXY_PIDS=()
@@ -109,6 +114,20 @@ cfg_index=0
 tot_stmt=0; tot_served=0; tot_refused=0; tot_err=0; tot_control=0; tot_leaks=0; bad=0
 
 for cfg in "${CONFIGS[@]}"; do
+  mirror_env=""
+  if [[ "$cfg" == "mirror" ]]; then
+    # Nothing masked, and opaque=reject so any query with an expression is
+    # refused rather than nulled — which leaves exactly the queries whose
+    # output all has provenance, the ones that must come back untouched.
+    sed -E -e "s|^listen = .*|listen = \"127.0.0.1:$port\"|" \
+           -e 's|^mask = "(.*)"$|mask = "none"|' \
+           -e 's|^type = "(.*)"$|mask = "none"|' \
+           -e 's|^unclassified = .*|unclassified = "allow"|' \
+           -e 's|^opaque = .*|opaque = "reject"|' \
+           -e "s|^metrics_interval_seconds.*|metrics_interval_seconds = 0\nmetrics_listen = \"127.0.0.1:$metrics\"|" \
+           examples/fuzz/catalog.toml > "/tmp/pgmask-fuzz-cfg$cfg_index.toml"
+    mirror_env="EXPECT_MIRROR=1"
+  else
   lin="${cfg#lineage=}"; lin="${lin%% *}"
   opq="${cfg##*opaque=}"
   sed -e "s|^listen = .*|listen = \"127.0.0.1:$port\"|" \
@@ -116,13 +135,14 @@ for cfg in "${CONFIGS[@]}"; do
       -e "s|^opaque = .*|opaque = \"$opq\"|" \
       -e "s|^metrics_interval_seconds.*|metrics_interval_seconds = 0\nmetrics_listen = \"127.0.0.1:$metrics\"|" \
       examples/fuzz/catalog.toml > "/tmp/pgmask-fuzz-cfg$cfg_index.toml"
+  fi
   ./target/release/pgmask "/tmp/pgmask-fuzz-cfg$cfg_index.toml" >"/tmp/pgmask-fuzz-cfg$cfg_index.log" 2>&1 &
   PROXY_PIDS+=($!)
   sleep 2
 
   pids=()
   for s in $(seq 1 "$SEEDS"); do
-    ( DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb" \
+    ( env $mirror_env DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb" \
       PROXY_URL="postgres://postgres:demo@localhost:$port/fuzzdb" \
       ./target/release/fuzz "/tmp/pgmask-fuzz-$s.sql" >"/tmp/pgmask-fuzz-c$cfg_index-$s.out" 2>&1; \
       echo $? > "/tmp/pgmask-fuzz-c$cfg_index-$s.status" ) &
@@ -148,7 +168,12 @@ for cfg in "${CONFIGS[@]}"; do
   agree="agree"
   if [[ "$c_ref" != "$scraped" ]]; then agree="DISAGREE (proxy says $scraped)"; bad=1; fi
 
-  printf '  %-28s served %5d  refused %5d  leaks %3d  [%s]\n' "$cfg" "$c_served" "$c_ref" "$c_leak" "$agree"
+  if [[ "$cfg" == "mirror" ]]; then
+    cmp=$(grep -h 'compared to direct' /tmp/pgmask-fuzz-c$cfg_index-*.out | awk '{s+=$4} END {print s+0}')
+    printf '  %-28s compared %5d  divergences %3d  [%s]\n' "$cfg (masks nothing)" "$cmp" "$c_leak" "$agree"
+  else
+    printf '  %-28s served %5d  refused %5d  leaks %3d  [%s]\n' "$cfg" "$c_served" "$c_ref" "$c_leak" "$agree"
+  fi
   tot_stmt=$((tot_stmt+c_stmt)); tot_served=$((tot_served+c_served)); tot_refused=$((tot_refused+c_ref))
   tot_err=$((tot_err+c_err)); tot_control=$((tot_control+c_ctl)); tot_leaks=$((tot_leaks+c_leak))
   port=$((port+2)); metrics=$((metrics+1)); cfg_index=$((cfg_index+1))

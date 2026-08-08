@@ -89,6 +89,53 @@ fn shape_leak(value: &str) -> Option<&'static str> {
     None
 }
 
+/// Every value a query returned, in order, plus the row count.
+///
+/// Used for the equivalence oracle: with nothing masked, the proxy must be a
+/// byte-exact mirror of the database. Any divergence is the proxy corrupting
+/// data it was told to leave alone — masking the wrong column, losing a row,
+/// mangling an encoding — none of which the canary oracle can see, because a
+/// canary only answers "did anything leak".
+fn shape_from(response: &[SimpleQueryMessage]) -> (usize, Vec<String>) {
+    let mut rows = 0usize;
+    let mut values = Vec::new();
+    for message in response {
+        let SimpleQueryMessage::Row(row) = message else {
+            continue;
+        };
+        rows += 1;
+        for i in 0..row.len() {
+            values.push(match row.try_get(i) {
+                Ok(Some(v)) => v.to_string(),
+                _ => "\u{0}NULL".to_string(),
+            });
+        }
+    }
+    (rows, values)
+}
+
+async fn shape_of_result(
+    client: &tokio_postgres::Client,
+    sql: &str,
+) -> Option<(usize, Vec<String>)> {
+    let response = client.simple_query(sql).await.ok()?;
+    let mut rows = 0usize;
+    let mut values = Vec::new();
+    for message in &response {
+        let SimpleQueryMessage::Row(row) = message else {
+            continue;
+        };
+        rows += 1;
+        for i in 0..row.len() {
+            values.push(match row.try_get(i) {
+                Ok(Some(v)) => v.to_string(),
+                _ => "\u{0}NULL".to_string(),
+            });
+        }
+    }
+    Some((rows, values))
+}
+
 /// Count canary tokens across every value a query returned.
 async fn tokens_in_result(
     client: &tokio_postgres::Client,
@@ -144,16 +191,78 @@ async fn main() -> Result<()> {
 
     let mut client = connect(&url).await?;
     let direct = connect(&direct_url).await?;
+    // A *second* direct session, not a second run on the first.
+    //
+    // The baseline check originally ran the same query twice on one connection,
+    // which cannot detect session-dependence at all: pg_backend_pid() and
+    // friends are perfectly stable within a session and differ between them.
+    // That produced `direct "45770" vs proxy "45748"` and looked like the proxy
+    // corrupting an integer. Comparing two independent sessions catches
+    // session-dependent and time-varying values alike.
+    let direct2 = connect(&direct_url).await?;
     // How much masked data the generated SQL actually reached. Zero means the
     // run proved nothing, whatever the proxy did.
     let mut tokens_visible_directly = 0usize;
     let mut queries_reaching_masked_data = 0usize;
+    // Set when the catalog masks nothing: the proxy then has to be a mirror.
+    let mirror = std::env::var("EXPECT_MIRROR").is_ok();
+    let mut compared = 0usize;
+    let mut row_count_mismatch = 0usize;
+    let mut nondeterministic = 0usize;
+    let mut value_mismatch: Vec<(String, String, String)> = Vec::new();
 
     for (index, sql) in queries.iter().enumerate() {
         // A token present in the query itself would be echoed back legitimately,
         // and we cannot tell that apart from a leak. Skip rather than guess.
         if CANARIES.iter().any(|(token, _)| sql.contains(token)) {
             continue;
+        }
+
+        // Scoped to this iteration. As an outer variable it survived a query
+        // that was refused or errored, and got compared against the *next*
+        // query's response — a cross-statement mix-up that reported clean
+        // queries as divergent.
+        let mut mirror_baseline: Option<(usize, Vec<String>)> = None;
+
+        // Constructs that are non-deterministic by definition. The double-run
+        // check below is probabilistic and cannot filter these reliably:
+        // TABLESAMPLE SYSTEM on a single-block table returns all-or-nothing, so
+        // two consecutive runs agree about 80% of the time and the third
+        // disagrees. That produced a "row-count mismatch" that looked like the
+        // proxy losing rows.
+        const NONDETERMINISTIC: &[&str] = &[
+            "tablesample",
+            "random(",
+            "clock_timestamp",
+            "timeofday",
+            "nextval",
+            "currval",
+            "uuid_generate",
+            "gen_random_uuid",
+        ];
+        let lowered = sql.to_ascii_lowercase();
+        let skip_mirror = NONDETERMINISTIC.iter().any(|k| lowered.contains(k));
+
+        if mirror && skip_mirror {
+            nondeterministic += 1;
+        } else if mirror {
+            // Run the query twice against the database first. Generated SQL is
+            // not all deterministic — volatile functions, LIMIT with no ORDER
+            // BY — and a query that disagrees with itself cannot be used to
+            // judge the proxy. 11 apparent row-count mismatches in the first
+            // run were all of this kind; blaming the proxy for them would have
+            // been the mirror-image of a vacuous pass.
+            let baseline = shape_of_result(&direct, sql).await;
+            let repeat = shape_of_result(&direct2, sql).await;
+            if baseline.is_some() && baseline != repeat {
+                nondeterministic += 1;
+            } else {
+                // Compared below, against the single proxy call the main path
+                // makes. Querying the proxy twice here made its own rejection
+                // counter read double the harness's, which broke the
+                // cross-check that exists to catch exactly that kind of drift.
+                mirror_baseline = baseline;
+            }
         }
 
         if let Some(found) = tokens_in_result(&direct, sql).await {
@@ -189,6 +298,31 @@ async fn main() -> Result<()> {
         };
 
         served += 1;
+        if mirror {
+            if let Some((dr, dv)) = mirror_baseline.take() {
+                let (pr, pv) = shape_from(&response);
+                compared += 1;
+                if dr != pr {
+                    row_count_mismatch += 1;
+                    if value_mismatch.len() < 5 {
+                        value_mismatch.push((
+                            format!("{dr} rows"),
+                            format!("{pr} rows"),
+                            sql.chars().take(400).collect(),
+                        ));
+                    }
+                } else if dv != pv {
+                    let at = dv.iter().zip(&pv).position(|(a, b)| a != b).unwrap_or(0);
+                    if value_mismatch.len() < 5 {
+                        value_mismatch.push((
+                            dv.get(at).cloned().unwrap_or_default(),
+                            pv.get(at).cloned().unwrap_or_default(),
+                            sql.chars().take(160).collect(),
+                        ));
+                    }
+                }
+            }
+        }
         for message in &response {
             let SimpleQueryMessage::Row(row) = message else {
                 continue;
@@ -217,6 +351,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    if mirror {
+        // Nothing is masked in mirror mode, so canaries coming through is the
+        // point of the run, not a finding.
+        leaks.clear();
+    }
+
     // The session has to still work, or every "no leak" above proves nothing.
     // The probe has to name something that exists in the fixture — pointing it
     // at another database's table reports the proxy as dead when it is fine.
@@ -242,6 +382,23 @@ async fn main() -> Result<()> {
     );
     println!("  LEAKED                   {:>6}", leaks.len());
     // Parsed by scripts/test-fuzz.sh when running seeds in parallel.
+    if mirror {
+        println!("  compared to direct       {compared:>6}  (mirror mode)");
+        println!("  excluded, non-deterministic {nondeterministic:>4}  (disagreed with itself)");
+        println!("  row-count mismatches     {row_count_mismatch:>6}");
+        println!("  value mismatches         {:>6}", value_mismatch.len());
+        for (d, p, sql) in value_mismatch.iter().take(3) {
+            println!("    direct {d:?} vs proxy {p:?}\n      via {sql}");
+        }
+        if row_count_mismatch > 0 || !value_mismatch.is_empty() {
+            eprintln!("\nwith nothing masked the proxy must be a byte-exact mirror; it is not");
+            std::process::exit(1);
+        }
+        if compared == 0 {
+            eprintln!("\nVACUOUS: mirror mode compared nothing");
+            std::process::exit(2);
+        }
+    }
     println!(
         "RESULT statements={} served={} refused={} errors={} control={} leaks={}",
         queries.len(),
