@@ -44,6 +44,8 @@ use tokio_postgres::{NoTls, SimpleQueryMessage};
 /// column of the demo fixture and nowhere else in the database.
 const CANARIES: &[(&str, &str)] = &[
     ("CANARY", "a masked text column in fz"),
+    ("00000000-0000-4000-a000-", "fz.people.account_uuid"),
+    ("555-77", "fz.people.phone"),
     ("@example.com", "demo.customers.email"),
     ("Customer ", "demo.customers.name"),
     ("555-", "demo.customers.phone"),
@@ -51,6 +53,41 @@ const CANARIES: &[(&str, &str)] = &[
     ("00000000-0000-4000-9000-", "an fz uuid column"),
     ("00000000-0000-4000-8000-", "demo.customers.account_uuid"),
 ];
+
+/// Values whose *shape* betrays an unmasked type-aware column.
+///
+/// A substring token cannot cover a date or an IP: the leak is not a marker,
+/// it is the absence of coarsening. The fixture is seeded so the raw form is a
+/// shape the masked form never has — birth dates are never 1 January,
+/// addresses in 198.51.100/24 never end .0 — so these patterns match only
+/// values that escaped their mask.
+fn shape_leak(value: &str) -> Option<&'static str> {
+    // 198.51.100.7 escaped; 198.51.100.0 is correctly masked.
+    if let Some(rest) = value.strip_prefix("198.51.100.") {
+        let host: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !host.is_empty() && host != "0" {
+            return Some("fz.people.last_ip (not truncated to /24)");
+        }
+    }
+    // 1975-02-03 escaped; 1975-01-01 is correctly masked.
+    for (i, _) in value.match_indices("19") {
+        let window = &value[i..];
+        if window.len() >= 10 {
+            let d = &window[..10];
+            let bytes = d.as_bytes();
+            if bytes[4] == b'-'
+                && bytes[7] == b'-'
+                && d[..4].chars().all(|c| c.is_ascii_digit())
+                && d[5..7].chars().all(|c| c.is_ascii_digit())
+                && d[8..].chars().all(|c| c.is_ascii_digit())
+                && &d[5..] != "01-01"
+            {
+                return Some("fz.people.birth_date (not truncated to its year)");
+            }
+        }
+    }
+    None
+}
 
 /// Count canary tokens across every value a query returned.
 async fn tokens_in_result(
@@ -71,6 +108,9 @@ async fn tokens_in_result(
                 if value.contains(token) {
                     found.push(((*column).to_string(), value.chars().take(60).collect()));
                 }
+            }
+            if let Some(column) = shape_leak(value) {
+                found.push((column.to_string(), value.chars().take(60).collect()));
             }
         }
     }
@@ -166,6 +206,13 @@ async fn main() -> Result<()> {
                         ));
                     }
                 }
+                if let Some(column) = shape_leak(value) {
+                    leaks.push((
+                        column.to_string(),
+                        value.chars().take(60).collect(),
+                        format!("#{index}: {}", sql.chars().take(200).collect::<String>()),
+                    ));
+                }
             }
         }
     }
@@ -185,7 +232,7 @@ async fn main() -> Result<()> {
     println!("  masked values visible    {tokens_visible_directly:>6}  without the proxy");
     println!("  served (rows inspected)  {served:>6}");
     println!("  refused by pgmask        {refused:>6}");
-    println!("  postgres error           {errored:>6}");
+    println!("  postgres error           {errored:>6}  (incl. timeouts)");
     if reconnects > 0 {
         println!("  connection re-opened     {reconnects:>6}");
     }
@@ -194,6 +241,36 @@ async fn main() -> Result<()> {
         if alive { "yes" } else { "NO" }
     );
     println!("  LEAKED                   {:>6}", leaks.len());
+    // Parsed by scripts/test-fuzz.sh when running seeds in parallel.
+    println!(
+        "RESULT statements={} served={} refused={} errors={} control={} leaks={}",
+        queries.len(),
+        served,
+        refused,
+        errored,
+        tokens_visible_directly,
+        leaks.len()
+    );
+
+    // A test that has never failed is not known to work. The poison run in
+    // scripts/test-fuzz.sh deliberately unmasks a canary column and sets this,
+    // so a fuzzer that has quietly stopped detecting anything fails loudly
+    // instead of reporting a clean sweep.
+    let expect_leaks = std::env::var("EXPECT_LEAKS").is_ok();
+    if expect_leaks {
+        println!(
+            "\nEXPECT_LEAKS: the oracle must fire on this run ({} found)",
+            leaks.len()
+        );
+        if leaks.is_empty() {
+            eprintln!(
+                "the oracle did not fire on a deliberately unmasked column — \
+                 it is not detecting anything"
+            );
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     if !leaks.is_empty() {
         let mut by_column: BTreeMap<&str, usize> = BTreeMap::new();
@@ -247,8 +324,13 @@ async fn connect(url: &str) -> Result<tokio_postgres::Client> {
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    // Generated SQL can ask for a cross join of everything. A hang would look
-    // like a pass.
-    let _ = client.simple_query("SET statement_timeout = '5s'").await;
+    // Generated SQL asks for cross joins across nine populated tables, so a
+    // meaningful fraction of it is unbounded work. A hang would look like a
+    // pass, and a 5s timeout made a 3000-statement seed take longer than the
+    // whole campaign budget. Nothing worth testing here needs a second.
+    let timeout = std::env::var("FUZZ_TIMEOUT_MS").unwrap_or_else(|_| "400".into());
+    let _ = client
+        .simple_query(&format!("SET statement_timeout = '{timeout}ms'"))
+        .await;
     Ok(client)
 }

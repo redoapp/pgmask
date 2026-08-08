@@ -62,11 +62,14 @@ What pgmask owes them instead:
   parameters are refused, and a classification that stops resolving logs a
   warning rather than silently ceasing to mask.
 
-**What to do next.** More generated-SQL fuzzing — `./scripts/test-fuzz.sh`
-replays sqlsmith output through the proxy and asserts no masked value reaches
-the client, with a direct connection as the control so a run that never touched
-masked data reports as vacuous instead of passing. 6000 statements: 9082 masked
-values readable without the proxy, none through it. Phase 6 lineage is done — measured at converting about a third
+**What to do next.** `./scripts/test-fuzz.sh` is the standing answer to having
+no second reviewer: 8 sqlsmith seeds x 3 policy combinations = 72,000 generated
+statements in 88 seconds, **189,468 masked values readable without the proxy and
+none through it**. It refuses to pass on a technicality — a poison run with
+masking removed must trip the oracle first, a run that never reached masked data
+exits VACUOUS, the harness refusal count is cross-checked against the proxy's own
+metrics, and the fixture is verified unchanged. Beyond that: more fixture shapes,
+and someone other than Claude reading `analysis.rs` and `lineage.rs`. Phase 6 lineage is done — measured at converting about a third
 of refusals, see [docs/lineage-estimate.md](docs/lineage-estimate.md). The
 limits below are real and unchanged.
 
@@ -103,7 +106,7 @@ It cut the false-rejection rate on a real workload from 23% to 6%.
 
 ```bash
 ./examples/demo/verify.sh        # acceptance criteria against a real Postgres
-./scripts/test-fuzz.sh           # generated SQL, asserts no masked value escapes
+./scripts/test-fuzz.sh           # 72k generated statements, asserts nothing leaks
 ./scripts/test-integration.sh    # canary + adversarial + resilience, 23 tests
 ./scripts/test-tls.sh            # TLS on both legs via a real psql, 7 assertions
 ```

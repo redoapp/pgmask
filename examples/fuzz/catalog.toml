@@ -273,3 +273,68 @@ mask = "redact"
 relation = "fz.v_join"
 column = "yb"
 mask = "redact"
+
+# --- fz.people: one column per mask kind, so the fuzzer exercises all of them.
+[[semantic_type]]
+name = "email"
+mask = "pseudonym"
+
+[[semantic_type]]
+name = "person_name"
+mask = "redact"
+
+[[semantic_type]]
+name = "phone"
+mask = "partial"
+keep = 4
+
+[[column]]
+relation = "fz.people"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.people"
+column = "email"
+type = "email"
+
+[[column]]
+relation = "fz.people"
+column = "full_name"
+type = "person_name"
+
+[[column]]
+relation = "fz.people"
+column = "phone"
+type = "phone"
+
+[[column]]
+relation = "fz.people"
+column = "city"
+mask = "none"
+
+[[column]]
+relation = "fz.people"
+column = "birth_date"
+mask = "date-year"
+
+[[column]]
+relation = "fz.people"
+column = "annual_salary"
+mask = "numeric-bucket"
+bucket = 25000
+
+[[column]]
+relation = "fz.people"
+column = "last_ip"
+mask = "ip-prefix"
+
+[[column]]
+relation = "fz.people"
+column = "account_uuid"
+mask = "pseudonym"
+
+[[column]]
+relation = "fz.people"
+column = "note"
+mask = "null"

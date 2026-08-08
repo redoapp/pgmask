@@ -36,6 +36,41 @@ BEGIN
   END LOOP;
 END $$;
 
+-- PII-shaped, so the type-aware masks are exercised and not just `redact`.
+-- Values are chosen so the masked form is *recognisably different*: dates are
+-- never 1 January, addresses never end .0, uuids carry a fixed prefix. The
+-- masked output of each is a shape the raw value never has, which is what lets
+-- the oracle check them without an expected-output file.
+CREATE TABLE fz.people (
+  id            int primary key,
+  email         text not null,
+  full_name     text not null,
+  phone         text not null,
+  city          text not null,
+  birth_date    date not null,
+  annual_salary int  not null,
+  last_ip       text not null,
+  account_uuid  uuid not null,
+  note          text
+);
+
+INSERT INTO fz.people
+SELECT i,
+       'CANARY-mail-' || i || '@fuzz.example',
+       'CANARY-name-' || i,
+       '555-77' || lpad((i % 100)::text, 2, '0'),
+       (ARRAY['Leeds','Derby','Truro','Ely'])[1 + (i % 4)],
+       -- never 1 January, so a year-truncated value is distinguishable
+       DATE '1975-02-03' + (i * 11),
+       41111 + i * 137,
+       -- never .0, so a /24-masked value is distinguishable
+       '198.51.100.' || (1 + (i % 250)),
+       ('00000000-0000-4000-a000-' || lpad(i::text, 12, '0'))::uuid,
+       'CANARY-note-' || i
+  FROM generate_series(1, 60) AS i;
+
+ANALYZE fz.people;
+
 -- A view and a join view, because those lose provenance differently.
 CREATE VIEW fz.v_union AS SELECT id, a FROM fz.t1 UNION ALL SELECT id, a FROM fz.t2;
 CREATE VIEW fz.v_join  AS SELECT x.id, x.a AS xa, y.b AS yb FROM fz.t3 x JOIN fz.t4 y ON y.id = x.id;
