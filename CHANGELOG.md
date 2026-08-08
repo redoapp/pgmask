@@ -2,6 +2,8 @@
 
 ## 0.1.0 — first release
 
+MIT licensed.
+
 A fail-closed column masking proxy for Postgres. Point a connection string at
 pgmask instead of the database and sensitive column values are rewritten on the
 way back out. Nothing else about how people work changes: same client, same SQL,
