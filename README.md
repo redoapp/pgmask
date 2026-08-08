@@ -281,7 +281,7 @@ rejections, expressions and aggregates are 80%. Write-up in
 | corpus | refused | note |
 |---|---|---|
 | 31 hand-written queries, real Neon branch | 32% | [write-up](examples/neon/README.md) |
-| **TPC-DS, 99 queries** | **90%** | [write-up](examples/tpcds/README.md) |
+| **TPC-DS, 99 queries** | **55%** (was 90%) | [write-up](examples/tpcds/README.md) |
 
 `crates/corpus` measures this against any directory of SQL, using `Parse` +
 `Describe` so it needs **no data** — only the DDL. The gap between the two rows
@@ -295,10 +295,14 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   correct refusals, but they are also the largest source of friction.
   `SELECT 1`, `now()` and `count(*)` used to be refused too; they are now served
   (see below).
-- **Anything taking a column as an argument is refused conservatively**, even
-  when it is harmless — `avg(deals)`, `date_trunc('month', created_at)`. Opening
-  that door means classifying functions, and `max(email)` returns a real email
-  address.
+- **Summaries over classified columns are released** — `sum`, `avg`, `count`,
+  ranking windows, `date_trunc`. The bar is "you cannot read an anonymised
+  value", not "no information flows": a group of one row makes `sum(salary)`
+  that person's salary, which is accepted on the same terms as the predicate
+  oracles below. `summaries = "refuse"` reverts it.
+- **Functions that return a stored value are never released** — `min`, `max`,
+  `mode`, `percentile_*`, `string_agg`, `array_agg`, `first_value`, `lag`,
+  `lead`. `max(email)` is an email address.
 - **Set operations, recursive CTEs and `SETOF` functions are rejected** — Phase 0
   measured that they erase provenance. Expected to be the main source of
   rejections in practice; instrument by cause before deciding on Phase 6.

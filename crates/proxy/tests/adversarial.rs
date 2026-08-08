@@ -448,11 +448,14 @@ async fn the_rescue_path_cannot_be_tricked() -> Result<()> {
     for sql in [
         "SELECT max(email) FROM canary.subjects",
         "SELECT min(email) FROM canary.subjects",
-        "SELECT count(email) FROM canary.subjects",
         "SELECT string_agg(email, ',') FROM canary.subjects",
         "SELECT array_agg(email) FROM canary.subjects",
-        "SELECT count(*) FILTER (WHERE email = 'CANARY_EMAIL_a1b2c3') FROM canary.subjects",
-        "SELECT row_number() OVER (ORDER BY email) FROM canary.subjects",
+        "SELECT json_agg(email) FROM canary.subjects",
+        "SELECT first_value(email) OVER (ORDER BY id) FROM canary.subjects",
+        "SELECT last_value(email) OVER (ORDER BY id) FROM canary.subjects",
+        "SELECT lag(email) OVER (ORDER BY id) FROM canary.subjects",
+        "SELECT nth_value(email, 1) OVER (ORDER BY id) FROM canary.subjects",
+        "SELECT mode() WITHIN GROUP (ORDER BY email) FROM canary.subjects",
         "SELECT (SELECT email FROM canary.subjects LIMIT 1)",
         "SELECT coalesce(email, '') FROM canary.subjects",
         "SELECT 1, email FROM canary.subjects",
@@ -516,5 +519,31 @@ async fn the_rescue_path_works_and_holds_over_the_extended_protocol() -> Result<
     client.send(sync_msg()).await?;
     client.read_until_ready_or_eof().await?;
     assert_no_canary(&client, "extended protocol rescue path");
+    Ok(())
+}
+
+/// Summaries over classified columns are released now, on the stated bar of
+/// "you cannot read an anonymised value". These must come back with rows *and*
+/// without a sentinel — the canary assertion is what makes the relaxation safe
+/// rather than merely convenient.
+#[tokio::test]
+async fn summaries_are_served_without_leaking() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    for sql in [
+        "SELECT count(email) FROM canary.subjects",
+        "SELECT count(DISTINCT email) FROM canary.subjects",
+        "SELECT city, count(*) FROM canary.subjects GROUP BY city",
+        "SELECT count(*) FILTER (WHERE email = 'CANARY_EMAIL_a1b2c3') FROM canary.subjects",
+        "SELECT row_number() OVER (ORDER BY email) FROM canary.subjects",
+        "SELECT rank() OVER (ORDER BY name) FROM canary.subjects",
+    ] {
+        let msgs = client.simple_query(sql).await?;
+        assert!(msgs.iter().any(|m| m.tag == b'D'), "{sql} should be served");
+        assert_no_canary(&client, sql);
+    }
     Ok(())
 }

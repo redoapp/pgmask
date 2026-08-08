@@ -178,6 +178,7 @@ pub async fn start_proxy_at(
         catalog_refresh_seconds: 1,
         catalog_refresh_min_seconds: 1,
         metrics_interval_seconds: 0,
+        summaries: pgmask::catalog::Summaries::Allow,
     };
     let catalog = Arc::new(
         Catalog::resolve(&config.column, &config.semantic_type, &config.catalog_dsn).await?,

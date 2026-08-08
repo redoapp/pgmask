@@ -21,6 +21,16 @@ use tokio::sync::Notify;
 
 use crate::mask::{Mask, MaskSpec};
 
+/// Whether summarising aggregates over classified columns may be released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Summaries {
+    /// `sum`/`avg`/`count` are released. They cannot return a stored value.
+    Allow,
+    /// Refuse them too. Strictly safer, and refuses most analytical SQL.
+    Refuse,
+}
+
 /// What to do with a field that HAS provenance but no catalog entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -225,6 +235,16 @@ pub struct Config {
     /// How often to log rejection counters. 0 disables.
     #[serde(default = "default_metrics_seconds")]
     pub metrics_interval_seconds: u64,
+    /// Release aggregates that only summarise — `sum`, `avg`, `count(col)` —
+    /// over classified columns.
+    ///
+    /// The bar this encodes is "you cannot read an anonymised value", not "no
+    /// information flows". A group of one row makes `sum(salary)` that person's
+    /// salary; that is the same accepted trade as the predicate oracles in
+    /// handoff §11. Set to `refuse` for the stricter reading, at the cost of
+    /// roughly 90% of analytical SQL.
+    #[serde(default = "default_summaries")]
+    pub summaries: Summaries,
 }
 
 fn default_listen() -> String {
@@ -247,6 +267,9 @@ fn default_refresh_min_seconds() -> u64 {
 }
 fn default_metrics_seconds() -> u64 {
     60
+}
+fn default_summaries() -> Summaries {
+    Summaries::Allow
 }
 
 impl Config {

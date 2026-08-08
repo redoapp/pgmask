@@ -6,8 +6,9 @@ real analytical SQL. TPC-DS is the industry-standard decision-support benchmark:
 99 queries over a 25-table retail schema, deliberately heavy on aggregates,
 window functions, `INTERSECT`/`EXCEPT`, `ROLLUP` and `GROUPING SETS`.
 
-**Result: 90% of it is refused.** That is not a rounding error on the 32% we
-measured against our own corpus — it is a different conclusion.
+**First run: 90% of it was refused.** That was not a rounding error on the 32%
+we measured against our own corpus — it was a different conclusion, and it drove
+the change described at the bottom. It now sits at **55%**.
 
 ## Running it
 
@@ -93,3 +94,47 @@ The trap remains unchanged: `count`/`sum`/`avg` emit no stored value, while
 `min`/`max` return a real one and `string_agg`/`array_agg` return all of them.
 The parse tree separates them by function name, but that allowlist has to be
 right, because every entry converts refusals into acceptances.
+
+
+## Follow-up: releasing summaries
+
+The 90% forced the threat model to be stated explicitly rather than assumed. The
+bar is **"you cannot read an anonymised value"**, not "no information flows". On
+that bar `sum(salary)` is fine — it is a summary, not a salary. A group of one
+row makes it that person's salary, and that is accepted, exactly as the
+predicate oracles in handoff §11 already are.
+
+That relaxation needs no lineage engine. If the outermost node of a target
+expression is a **reducing** aggregate, it cannot return a value it consumed
+whatever is inside it — a purely syntactic check on the parse tree.
+
+| | refused | rate |
+|---|---|---|
+| output-classification only | 69 | 90% |
+| + reducing aggregates, ranking windows, coarsening | 46 | 60% |
+| + arithmetic/CASE through releasable operands, `SELECT *` unwrapping | **42** | **55%** |
+
+Controlled by `summaries = "allow" \| "refuse"`; `refuse` restores the 90%.
+
+### What is still refused, and why it is the right list
+
+The list of functions that must **never** be released is the load-bearing part,
+and it is not "aggregates are safe":
+
+- `min`, `max`, `mode`, `percentile_disc/cont` — return an actual member
+- `string_agg`, `array_agg`, `json_agg`, `xmlagg` — return all of them
+- `first_value`, `last_value`, `nth_value`, `lag`, `lead` — reach into a row
+
+`max(email)` is an email address. Nine unit tests exist purely to keep that list
+honest.
+
+### The next blocker moved
+
+With aggregates handled, the remaining 42 are dominated by **set operations** —
+TPC-DS's characteristic `SELECT * FROM (channel_a UNION ALL channel_b)` — plus
+scalar subqueries in target lists and multi-`FROM` star queries.
+
+Set operations scored 7% on our hand-written corpus and 0% on the first TPC-DS
+run, because everything died on aggregates before reaching them. They are now
+the main cost. Fixing the top cause reveals the next one, and a measured
+priority is only ever valid for the current top.

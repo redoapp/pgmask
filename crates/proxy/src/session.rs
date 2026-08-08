@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::analysis::{self, Safety};
-use crate::catalog::{Catalog, Config, Opaque, Unclassified};
+use crate::catalog::{Catalog, Config, Opaque, Summaries, Unclassified};
 use crate::mask::{Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
 use crate::protocol::{self, DescribeTarget, FrameReader, Message};
@@ -58,6 +58,7 @@ pub struct Policy {
     pub unclassified_mask: Mask,
     pub opaque: Opaque,
     pub metrics: Arc<Metrics>,
+    pub summaries: Summaries,
     /// Principal -> roles, from `[[role]]`.
     pub roles: HashMap<String, HashSet<String>>,
     /// Present when `tls_cert`/`tls_key` are configured. Absent means we answer
@@ -80,6 +81,7 @@ impl Policy {
             unclassified_mask: config.unclassified_mask,
             opaque: config.opaque,
             metrics: Arc::new(Metrics::default()),
+            summaries: config.summaries,
             roles: roles_by_principal(&config.role),
             tls,
             backend_tls: config.backend_tls,
@@ -105,7 +107,7 @@ impl Policy {
         let snapshot = self.catalog.snapshot();
         let mut plan = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
-            let provably_safe = safety.get(index).copied() == Some(Safety::ProvablyColumnFree);
+            let provably_safe = safety.get(index).copied() == Some(Safety::Releasable);
             let spec = if !field.has_provenance() {
                 // An expression we positively identified as carrying no column
                 // value — `SELECT 1`, `now()`, `count(*)`. Passing it through is
@@ -628,7 +630,9 @@ impl Session {
         // Only consulted for fields with no provenance, and only ever able to
         // turn a refusal into a passthrough for a positively-identified shape.
         let safety = match &self.described_sql {
-            Some(sql) => analysis::analyze(sql, fields.len()),
+            Some(sql) => {
+                analysis::analyze(sql, fields.len(), self.policy.summaries == Summaries::Allow)
+            }
             None => vec![Safety::Unknown; fields.len()],
         };
         let plan = match self.policy.plan_for(&fields, &self.roles, &safety) {
@@ -948,8 +952,9 @@ mod tests {
             unclassified,
             unclassified_mask: Mask::Null,
             opaque,
-            roles: HashMap::new(),
             metrics: Arc::new(Metrics::default()),
+            summaries: Summaries::Allow,
+            roles: HashMap::new(),
             tls: None,
             backend_tls: BackendTls::Disable,
         })
@@ -1015,6 +1020,7 @@ mod tests {
             unclassified_mask: Mask::Null,
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
+            summaries: Summaries::Allow,
             roles: HashMap::new(),
             tls: None,
             backend_tls: BackendTls::Disable,
