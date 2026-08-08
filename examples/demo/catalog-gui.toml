@@ -1,0 +1,237 @@
+listen = "127.0.0.1:6432"
+backend = "127.0.0.1:55432"
+catalog_dsn = "postgres://postgres:demo@localhost:55432/demo"
+
+# Rotating this invalidates every pseudonym already handed out.
+pseudonym_key = "demo-key-not-for-production"
+
+# Default-deny: a column with provenance but no rule below is masked, not passed.
+unclassified = "mask"
+unclassified_mask = "null"
+
+# A result set containing any field with no provenance is refused outright.
+opaque = "reject"
+
+# Harlequin, DBeaver and psql's \d read pg_catalog before showing anything.
+# Without this the catalog tree comes back empty. See docs/gui-clients.md.
+system_catalogs = "allow"
+
+# Release expressions whose base columns are all released, so aggregates and
+# unions over business data work. See docs/lineage-estimate.md.
+lineage = "allow"
+
+catalog_refresh_seconds = 30
+metrics_interval_seconds = 60
+
+# --- Who is who -------------------------------------------------------------
+# Members are usernames Postgres itself verified during authentication, never
+# ones a client merely claimed.
+
+[[role]]
+name = "analyst"
+members = ["analyst_ann"]
+
+[[role]]
+name = "support"
+members = ["support_sam"]
+
+# --- Semantic types ---------------------------------------------------------
+# Describe a kind of data once; reference it from every column that holds it.
+# The type name is also the default pseudonym domain, so two columns of the same
+# type stay joinable while unrelated types cannot be linked to each other.
+
+[[semantic_type]]
+name = "email"
+mask = "pseudonym"
+by_role = { support = "inner" }   # support needs to eyeball an address
+keep = 3
+
+[[semantic_type]]
+name = "person_name"
+mask = "redact"
+by_role = { support = "none" }
+
+[[semantic_type]]
+name = "phone"
+mask = "partial"
+keep = 4
+by_role = { support = "none" }
+
+[[semantic_type]]
+name = "birth_date"
+mask = "date-year"                # keep the cohort, drop the individual
+by_role = { analyst = "date-month" }
+
+[[semantic_type]]
+name = "salary"
+mask = "numeric-bucket"
+bucket = 25000
+by_role = { analyst = "numeric-bucket" }
+
+[[semantic_type]]
+name = "street_address"
+mask = "redact"
+
+[[semantic_type]]
+name = "ip_address"
+mask = "ip-prefix"
+
+[[semantic_type]]
+name = "account_id"
+mask = "pseudonym"
+# A distinct domain: an account id that happens to equal a phone number must not
+# pseudonymise to the same value, or the two columns could be linked.
+
+# --- demo.customers ---------------------------------------------------------
+
+[[column]]
+relation = "demo.customers"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "demo.customers"
+column = "email"
+type = "email"
+
+[[column]]
+relation = "demo.customers"
+column = "name"
+type = "person_name"
+
+[[column]]
+relation = "demo.customers"
+column = "phone"
+type = "phone"
+
+[[column]]
+relation = "demo.customers"
+column = "city"
+mask = "none"           # explicitly allowed — a decision, not an omission
+
+[[column]]
+relation = "demo.customers"
+column = "birth_date"
+type = "birth_date"
+
+[[column]]
+relation = "demo.customers"
+column = "annual_salary"
+type = "salary"
+
+[[column]]
+relation = "demo.customers"
+column = "last_ip"
+type = "ip_address"
+
+[[column]]
+relation = "demo.customers"
+column = "account_uuid"
+type = "account_id"
+
+# demo.customers.internal_note is deliberately absent: default-deny nulls it.
+
+# --- demo.customer_directory ------------------------------------------------
+# Phase 0 finding: Postgres reports the VIEW's OID, not the base table's, so a
+# view needs its own entries or every column in it reads as unclassified.
+
+[[column]]
+relation = "demo.customer_directory"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "demo.customer_directory"
+column = "email"
+type = "email"
+
+[[column]]
+relation = "demo.customer_directory"
+column = "name"
+type = "person_name"
+
+[[column]]
+relation = "demo.customer_directory"
+column = "city"
+mask = "none"
+
+# --- demo.orders -------------------------------------------------------------
+# The join side. Note what is *not* classified: order_total, status, ship_city
+# and placed_at are business facts, not personal data, so they pass through and
+# stay aggregatable. That is what keeps debugging possible.
+
+[[column]]
+relation = "demo.orders"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "customer_id"
+mask = "none"           # a surrogate key to a masked table; useless on its own
+
+[[column]]
+relation = "demo.orders"
+column = "status"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "order_total"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "ship_city"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "placed_at"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "ship_address"
+type = "street_address"
+
+# demo.orders.internal_note is deliberately absent: default-deny nulls it.
+
+# --- demo.orders: business facts, released so lineage has something to work with
+
+[[column]]
+relation = "demo.orders"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "customer_id"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "status"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "order_total"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "ship_city"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "placed_at"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "ship_address"
+type = "street_address"
+
+# demo.orders.internal_note is deliberately absent: default-deny nulls it.
