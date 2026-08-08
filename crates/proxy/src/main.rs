@@ -116,7 +116,18 @@ async fn main() -> Result<()> {
 
     let backend = Arc::new(config.backend.clone());
     loop {
-        let (client, peer) = listener.accept().await?;
+        // Stop accepting on a shutdown signal and return, rather than being
+        // killed mid-loop. A rolling deploy sends SIGTERM and expects the
+        // process to go quietly; a SIGKILL-shaped exit also skips every
+        // at-exit hook, which is how a coverage run of this binary came back
+        // reading 0% on every module.
+        let (client, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = shutdown_signal() => {
+                tracing::info!("shutting down: no longer accepting connections");
+                return Ok(());
+            }
+        };
         let policy = policy.clone();
         let backend = backend.clone();
         // `.instrument()`, not `span.enter()`: an entered guard does not follow
@@ -130,5 +141,26 @@ async fn main() -> Result<()> {
             }
             .instrument(tracing::info_span!("session", %peer)),
         );
+    }
+}
+
+/// Resolves on SIGTERM or SIGINT.
+///
+/// In-flight sessions are not drained: each is its own task holding its own
+/// backend connection, and a masking proxy that lingered to finish streaming a
+/// result set would delay a deploy for as long as the longest query. Refusing
+/// new connections and exiting is the behaviour a supervisor expects.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot listen for SIGTERM");
+            return std::future::pending().await;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
     }
 }

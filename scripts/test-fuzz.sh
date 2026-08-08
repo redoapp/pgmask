@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 PER_SEED="${1:-3000}"
 SEEDS="${2:-8}"
 PARALLEL="${3:-4}"
-PG_PORT=55432
+PG_PORT=55433   # not 55432: verify.sh keeps a container there under KEEP=1
 PROXY_PORT=6470
 POISON_PORT=6471
 METRICS_PORT=9470
@@ -63,6 +63,7 @@ gen() { # seed count outfile
 # --- 1. Prove the oracle can fail -------------------------------------------
 echo "==> poison run: masking removed from two columns, the oracle must fire"
 sed -e 's/^mask = "ip-prefix"/mask = "none"/' -e 's/^mask = "date-year"/mask = "none"/' \
+    -e "s|55432|$PG_PORT|g" \
     -e "s/^listen = .*/listen = \"127.0.0.1:$POISON_PORT\"/" \
     -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-poison.toml
 ./target/release/pgmask /tmp/pgmask-poison.toml >/tmp/pgmask-poison.log 2>&1 &
@@ -124,6 +125,7 @@ for cfg in "${CONFIGS[@]}"; do
            -e 's|^type = "(.*)"$|mask = "none"|' \
            -e 's|^unclassified = .*|unclassified = "allow"|' \
            -e 's|^opaque = .*|opaque = "reject"|' \
+           -e "s|55432|$PG_PORT|g" \
            -e "s|^metrics_interval_seconds.*|metrics_interval_seconds = 0\nmetrics_listen = \"127.0.0.1:$metrics\"|" \
            examples/fuzz/catalog.toml > "/tmp/pgmask-fuzz-cfg$cfg_index.toml"
     mirror_env="EXPECT_MIRROR=1"
@@ -134,6 +136,7 @@ for cfg in "${CONFIGS[@]}"; do
       -e "s|^lineage = .*|lineage = \"$lin\"|" \
       -e "s|^opaque = .*|opaque = \"$opq\"|" \
       -e "s|^metrics_interval_seconds.*|metrics_interval_seconds = 0\nmetrics_listen = \"127.0.0.1:$metrics\"|" \
+      -e "s|55432|$PG_PORT|g" \
       examples/fuzz/catalog.toml > "/tmp/pgmask-fuzz-cfg$cfg_index.toml"
   fi
   ./target/release/pgmask "/tmp/pgmask-fuzz-cfg$cfg_index.toml" >"/tmp/pgmask-fuzz-cfg$cfg_index.log" 2>&1 &

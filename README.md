@@ -72,7 +72,12 @@ refuses to pass on a technicality: a poison run with masking removed must trip
 the oracle first, a run that never reached masked data exits VACUOUS, the
 harness refusal count is cross-checked against the proxy's own metrics, and the
 fixture is verified unchanged. Beyond that: more fixture shapes,
-and someone other than Claude reading `analysis.rs` and `lineage.rs`. Phase 6 lineage is done — measured at converting about a third
+and someone other than Claude reading `analysis.rs` and `lineage.rs`.
+
+Coverage across every suite (Rust tests plus the binary under all three shell
+suites) is **79%**, with the parts that decide masking highest: `analysis.rs`
+98%, `mask.rs` 94%, `session.rs` 85%, `lineage.rs` 97%. Measure it by sourcing
+`cargo llvm-cov show-env --export-prefix` before running the suites. Phase 6 lineage is done — measured at converting about a third
 of refusals, see [docs/lineage-estimate.md](docs/lineage-estimate.md). The
 limits below are real and unchanged.
 
@@ -112,6 +117,7 @@ It cut the false-rejection rate on a real workload from 23% to 6%.
 ./scripts/test-fuzz.sh           # 72k generated statements, asserts nothing leaks
 ./scripts/test-integration.sh    # canary + adversarial + resilience, 23 tests
 ./scripts/test-tls.sh            # TLS on both legs via a real psql, 7 assertions
+cargo llvm-cov --release --summary-only   # coverage, after running the above
 ```
 
 Or by hand:

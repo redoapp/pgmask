@@ -120,7 +120,10 @@ echo
 echo "TLS criteria"
 echo "------------"
 
-check "proxy reports TLS enabled on startup" "tls=on" "$(cat /tmp/pgmask-tls.log)"
+# `tls=true`, not `tls=on`: the startup line became a structured tracing event.
+# This assertion kept checking the old text and had been failing silently for
+# several commits, while the README went on claiming all 7 TLS checks passed.
+check "proxy reports TLS enabled on startup" "tls=true" "$(cat /tmp/pgmask-tls.log)"
 check "backend leg configured as expected" "backend_tls=" "$(cat /tmp/pgmask-tls.log)"
 
 # pg_stat_ssl reports what the *server side of this session* negotiated, which

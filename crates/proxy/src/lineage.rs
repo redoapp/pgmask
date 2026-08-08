@@ -189,17 +189,6 @@ pub fn resolve(
         .collect()
 }
 
-/// Whether any field in the statement could benefit from lineage, so the
-/// analysis is skipped entirely on the queries that already work.
-pub fn worth_trying(
-    safety: &[crate::analysis::Safety],
-    fields_with_provenance: &HashSet<usize>,
-) -> bool {
-    safety.iter().enumerate().any(|(i, s)| {
-        *s != crate::analysis::Safety::Releasable && !fields_with_provenance.contains(&i)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +317,69 @@ mod tests {
         assert_eq!(one("this is not sql"), Verdict::Unresolved);
         for v in verdicts("SELECT ship_city FROM demo.orders; SELECT 1", 1) {
             assert_eq!(v, Verdict::Unresolved);
+        }
+    }
+
+    // --- unqualified names, where the catalog does the disambiguating -----
+    //
+    // Coverage found `resolve_column` had never executed: sqlsmith qualifies
+    // everything, so the fuzz campaign never reached it. It is the function
+    // that decides which table an unqualified column belongs to, and picking
+    // the wrong one attributes a masked column to a released table.
+
+    fn two_tables() -> Arc<Snapshot> {
+        let mut s = Snapshot::default();
+        // `shared` exists in both; `only_pub` and `secret` in one each.
+        s.insert_relation_for_test(
+            "demo.pub_t",
+            &[("shared", Mask::None), ("only_pub", Mask::None)],
+        );
+        s.insert_relation_for_test(
+            "demo.sec_t",
+            &[("shared", Mask::Redact), ("secret", Mask::Redact)],
+        );
+        Arc::new(s)
+    }
+
+    #[test]
+    fn an_unqualified_name_owned_by_one_table_resolves_to_it() {
+        let s = two_tables();
+        let sql = "SELECT upper(only_pub) FROM demo.pub_t JOIN demo.sec_t ON true";
+        assert_eq!(resolve(sql, 1, &s, &HashSet::new())[0], Verdict::Release);
+    }
+
+    #[test]
+    fn an_unqualified_name_reaching_a_masked_column_is_not_released() {
+        let s = two_tables();
+        let sql = "SELECT upper(secret) FROM demo.pub_t JOIN demo.sec_t ON true";
+        assert_ne!(resolve(sql, 1, &s, &HashSet::new())[0], Verdict::Release);
+    }
+
+    #[test]
+    fn an_ambiguous_unqualified_name_is_never_released() {
+        // `shared` is released in one table and masked in the other. Guessing
+        // picks a mask at random, and half those guesses are a disclosure.
+        let s = two_tables();
+        let sql = "SELECT upper(shared) FROM demo.pub_t JOIN demo.sec_t ON true";
+        assert_ne!(
+            resolve(sql, 1, &s, &HashSet::new())[0],
+            Verdict::Release,
+            "an ambiguous column must not be released on a guess"
+        );
+    }
+
+    #[test]
+    fn a_star_expansion_cannot_release_a_masked_column() {
+        // `SELECT *` needs the catalog to expand. If expansion misses a column,
+        // the mask that column carries is missed with it.
+        let s = two_tables();
+        for sql in [
+            "SELECT * FROM (SELECT * FROM demo.sec_t) q",
+            "SELECT upper(x) FROM (SELECT * FROM demo.sec_t) q(x, y)",
+        ] {
+            for v in resolve(sql, 2, &s, &HashSet::new()) {
+                assert_ne!(v, Verdict::Release, "{sql}");
+            }
         }
     }
 
