@@ -22,3 +22,6 @@ rustls-pemfile = "2"
 tokio-postgres-rustls = "0.13"
 pg_query = "6"
 proptest = "1"
+jiff = "0.2"
+rust_decimal = "1"
+postgres-types = { version = "0.2", features = ["with-jiff-0_2"] }

@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -424,38 +424,24 @@ fn ip_prefix(text: &str) -> String {
 
 // --- Date truncation --------------------------------------------------------
 
-/// Days from 1970-01-01 to a civil date. Howard Hinnant's algorithm.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = y - if m <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
+// Postgres date and timestamp handling goes through `postgres-types`'
+// `FromSql`/`ToSql` with jiff's civil types, rather than epoch arithmetic of our
+// own. What used to live here was Howard Hinnant's civil-date algorithm plus a
+// Postgres epoch offset, hand-written, and it produced three of the defects
+// found in a day: an overflow at the extremes of the microsecond domain, a
+// narrowing cast that moved a date rather than coarsening it, and a dropped
+// `BC` era. jiff's types are range-checked by construction, so a value outside
+// what Postgres can represent fails to decode instead of wrapping.
 
-/// The inverse.
-///
-/// `d` and `m` are bounded to [1, 31] and [1, 12] by the algorithm, which the
-/// lint cannot see.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (y + if m <= 2 { 1 } else { 0 }, m, d)
+/// Coarsen a jiff civil date to the first of its year or month.
+fn coarsen(date: jiff::civil::Date, to_month: bool) -> Result<jiff::civil::Date, MaskError> {
+    jiff::civil::Date::new(date.year(), if to_month { date.month() } else { 1 }, 1).map_err(|_| {
+        MaskError::Undecodable {
+            type_oid: OID_DATE,
+            format: FORMAT_BINARY,
+        }
+    })
 }
-
-/// Postgres counts days and microseconds from 2000-01-01, not the Unix epoch.
-const PG_EPOCH_DAYS: i64 = 10957;
-const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 fn truncate_date(
     bytes: &Bytes,
@@ -490,42 +476,44 @@ fn truncate_date(
         }));
     }
 
+    // Binary: decode with the type's own codec, coarsen, re-encode. No epoch
+    // constants and no casts, so the range checks are the library's problem.
+    use postgres_types::{FromSql, ToSql, Type};
+    let undecodable = || MaskError::Undecodable { type_oid, format };
+    let mut out = BytesMut::new();
     match type_oid {
         OID_DATE => {
-            if bytes.len() != 4 {
-                return Err(MaskError::Undecodable { type_oid, format });
-            }
-            let days = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64;
-            let (y, m, _) = civil_from_days(days + PG_EPOCH_DAYS);
-            // Clamped for the same reason the timestamp path saturates: the
-            // day domain is wider than the truncated value is guaranteed to be,
-            // and a wrapping cast moves the date instead of coarsening it.
-            let truncated = days_from_civil(y, if to_month { m } else { 1 }, 1) - PG_EPOCH_DAYS;
-            let truncated = i32::try_from(truncated.clamp(i32::MIN as i64, i32::MAX as i64))
-                .expect("clamped into range on the line above");
-            Ok(Bytes::copy_from_slice(&truncated.to_be_bytes()))
+            let date =
+                jiff::civil::Date::from_sql(&Type::DATE, bytes).map_err(|_| undecodable())?;
+            coarsen(date, to_month)?
+                .to_sql(&Type::DATE, &mut out)
+                .map_err(|_| undecodable())?;
         }
-        OID_TIMESTAMP | OID_TIMESTAMPTZ => {
-            if bytes.len() != 8 {
-                return Err(MaskError::Undecodable { type_oid, format });
-            }
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(&bytes[..8]);
-            let micros = i64::from_be_bytes(raw);
-            // Floor, so instants before the epoch land on the right day.
-            let days = micros.div_euclid(MICROS_PER_DAY);
-            let (y, m, _) = civil_from_days(days + PG_EPOCH_DAYS);
-            let truncated = days_from_civil(y, if to_month { m } else { 1 }, 1) - PG_EPOCH_DAYS;
-            // Saturating for the same reason `floor_to` is: the extremes of the
-            // i64 microsecond domain are far outside what a day count times a
-            // microsecond multiplier can hold, and the wrap moves the value
-            // rather than coarsening it.
-            Ok(Bytes::copy_from_slice(
-                &truncated.saturating_mul(MICROS_PER_DAY).to_be_bytes(),
-            ))
+        OID_TIMESTAMP => {
+            let dt = jiff::civil::DateTime::from_sql(&Type::TIMESTAMP, bytes)
+                .map_err(|_| undecodable())?;
+            coarsen(dt.date(), to_month)?
+                .to_datetime(jiff::civil::Time::midnight())
+                .to_sql(&Type::TIMESTAMP, &mut out)
+                .map_err(|_| undecodable())?;
         }
-        _ => Err(MaskError::Undecodable { type_oid, format }),
+        OID_TIMESTAMPTZ => {
+            let ts =
+                jiff::Timestamp::from_sql(&Type::TIMESTAMPTZ, bytes).map_err(|_| undecodable())?;
+            // Coarsen in UTC: the wire value is an instant, and the session's
+            // display zone is not ours to guess.
+            let utc = ts.to_zoned(jiff::tz::TimeZone::UTC);
+            coarsen(utc.date(), to_month)?
+                .to_datetime(jiff::civil::Time::midnight())
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .map_err(|_| undecodable())?
+                .timestamp()
+                .to_sql(&Type::TIMESTAMPTZ, &mut out)
+                .map_err(|_| undecodable())?;
+        }
+        _ => return Err(undecodable()),
     }
+    Ok(out.freeze())
 }
 
 // --- Numeric bucketing ------------------------------------------------------
@@ -540,10 +528,19 @@ fn bucket_number(
 
     if format == FORMAT_TEXT {
         let text = String::from_utf8_lossy(bytes);
-        if let Ok(v) = text.trim().parse::<i64>() {
+        let trimmed = text.trim();
+        if let Ok(v) = trimmed.parse::<i64>() {
             return Ok(Bytes::from(floor_to(v, bucket).to_string()));
         }
-        if let Ok(v) = text.trim().parse::<f64>() {
+        // `numeric` is arbitrary precision. Going through f64 silently rounded
+        // large values and printed them back in a shape Postgres might not
+        // accept; a decimal keeps the digits and renders a valid literal.
+        if let Ok(v) = trimmed.parse::<rust_decimal::Decimal>() {
+            let b = rust_decimal::Decimal::from(bucket);
+            let floored = (v / b).floor() * b;
+            return Ok(Bytes::from(floored.normalize().to_string()));
+        }
+        if let Ok(v) = trimmed.parse::<f64>() {
             // Postgres accepts NaN/Infinity/-Infinity for float and numeric, and
             // spells them that way. Rust prints "inf", which the client cannot
             // parse back into the column's type. Bucketing a non-finite value
@@ -894,20 +891,6 @@ mod tests {
     // --- Dates ---------------------------------------------------------------
 
     #[test]
-    fn civil_date_conversion_round_trips() {
-        for (y, m, d) in [
-            (1970, 1, 1),
-            (2000, 1, 1),
-            (2024, 2, 29),
-            (1899, 12, 31),
-            (2100, 6, 15),
-        ] {
-            let days = days_from_civil(y, m, d);
-            assert_eq!(civil_from_days(days), (y, m, d), "{y}-{m}-{d}");
-        }
-    }
-
-    #[test]
     fn date_year_truncates_in_text() {
         let m = masker();
         let out = m
@@ -935,45 +918,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&out[..], b"2024-03-01 00:00:00");
-    }
-
-    #[test]
-    fn date_truncation_in_binary_matches_text() {
-        let m = masker();
-        // 2024-03-15 as days since 2000-01-01.
-        let days = i32::try_from(days_from_civil(2024, 3, 15) - PG_EPOCH_DAYS).unwrap();
-        let out = m
-            .apply(
-                &spec(Mask::DateYear),
-                OID_DATE,
-                FORMAT_BINARY,
-                Some(Bytes::copy_from_slice(&days.to_be_bytes())),
-            )
-            .unwrap()
-            .unwrap();
-        let got = i32::from_be_bytes([out[0], out[1], out[2], out[3]]) as i64;
-        assert_eq!(civil_from_days(got + PG_EPOCH_DAYS), (2024, 1, 1));
-    }
-
-    #[test]
-    fn timestamps_before_the_postgres_epoch_floor_correctly() {
-        let m = masker();
-        // 1999-06-15, i.e. negative microseconds since 2000-01-01.
-        let days = days_from_civil(1999, 6, 15) - PG_EPOCH_DAYS;
-        let micros = days * MICROS_PER_DAY;
-        let out = m
-            .apply(
-                &spec(Mask::DateYear),
-                OID_TIMESTAMP,
-                FORMAT_BINARY,
-                Some(Bytes::copy_from_slice(&micros.to_be_bytes())),
-            )
-            .unwrap()
-            .unwrap();
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(&out[..8]);
-        let got_days = i64::from_be_bytes(raw) / MICROS_PER_DAY;
-        assert_eq!(civil_from_days(got_days + PG_EPOCH_DAYS), (1999, 1, 1));
     }
 
     // --- Numbers -------------------------------------------------------------
@@ -1120,5 +1064,133 @@ mod tests {
         }
         // Anything that does not parse is fully masked, not half-transformed.
         assert_eq!(apply_text(&spec(Mask::IpPrefix), "not-an-ip"), "*********");
+    }
+
+    // --- Dates, now expressed in the same types the wire codec uses ---------
+
+    fn date_wire(y: i16, m: i8, d: i8) -> Bytes {
+        use postgres_types::{ToSql, Type};
+        let mut out = BytesMut::new();
+        jiff::civil::Date::new(y, m, d)
+            .unwrap()
+            .to_sql(&Type::DATE, &mut out)
+            .unwrap();
+        out.freeze()
+    }
+
+    fn date_from_wire(bytes: &Bytes) -> jiff::civil::Date {
+        use postgres_types::{FromSql, Type};
+        jiff::civil::Date::from_sql(&Type::DATE, bytes).unwrap()
+    }
+
+    #[test]
+    fn binary_date_truncation_agrees_with_the_text_path() {
+        let m = masker();
+        let binary = m
+            .apply(
+                &spec(Mask::DateYear),
+                OID_DATE,
+                FORMAT_BINARY,
+                Some(date_wire(2024, 3, 15)),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            date_from_wire(&binary),
+            jiff::civil::Date::new(2024, 1, 1).unwrap()
+        );
+
+        let text = m
+            .apply(
+                &spec(Mask::DateYear),
+                OID_DATE,
+                FORMAT_TEXT,
+                Some(Bytes::from_static(b"2024-03-15")),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(&text[..], b"2024-01-01", "text and binary must agree");
+    }
+
+    /// Postgres counts from 2000, so anything earlier is a negative day count —
+    /// the case the hand-rolled epoch arithmetic used to get wrong.
+    #[test]
+    fn dates_before_the_postgres_epoch_truncate_correctly() {
+        let out = masker()
+            .apply(
+                &spec(Mask::DateYear),
+                OID_DATE,
+                FORMAT_BINARY,
+                Some(date_wire(1999, 6, 15)),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            date_from_wire(&out),
+            jiff::civil::Date::new(1999, 1, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn month_truncation_keeps_the_month() {
+        let out = masker()
+            .apply(
+                &spec(Mask::DateMonth),
+                OID_DATE,
+                FORMAT_BINARY,
+                Some(date_wire(2024, 3, 15)),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            date_from_wire(&out),
+            jiff::civil::Date::new(2024, 3, 1).unwrap()
+        );
+    }
+
+    /// A value outside what the type can represent must fail to decode rather
+    /// than wrap. This is the property the library buys us.
+    #[test]
+    fn out_of_range_binary_dates_are_refused_not_wrapped() {
+        let refused = masker().apply(
+            &spec(Mask::DateYear),
+            OID_DATE,
+            FORMAT_BINARY,
+            Some(Bytes::copy_from_slice(&i32::MAX.to_be_bytes())),
+        );
+        assert!(
+            refused.is_err(),
+            "an unrepresentable date must be refused, not silently moved"
+        );
+    }
+
+    /// `numeric` is arbitrary precision. The old f64 round-trip lost digits on
+    /// large values; a decimal keeps them and renders a literal Postgres reads.
+    #[test]
+    fn numeric_text_bucketing_keeps_precision() {
+        let mut s = spec(Mask::NumericBucket);
+        s.bucket = 1000;
+        let out = masker()
+            .apply(
+                &s,
+                OID_NUMERIC,
+                FORMAT_TEXT,
+                Some(Bytes::from_static(b"123456789012345678901234.56")),
+            )
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        assert!(
+            !text.contains('e') && !text.contains('E'),
+            "must not fall back to scientific notation: {text}"
+        );
+        assert!(
+            text.ends_with("000"),
+            "must land on a bucket boundary: {text}"
+        );
+        assert!(
+            text.parse::<rust_decimal::Decimal>().is_ok(),
+            "must still be a numeric literal: {text}"
+        );
     }
 }

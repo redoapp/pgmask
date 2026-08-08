@@ -27,6 +27,9 @@ tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio-postgres-rustls.workspace = true
 pg_query.workspace = true
+jiff.workspace = true
+rust_decimal.workspace = true
+postgres-types.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

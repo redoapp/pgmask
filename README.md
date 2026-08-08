@@ -153,6 +153,14 @@ type     = "email"          # or an inline `mask =`, which overrides the type
 
 Type and format compatibility is checked once when the result set is described,
 so a misconfiguration refuses cleanly instead of dying halfway through a stream.
+
+Dates and timestamps are decoded and re-encoded through `postgres-types`'
+`FromSql`/`ToSql` with jiff's civil types, and `numeric` through `rust_decimal`,
+rather than through epoch arithmetic and `f64` of our own. Three defects came
+out of the hand-rolled version — an overflow at the microsecond extremes, a
+narrowing cast that moved a date instead of coarsening it, and a dropped `BC`
+era — and the library's types are range-checked, so an unrepresentable value now
+fails to decode rather than wrapping.
 Negative numbers floor *downward* (`-37` with bucket 10 → `-40`), because
 rounding toward zero would reveal more than the bucket size promises.
 
