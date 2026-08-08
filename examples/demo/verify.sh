@@ -261,6 +261,29 @@ refute "12h. query_to_xml cannot launder a user table"          "user1@example.c
   "$(gui "SELECT pg_catalog.query_to_xml('SELECT email FROM demo.customers LIMIT 1', false, true, '') FROM pg_catalog.pg_class LIMIT 1;")"
 refute "12i. ordinary data queries are unaffected by the knob"  "user1@example.com" \
   "$(gui 'SELECT email FROM demo.customers WHERE id = 1;')"
+
+# Harlequin writes `from pg_database` unqualified, so requiring an explicit
+# schema locked out a real client. The name is now a hint and the OID decides.
+check "12j. an unqualified catalog reference is served" \
+  "postgres" "$(gui 'SELECT datname FROM pg_database ORDER BY 1;')"
+check "12k. size functions are served (every GUI shows table sizes)" \
+  "8" "$(gui "SELECT pg_total_relation_size('demo.customers') AS bytes;")"
+
+# ...which is exactly why the OID gate exists. `pg_` is reserved for schema
+# names, NOT relation names, so a user can own a public.pg_database and put
+# public ahead of pg_catalog on the search_path.
+direct "DROP TABLE IF EXISTS public.pg_database;
+        CREATE TABLE public.pg_database (datname text);
+        INSERT INTO public.pg_database VALUES ('SENTINEL-LEAKED-SECRET');" >/dev/null
+shadowed="$(psql -h localhost -p "$PG_PORT" -U postgres -d demo -X -tAq \
+  -c 'SET search_path TO public, pg_catalog;' -c 'SELECT datname FROM pg_database;' 2>&1)"
+check  "12l. the search_path shadow really does take effect" \
+  "SENTINEL-LEAKED-SECRET" "$shadowed"
+proxied_shadow="$(psql -h localhost -p 6456 -U postgres -d demo -X -tAq \
+  -c 'SET search_path TO public, pg_catalog;' -c 'SELECT datname FROM pg_database;' 2>&1)"
+refute "12m. ...and pgmask does not release the shadowed table" \
+  "SENTINEL-LEAKED-SECRET" "$proxied_shadow"
+direct "DROP TABLE IF EXISTS public.pg_database;" >/dev/null
 kill "$GUI_PID" 2>/dev/null
 
 echo

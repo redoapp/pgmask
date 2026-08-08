@@ -43,6 +43,28 @@ pub enum Safety {
     Unknown,
 }
 
+/// Functions reporting how much storage an object occupies.
+///
+/// Every GUI client shows table sizes; Beekeeper's stack and Harlequin both
+/// call these. They take a relation and return a byte count, so unlike
+/// `min(email)` there is no argument that could come back out — the return type
+/// is a number, whatever is inside. They do leak approximate row counts, which
+/// is the same order of disclosure as `count(*)`, already accepted.
+///
+/// `pg_read_file` and friends are emphatically not here; those are on
+/// [`CATALOG_ESCAPE_FUNCTIONS`].
+const SIZE_FUNCTIONS: &[&str] = &[
+    "pg_relation_size",
+    "pg_table_size",
+    "pg_indexes_size",
+    "pg_total_relation_size",
+    "pg_database_size",
+    "pg_tablespace_size",
+    "pg_size_pretty",
+    "pg_size_bytes",
+    "pg_column_size",
+];
+
 /// Zero-argument functions returning session or clock context, never table data.
 ///
 /// Deliberately short. `random()` and `gen_random_uuid()` would also qualify but
@@ -325,6 +347,12 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
             if !call.agg_star && bare && CONTEXT_FUNCTIONS.contains(&name) {
                 return Safety::Releasable;
             }
+            // A size function returns a byte count whatever it is pointed at,
+            // so no argument of it can come back out. Releasable under the
+            // strict setting for the same reason `count(*)` is.
+            if call.over.is_none() && SIZE_FUNCTIONS.contains(&name) {
+                return Safety::Releasable;
+            }
             // count(*) is releasable even under the strict setting: it consumes
             // no column at all.
             if call.agg_star && call.over.is_none() && name == "count" {
@@ -557,12 +585,19 @@ const CATALOG_ESCAPE_FUNCTIONS: &[&str] = &[
 /// whose every relation is a metadata-only system catalog — so the result set
 /// carries nothing from a user table.
 ///
-/// Requires each relation to be **explicitly** schema-qualified. A bare
-/// `pg_class` resolves through `search_path`, and while Postgres reserves the
-/// `pg_` schema-name prefix — `CREATE SCHEMA pg_evil` is refused by the server —
-/// relying on resolution order is a worse rule than reading the qualification
-/// that every real client already writes. psql and DBeaver both emit
-/// `pg_catalog.pg_class`.
+/// **This check alone is not sufficient, and is not meant to be.** It reasons
+/// about names, and a name proves nothing: Harlequin writes `from pg_database`
+/// unqualified, and `CREATE TABLE public.pg_database` is permitted (Postgres
+/// reserves the `pg_` prefix for *schema* names, not relation names), so
+/// `SET search_path TO public, pg_catalog` can make an unqualified catalog name
+/// resolve to a user table.
+///
+/// The caller must therefore also confirm, against `Snapshot::is_system_relation`,
+/// that every provenance-bearing field in the `RowDescription` really belongs to
+/// `pg_catalog` or `information_schema`. That is the engine's own answer and the
+/// only one `search_path` cannot move. This function's job is the part OIDs
+/// cannot cover: relations that appear in the statement without surfacing as an
+/// output field, and functions that take SQL as a string.
 ///
 /// Fails closed everywhere: an unparseable statement, a statement that names no
 /// relation at all, a CTE reference that is not declared locally, and any
@@ -608,13 +643,16 @@ pub fn reads_only_server_metadata(sql: &str) -> bool {
                 let relation = v.relname.to_ascii_lowercase();
 
                 if schema.is_empty() {
-                    // Only a locally declared CTE may go unqualified.
+                    // A locally declared CTE, or a bare name that at least
+                    // *looks* like a system catalog. Whether it really is one is
+                    // settled by the OID check in the caller, not here.
                     if cte_names.contains(&relation) {
                         continue;
                     }
-                    return false;
-                }
-                if schema != "pg_catalog" && schema != "information_schema" {
+                    if !relation.starts_with("pg_") {
+                        return false;
+                    }
+                } else if schema != "pg_catalog" && schema != "information_schema" {
                     return false;
                 }
                 if LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str()) {
@@ -647,6 +685,34 @@ pub fn reads_only_server_metadata(sql: &str) -> bool {
     // known bug where a self-referencing CTE yields an empty table list. Either
     // way, releasing on an empty set would release on absence of evidence.
     saw_relation
+}
+
+/// Whether every relation in the statement carries an explicit schema.
+///
+/// Used only to decide whether a result set made entirely of expressions can be
+/// trusted: with no provenance-bearing field, there is no OID to check, so the
+/// name has to have been unambiguous in the first place.
+pub fn every_relation_is_qualified(sql: &str) -> bool {
+    use pg_query::NodeRef;
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    let mut cte_names: Vec<String> = Vec::new();
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        if let NodeRef::CommonTableExpr(cte) = node {
+            cte_names.push(cte.ctename.to_ascii_lowercase());
+        }
+    }
+    parsed
+        .protobuf
+        .nodes()
+        .iter()
+        .all(|(node, _, _, _)| match node {
+            NodeRef::RangeVar(v) => {
+                !v.schemaname.is_empty() || cte_names.contains(&v.relname.to_ascii_lowercase())
+            }
+            _ => true,
+        })
 }
 
 #[cfg(test)]
@@ -706,13 +772,32 @@ mod tests {
     }
 
     #[test]
-    fn qualification_is_required_because_search_path_is_not_ours() {
-        // Postgres reserves the `pg_` schema prefix, so `pg_catalog.x` cannot be
-        // spoofed — but a bare name resolves through search_path, and reading
-        // the qualification every real client already writes is the better rule.
-        assert!(!reads_only_server_metadata("SELECT relname FROM pg_class"));
+    fn an_unqualified_catalog_name_passes_here_and_is_settled_by_oids() {
+        // Harlequin writes `from pg_database`. Refusing it outright locked out a
+        // real client; accepting it on the name alone would be exploitable via
+        // `SET search_path TO public, pg_catalog` against a user-owned
+        // `public.pg_database`. So this layer lets the name through and
+        // session.rs confirms the RowDescription OID really is a system relation.
+        assert!(reads_only_server_metadata(
+            "SELECT datname FROM pg_database"
+        ));
         assert!(reads_only_server_metadata(
             "SELECT relname FROM pg_catalog.pg_class"
+        ));
+        // A bare name that is not even catalog-shaped is still refused here.
+        assert!(!reads_only_server_metadata("SELECT email FROM customers"));
+    }
+
+    #[test]
+    fn qualification_is_reported_for_the_all_expressions_case() {
+        assert!(every_relation_is_qualified(
+            "SELECT pg_catalog.pg_get_userbyid(c.relowner) FROM pg_catalog.pg_class c"
+        ));
+        assert!(!every_relation_is_qualified(
+            "SELECT upper(datname) FROM pg_database"
+        ));
+        assert!(every_relation_is_qualified(
+            "WITH k AS (SELECT oid FROM pg_catalog.pg_class) SELECT count(*) FROM k"
         ));
     }
 
@@ -745,6 +830,25 @@ mod tests {
         assert!(!reads_only_server_metadata(
             "WITH pg_class AS (SELECT email FROM demo.customers) SELECT email FROM pg_class"
         ));
+    }
+
+    #[test]
+    fn size_functions_are_released_but_value_returning_ones_are_not() {
+        // Every GUI client shows table sizes. A byte count cannot carry a row.
+        for sql in [
+            "SELECT pg_total_relation_size('demo.customers')",
+            "SELECT pg_size_pretty(pg_table_size('demo.customers'))",
+            "SELECT pg_relation_size(c.oid) FROM pg_catalog.pg_class c",
+        ] {
+            assert_eq!(analyze(sql, 1, false), vec![Safety::Releasable], "{sql}");
+        }
+        // The neighbouring trap stays shut: these return an actual member.
+        for sql in [
+            "SELECT max(email) FROM demo.customers",
+            "SELECT pg_read_file('/etc/passwd')",
+        ] {
+            assert_eq!(analyze(sql, 1, true), vec![Safety::Unknown], "{sql}");
+        }
     }
 
     #[test]

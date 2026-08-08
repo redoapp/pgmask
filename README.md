@@ -35,12 +35,12 @@ HINT:  Select the underlying column directly. Expressions, set operations
 | Per-principal policy, semantic types, type-aware masks | done |
 | Validated against a real database | done ([Neon run](examples/neon/README.md)) |
 | Phase 1 — catalog discovery (`crates/classify`) | done ([what it found](docs/classification.md)) |
-| GUI clients — DBeaver, DataGrip, psql `\d` | done, opt-in ([how](docs/gui-clients.md)) |
+| GUI clients — Harlequin, Beekeeper's stack, psql `\d` | done, opt-in ([how](docs/gui-clients.md)) |
 | **Phase 1 — CI gate on catalog drift** | **open, and the largest item left** |
 | Phase 6 — parser rules | open; priority revised by measurement, not guesswork |
 
-226 assertions across seven suites: 171 cargo (97 unit, 30 property, 23
-adversarial, 13 classification, 8 resilience), 48 demo, 7 TLS. The adversarial
+232 assertions across seven suites: 173 cargo (99 unit, 30 property, 23
+adversarial, 13 classification, 8 resilience), 52 demo, 7 TLS. The adversarial
 suite drives a raw wire client and asserts no sentinel byte ever crosses the
 boundary.
 

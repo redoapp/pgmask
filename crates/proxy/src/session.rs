@@ -637,11 +637,39 @@ impl Session {
         // catalog file lists and which default-deny would otherwise null. That
         // nulling is what breaks `\d`: psql feeds the OID from one query into
         // the next and gets `invalid input syntax for type oid: ""`.
+        // Two independent gates, and both must hold.
+        //
+        // The parse tree covers what OIDs cannot see: a user table in a
+        // subquery that never becomes an output field, and functions like
+        // `query_to_xml` that take their query as a string.
+        //
+        // The OIDs cover what the parse tree cannot: whether a name actually
+        // resolved to a system catalog. Harlequin writes `from pg_database`
+        // unqualified, `CREATE TABLE public.pg_database` is allowed, and
+        // `search_path` is the client's to set — so the name is a hint and the
+        // OID in the RowDescription is the fact.
         let system_catalog = self.policy.system_catalogs == SystemCatalogs::Allow
             && self
                 .described_sql
                 .as_deref()
-                .is_some_and(analysis::reads_only_server_metadata);
+                .is_some_and(analysis::reads_only_server_metadata)
+            && {
+                let snapshot = self.policy.catalog.snapshot();
+                let mut provenanced = 0usize;
+                let all_system = fields.iter().filter(|f| f.has_provenance()).all(|f| {
+                    provenanced += 1;
+                    snapshot.is_system_relation(f.table_oid)
+                });
+                // A result set of nothing but expressions gives the OID
+                // check no purchase, so it is only trusted when the parse
+                // tree named every relation with an explicit schema. `SHOW`
+                // reads no relation at all and is handled there.
+                all_system
+                    && (provenanced > 0
+                        || analysis::every_relation_is_qualified(
+                            self.described_sql.as_deref().unwrap_or_default(),
+                        ))
+            };
 
         let safety = match &self.described_sql {
             Some(sql) => {

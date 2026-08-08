@@ -316,9 +316,28 @@ pub struct Snapshot {
     relations: HashSet<u32>,
     /// Rules that failed to resolve on the most recent attempt.
     unresolved: Vec<String>,
+    /// OIDs of every relation in `pg_catalog` and `information_schema`.
+    ///
+    /// The engine's own answer to "is this a system catalog", which is the only
+    /// answer that survives `search_path`. A client may write `FROM pg_database`
+    /// unqualified — Harlequin does — and a user may own a `public.pg_database`,
+    /// so a name proves nothing. The OID in the `RowDescription` does.
+    system_relations: HashSet<u32>,
 }
 
 impl Snapshot {
+    /// Whether this OID is a relation in `pg_catalog` or `information_schema`.
+    pub fn is_system_relation(&self, table_oid: u32) -> bool {
+        self.system_relations.contains(&table_oid)
+    }
+
+    /// Whether the system-catalog OID set was loaded at all. An empty set would
+    /// otherwise make every OID check vacuously fail closed, which is safe but
+    /// silently disables GUI support; the caller logs instead of guessing.
+    pub fn has_system_relations(&self) -> bool {
+        !self.system_relations.is_empty()
+    }
+
     pub fn lookup(&self, table_oid: u32, column_id: i16) -> Option<&Classification> {
         self.by_column.get(&(table_oid, column_id))
     }
@@ -660,9 +679,6 @@ async fn resolve_snapshot(
     types: &HashMap<String, SemanticType>,
     dsn: &str,
 ) -> Result<Snapshot> {
-    if rules.is_empty() {
-        return Ok(Snapshot::default());
-    }
     // TLS-capable, because managed Postgres generally refuses plaintext. A
     // NoTls connector here meant the catalog could not be resolved against Neon
     // (or RDS with rds.force_ssl, or Cloud SQL) at all — the proxy would fail to
@@ -683,6 +699,32 @@ async fn resolve_snapshot(
             eprintln!("catalog connection error: {err}");
         }
     });
+
+    // Every system-catalog relation, so a `RowDescription` OID can be checked
+    // against the engine's own namespacing rather than against a name.
+    let system_relations: HashSet<u32> = client
+        .query(
+            "SELECT c.oid::int8 AS oid
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname IN ('pg_catalog', 'information_schema')",
+            &[],
+        )
+        .await
+        .context("loading system catalog OIDs")?
+        .iter()
+        .map(|row| row.get::<_, i64>("oid") as u32)
+        .collect();
+
+    if rules.is_empty() {
+        let snapshot = Snapshot {
+            system_relations,
+            ..Default::default()
+        };
+        drop(client);
+        handle.abort();
+        return Ok(snapshot);
+    }
 
     let relations: Vec<String> = {
         let mut seen: Vec<String> = rules.iter().map(|r| r.relation.clone()).collect();
@@ -720,7 +762,10 @@ async fn resolve_snapshot(
     drop(client);
     handle.abort();
 
-    let mut snapshot = Snapshot::default();
+    let mut snapshot = Snapshot {
+        system_relations,
+        ..Default::default()
+    };
     for rule in rules {
         match resolved.get(&rule.key()) {
             Some(&(oid, attnum)) => {
