@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
-use pgmask::catalog::{ColumnRule, Config, Opaque, SystemCatalogs, Unclassified};
+use pgmask::catalog::{ColumnRule, Config, Lineage, Opaque, SystemCatalogs, Unclassified};
 use pgmask::mask::Mask;
 use pgmask::protocol::{FrameReader, Message, StartupPacket};
 use pgmask::{Catalog, Policy};
@@ -180,6 +180,7 @@ pub async fn start_proxy_at(
         metrics_interval_seconds: 0,
         summaries: pgmask::catalog::Summaries::Allow,
         system_catalogs: SystemCatalogs::Refuse,
+        lineage: Lineage::Refuse,
         metrics_listen: None,
     };
     let catalog = Arc::new(

@@ -37,10 +37,10 @@ HINT:  Select the underlying column directly. Expressions, set operations
 | Phase 1 — catalog discovery (`crates/classify`) | done ([what it found](docs/classification.md)) |
 | GUI clients — Harlequin, Beekeeper's stack, psql `\d` | done, opt-in ([how](docs/gui-clients.md)) |
 | `classify --check` — CI gate on catalog drift | done ([who owns what](docs/responsibilities.md)) |
-| Phase 6 — parser rules | open; priority revised by measurement, not guesswork |
+| Phase 6 — lineage (`lineage = "allow"`) | done, opt-in; TPC-DS refusals 55% → 26% ([measured](docs/lineage-estimate.md)) |
 
-254 assertions across eight suites: 179 cargo (101 unit, 30 property, 23
-adversarial, 13 classification, 8 resilience, 4 differential), 68 demo, 7 TLS. The adversarial
+276 assertions across eight suites: 187 cargo (109 unit, 30 property, 23
+adversarial, 13 classification, 8 resilience, 4 differential), 82 demo, 7 TLS. The adversarial
 suite drives a raw wire client and asserts no sentinel byte ever crosses the
 boundary.
 
@@ -62,7 +62,7 @@ What pgmask owes them instead:
   parameters are refused, and a classification that stops resolving logs a
   warning rather than silently ceasing to mask.
 
-**What to do next.** Phase 6 lineage — measured at converting about a third
+**What to do next.** A second reviewer on the analysis rules. Phase 6 lineage is done — measured at converting about a third
 of refusals, see [docs/lineage-estimate.md](docs/lineage-estimate.md). The
 limits below are real and unchanged.
 
@@ -183,6 +183,7 @@ pseudonym_key = "..."              # rotating invalidates every pseudonym issued
 unclassified      = "mask"   # mask | allow    — default-deny
 unclassified_mask = "null"
 opaque            = "reject" # reject | mask   — fields with no provenance
+lineage           = "refuse" # refuse | allow  — trace expressions to base columns
 
 tls_cert    = "/path/proxy.crt"   # omit both to serve plaintext
 tls_key     = "/path/proxy.key"

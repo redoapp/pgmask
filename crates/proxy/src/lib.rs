@@ -6,6 +6,7 @@
 
 pub mod analysis;
 pub mod catalog;
+pub mod lineage;
 pub mod mask;
 pub mod metrics;
 pub mod protocol;

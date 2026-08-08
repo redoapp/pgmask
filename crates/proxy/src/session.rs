@@ -27,7 +27,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::analysis::{self, Safety};
-use crate::catalog::{Catalog, Config, Opaque, Summaries, SystemCatalogs, Unclassified};
+use crate::catalog::{Catalog, Config, Lineage, Opaque, Summaries, SystemCatalogs, Unclassified};
+use crate::lineage::{self, Verdict};
 use crate::mask::{Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
 use crate::protocol::{self, DescribeTarget, FrameReader, Message};
@@ -61,6 +62,7 @@ pub struct Policy {
     pub metrics: Arc<Metrics>,
     pub summaries: Summaries,
     pub system_catalogs: SystemCatalogs,
+    pub lineage: Lineage,
     /// Principal -> roles, from `[[role]]`.
     pub roles: HashMap<String, HashSet<String>>,
     /// Present when `tls_cert`/`tls_key` are configured. Absent means we answer
@@ -87,6 +89,7 @@ impl Policy {
             metrics: Arc::new(Metrics::default()),
             summaries: config.summaries,
             system_catalogs: config.system_catalogs,
+            lineage: config.lineage,
             roles: roles_by_principal(&config.role),
             tls,
             backend_tls: config.backend_tls,
@@ -108,6 +111,7 @@ impl Policy {
         fields: &[protocol::FieldDescription],
         roles: &HashSet<String>,
         safety: &[Safety],
+        lineage: &[Verdict],
     ) -> Result<Plan, Rejection> {
         let snapshot = self.catalog.snapshot();
         let mut plan = Vec::with_capacity(fields.len());
@@ -121,9 +125,33 @@ impl Policy {
                 if provably_safe {
                     self.metrics.record_rescued();
                     MaskSpec::new(Mask::None)
+                } else if lineage.get(index) == Some(&Verdict::Release) {
+                    // Every base column this derives from is explicitly
+                    // released, so it cannot be carrying a masked value.
+                    self.metrics.record_rescued();
+                    MaskSpec::new(Mask::None)
                 } else {
                     match self.opaque {
                         Opaque::Reject => {
+                            // When lineage worked out *why*, say so. "derives
+                            // from customer.c_first_name, which is masked" is
+                            // the difference between a ticket and a rewrite.
+                            if let Some(Verdict::Blocked(source)) = lineage.get(index) {
+                                return Err(Rejection {
+                                    cause: Cause::classify_opaque(&field.name, &snapshot),
+                                    message: format!(
+                                        "pgmask: output column \"{}\" derives from {source}, \
+                                         which is masked",
+                                        field.name
+                                    ),
+                                    hint: Some(
+                                        "An expression over a masked column cannot be masked \
+                                         after the fact. Select a column that is released, or \
+                                         aggregate in a way that cannot return a stored value."
+                                            .into(),
+                                    ),
+                                });
+                            }
                             return Err(Rejection {
                                 cause: Cause::classify_opaque(&field.name, &snapshot),
                                 message: format!(
@@ -137,7 +165,7 @@ impl Policy {
                                  SETOF-returning functions all erase provenance."
                                         .into(),
                                 ),
-                            })
+                            });
                         }
                         Opaque::Mask => MaskSpec::new(Mask::Null),
                     }
@@ -680,6 +708,24 @@ impl Session {
             }
             None => vec![Safety::Unknown; fields.len()],
         };
+        // Only computed when something would otherwise be refused: a query whose
+        // every field either has provenance or is already released by shape
+        // never pays for the analysis.
+        let needs_lineage = self.policy.lineage == Lineage::Allow
+            && fields
+                .iter()
+                .zip(&safety)
+                .any(|(field, safety)| !field.has_provenance() && *safety != Safety::Releasable);
+        let lineage_verdicts: Vec<Verdict> = match (&self.described_sql, needs_lineage) {
+            (Some(sql), true) => lineage::resolve(
+                sql,
+                fields.len(),
+                &self.policy.catalog.snapshot(),
+                &self.roles,
+            ),
+            _ => Vec::new(),
+        };
+
         let planned = if system_catalog {
             Ok(Arc::new(
                 fields
@@ -692,7 +738,8 @@ impl Session {
                     .collect::<Vec<_>>(),
             ))
         } else {
-            self.policy.plan_for(&fields, &self.roles, &safety)
+            self.policy
+                .plan_for(&fields, &self.roles, &safety, &lineage_verdicts)
         };
         let plan = match planned {
             Ok(plan) => plan,
@@ -1018,6 +1065,7 @@ mod tests {
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
             system_catalogs: SystemCatalogs::Refuse,
+            lineage: Lineage::Refuse,
             roles: HashMap::new(),
             tls: None,
             backend_tls: BackendTls::Disable,
@@ -1038,7 +1086,7 @@ mod tests {
     fn opaque_field_is_rejected_by_default() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let err = p
-            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[])
+            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[], &[])
             .expect_err("must reject");
         assert!(err.message.contains("no column provenance"));
     }
@@ -1047,7 +1095,7 @@ mod tests {
     fn opaque_field_can_be_masked_instead() {
         let p = policy(Unclassified::Allow, Opaque::Mask);
         let plan = p
-            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[])
+            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[], &[])
             .ok()
             .expect("must allow");
         assert_eq!(plan[0].spec.kind, Mask::Null);
@@ -1057,7 +1105,7 @@ mod tests {
     fn unclassified_columns_are_masked_by_default() {
         let p = policy(Unclassified::Mask, Opaque::Reject);
         let plan = p
-            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new(), &[])
+            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new(), &[], &[])
             .ok()
             .unwrap();
         assert_eq!(plan[0].spec.kind, Mask::Null, "default-deny");
@@ -1067,7 +1115,7 @@ mod tests {
     fn allow_mode_passes_unclassified_columns() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let plan = p
-            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new(), &[])
+            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new(), &[], &[])
             .ok()
             .unwrap();
         assert_eq!(plan[0].spec.kind, Mask::None);
@@ -1086,13 +1134,14 @@ mod tests {
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
             system_catalogs: SystemCatalogs::Refuse,
+            lineage: Lineage::Refuse,
             roles: HashMap::new(),
             tls: None,
             backend_tls: BackendTls::Disable,
         });
         // int4, not a text type: pseudonym rewrites values as text.
         let err = p
-            .plan_for(&[field("id", 16391, 1, 23)], &HashSet::new(), &[])
+            .plan_for(&[field("id", 16391, 1, 23)], &HashSet::new(), &[], &[])
             .expect_err("must reject");
         assert!(
             err.message.contains("cannot be applied to type OID 23"),

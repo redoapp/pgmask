@@ -1,4 +1,10 @@
-# Phase 6: lineage — what it would buy, and who should compute it
+# Phase 6: lineage — what it bought, and who computes it
+
+> **Shipped.** `lineage = "allow"`, off by default. Measured end to end on
+> TPC-DS with a complete catalog (58 masked of 429): **refusals 55% → 26%**,
+> which beat the estimate below of ~35%. The estimate was computed against what
+> EXPLAIN could resolve; the implementation uses `sqllineage`, which resolves
+> more and handles CTEs natively.
 
 pgmask refuses a result set when a field has no provenance and no allowlisted
 shape explains it. Lineage is the idea of tracing such a field back to the base

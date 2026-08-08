@@ -358,6 +358,62 @@ check "14g. a renamed column is caught as uncovered" "last_ip_addr" "$renamed"
 check "14h. ...and the orphaned rule is caught too"  "match nothing" "$renamed"
 direct 'ALTER TABLE demo.customers RENAME COLUMN last_ip_addr TO last_ip;' >/dev/null
 
+# 15 — lineage. Off by default: this is the one rule where missing something is
+# a disclosure rather than a lost query, so it is opt-in. See docs/lineage-estimate.md.
+echo
+echo "lineage"
+echo "-----------------------"
+python3 - <<'PYEOF'
+import pathlib
+base = pathlib.Path("examples/demo/catalog.toml").read_text()
+base = base.replace('listen = "127.0.0.1:6432"', 'listen = "127.0.0.1:6460"')
+base = base.replace('opaque = "reject"', 'opaque = "reject"\nlineage = "allow"')
+extra = ""
+for c in ["id", "customer_id", "status", "order_total", "ship_city", "placed_at"]:
+    extra += f'\n[[column]]\nrelation = "demo.orders"\ncolumn = "{c}"\nmask = "none"\n'
+extra += '\n[[column]]\nrelation = "demo.orders"\ncolumn = "ship_address"\ntype = "street_address"\n'
+pathlib.Path("/tmp/pgmask-lineage.toml").write_text(base + extra)
+PYEOF
+./target/release/pgmask /tmp/pgmask-lineage.toml >/tmp/pgmask-lineage.log 2>&1 &
+LIN_PID=$!
+sleep 2
+lin() { psql -h localhost -p 6460 -U postgres -d demo -X -tAq -c "$1" 2>&1 | head -1; }
+
+# Released base columns: previously refused, now served.
+check "15a. an expression over released columns is served" \
+  "Austin/delivered" "$(lin "SELECT ship_city || '/' || status FROM demo.orders ORDER BY 1 LIMIT 1;")"
+check "15b. a UNION over released columns is served" \
+  "Austin" "$(lin 'SELECT ship_city FROM demo.orders UNION SELECT ship_city FROM demo.orders ORDER BY 1 LIMIT 1;')"
+check "15c. ...where lineage OFF still refuses it" \
+  "no column provenance" "$(proxied 'SELECT ship_city FROM demo.orders UNION SELECT ship_city FROM demo.orders;')"
+
+# The message is the other half of the feature.
+check "15d. a masked source is named in the refusal" \
+  "derives from demo.customers.email" "$(lin 'SELECT lower(email) FROM demo.customers LIMIT 1;')"
+
+# Laundering attempts. Each of these must refuse.
+for probe in \
+  "15e|mixing released and masked|SELECT city || email FROM demo.customers LIMIT 1;" \
+  "15f|aliasing through a CTE|WITH t AS (SELECT email AS x FROM demo.customers) SELECT upper(x) FROM t;" \
+  "15g|aliasing through a subquery|SELECT upper(x) FROM (SELECT email AS x FROM demo.customers) q LIMIT 1;" \
+  "15h|hiding a masked column in a CASE|SELECT CASE WHEN id > 0 THEN email ELSE city END FROM demo.customers LIMIT 1;" \
+  "15i|a join carrying a masked column|SELECT o.ship_city || c.email FROM demo.orders o JOIN demo.customers c ON c.id = o.customer_id LIMIT 1;" \
+  "15j|an unclassified column|SELECT upper(internal_note) FROM demo.orders LIMIT 1;" \
+  "15k|a UNION mixing released and masked|SELECT ship_city FROM demo.orders UNION SELECT email FROM demo.customers;" ; do
+  IFS='|' read -r id what sql <<< "$probe"
+  check "$id. refuses $what" "pgmask:" "$(lin "$sql")"
+done
+
+# Per-principal: the same expression, two people, two answers.
+lin_as() { psql -h localhost -p 6460 -U "$1" -d demo -X -tAq -c "$2" 2>&1 | head -1; }
+check  "15l. support may read an expression over a column they see" \
+  "CUSTOMER 1" "$(lin_as support_sam 'SELECT upper(name) FROM demo.customers WHERE id = 1;')"
+check  "15m. ...and everyone else may not" \
+  "pgmask:" "$(lin 'SELECT upper(name) FROM demo.customers WHERE id = 1;')"
+check  "15n. ...and email stays masked even for support" \
+  "pgmask:" "$(lin_as support_sam 'SELECT upper(email) FROM demo.customers WHERE id = 1;')"
+kill "$LIN_PID" 2>/dev/null
+
 echo
 echo "-----------------------"
 printf 'passed %d, failed %d\n' "$pass" "$fail"

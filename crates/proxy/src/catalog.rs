@@ -33,6 +33,20 @@ pub enum Summaries {
     Refuse,
 }
 
+/// Whether to trace expressions back to their base columns before refusing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Lineage {
+    /// Release an expression when every base column it derives from is
+    /// explicitly released. Converts about a third of refusals on analytical
+    /// SQL; see docs/lineage-estimate.md.
+    Allow,
+    /// Refuse anything without provenance, whatever it derives from. The safe
+    /// default: lineage is the one rule here where missing something is a
+    /// disclosure rather than a lost query.
+    Refuse,
+}
+
 /// Whether to serve queries that read only `pg_catalog` / `information_schema`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -277,6 +291,10 @@ pub struct Config {
     /// engine metadata, and it is what makes DBeaver and `\d` work.
     #[serde(default = "default_system_catalogs")]
     pub system_catalogs: SystemCatalogs,
+    /// Off by default. Turning it on trades a sound-by-construction rule for
+    /// one that depends on a resolver being complete.
+    #[serde(default = "default_lineage")]
+    pub lineage: Lineage,
     /// `host:port` to serve Prometheus metrics on, e.g. `"127.0.0.1:9464"`.
     ///
     /// Absent means no endpoint is opened. Deliberately not defaulted to a
@@ -307,6 +325,10 @@ fn default_refresh_min_seconds() -> u64 {
 fn default_metrics_seconds() -> u64 {
     60
 }
+fn default_lineage() -> Lineage {
+    Lineage::Refuse
+}
+
 fn default_system_catalogs() -> SystemCatalogs {
     SystemCatalogs::Refuse
 }
@@ -332,6 +354,17 @@ pub struct Snapshot {
     relations: HashSet<u32>,
     /// Rules that failed to resolve on the most recent attempt.
     unresolved: Vec<String>,
+    /// `schema.table` (lowercased) -> its column names, for every user relation.
+    ///
+    /// Needed by lineage: the static analyser has to expand `SELECT *` and
+    /// disambiguate unqualified names, and — the load-bearing one — it lets us
+    /// check that a table it claims to have resolved actually exists. The crate
+    /// returns placeholders like `?cte?` as if they were real tables, so
+    /// existence is the only honest test.
+    relation_columns: HashMap<String, Vec<String>>,
+    /// `(schema.table, column)` -> classification, for looking up a source
+    /// column that lineage identified by name rather than by OID.
+    by_name: HashMap<(String, String), Classification>,
     /// OIDs of every relation in `pg_catalog` and `information_schema`.
     ///
     /// The engine's own answer to "is this a system catalog", which is the only
@@ -342,6 +375,26 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Column names of a user relation, or `None` if we have never seen it.
+    ///
+    /// `None` is the answer that matters: it means a name lineage handed us is
+    /// not a real table, so nothing resolved.
+    pub fn relation_columns(&self, relation: &str) -> Option<&[String]> {
+        self.relation_columns
+            .get(&relation.to_ascii_lowercase())
+            .map(Vec::as_slice)
+    }
+
+    /// Classification of a column identified by name.
+    ///
+    /// `None` means unclassified, which under default-deny is masked — so a
+    /// caller deciding releasability must treat `None` as "not releasable",
+    /// never as "nothing to worry about".
+    pub fn lookup_by_name(&self, relation: &str, column: &str) -> Option<&Classification> {
+        self.by_name
+            .get(&(relation.to_ascii_lowercase(), column.to_ascii_lowercase()))
+    }
+
     /// Whether this OID is a relation in `pg_catalog` or `information_schema`.
     pub fn is_system_relation(&self, table_oid: u32) -> bool {
         self.system_relations.contains(&table_oid)
@@ -385,6 +438,47 @@ impl Snapshot {
     }
 
     #[cfg(test)]
+    /// Register a relation's columns and their masks by name, the way a
+    /// refresh would, so lineage can be tested without a database.
+    pub fn insert_relation_for_test(&mut self, relation: &str, columns: &[(&str, Mask)]) {
+        let relation = relation.to_ascii_lowercase();
+        self.relation_columns.insert(
+            relation.clone(),
+            columns
+                .iter()
+                .map(|(c, _)| c.to_ascii_lowercase())
+                .collect(),
+        );
+        for (column, mask) in columns {
+            self.by_name.insert(
+                (relation.clone(), column.to_ascii_lowercase()),
+                Classification {
+                    default: MaskSpec::new(*mask),
+                    by_role: HashMap::new(),
+                },
+            );
+        }
+    }
+
+    /// Register a relation's columns with no classification at all, so the
+    /// "unclassified is not releasable" path can be exercised.
+    pub fn relation_columns_for_test(&mut self, relation: &str, columns: &[&str]) {
+        self.relation_columns.insert(
+            relation.to_ascii_lowercase(),
+            columns.iter().map(|c| c.to_ascii_lowercase()).collect(),
+        );
+    }
+
+    /// Give a column a different mask for one role.
+    pub fn set_role_mask_for_test(&mut self, relation: &str, column: &str, role: &str, mask: Mask) {
+        if let Some(c) = self
+            .by_name
+            .get_mut(&(relation.to_ascii_lowercase(), column.to_ascii_lowercase()))
+        {
+            c.by_role.insert(role.to_string(), MaskSpec::new(mask));
+        }
+    }
+
     pub fn insert_for_test(&mut self, table_oid: u32, column_id: i16, mask: Mask, name: &str) {
         self.by_column.insert(
             (table_oid, column_id),
@@ -735,9 +829,38 @@ async fn resolve_snapshot(
         .map(|row| row.get::<_, i64>("oid") as u32)
         .collect();
 
+    // Every user relation and its columns. Bounded by schema count, loaded once
+    // per refresh, and lineage cannot resolve anything without it.
+    let mut relation_columns: HashMap<String, Vec<String>> = HashMap::new();
+    for row in client
+        .query(
+            "SELECT n.nspname || '.' || c.relname AS relation, a.attname AS column
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               JOIN pg_attribute a ON a.attrelid = c.oid
+              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                AND n.nspname NOT LIKE 'pg_temp%'
+                AND a.attnum > 0
+                AND NOT a.attisdropped
+                AND c.relkind = ANY('{r,v,m,p,f}')
+              ORDER BY 1, a.attnum",
+            &[],
+        )
+        .await
+        .context("loading relation column lists")?
+    {
+        let relation: String = row.get("relation");
+        let column: String = row.get("column");
+        relation_columns
+            .entry(relation.to_ascii_lowercase())
+            .or_default()
+            .push(column.to_ascii_lowercase());
+    }
+
     if rules.is_empty() {
         let snapshot = Snapshot {
             system_relations,
+            relation_columns,
             ..Default::default()
         };
         drop(client);
@@ -783,6 +906,7 @@ async fn resolve_snapshot(
 
     let mut snapshot = Snapshot {
         system_relations,
+        relation_columns,
         ..Default::default()
     };
     for rule in rules {
@@ -793,6 +917,13 @@ async fn resolve_snapshot(
                     .insert((oid, attnum), classify(rule, types)?);
                 snapshot.names.insert((oid, attnum), rule.display());
                 snapshot.relations.insert(oid);
+                snapshot.by_name.insert(
+                    (
+                        rule.relation.to_ascii_lowercase(),
+                        rule.column.to_ascii_lowercase(),
+                    ),
+                    classify(rule, types)?,
+                );
             }
             None => snapshot.unresolved.push(rule.display()),
         }
