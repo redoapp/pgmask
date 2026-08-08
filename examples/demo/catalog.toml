@@ -61,6 +61,10 @@ bucket = 25000
 by_role = { analyst = "numeric-bucket" }
 
 [[semantic_type]]
+name = "street_address"
+mask = "redact"
+
+[[semantic_type]]
 name = "ip_address"
 mask = "ip-prefix"
 
@@ -142,3 +146,45 @@ type = "person_name"
 relation = "demo.customer_directory"
 column = "city"
 mask = "none"
+
+# --- demo.orders -------------------------------------------------------------
+# The join side. Note what is *not* classified: order_total, status, ship_city
+# and placed_at are business facts, not personal data, so they pass through and
+# stay aggregatable. That is what keeps debugging possible.
+
+[[column]]
+relation = "demo.orders"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "customer_id"
+mask = "none"           # a surrogate key to a masked table; useless on its own
+
+[[column]]
+relation = "demo.orders"
+column = "status"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "order_total"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "ship_city"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "placed_at"
+mask = "none"
+
+[[column]]
+relation = "demo.orders"
+column = "ship_address"
+type = "street_address"
+
+# demo.orders.internal_note is deliberately absent: default-deny nulls it.

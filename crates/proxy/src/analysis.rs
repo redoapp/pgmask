@@ -471,8 +471,307 @@ fn function_name(parts: &[pg_query::protobuf::Node]) -> Option<String> {
     }
 }
 
+// --- System catalogs --------------------------------------------------------
+//
+// GUI clients (DBeaver, DataGrip, pgAdmin) and psql's own `\d` commands read
+// `pg_catalog` on connect. Those queries are full of expressions —
+// `pg_get_userbyid(c.relowner)`, `format_type(...)`, `'pg_class'::regclass` —
+// so output classification refuses them, and the columns that *do* have
+// provenance point at catalog tables that are not in anyone's catalog file, so
+// default-deny nulls them.
+//
+// Nulling is the worse half. `\d` sends a follow-up query built from the OID
+// the first one returned; masked to NULL, psql interpolates an empty string and
+// Postgres answers `invalid input syntax for type oid: ""`. Default-deny did
+// not refuse, it corrupted the client's logic.
+//
+// The rule below releases a result set when **every relation the statement
+// reads is a system catalog holding metadata rather than user data**. Nothing
+// from a user table can appear in the output of a query that reads no user
+// table, so the fields need no provenance.
+
+/// Catalogs that hold user data, not metadata about it.
+///
+/// Measured, not assumed. On the demo database `pg_stats` returns
+/// `most_common_vals = {shared@example.com}` for a pseudonymised column, and
+/// exact `histogram_bounds` for a date masked to its year and an IP masked to
+/// its /24. Releasing `pg_catalog` wholesale would hand back the values the
+/// proxy exists to hide.
+///
+/// `pg_statistic_ext` is deliberately absent: it records *which* extended
+/// statistics objects exist. The values live in `pg_statistic_ext_data`, and
+/// `\d` reads the former.
+const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
+    // Sampled values from user tables.
+    "pg_statistic",
+    "pg_statistic_ext_data",
+    "pg_stats",
+    "pg_stats_ext",
+    "pg_stats_ext_exprs",
+    // Other sessions' SQL text, literals included.
+    "pg_stat_activity",
+    "pg_stat_statements",
+    "pg_prepared_statements",
+    // Large object contents.
+    "pg_largeobject",
+    // Password hashes and connection strings.
+    "pg_authid",
+    "pg_shadow",
+    "pg_user_mapping",
+    "pg_user_mappings",
+    "pg_subscription",
+    // Host configuration and file contents.
+    "pg_file_settings",
+    "pg_hba_file_rules",
+    "pg_ident_file_mappings",
+    "pg_backend_memory_contexts",
+];
+
+/// Functions that reach data the parse tree never names.
+///
+/// `query_to_xml('SELECT * FROM demo.customers', …)` takes its query as a
+/// *string*, so no `RangeVar` for `customers` exists to check. Without this
+/// list the whole rule is bypassable in one call.
+const CATALOG_ESCAPE_FUNCTIONS: &[&str] = &[
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "table_to_xml",
+    "table_to_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "dblink",
+    "dblink_send_query",
+    "dblink_get_result",
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_stat_file",
+    "lo_get",
+    "lo_import",
+    "lo_export",
+];
+
+/// True when this statement reads only server metadata — a `SHOW`, or a query
+/// whose every relation is a metadata-only system catalog — so the result set
+/// carries nothing from a user table.
+///
+/// Requires each relation to be **explicitly** schema-qualified. A bare
+/// `pg_class` resolves through `search_path`, and while Postgres reserves the
+/// `pg_` schema-name prefix — `CREATE SCHEMA pg_evil` is refused by the server —
+/// relying on resolution order is a worse rule than reading the qualification
+/// that every real client already writes. psql and DBeaver both emit
+/// `pg_catalog.pg_class`.
+///
+/// Fails closed everywhere: an unparseable statement, a statement that names no
+/// relation at all, a CTE reference that is not declared locally, and any
+/// function on [`CATALOG_ESCAPE_FUNCTIONS`] all return `false`.
+pub fn reads_only_server_metadata(sql: &str) -> bool {
+    use pg_query::NodeRef;
+
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    if parsed.protobuf.stmts.len() != 1 {
+        return false;
+    }
+
+    // `SHOW search_path` and friends. Every JDBC driver sends one during
+    // connection setup, and a GUC holds server configuration — there is no path
+    // from a table's contents into one.
+    if let Some(NodeEnum::VariableShowStmt(_)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    {
+        return true;
+    }
+
+    // Collected first: a CTE reference is an unqualified RangeVar, and refusing
+    // every catalog query that uses `WITH` would be needlessly strict. The
+    // CTE's own body is walked like everything else, so this shadows nothing.
+    let mut cte_names: Vec<String> = Vec::new();
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        if let NodeRef::CommonTableExpr(cte) = node {
+            cte_names.push(cte.ctename.to_ascii_lowercase());
+        }
+    }
+
+    let mut saw_relation = false;
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        match node {
+            NodeRef::RangeVar(v) => {
+                let schema = v.schemaname.to_ascii_lowercase();
+                let relation = v.relname.to_ascii_lowercase();
+
+                if schema.is_empty() {
+                    // Only a locally declared CTE may go unqualified.
+                    if cte_names.contains(&relation) {
+                        continue;
+                    }
+                    return false;
+                }
+                if schema != "pg_catalog" && schema != "information_schema" {
+                    return false;
+                }
+                if LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str()) {
+                    return false;
+                }
+                saw_relation = true;
+            }
+            NodeRef::FuncCall(call) => {
+                // Compare on the bare name: `pg_catalog.query_to_xml` and
+                // `query_to_xml` are the same function.
+                let last =
+                    call.funcname
+                        .last()
+                        .and_then(|n| n.node.as_ref())
+                        .and_then(|n| match n {
+                            NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
+                            _ => None,
+                        });
+                if let Some(name) = last {
+                    if CATALOG_ESCAPE_FUNCTIONS.contains(&name.as_str()) {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A statement naming no relation is not a catalog query, and pg_query has a
+    // known bug where a self-referencing CTE yields an empty table list. Either
+    // way, releasing on an empty set would release on absence of evidence.
+    saw_relation
+}
+
 #[cfg(test)]
 mod tests {
+
+    // --- system catalogs ---------------------------------------------------
+
+    #[test]
+    fn metadata_only_catalog_queries_are_released() {
+        // The shapes psql actually sends. Each is full of expressions that
+        // output classification cannot judge.
+        for sql in [
+            "SELECT n.nspname, c.relname, pg_catalog.pg_get_userbyid(c.relowner) \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             FROM pg_catalog.pg_attribute a WHERE a.attrelid = 1",
+            "SELECT table_name FROM information_schema.tables",
+            "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_statistic_ext e \
+             ON e.stxrelid = c.oid",
+        ] {
+            assert!(reads_only_server_metadata(sql), "should be released: {sql}");
+        }
+    }
+
+    #[test]
+    fn catalogs_that_carry_user_data_are_not_released() {
+        // pg_stats returns most_common_vals and histogram_bounds — literal
+        // values sampled out of the user's tables, including the ones the proxy
+        // pseudonymises. Measured on the demo database, not assumed.
+        for sql in [
+            "SELECT most_common_vals FROM pg_catalog.pg_stats",
+            "SELECT stavalues1 FROM pg_catalog.pg_statistic",
+            "SELECT stxdmcv FROM pg_catalog.pg_statistic_ext_data",
+            "SELECT rolpassword FROM pg_catalog.pg_authid",
+            "SELECT query FROM pg_catalog.pg_stat_activity",
+            "SELECT data FROM pg_catalog.pg_largeobject",
+            "SELECT umoptions FROM pg_catalog.pg_user_mappings",
+            "SELECT subconninfo FROM pg_catalog.pg_subscription",
+        ] {
+            assert!(
+                !reads_only_server_metadata(sql),
+                "must not be released: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_table_anywhere_disqualifies_the_whole_statement() {
+        for sql in [
+            "SELECT c.email FROM demo.customers c JOIN pg_catalog.pg_class k ON true",
+            "SELECT relname FROM pg_catalog.pg_class WHERE relname IN (SELECT email FROM demo.customers)",
+            "SELECT (SELECT email FROM demo.customers LIMIT 1) FROM pg_catalog.pg_class",
+        ] {
+            assert!(!reads_only_server_metadata(sql), "must not be released: {sql}");
+        }
+    }
+
+    #[test]
+    fn qualification_is_required_because_search_path_is_not_ours() {
+        // Postgres reserves the `pg_` schema prefix, so `pg_catalog.x` cannot be
+        // spoofed — but a bare name resolves through search_path, and reading
+        // the qualification every real client already writes is the better rule.
+        assert!(!reads_only_server_metadata("SELECT relname FROM pg_class"));
+        assert!(reads_only_server_metadata(
+            "SELECT relname FROM pg_catalog.pg_class"
+        ));
+    }
+
+    #[test]
+    fn functions_that_take_sql_as_a_string_are_refused() {
+        // The parse tree has no RangeVar for `demo.customers` here, so without
+        // the escape list the entire rule is bypassable in one call.
+        for sql in [
+            "SELECT pg_catalog.query_to_xml('SELECT email FROM demo.customers', false, true, '') \
+             FROM pg_catalog.pg_class",
+            "SELECT table_to_xml('demo.customers'::regclass, false, true, '') \
+             FROM pg_catalog.pg_class",
+            "SELECT pg_read_file('/etc/passwd') FROM pg_catalog.pg_class",
+            "SELECT dblink('', 'SELECT email FROM demo.customers') FROM pg_catalog.pg_class",
+        ] {
+            assert!(
+                !reads_only_server_metadata(sql),
+                "must not be released: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cte_may_go_unqualified_but_only_if_it_is_declared_here() {
+        assert!(reads_only_server_metadata(
+            "WITH cls AS (SELECT oid, relname FROM pg_catalog.pg_class) \
+             SELECT relname FROM cls"
+        ));
+        // A CTE named after a catalog must not launder a user table.
+        assert!(!reads_only_server_metadata(
+            "WITH pg_class AS (SELECT email FROM demo.customers) SELECT email FROM pg_class"
+        ));
+    }
+
+    #[test]
+    fn show_is_released_because_a_guc_is_not_table_data() {
+        for sql in ["SHOW search_path", "SHOW ALL", "SHOW transaction_isolation"] {
+            assert!(reads_only_server_metadata(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn absence_of_evidence_is_not_release() {
+        // pg_query has a known bug where a self-referencing CTE yields an empty
+        // table list. Releasing on an empty set would turn that into a leak.
+        for sql in [
+            "SELECT 1",
+            "SELECT now()",
+            "WITH f AS (SELECT * FROM f LIMIT 1) SELECT * FROM f",
+            "not valid sql at all",
+            "SELECT 1; SELECT 2",
+        ] {
+            assert!(
+                !reads_only_server_metadata(sql),
+                "must not be released: {sql}"
+            );
+        }
+    }
+
     use super::*;
 
     /// Default posture: summaries released.

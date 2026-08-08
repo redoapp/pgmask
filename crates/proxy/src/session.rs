@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::analysis::{self, Safety};
-use crate::catalog::{Catalog, Config, Opaque, Summaries, Unclassified};
+use crate::catalog::{Catalog, Config, Opaque, Summaries, SystemCatalogs, Unclassified};
 use crate::mask::{Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
 use crate::protocol::{self, DescribeTarget, FrameReader, Message};
@@ -59,6 +59,7 @@ pub struct Policy {
     pub opaque: Opaque,
     pub metrics: Arc<Metrics>,
     pub summaries: Summaries,
+    pub system_catalogs: SystemCatalogs,
     /// Principal -> roles, from `[[role]]`.
     pub roles: HashMap<String, HashSet<String>>,
     /// Present when `tls_cert`/`tls_key` are configured. Absent means we answer
@@ -82,6 +83,7 @@ impl Policy {
             opaque: config.opaque,
             metrics: Arc::new(Metrics::default()),
             summaries: config.summaries,
+            system_catalogs: config.system_catalogs,
             roles: roles_by_principal(&config.role),
             tls,
             backend_tls: config.backend_tls,
@@ -629,13 +631,39 @@ impl Session {
 
         // Only consulted for fields with no provenance, and only ever able to
         // turn a refusal into a passthrough for a positively-identified shape.
+        // A statement that reads only metadata-only system catalogs carries
+        // nothing from a user table, so every field is released — including the
+        // ones that DO have provenance, which point at catalog relations no
+        // catalog file lists and which default-deny would otherwise null. That
+        // nulling is what breaks `\d`: psql feeds the OID from one query into
+        // the next and gets `invalid input syntax for type oid: ""`.
+        let system_catalog = self.policy.system_catalogs == SystemCatalogs::Allow
+            && self
+                .described_sql
+                .as_deref()
+                .is_some_and(analysis::reads_only_server_metadata);
+
         let safety = match &self.described_sql {
             Some(sql) => {
                 analysis::analyze(sql, fields.len(), self.policy.summaries == Summaries::Allow)
             }
             None => vec![Safety::Unknown; fields.len()],
         };
-        let plan = match self.policy.plan_for(&fields, &self.roles, &safety) {
+        let planned = if system_catalog {
+            Ok(Arc::new(
+                fields
+                    .iter()
+                    .map(|field| FieldPlan {
+                        spec: MaskSpec::new(Mask::None),
+                        type_oid: field.type_oid,
+                        format: field.format,
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            self.policy.plan_for(&fields, &self.roles, &safety)
+        };
+        let plan = match planned {
             Ok(plan) => plan,
             Err(rejection) => {
                 self.pending_describes.pop_front();
@@ -954,6 +982,7 @@ mod tests {
             opaque,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
+            system_catalogs: SystemCatalogs::Refuse,
             roles: HashMap::new(),
             tls: None,
             backend_tls: BackendTls::Disable,
@@ -1021,6 +1050,7 @@ mod tests {
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
+            system_catalogs: SystemCatalogs::Refuse,
             roles: HashMap::new(),
             tls: None,
             backend_tls: BackendTls::Disable,

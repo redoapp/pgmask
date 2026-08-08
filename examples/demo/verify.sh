@@ -225,6 +225,44 @@ refute "11e. ...masking the address it discovered"           "user1@example.com"
 check  "11f. ...and the IP it discovered"                    "203.0.113.0"      "$(gen 'SELECT last_ip FROM demo.customers WHERE id = 100;')"
 kill "$GEN_PID" 2>/dev/null
 
+# 12 — GUI clients and psql's \d read pg_catalog. Off by default; on, only
+# metadata-only catalogs are released, and the leaky ones must stay masked.
+echo
+echo "system catalogs (DBeaver / psql \\d)"
+echo "-----------------------"
+sed -e 's/^listen = .*/listen = "127.0.0.1:6456"/' \
+    -e 's/^opaque = .*/opaque = "reject"\nsystem_catalogs = "allow"/' \
+    examples/demo/catalog.toml > /tmp/pgmask-gui.toml
+./target/release/pgmask /tmp/pgmask-gui.toml >/tmp/pgmask-gui.log 2>&1 &
+GUI_PID=$!
+sleep 2
+gui() { psql -h localhost -p 6456 -U postgres -d demo -X -c "$1" 2>&1; }
+
+check "12a. \\dt lists tables (default-deny refuses this)" \
+  "customers" "$(gui '\dt demo.*')"
+check "12b. \\d describes columns" \
+  "annual_salary" "$(gui '\d demo.customers')"
+# Default-deny does not merely refuse \d, it nulls the OID that psql feeds into
+# its next query — so the failure surfaces as a Postgres syntax error, not ours.
+refute "12c. ...and does not corrupt psql's follow-up query" \
+  "invalid input syntax" "$(gui '\d demo.customers')"
+
+# pg_stats hands back most_common_vals and histogram_bounds: literal values
+# sampled from the user's tables, including pseudonymised ones.
+check  "12d. Postgres really does expose the value in pg_stats" "shared@example.com" \
+  "$(direct "SELECT most_common_vals FROM pg_stats WHERE tablename='customers' AND attname='email';")"
+refute "12e. ...and pgmask does not release it"                 "shared@example.com" \
+  "$(gui "SELECT most_common_vals FROM pg_catalog.pg_stats WHERE tablename='customers' AND attname='email';")"
+refute "12f. pg_authid password hashes stay masked"             "SCRAM-SHA-256" \
+  "$(gui 'SELECT rolpassword FROM pg_catalog.pg_authid LIMIT 1;')"
+refute "12g. a user table joined to a catalog is still masked"  "user1@example.com" \
+  "$(gui 'SELECT c.email FROM demo.customers c JOIN pg_catalog.pg_class k ON true WHERE c.id=1 LIMIT 1;')"
+refute "12h. query_to_xml cannot launder a user table"          "user1@example.com" \
+  "$(gui "SELECT pg_catalog.query_to_xml('SELECT email FROM demo.customers LIMIT 1', false, true, '') FROM pg_catalog.pg_class LIMIT 1;")"
+refute "12i. ordinary data queries are unaffected by the knob"  "user1@example.com" \
+  "$(gui 'SELECT email FROM demo.customers WHERE id = 1;')"
+kill "$GUI_PID" 2>/dev/null
+
 echo
 echo "-----------------------"
 printf 'passed %d, failed %d\n' "$pass" "$fail"

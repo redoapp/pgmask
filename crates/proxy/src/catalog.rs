@@ -31,6 +31,20 @@ pub enum Summaries {
     Refuse,
 }
 
+/// Whether to serve queries that read only `pg_catalog` / `information_schema`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SystemCatalogs {
+    /// Serve them unmasked. Required for GUI clients and psql's `\d`, which
+    /// cannot list a table without reading the catalog. Only statements whose
+    /// every relation is an explicitly qualified, metadata-only catalog
+    /// qualify, plus `SHOW`; see `analysis::reads_only_server_metadata`.
+    Allow,
+    /// Refuse them, like any other unclassified relation. The safe default, and
+    /// it means no GUI client will connect.
+    Refuse,
+}
+
 /// What to do with a field that HAS provenance but no catalog entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -250,6 +264,10 @@ pub struct Config {
     /// roughly 90% of analytical SQL.
     #[serde(default = "default_summaries")]
     pub summaries: Summaries,
+    /// Off by default: turning it on is a deliberate decision to release
+    /// engine metadata, and it is what makes DBeaver and `\d` work.
+    #[serde(default = "default_system_catalogs")]
+    pub system_catalogs: SystemCatalogs,
 }
 
 fn default_listen() -> String {
@@ -273,6 +291,10 @@ fn default_refresh_min_seconds() -> u64 {
 fn default_metrics_seconds() -> u64 {
     60
 }
+fn default_system_catalogs() -> SystemCatalogs {
+    SystemCatalogs::Refuse
+}
+
 fn default_summaries() -> Summaries {
     Summaries::Allow
 }
