@@ -30,3 +30,4 @@ pg_query.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+proptest.workspace = true

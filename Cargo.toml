@@ -21,3 +21,4 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-pemfile = "2"
 tokio-postgres-rustls = "0.13"
 pg_query = "6"
+proptest = "1"

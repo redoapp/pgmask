@@ -297,7 +297,10 @@ impl Masker {
         }
 
         let text = String::from_utf8_lossy(bytes);
-        Ok(Bytes::from(match text.split_once('@') {
+        let as_email = text
+            .split_once('@')
+            .filter(|(local, domain)| !local.is_empty() && !domain.is_empty());
+        Ok(Bytes::from(match as_email {
             // The local part alone is not the identifying half of a work
             // address. `alice@tinystartup.io` names a company, and with one
             // contact there it names a person — so the domain is pseudonymised
@@ -457,13 +460,16 @@ fn truncate_date(
         // Text is `YYYY-MM-DD[ HH:MM:SS...]`; rebuilding from the leading date
         // avoids re-deriving the timezone suffix.
         let text = String::from_utf8_lossy(bytes);
-        if text.len() < 10 {
+        if text.len() < 10 || !text.is_char_boundary(10) {
             return Err(MaskError::Undecodable { type_oid, format });
         }
+        // Postgres renders pre-year-1 dates with a ` BC` suffix. Dropping it
+        // moves the value roughly four thousand years into the future.
+        let era = if text.ends_with(" BC") { " BC" } else { "" };
         let year = &text[0..4];
         let month = if to_month { &text[5..7] } else { "01" };
         return Ok(Bytes::from(if type_oid == OID_DATE {
-            format!("{year}-{month}-01")
+            format!("{year}-{month}-01{era}")
         } else {
             // Keep any timezone suffix so the client parses what it expects.
             let tz = text
@@ -471,7 +477,7 @@ fn truncate_date(
                 .filter(|i| *i > 10)
                 .map(|i| &text[i..])
                 .unwrap_or("");
-            format!("{year}-{month}-01 00:00:00{tz}")
+            format!("{year}-{month}-01 00:00:00{tz}{era}")
         }));
     }
 
@@ -496,8 +502,12 @@ fn truncate_date(
             let days = micros.div_euclid(MICROS_PER_DAY);
             let (y, m, _) = civil_from_days(days + PG_EPOCH_DAYS);
             let truncated = days_from_civil(y, if to_month { m } else { 1 }, 1) - PG_EPOCH_DAYS;
+            // Saturating for the same reason `floor_to` is: the extremes of the
+            // i64 microsecond domain are far outside what a day count times a
+            // microsecond multiplier can hold, and the wrap moves the value
+            // rather than coarsening it.
             Ok(Bytes::copy_from_slice(
-                &(truncated * MICROS_PER_DAY).to_be_bytes(),
+                &truncated.saturating_mul(MICROS_PER_DAY).to_be_bytes(),
             ))
         }
         _ => Err(MaskError::Undecodable { type_oid, format }),
@@ -520,6 +530,19 @@ fn bucket_number(
             return Ok(Bytes::from(floor_to(v, bucket).to_string()));
         }
         if let Ok(v) = text.trim().parse::<f64>() {
+            // Postgres accepts NaN/Infinity/-Infinity for float and numeric, and
+            // spells them that way. Rust prints "inf", which the client cannot
+            // parse back into the column's type. Bucketing a non-finite value
+            // is meaningless anyway, so echo the canonical spelling.
+            if !v.is_finite() {
+                return Ok(Bytes::from_static(if v.is_nan() {
+                    b"NaN"
+                } else if v.is_sign_positive() {
+                    b"Infinity"
+                } else {
+                    b"-Infinity"
+                }));
+            }
             let b = bucket as f64;
             return Ok(Bytes::from(((v / b).floor() * b).to_string()));
         }
@@ -529,15 +552,13 @@ fn bucket_number(
     match type_oid {
         OID_INT2 if bytes.len() == 2 => {
             let v = i16::from_be_bytes([bytes[0], bytes[1]]) as i64;
-            Ok(Bytes::copy_from_slice(
-                &(floor_to(v, bucket) as i16).to_be_bytes(),
-            ))
+            let out = floor_within(v, bucket, i16::MIN as i64, i16::MAX as i64);
+            Ok(Bytes::copy_from_slice(&(out as i16).to_be_bytes()))
         }
         OID_INT4 if bytes.len() == 4 => {
             let v = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64;
-            Ok(Bytes::copy_from_slice(
-                &(floor_to(v, bucket) as i32).to_be_bytes(),
-            ))
+            let out = floor_within(v, bucket, i32::MIN as i64, i32::MAX as i64);
+            Ok(Bytes::copy_from_slice(&(out as i32).to_be_bytes()))
         }
         OID_INT8 if bytes.len() == 8 => {
             let mut raw = [0u8; 8];
@@ -564,8 +585,23 @@ fn bucket_number(
 }
 
 /// Floor division, so negatives bucket downward rather than toward zero.
+///
+/// Saturating, because `i64::MIN` with a bucket that does not divide it
+/// overflows the multiply — a panic in debug, and in release a wrap that
+/// produces a value *larger* than the input, which is the opposite of masking.
 fn floor_to(v: i64, bucket: i64) -> i64 {
-    v.div_euclid(bucket) * bucket
+    let bucket = bucket.max(1);
+    v.div_euclid(bucket).saturating_mul(bucket)
+}
+
+/// Floor, then bring the result back inside the column's own range.
+///
+/// A bucket wider than the type is legitimate — it means "one bucket covers
+/// everything" — but the floor then sits below the type's minimum, and the cast
+/// wrapped it to a large positive number. `-1` with a bucket of 32769 came back
+/// as `32767`. Clamping keeps the guarantee that matters: never above the input.
+fn floor_within(v: i64, bucket: i64, min: i64, max: i64) -> i64 {
+    floor_to(v, bucket).clamp(min, max)
 }
 
 // --- Helpers ----------------------------------------------------------------
