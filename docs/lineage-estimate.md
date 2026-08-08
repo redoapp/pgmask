@@ -106,63 +106,85 @@ Watch the tail: `query_64` took 12.6 ms. This wants a statement timeout with
 fail-closed on expiry, and the cache hit rate wants instrumenting from day one,
 because planning burns CPU on the database you are protecting.
 
-## Why not a lineage library
+## Which engine: sqllineage, with two guards
 
-`sqllineage` v0.2 is a Rust crate that does exactly this, statically, with no
-database. It looked excellent:
+`sqllineage` v0.2 is a Rust crate that computes this statically, with no
+database. It was nearly rejected on a measurement error, so both the finding and
+the correction are recorded here.
 
 - **Parsed all 42 TPC-DS queries.** Zero failures. The dialect worry — that
   `sqlparser-rs` would choke where the real Postgres grammar does not — was
   simply wrong.
-- **Models unresolved states properly.** `Concrete` / `Ambiguous` / `Wildcard` /
-  `Recursive`, so a fail-closed consumer can refuse anything not `Concrete`.
 - **Takes a `CatalogProvider`**, and we have a catalog. Wiring our column lists
-  in took 30 lines and moved it from 7 fully-resolved queries to **32 of 42** —
-  better than EXPLAIN's 23, with no round trip and no CTE materialization
-  problem.
+  in took 30 lines and moved it from 7 fully-resolved queries to 32 of 42.
 
-Then the test that mattered. Comparing its source columns against the base
-columns Postgres's own planner projects, on queries where both resolved:
+### The measurement error, because it is the lesson
+
+Comparing its source columns against what Postgres's planner projects, three
+queries appeared to *miss* columns — `query_33`, `query_56`, `query_60` each
+seemed to drop `store_sales.ss_ext_sales_price` from a `UNION ALL`. That is the
+leak direction, and it nearly disqualified the crate.
+
+It was not a miss. Dumping the actual mapping for `query_33`:
+
+```
+i_manufact_id  <- [?cte?.i_manufact_id]  (Direct)
+total_sales    <- [?cte?.total_sales]    (Aggregation)
+```
+
+`?cte?` is the library's placeholder for a CTE it could not resolve — and it is
+returned as `ColumnOrigin::Concrete`, so code that trusts the enum variant reads
+it as a resolved base column. The classifier doing the comparison believed the
+variant. **The type says resolved and it is not.**
+
+There is a second sentinel, `?unknown?`, produced the same way.
+
+### The guards
+
+Both sentinels, and any future one, are caught by not trusting names:
+
+1. **A `Concrete` source whose table is not in the operator's schema is
+   unresolved.** Checking existence rather than matching `?cte?` by name means a
+   sentinel added in a later version fails closed instead of silently passing.
+2. **A mapping with an empty `sources` list is unresolved.** Empty means either
+   "genuinely none" or "did not look inside", and the type cannot tell you
+   which: `count(*)` and `'DIAMOND' || ',' || 'AIRBORNE'` sit in the same bucket
+   as `query_9`'s `bucket1`, a `CASE` over scalar subqueries whose sources were
+   missed. Failing closed here costs nothing, because the existing allowlist
+   already releases `count(*)` and literals.
+
+With both guards applied:
 
 | | |
 |---|---|
-| sets agree, or sqllineage saw more | 14 |
-| **sqllineage missed columns EXPLAIN found** | **3** |
-| not comparable | 15 |
+| genuinely resolved | **27** of 42 |
+| `Concrete` but a placeholder table | 5 → refuse |
+| target with no sources | 10 → refuse |
+| **under-reports vs Postgres, on the 14 comparable queries** | **0** |
 
-**Three of seventeen — an 18% under-report rate on answers it reported as fully
-resolved.** `query_33`, `query_56` and `query_60` each missed
-`store_sales.ss_ext_sales_price`: `UNION ALL` across three sales channels, where
-it resolved some branches and not others.
+27 beats EXPLAIN's 23, with no round trip, no planning load on the database
+being protected, and none of the CTE-materialization problem — a CTE is just a
+scope to a static analyser.
 
-Under-reporting is the leak direction. Over-reporting costs a query; missing a
-source column means saying "nothing sensitive here" about something sensitive.
+### What is still not proven
 
-There is a second, quieter problem. An empty `sources` list means either
-"genuinely none" or "I did not look inside", and the type cannot distinguish
-them. Of the ten such cases, `count(*)` and `'DIAMOND' || ',' || 'AIRBORNE'` are
-genuinely source-free, while `query_9`'s `bucket1` is a `CASE` over scalar
-subqueries whose sources were simply not found. A consumer must fail closed on
-empty sources — which costs nothing here, since our existing allowlist already
-releases `count(*)` and literals.
+Zero misses in 14 comparable queries is encouraging, not proof. And the `?cte?`
+episode is the standing warning: a type that says `Concrete` was not. The
+residual risk that no corpus can measure is a *misparse* — `sqlparser-rs`
+accepting a query and reading it differently from Postgres. A parse failure is
+safe (refuse); a silent misreading is not.
 
-**None of this is a criticism of the library.** It is built for data-catalog
-lineage, where a missed edge is a cosmetic gap in a graph. We would be using it
-as a security control, where a missed edge is a disclosure. It is three weeks
-old at v0.2.0 and worth re-testing later.
+So EXPLAIN does not go away, it changes role.
 
 ## The recommendation
 
-**EXPLAIN is the authority.** Postgres resolved the names; it cannot disagree
-with itself. The only thing that can be wrong is our extraction from the plan,
-which is our code and can be made conservative.
+**`sqllineage` is the engine**, behind the two guards above.
 
-**`sqllineage` is the oracle**, as a dev-dependency, the same role `pgwire`
-plays for the wire protocol in `tests/differential.rs`. It needs no database, so
-it runs in CI on the corpus; where it reports a source column our extraction
-missed, that is a bug in our extraction and the build should say so. Its own
-under-reporting does not matter in that direction — we only act on it finding
-*more* than we did.
+**EXPLAIN is the oracle.** `crates/corpus` already submits SQL to a real
+Postgres; adding a differential — where Postgres's own plan names a source
+column sqllineage did not, fail the build — turns the authority into a test
+rather than a runtime dependency. Same role `pgwire` plays for the wire protocol
+in `tests/differential.rs`: not the implementation, the second opinion.
 
-Neither replaces the other, and using the library as the authority would have
-shipped a leak on one query in six.
+That ordering was reversed in the first draft of this document, on the strength
+of a comparison that was measuring its own bug.
