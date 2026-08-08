@@ -137,12 +137,58 @@ const RANKING_WINDOWS: &[&str] = &[
     "ntile",
 ];
 
-/// Scalar functions that reduce precision and cannot recover the input.
+/// Precisions `date_trunc` may coarsen to.
 ///
-/// `date_trunc('month', birth_date)` gives a coarser value than pgmask's own
-/// `date-month` mask would. Refusing it while offering the same transformation
-/// as a mask was incoherent.
-const COARSENING_SCALARS: &[&str] = &["date_trunc", "date_part", "extract", "width_bucket"];
+/// **The precision is an argument, so it is caller-controlled.**
+/// `date_trunc('microseconds', birth_date)` coarsens nothing. Only units at or
+/// above a day qualify, and the argument has to be a literal we can read — a
+/// computed precision is not checkable.
+const COARSE_DATE_UNITS: &[&str] = &[
+    "day",
+    "week",
+    "month",
+    "quarter",
+    "year",
+    "decade",
+    "century",
+    "millennium",
+];
+
+/// Pure scalar functions that compute from their arguments and nothing else.
+///
+/// Releasable *only when every argument is*, which is what makes them safe:
+/// `round(sum(a) / sum(b), 1)` is arithmetic over summaries, `round(salary)` is
+/// still a salary.
+///
+/// This has to be an allowlist rather than "any function with releasable
+/// arguments". A user-defined `leak_email(1)` takes a constant and returns a
+/// column value, so argument safety says nothing about an arbitrary function.
+const PURE_SCALARS: &[&str] = &[
+    "abs",
+    "round",
+    "ceil",
+    "ceiling",
+    "floor",
+    "trunc",
+    "sign",
+    "mod",
+    "div",
+    "power",
+    "sqrt",
+    "cbrt",
+    "exp",
+    "ln",
+    "log",
+    "greatest",
+    "least",
+    "nullif",
+    "to_char",
+    "to_number",
+    "numeric",
+    "int4",
+    "int8",
+    "float8",
+];
 
 /// Classify each output field of `sql`, given how many fields the server said
 /// the result set has.
@@ -296,10 +342,33 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
             if call.over.is_some() && RANKING_WINDOWS.contains(&name) {
                 return Safety::Releasable;
             }
-            // Precision reduction. Never released as a window function, where
-            // the frame could narrow to a single row.
-            if call.over.is_none() && COARSENING_SCALARS.contains(&name) {
-                return Safety::Releasable;
+            // Precision reduction, and *only* to a coarse literal unit.
+            //
+            // `date_part`/`extract` are deliberately absent: they extract a
+            // component rather than coarsen, and the component is an argument.
+            // `date_part('epoch', birth_date)` returned the exact date through a
+            // year-masked column — found by adversarial review, not by a test.
+            // `width_bucket` is absent for the same reason: the bucket count is
+            // caller-controlled and can be made lossless.
+            if call.over.is_none() && name == "date_trunc" && call.args.len() >= 2 {
+                if coarse_unit_literal(&call.args[0]) {
+                    return Safety::Releasable;
+                }
+                return Safety::Unknown;
+            }
+            // A pure scalar over releasable arguments. `round(sum(a)/sum(b), 1)`
+            // is the shape that made this necessary — wrapping a summary in
+            // formatting should not lose its releasability.
+            if call.over.is_none() && !call.args.is_empty() && PURE_SCALARS.contains(&name) {
+                let all = call.args.iter().all(|a| {
+                    a.node
+                        .as_ref()
+                        .map(|inner| classify(inner, allow_summaries) == Safety::Releasable)
+                        .unwrap_or(false)
+                });
+                if all {
+                    return Safety::Releasable;
+                }
             }
             Safety::Unknown
         }
@@ -365,6 +434,21 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
         }
 
         _ => Safety::Unknown,
+    }
+}
+
+/// Is this argument a string literal naming a coarse date unit?
+///
+/// Anything computed, or any unit finer than a day, fails closed.
+fn coarse_unit_literal(arg: &pg_query::protobuf::Node) -> bool {
+    let Some(NodeEnum::AConst(constant)) = arg.node.as_ref() else {
+        return false;
+    };
+    match constant.val.as_ref() {
+        Some(pg_query::protobuf::a_const::Val::Sval(s)) => {
+            COARSE_DATE_UNITS.contains(&s.sval.trim().to_ascii_lowercase().as_str())
+        }
+        _ => false,
     }
 }
 
@@ -716,6 +800,100 @@ mod tests {
                 "SELECT * FROM (SELECT email FROM t UNION SELECT email FROM t) q",
                 1
             ),
+            vec![Safety::Unknown]
+        );
+    }
+
+    #[test]
+    fn pure_scalars_pass_through_releasability() {
+        assert_eq!(
+            safety("SELECT round(sum(a) / sum(b), 1) FROM t", 1),
+            vec![Safety::Releasable]
+        );
+        assert_eq!(
+            safety("SELECT abs(sum(salary)) FROM t", 1),
+            vec![Safety::Releasable]
+        );
+        // ...but never over a column.
+        assert_eq!(
+            safety("SELECT round(salary) FROM t", 1),
+            vec![Safety::Unknown]
+        );
+        assert_eq!(
+            safety("SELECT abs(salary) FROM t", 1),
+            vec![Safety::Unknown]
+        );
+    }
+
+    /// The reason PURE_SCALARS is an allowlist. A user-defined function taking a
+    /// harmless argument can return anything at all, so "all arguments are
+    /// releasable" says nothing about an arbitrary callee.
+    #[test]
+    fn an_unknown_function_over_releasable_arguments_is_not_released() {
+        assert_eq!(
+            safety("SELECT leak_email(1) FROM t", 1),
+            vec![Safety::Unknown]
+        );
+        assert_eq!(
+            safety("SELECT leak_email() FROM t", 1),
+            vec![Safety::Unknown]
+        );
+        assert_eq!(
+            safety("SELECT leak_email(count(*)) FROM t", 1),
+            vec![Safety::Unknown]
+        );
+    }
+
+    /// Regression for a hole found by adversarial review rather than by a test.
+    ///
+    /// `date_part`/`extract` do not coarsen, they extract a component, and the
+    /// component is an argument. Through a `date-year` masked column,
+    /// `date_part('epoch', birth_date)` returned the exact date and
+    /// `date_part('day', …)` returned precisely what the mask hides.
+    #[test]
+    fn component_extraction_is_never_released() {
+        for sql in [
+            "SELECT date_part('epoch', birth_date) FROM t",
+            "SELECT date_part('day', birth_date) FROM t",
+            "SELECT extract(epoch from birth_date) FROM t",
+            "SELECT extract(day from birth_date) FROM t",
+            "SELECT width_bucket(salary, 0, 1000000, 1000000) FROM t",
+        ] {
+            assert_eq!(
+                safety(sql, 1),
+                vec![Safety::Unknown],
+                "{sql} recovers detail the mask removed"
+            );
+        }
+    }
+
+    /// `date_trunc` is released only to a coarse *literal* precision. The unit is
+    /// an argument, so a fine one coarsens nothing.
+    #[test]
+    fn date_trunc_is_released_only_at_coarse_literal_precision() {
+        for unit in ["day", "month", "quarter", "year"] {
+            assert_eq!(
+                safety(
+                    &format!("SELECT date_trunc('{unit}', birth_date) FROM t"),
+                    1
+                ),
+                vec![Safety::Releasable],
+                "{unit} should be coarse enough"
+            );
+        }
+        for unit in ["microseconds", "milliseconds", "second", "minute", "hour"] {
+            assert_eq!(
+                safety(
+                    &format!("SELECT date_trunc('{unit}', birth_date) FROM t"),
+                    1
+                ),
+                vec![Safety::Unknown],
+                "{unit} coarsens too little"
+            );
+        }
+        // A computed precision cannot be checked, so it fails closed.
+        assert_eq!(
+            safety("SELECT date_trunc(some_unit, birth_date) FROM t", 1),
             vec![Safety::Unknown]
         );
     }
