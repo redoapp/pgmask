@@ -270,6 +270,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "classify"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "pgmask",
+ "regex",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

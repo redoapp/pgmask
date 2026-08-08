@@ -34,17 +34,22 @@ HINT:  Select the underlying column directly. Expressions, set operations
 | Catalog freshness + rejection metrics | done |
 | Per-principal policy, semantic types, type-aware masks | done |
 | Validated against a real database | done ([Neon run](examples/neon/README.md)) |
-| **Phase 1 — classification catalog + CI gate** | **open, and the largest item left** |
+| Phase 1 — catalog discovery (`crates/classify`) | done ([what it found](docs/classification.md)) |
+| **Phase 1 — CI gate on catalog drift** | **open, and the largest item left** |
 | Phase 6 — parser rules | open; priority revised by measurement, not guesswork |
 
-117 assertions across five suites: 55 unit, 18 adversarial, 8 resilience, 7 TLS,
-29 demo. The adversarial suite drives a raw wire client and asserts no sentinel
-byte ever crosses the boundary.
+209 assertions across seven suites: 163 cargo (89 unit, 30 property, 23
+adversarial, 13 classification, 8 resilience), 39 demo, 7 TLS. The adversarial
+suite drives a raw wire client and asserts no sentinel byte ever crosses the
+boundary.
 
-**What to do next, in order.** Phase 1 is the gate on this being useful — the
-enforcement mechanism is in good shape and the policy it enforces still has to
-be written. Then decide Phase 6 from the measured causes (aggregates first, not
-set operations). The limits below are real and unchanged.
+**What to do next, in order.** The catalog is no longer hand-written —
+`classify` proposes one and names what it cannot decide, and on TPC-DS it found
+46 sensitive columns a hand-written catalog had missed, including every
+special-category demographic column. What is still missing is the **CI gate**: a
+column added tomorrow is masked by default-deny but appears in no report until
+somebody re-runs the tool. Then decide Phase 6 from the measured causes
+(aggregates first, not set operations). The limits below are real and unchanged.
 
 ## How it works
 

@@ -187,6 +187,44 @@ e1="$(proxied 'SELECT email FROM demo.customers WHERE id = 1;')"
 e2="$(proxied 'SELECT email FROM demo.customer_directory WHERE id = 1;')"
 check "10. same semantic type pseudonymises alike across relations" "$e1" "$e2"
 
+# 11 — Phase 1: the catalog the classifier writes must actually work.
+# Hand-writing the catalog is the part nothing else checks, so this closes the
+# loop: generate one, run pgmask against it, and confirm it masks.
+echo
+echo "generated catalog"
+echo "-----------------------"
+DSN="postgres://postgres:demo@localhost:$PG_PORT/demo" \
+  ./target/release/classify --schema demo --sample 200 >/tmp/pgmask-generated.toml 2>/tmp/pgmask-classify.log
+{
+  echo "listen = \"127.0.0.1:6455\""
+  echo "backend = \"127.0.0.1:$PG_PORT\""
+  echo "catalog_dsn = \"postgres://postgres:demo@localhost:$PG_PORT/demo\""
+  echo "pseudonym_key = \"generated-catalog-smoke-test\""
+  echo "unclassified = \"mask\""
+  echo "unclassified_mask = \"null\""
+  echo "opaque = \"reject\""
+  cat /tmp/pgmask-generated.toml
+} > /tmp/pgmask-generated-full.toml
+
+check "11a. classify names the columns a human must decide on" \
+  "customers.name" "$(cat /tmp/pgmask-classify.log)"
+# The tool reads real values to confirm its guesses. Neither output may carry
+# one back out — that would make the discovery step its own disclosure.
+refute "11b. ...without echoing a sampled value to the report" \
+  "user1@example.com" "$(cat /tmp/pgmask-classify.log)"
+refute "11c. ...or into the catalog it writes" \
+  "user1@example.com" "$(cat /tmp/pgmask-generated.toml)"
+
+./target/release/pgmask /tmp/pgmask-generated-full.toml >/tmp/pgmask-generated.log 2>&1 &
+GEN_PID=$!
+sleep 2
+gen() { psql -h localhost -p 6455 -U postgres -d demo -tAq -c "$1" 2>&1; }
+genrow="$(gen 'SELECT email, name, last_ip FROM demo.customers WHERE id = 1;')"
+check  "11d. pgmask loads the generated catalog and serves"  "***"              "$genrow"
+refute "11e. ...masking the address it discovered"           "user1@example.com" "$genrow"
+check  "11f. ...and the IP it discovered"                    "203.0.113.0"      "$(gen 'SELECT last_ip FROM demo.customers WHERE id = 100;')"
+kill "$GEN_PID" 2>/dev/null
+
 echo
 echo "-----------------------"
 printf 'passed %d, failed %d\n' "$pass" "$fail"

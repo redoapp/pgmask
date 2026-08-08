@@ -138,3 +138,19 @@ Set operations scored 7% on our hand-written corpus and 0% on the first TPC-DS
 run, because everything died on aggregates before reaching them. They are now
 the main cost. Fixing the top cause reveals the next one, and a measured
 priority is only ever valid for the current top.
+
+## Follow-up: what the hand-written catalog had missed
+
+The catalog used above was written by hand and covered **12** columns. Running
+`crates/classify` over the same 429-column schema proposed **58** — and the
+delta was not padding. It found four `*_street/city/county/state/zip` blocks
+beyond `customer_address`, every `*_manager` employee name, both income-band
+columns, and all four `customer_demographics` special-category columns
+(`cd_gender`, `cd_marital_status`, `cd_education_status`, `cd_credit_rating`),
+none of which the hand-written catalog had.
+
+Reviewing 429 columns by hand is the kind of task that gets done once, badly,
+and never revisited. The same run also broke four of the classifier's own rules
+— including an unanchored `ip_addr` pattern that matched `cs_sh|ip_addr|_sk` and
+proposed an IP mask for an integer surrogate key. All four are pinned by tests
+now. Details in [`docs/classification.md`](../../docs/classification.md).
