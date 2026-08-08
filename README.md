@@ -36,7 +36,7 @@ HINT:  Select the underlying column directly. Expressions, set operations
 | Validated against a real database | done ([Neon run](examples/neon/README.md)) |
 | Phase 1 — catalog discovery (`crates/classify`) | done ([what it found](docs/classification.md)) |
 | GUI clients — Harlequin, Beekeeper's stack, psql `\d` | done, opt-in ([how](docs/gui-clients.md)) |
-| **Phase 1 — CI gate on catalog drift** | **open, and the largest item left** |
+| `classify --check` — exit non-zero on unclassified columns | open, small |
 | Phase 6 — parser rules | open; priority revised by measurement, not guesswork |
 
 246 assertions across eight suites: 179 cargo (101 unit, 30 property, 23
@@ -44,13 +44,28 @@ adversarial, 13 classification, 8 resilience, 4 differential), 60 demo, 7 TLS. T
 suite drives a raw wire client and asserts no sentinel byte ever crosses the
 boundary.
 
-**What to do next, in order.** The catalog is no longer hand-written —
-`classify` proposes one and names what it cannot decide, and on TPC-DS it found
-46 sensitive columns a hand-written catalog had missed, including every
-special-category demographic column. What is still missing is the **CI gate**: a
-column added tomorrow is masked by default-deny but appears in no report until
-somebody re-runs the tool. Then decide Phase 6 from the measured causes
-(aggregates first, not set operations). The limits below are real and unchanged.
+### Who owns what
+
+**The catalog belongs to whoever deploys this, not to pgmask.** They know which
+of their columns are sensitive; we do not, and a proxy that shipped opinions
+about someone else's schema would be wrong more often than useful.
+
+What pgmask owes them instead:
+
+- **A safe default.** An unclassified column is masked, so a catalog that is
+  incomplete costs utility, never exposure.
+- **Tools to build and keep the catalog.** `classify` reads a live schema and
+  proposes one, naming what it cannot decide rather than guessing — on TPC-DS it
+  surfaced 46 sensitive columns a hand-written catalog had missed, including
+  every special-category demographic column.
+- **Loud misconfiguration.** Unknown config keys are refused, degenerate mask
+  parameters are refused, and a classification that stops resolving logs a
+  warning rather than silently ceasing to mask.
+
+**What to do next.** `classify --check`, so operators can gate their own CI on
+their own catalog, then Phase 6 lineage — measured at converting about a third
+of refusals, see [docs/lineage-estimate.md](docs/lineage-estimate.md). The
+limits below are real and unchanged.
 
 ## How it works
 
