@@ -78,6 +78,13 @@ Coverage across all suites is 79%, with the modules that decide masking highest:
   synthetic fixture, and one read-only database branch. No soak test.
 - **26% of TPC-DS is still refused**, even with lineage on. Row-level lookup
   work is comfortable; heavy analytical SQL is not.
+- **Masked values do not round-trip.** Masking happens on the way out only;
+  pasting a pseudonym back into a `WHERE` clause matches nothing. Join on the
+  key inside one query, or filter by the real value. Making it round-trip needs
+  inbound SQL rewriting and a reversible tokeniser, which is a different
+  security posture, not a small change.
+- **Changing the catalog needs a restart.** OIDs refresh on a timer; the file
+  is read once at boot. No `SIGHUP` reload.
 - **`min()`/`max()` over an explicitly released column are refused.** Correct in
   general, over-strict here, and unfixed.
 - **DBeaver and DataGrip have not been driven** — only their query shapes and,

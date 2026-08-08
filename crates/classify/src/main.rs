@@ -172,6 +172,28 @@ fn width_permits(semantic_type: &str, max_length: Option<i32>) -> bool {
     len >= shortest
 }
 
+/// The config name of a mask, matching the strings `mask_fits` expects and the
+/// kebab-case serde uses in the catalog file.
+fn mask_name(mask: &pgmask::mask::Mask) -> &'static str {
+    use pgmask::mask::Mask;
+    match mask {
+        Mask::None => "none",
+        Mask::Null => "null",
+        Mask::Redact => "redact",
+        Mask::Partial => "partial",
+        Mask::Inner => "inner",
+        Mask::Outer => "outer",
+        Mask::Range => "range",
+        Mask::Hash => "hash",
+        Mask::Pseudonym => "pseudonym",
+        Mask::DateYear => "date-year",
+        Mask::DateMonth => "date-month",
+        Mask::NumericBucket => "numeric-bucket",
+        Mask::IpPrefix => "ip-prefix",
+        Mask::Scrub => "scrub",
+    }
+}
+
 /// Whether a proposed mask can actually apply to this column's type.
 ///
 /// Found by running this against TPC-DS, which has `c_birth_year` as an
@@ -332,6 +354,51 @@ fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
     let config =
         pgmask::catalog::Config::load(path).with_context(|| format!("loading catalog {path}"))?;
 
+    // Every rule's effective mask, and every column's current type, so a
+    // migration that changes a type fails the build instead of refusing
+    // queries in production. A `date-year` mask on a column that became `text`
+    // is not a coverage gap — it is an outage waiting for the first SELECT.
+    let mut mask_of_type: BTreeMap<&str, &pgmask::mask::Mask> = BTreeMap::new();
+    for t in &config.semantic_type {
+        mask_of_type.insert(t.name.as_str(), &t.mask);
+    }
+    let live_type: BTreeMap<(String, String), &str> = proposals
+        .iter()
+        .map(|p| {
+            (
+                (
+                    format!("{}.{}", p.column.schema, p.column.table),
+                    p.column.name.clone(),
+                ),
+                p.column.data_type.as_str(),
+            )
+        })
+        .collect();
+
+    let mut incompatible: Vec<(String, String, String, String)> = Vec::new();
+    for rule in &config.column {
+        let key = (rule.relation.clone(), rule.column.clone());
+        let Some(data_type) = live_type.get(&key) else {
+            continue; // reported as a stale rule below
+        };
+        let effective = rule.mask.as_ref().or_else(|| {
+            rule.semantic_type
+                .as_deref()
+                .and_then(|t| mask_of_type.get(t).copied())
+        });
+        if let Some(mask) = effective {
+            let name = mask_name(mask);
+            if !mask_fits(name, data_type) {
+                incompatible.push((
+                    rule.relation.clone(),
+                    rule.column.clone(),
+                    name.to_string(),
+                    (*data_type).to_string(),
+                ));
+            }
+        }
+    }
+
     let live: BTreeSet<(String, String)> = proposals
         .iter()
         .map(|p| {
@@ -390,7 +457,17 @@ fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
         }
     }
 
-    if unclassified.is_empty() && stale.is_empty() {
+    if !incompatible.is_empty() {
+        println!(
+            "\n{} rule(s) name a mask the column's current type cannot take. This is\nnot a coverage gap — the proxy refuses these result sets at runtime:",
+            incompatible.len()
+        );
+        for (relation, column, mask, data_type) in &incompatible {
+            println!("  {relation}.{column}  mask `{mask}` vs {data_type}");
+        }
+    }
+
+    if unclassified.is_empty() && stale.is_empty() && incompatible.is_empty() {
         println!("\nevery column has a rule and every rule matches. no drift.");
         return Ok(());
     }

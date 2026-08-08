@@ -178,6 +178,13 @@ coverage warnings.
 
 ## Operating it
 
+Config, migrations and deploy ordering: [docs/operations.md](docs/operations.md).
+The short version — there is no unsafe deploy ordering, config and migration can
+land in either order, and `classify --check` turns every kind of schema drift
+into a build failure including a column type change, which is the one that
+otherwise surfaces as a production outage.
+
+
 Logs are `tracing`, structured, on stderr, filtered by `PGMASK_LOG` (falling
 back to `RUST_LOG`, defaulting to `info`). Each connection gets a span, so every
 line it emits carries its peer:
