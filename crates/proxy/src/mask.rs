@@ -43,6 +43,32 @@ pub const OID_UUID: u32 = 2950;
 pub const OID_INET: u32 = 869;
 pub const OID_CIDR: u32 = 650;
 
+/// The 16 bytes a uuid denotes, whatever form it arrived in.
+///
+/// Binary is already those bytes. Text is 32 hex digits with hyphens wherever
+/// the sender chose to put them — Postgres emits the canonical 8-4-4-4-12, but
+/// accepting any placement costs nothing and refusing a well-formed value would
+/// turn a mask into an outage.
+fn canonical_uuid(bytes: &[u8], format: i16) -> Option<[u8; 16]> {
+    if format == FORMAT_BINARY {
+        return <[u8; 16]>::try_from(bytes).ok();
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut out = [0u8; 16];
+    let mut nibbles = text.chars().filter(|c| *c != '-');
+    for byte in &mut out {
+        let hi = nibbles.next()?.to_digit(16)?;
+        let lo = nibbles.next()?.to_digit(16)?;
+        *byte = u8::try_from(hi * 16 + lo).ok()?;
+    }
+    // Anything left over is not a uuid, and guessing would mask two different
+    // values to the same pseudonym.
+    if nibbles.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
 /// Fixed pseudonym width, in hex characters. 64 bits.
 const PSEUDONYM_HEX_CHARS: usize = 16;
 
@@ -291,15 +317,26 @@ impl Masker {
         format: i16,
         bytes: &Bytes,
     ) -> Result<Bytes, MaskError> {
-        let digest = self.digest(spec, bytes);
-
         if type_oid == OID_UUID {
+            // Hash the canonical 16 bytes, never the wire bytes.
+            //
+            // A uuid is 16 raw bytes in binary and 36 hyphenated characters in
+            // text, so digesting the wire form gave the same row two different
+            // pseudonyms depending on the client's protocol. psql and pgx
+            // reading the same column could not be joined to each other, which
+            // defeats the point of deterministic pseudonymisation. Found by the
+            // first end-to-end test that asked for binary results.
+            let canonical =
+                canonical_uuid(bytes, format).ok_or(MaskError::Undecodable { type_oid, format })?;
+            let digest = self.digest(spec, &Bytes::copy_from_slice(&canonical));
             return Ok(if format == FORMAT_BINARY {
                 Bytes::copy_from_slice(&uuid_bytes(&digest))
             } else {
                 Bytes::from(uuid_text(&uuid_bytes(&digest)))
             });
         }
+
+        let digest = self.digest(spec, bytes);
 
         let text = String::from_utf8_lossy(bytes);
         let as_email = text
@@ -1192,5 +1229,70 @@ mod tests {
             text.parse::<rust_decimal::Decimal>().is_ok(),
             "must still be a numeric literal: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod uuid_format_tests {
+    use super::*;
+
+    const RAW: [u8; 16] = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x03,
+    ];
+
+    #[test]
+    fn a_uuid_pseudonymises_identically_in_both_wire_formats() {
+        // The bug this pins: digesting the wire bytes gave psql and a binary
+        // driver different pseudonyms for the same row, so masked data could
+        // not be joined across clients.
+        let masker = Masker::new(b"k".to_vec());
+        let spec = MaskSpec::new(Mask::Pseudonym);
+
+        let from_binary = masker
+            .apply(
+                &spec,
+                OID_UUID,
+                FORMAT_BINARY,
+                Some(Bytes::copy_from_slice(&RAW)),
+            )
+            .expect("binary masks")
+            .expect("not null");
+        let from_text = masker
+            .apply(
+                &spec,
+                OID_UUID,
+                FORMAT_TEXT,
+                Some(Bytes::from(uuid_text(&RAW))),
+            )
+            .expect("text masks")
+            .expect("not null");
+
+        let binary_as_text = uuid_text(&<[u8; 16]>::try_from(&from_binary[..]).expect("16 bytes"));
+        assert_eq!(
+            binary_as_text,
+            String::from_utf8_lossy(&from_text),
+            "the same uuid must pseudonymise to the same value in either format"
+        );
+    }
+
+    #[test]
+    fn uppercase_and_hyphenless_text_uuids_canonicalise_the_same() {
+        let canonical = canonical_uuid(uuid_text(&RAW).as_bytes(), FORMAT_TEXT);
+        let upper = canonical_uuid(uuid_text(&RAW).to_uppercase().as_bytes(), FORMAT_TEXT);
+        let bare = canonical_uuid(uuid_text(&RAW).replace('-', "").as_bytes(), FORMAT_TEXT);
+        assert_eq!(canonical, Some(RAW));
+        assert_eq!(upper, Some(RAW));
+        assert_eq!(bare, Some(RAW));
+    }
+
+    #[test]
+    fn a_malformed_uuid_is_refused_rather_than_guessed() {
+        assert_eq!(canonical_uuid(b"not-a-uuid", FORMAT_TEXT), None);
+        assert_eq!(canonical_uuid(b"", FORMAT_TEXT), None);
+        // Too many digits: truncating would map two values to one pseudonym.
+        let long = format!("{}00", uuid_text(&RAW));
+        assert_eq!(canonical_uuid(long.as_bytes(), FORMAT_TEXT), None);
+        assert_eq!(canonical_uuid(&RAW[..15], FORMAT_BINARY), None);
     }
 }

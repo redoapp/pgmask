@@ -82,6 +82,24 @@ fi
 echo "    $(grep -o 'must fire on this run ([0-9]*' /tmp/poison.out | grep -o '[0-9]*') leaks detected, as required"
 kill "$POISON_PID" 2>/dev/null; POISON_PID=""
 
+# --- 1b. Binary result format ------------------------------------------------
+# Everything else here speaks the simple query protocol, which is text-only.
+# Coverage showed no end-to-end suite had ever asked for binary results, and the
+# first one that did found two bugs.
+echo "==> binary result format"
+sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$POISON_PORT\"|" \
+    -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-binary.toml
+./target/release/pgmask /tmp/pgmask-binary.toml >/tmp/pgmask-binary.log 2>&1 &
+BIN_PID=$!
+sleep 2
+if ! DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb" \
+     PROXY_URL="postgres://postgres:demo@localhost:$POISON_PORT/fuzzdb" \
+     ./target/release/binary; then
+  kill "$BIN_PID" 2>/dev/null
+  exit 1
+fi
+kill "$BIN_PID" 2>/dev/null
+
 # --- 2. Generate corpora in parallel ----------------------------------------
 echo "==> generating $SEEDS x $PER_SEED statements ($PARALLEL at a time)"
 # Wait only on jobs we started here. A bare `wait` also waits for the proxy,

@@ -453,7 +453,27 @@ impl Session {
                         .insert(portal.clone(), statement.clone());
                     match self.statement_plans.get(&statement) {
                         Some(plan) => {
-                            self.portal_plans.insert(portal, plan.clone());
+                            // Re-stamp the plan with the formats this Bind
+                            // actually asked for. The plan was built from a
+                            // Describe(Statement), where every field reads as
+                            // text because the client had not chosen yet.
+                            let formats = protocol::parse_bind_result_formats(&msg.body);
+                            let plan = match formats {
+                                Some(formats) => Arc::new(
+                                    plan.iter()
+                                        .enumerate()
+                                        .map(|(i, field)| FieldPlan {
+                                            format: protocol::format_for(&formats, i),
+                                            ..field.clone()
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                                // Unparseable Bind: keep the plan as described
+                                // rather than guessing. A wrong format fails to
+                                // decode, which refuses the result set.
+                                None => plan.clone(),
+                            };
+                            self.portal_plans.insert(portal, plan);
                         }
                         None => {
                             self.portal_plans.remove(&portal);

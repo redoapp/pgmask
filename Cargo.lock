@@ -699,8 +699,10 @@ name = "fuzz"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "jiff",
  "tokio",
  "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]
@@ -1451,6 +1453,7 @@ dependencies = [
  "fallible-iterator",
  "jiff",
  "postgres-protocol",
+ "uuid",
 ]
 
 [[package]]

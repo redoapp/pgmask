@@ -254,6 +254,22 @@ fn try_take_startup(buf: &mut BytesMut) -> Result<Option<StartupPacket>> {
     }))
 }
 
+/// Length-checked, so a truncated or hostile frame returns `None` rather than
+/// panicking on a slice out of range.
+fn read_i16(buf: &mut Bytes) -> Option<i16> {
+    if buf.len() < 2 {
+        return None;
+    }
+    Some(buf.get_i16())
+}
+
+fn read_i32(buf: &mut Bytes) -> Option<i32> {
+    if buf.len() < 4 {
+        return None;
+    }
+    Some(buf.get_i32())
+}
+
 pub fn read_cstring(buf: &mut Bytes) -> Option<String> {
     let end = buf.iter().position(|b| *b == 0)?;
     let s = String::from_utf8_lossy(&buf[..end]).into_owned();
@@ -526,6 +542,57 @@ pub fn parse_bind(body: &Bytes) -> Option<(String, String)> {
     let portal = read_cstring(&mut buf)?;
     let statement = read_cstring(&mut buf)?;
     Some((portal, statement))
+}
+
+/// Result format codes from a `Bind`.
+///
+/// **These, not the `RowDescription`, decide how row values are encoded.**
+/// `Describe(Statement)` reports every field as format 0, because the client
+/// has not chosen yet — the choice is made at `Bind`. A plan that took the
+/// format from the description therefore believed "text" while a driver
+/// requesting binary sent four-byte dates, and masking failed on every one.
+///
+/// Layout after the two cstrings:
+/// `[i16 n_param_formats][i16 * n][i16 n_params][(i32 len + bytes) * n]
+///  [i16 n_result_formats][i16 * n]`
+///
+/// Per the protocol, `n_result_formats` of 0 means "all text" and 1 means "this
+/// one code applies to every column".
+pub fn parse_bind_result_formats(body: &Bytes) -> Option<Vec<i16>> {
+    let mut buf = body.clone();
+    let _portal = read_cstring(&mut buf)?;
+    let _statement = read_cstring(&mut buf)?;
+
+    let n_param_formats = read_i16(&mut buf)?;
+    for _ in 0..n_param_formats.max(0) {
+        read_i16(&mut buf)?;
+    }
+    let n_params = read_i16(&mut buf)?;
+    for _ in 0..n_params.max(0) {
+        let len = read_i32(&mut buf)?;
+        if len > 0 {
+            let len = usize::try_from(len).ok()?;
+            if buf.len() < len {
+                return None;
+            }
+            let _ = buf.split_to(len);
+        }
+    }
+    let n_result_formats = read_i16(&mut buf)?;
+    let mut formats = Vec::new();
+    for _ in 0..n_result_formats.max(0) {
+        formats.push(read_i16(&mut buf)?);
+    }
+    Some(formats)
+}
+
+/// The format for output field `index`, given a `Bind`'s result format codes.
+pub fn format_for(formats: &[i16], index: usize) -> i16 {
+    match formats.len() {
+        0 => 0,
+        1 => formats[0],
+        _ => formats.get(index).copied().unwrap_or(0),
+    }
 }
 
 /// A simple `Query` is a single cstring.
