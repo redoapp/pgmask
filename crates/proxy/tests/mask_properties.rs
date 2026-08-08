@@ -354,3 +354,29 @@ fn timezone_suffixes_survive_truncation() {
         );
     }
 }
+
+/// The day domain of a `date` column is far wider than any real date, and the
+/// truncated value has to stay inside it.
+#[test]
+fn date_truncation_at_the_day_extremes_stays_in_range() {
+    for days in [i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1, 0, -1] {
+        for kind in [Mask::DateYear, Mask::DateMonth] {
+            let out = mask_binary(&spec(kind), OID_DATE, days.to_be_bytes().to_vec());
+            if let Some(out) = out {
+                assert_eq!(out.len(), 4, "date must stay four bytes at {days}");
+            }
+        }
+    }
+}
+
+/// Flooring near `f32::MIN` must not push the result to negative infinity.
+#[test]
+fn float4_bucketing_stays_finite() {
+    let mut s = spec(Mask::NumericBucket);
+    s.bucket = 1000;
+    for v in [f32::MIN, f32::MAX, -0.0f32, 0.0f32] {
+        let out = mask_binary(&s, OID_FLOAT4, v.to_be_bytes().to_vec()).expect("value");
+        let got = f32::from_be_bytes([out[0], out[1], out[2], out[3]]);
+        assert!(got.is_finite(), "{v} bucketed to {got}");
+    }
+}

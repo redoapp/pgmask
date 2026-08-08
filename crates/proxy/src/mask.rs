@@ -13,6 +13,11 @@
 //! masks work in both. Everything else needs per-format handling, and each mask
 //! declares exactly what it can do in `MaskSpec::supports`.
 
+// Narrowing casts are how `-1` became `32767`: an i64 bucket floor wrapped on
+// the way into an i16. Every remaining cast in this module is either clamped
+// first or bounded by the algorithm around it, and a new one has to say which.
+#![deny(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -431,6 +436,10 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// The inverse.
+///
+/// `d` and `m` are bounded to [1, 31] and [1, 12] by the algorithm, which the
+/// lint cannot see.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -488,8 +497,13 @@ fn truncate_date(
             }
             let days = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64;
             let (y, m, _) = civil_from_days(days + PG_EPOCH_DAYS);
+            // Clamped for the same reason the timestamp path saturates: the
+            // day domain is wider than the truncated value is guaranteed to be,
+            // and a wrapping cast moves the date instead of coarsening it.
             let truncated = days_from_civil(y, if to_month { m } else { 1 }, 1) - PG_EPOCH_DAYS;
-            Ok(Bytes::copy_from_slice(&(truncated as i32).to_be_bytes()))
+            let truncated = i32::try_from(truncated.clamp(i32::MIN as i64, i32::MAX as i64))
+                .expect("clamped into range on the line above");
+            Ok(Bytes::copy_from_slice(&truncated.to_be_bytes()))
         }
         OID_TIMESTAMP | OID_TIMESTAMPTZ => {
             if bytes.len() != 8 {
@@ -553,12 +567,14 @@ fn bucket_number(
         OID_INT2 if bytes.len() == 2 => {
             let v = i16::from_be_bytes([bytes[0], bytes[1]]) as i64;
             let out = floor_within(v, bucket, i16::MIN as i64, i16::MAX as i64);
-            Ok(Bytes::copy_from_slice(&(out as i16).to_be_bytes()))
+            let out = i16::try_from(out).expect("clamped into range above");
+            Ok(Bytes::copy_from_slice(&out.to_be_bytes()))
         }
         OID_INT4 if bytes.len() == 4 => {
             let v = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64;
             let out = floor_within(v, bucket, i32::MIN as i64, i32::MAX as i64);
-            Ok(Bytes::copy_from_slice(&(out as i32).to_be_bytes()))
+            let out = i32::try_from(out).expect("clamped into range above");
+            Ok(Bytes::copy_from_slice(&out.to_be_bytes()))
         }
         OID_INT8 if bytes.len() == 8 => {
             let mut raw = [0u8; 8];
@@ -569,9 +585,14 @@ fn bucket_number(
         OID_FLOAT4 if bytes.len() == 4 => {
             let v = f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64;
             let b = bucket as f64;
-            Ok(Bytes::copy_from_slice(
-                &(((v / b).floor() * b) as f32).to_be_bytes(),
-            ))
+            // Flooring a float4 near its minimum can push the result past what
+            // an f32 holds, turning a masked value into -inf.
+            let bucketed = ((v / b).floor() * b).clamp(f32::MIN as f64, f32::MAX as f64);
+            // Clamped into f32's range immediately above; floats have no
+            // TryFrom, so the intent is stated rather than checked.
+            #[allow(clippy::cast_possible_truncation)]
+            let narrowed = bucketed as f32;
+            Ok(Bytes::copy_from_slice(&narrowed.to_be_bytes()))
         }
         OID_FLOAT8 if bytes.len() == 8 => {
             let mut raw = [0u8; 8];
@@ -920,7 +941,7 @@ mod tests {
     fn date_truncation_in_binary_matches_text() {
         let m = masker();
         // 2024-03-15 as days since 2000-01-01.
-        let days = (days_from_civil(2024, 3, 15) - PG_EPOCH_DAYS) as i32;
+        let days = i32::try_from(days_from_civil(2024, 3, 15) - PG_EPOCH_DAYS).unwrap();
         let out = m
             .apply(
                 &spec(Mask::DateYear),

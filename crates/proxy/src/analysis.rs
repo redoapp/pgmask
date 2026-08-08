@@ -93,10 +93,14 @@ const REDUCING_AGGREGATES: &[&str] = &[
     "bool_and",
     "bool_or",
     "every",
-    "bit_and",
-    "bit_or",
-    "bit_xor",
 ];
+
+// Deliberately absent from REDUCING_AGGREGATES, having been in it:
+//
+//   bit_and / bit_or / bit_xor — technically reductions, but far leakier per
+//   group than the numeric summaries. `bit_or` over a handful of integers
+//   reveals every bit set in any member. They are vanishingly rare over
+//   classified columns, so the utility given up is nil.
 
 /// Aggregates and window functions that **return one of the input values**, and
 /// are therefore exactly what this module must keep refusing.
