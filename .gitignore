@@ -1,4 +1,9 @@
 /target
+
+# Coverage artifacts. `cargo llvm-cov show-env` writes these into the repo
+# root, so they need ignoring or they get swept up by `git add -A`.
+*.profraw
+*.profdata
 node_modules/
 *.log
 

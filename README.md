@@ -5,17 +5,17 @@ pgmask instead of the database; it rewrites sensitive column values in result se
 according to a policy catalog, and refuses anything it cannot classify.
 
 ```
-$ psql -p 55432 -c 'SELECT id, email, name, phone, city, internal_note FROM demo.customers LIMIT 2'
+$ psql -p 55432 -c 'SELECT id, email, name, phone, city, internal_note FROM demo.customers ORDER BY id LIMIT 2'
  id |       email       |    name    |  phone   |  city  | internal_note
 ----+-------------------+------------+----------+--------+---------------
   1 | user1@example.com | Customer 1 | 555-0101 | Denver | note 1
   2 | user2@example.com | Customer 2 | 555-0102 | Austin | note 2
 
-$ psql -p 6432 -c 'SELECT id, email, name, phone, city, internal_note FROM demo.customers LIMIT 2'
- id |          email           | name |  phone   |  city  | internal_note
-----+--------------------------+------+----------+--------+---------------
-  1 | e4ad0ccc6148@example.com | ***  | ****0101 | Denver |
-  2 | 05045c648bac@example.com | ***  | ****0102 | Austin |
+$ psql -p 6432 -c 'SELECT id, email, name, phone, city, internal_note FROM demo.customers ORDER BY id LIMIT 2'
+ id |               email               | name |  phone   |  city  | internal_note
+----+-----------------------------------+------+----------+--------+---------------
+  1 | c22b1ef44518c300@8dedb655.invalid | ***  | ****0101 | Denver |
+  2 | c8080392aa49c538@8dedb655.invalid | ***  | ****0102 | Austin |
 
 $ psql -p 6432 -c 'SELECT lower(email) FROM demo.customers'
 ERROR:  pgmask: output column "lower" has no column provenance, so it cannot be classified
@@ -23,6 +23,13 @@ HINT:  Select the underlying column directly. Expressions, set operations
        (UNION/INTERSECT/EXCEPT), recursive CTEs and SETOF-returning functions
        all erase provenance.
 ```
+
+The address is pseudonymised on both sides of the `@`: the local part alone is
+not the identifying half of a work address, and the domain names an employer.
+Both map deterministically, so the same person is the same pseudonym everywhere
+and "group by employer" still works without naming one.
+
+**v0.1.0** — see [CHANGELOG.md](CHANGELOG.md) for what is and is not done.
 
 ## Where this stands
 
