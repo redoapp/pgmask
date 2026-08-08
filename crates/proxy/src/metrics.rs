@@ -124,7 +124,43 @@ impl Cause {
     }
 }
 
+/// Register the Prometheus metric names and their help text.
+///
+/// Called once at startup when an exporter is configured. Describing them up
+/// front means a metric that has not fired yet still appears in the scrape with
+/// its documentation, rather than materialising the first time something goes
+/// wrong — which is exactly when you do not want to be guessing what it means.
+pub fn describe() {
+    metrics::describe_counter!(
+        "pgmask_result_sets_masked_total",
+        "Result sets in which at least one field was masked"
+    );
+    metrics::describe_counter!(
+        "pgmask_fields_masked_total",
+        "Columns carrying a mask, summed over result sets — not values rewritten"
+    );
+    metrics::describe_counter!(
+        "pgmask_values_masked_total",
+        "Individual values rewritten by a mask, summed over sessions"
+    );
+    metrics::describe_counter!("pgmask_sessions_total", "Client connections closed");
+    metrics::describe_counter!(
+        "pgmask_rejections_total",
+        "Result sets refused, labelled by cause"
+    );
+    metrics::describe_counter!(
+        "pgmask_fields_rescued_total",
+        "Opaque fields released as provably carrying no column value; each is a rejection that did not happen"
+    );
+}
+
 /// Process-wide counters. Cheap enough to touch on every rejection.
+///
+/// These atomics stay even though every event is also emitted to the `metrics`
+/// crate, because the two answer different questions. The `metrics` crate has
+/// no read-back API, and the periodic summary line must work when no exporter
+/// is configured — which is the common case for a local run, and how the
+/// rejection-cause question got answered in the first place.
 #[derive(Debug, Default)]
 pub struct Metrics {
     counters: [AtomicU64; 11],
@@ -138,15 +174,35 @@ pub struct Metrics {
 impl Metrics {
     pub fn record(&self, cause: Cause) {
         self.counters[cause.index()].fetch_add(1, Ordering::Relaxed);
+        // A label rather than a metric per cause, so a new `Cause` variant
+        // needs no exporter change and queries can sum across causes.
+        metrics::counter!("pgmask_rejections_total", "cause" => cause.label()).increment(1);
     }
 
     pub fn record_rescued(&self) {
         self.fields_rescued.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("pgmask_fields_rescued_total").increment(1);
+    }
+
+    /// Emitted once per session rather than per value.
+    ///
+    /// The per-value site runs for every field of every row, and the `metrics`
+    /// macros do a registry lookup on each call. Benchmarking already showed
+    /// this proxy is syscall-bound, and adding a lookup to the innermost loop
+    /// to count something a session can total up itself is not a trade worth
+    /// making.
+    pub fn record_session_end(&self, values_masked: u64) {
+        metrics::counter!("pgmask_sessions_total").increment(1);
+        if values_masked > 0 {
+            metrics::counter!("pgmask_values_masked_total").increment(values_masked);
+        }
     }
 
     pub fn record_masked_result_set(&self, fields: u64) {
         self.result_sets_masked.fetch_add(1, Ordering::Relaxed);
         self.fields_masked.fetch_add(fields, Ordering::Relaxed);
+        metrics::counter!("pgmask_result_sets_masked_total").increment(1);
+        metrics::counter!("pgmask_fields_masked_total").increment(fields);
     }
 
     pub fn total_rejections(&self) -> u64 {
@@ -197,6 +253,20 @@ impl Metrics {
 mod tests {
     use super::*;
     use crate::mask::Mask;
+
+    #[test]
+    fn metric_help_text_survives_the_source_formatting() {
+        // A `\`-continued string literal keeps the indentation of the next
+        // line, and the run of spaces went out over the scrape endpoint. Cheap
+        // to assert, invisible until someone reads /metrics.
+        let source = include_str!("metrics.rs");
+        for line in source.lines() {
+            let line = line.trim();
+            if line.starts_with('"') && line.contains("  ") && !line.contains("//") {
+                panic!("collapsed whitespace in a string literal: {line}");
+            }
+        }
+    }
 
     fn snapshot_with(name: &str) -> Snapshot {
         let mut s = Snapshot::default();

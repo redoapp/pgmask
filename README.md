@@ -39,8 +39,8 @@ HINT:  Select the underlying column directly. Expressions, set operations
 | **Phase 1 — CI gate on catalog drift** | **open, and the largest item left** |
 | Phase 6 — parser rules | open; priority revised by measurement, not guesswork |
 
-237 assertions across eight suites: 178 cargo (100 unit, 30 property, 23
-adversarial, 13 classification, 8 resilience, 4 differential), 52 demo, 7 TLS. The adversarial
+246 assertions across eight suites: 179 cargo (101 unit, 30 property, 23
+adversarial, 13 classification, 8 resilience, 4 differential), 60 demo, 7 TLS. The adversarial
 suite drives a raw wire client and asserts no sentinel byte ever crosses the
 boundary.
 
@@ -107,6 +107,35 @@ PROXY_URL=postgres://postgres:demo@localhost:6432/demo \
   cargo run -p bench --release -- 10000 300
 ```
 
+## Operating it
+
+Logs are `tracing`, structured, on stderr, filtered by `PGMASK_LOG` (falling
+back to `RUST_LOG`, defaulting to `info`). Each connection gets a span, so every
+line it emits carries its peer:
+
+```
+INFO pgmask listening listen=127.0.0.1:6432 backend=127.0.0.1:55432 classified_columns=20 …
+WARN no tls_cert/tls_key — clients connect in plaintext, and a masking proxy reachable in plaintext is not a security boundary
+INFO session{peer=127.0.0.1:53295}: session closed user=postgres authenticated=true roles=0 masked_fields=10 rejected_result_sets=0
+```
+
+With `metrics_listen` set, `/metrics` serves Prometheus text. Rejection *causes*
+are a label rather than a metric each, so adding a cause needs no exporter
+change:
+
+```
+pgmask_rejections_total{cause="opaque_aggregate"} 1
+pgmask_rejections_total{cause="opaque_function"} 1
+pgmask_values_masked_total 10
+pgmask_fields_rescued_total 2
+pgmask_sessions_total 3
+```
+
+`pgmask_fields_masked_total` counts *columns carrying a mask* per result set;
+`pgmask_values_masked_total` counts values actually rewritten. Two assertions in
+`verify.sh` check that no metric or log line ever contains a column value or the
+pseudonym key.
+
 ## Configuration
 
 ```toml
@@ -125,7 +154,8 @@ backend_tls = "disable"           # disable | require — see the note below
 
 catalog_refresh_seconds     = 30  # OIDs are not stable across DDL
 catalog_refresh_min_seconds = 5   # floor on miss-triggered refreshes
-metrics_interval_seconds    = 60  # 0 disables
+metrics_interval_seconds    = 60  # summary log line; 0 disables
+metrics_listen = "127.0.0.1:9464"  # Prometheus /metrics; omit to open no port
 
 # Who is who. Members are usernames Postgres verified, never merely claimed.
 [[role]]

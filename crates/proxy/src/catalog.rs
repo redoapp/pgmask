@@ -10,9 +10,10 @@
 //! first time that happens: with `unclassified = "mask"` the columns quietly turn
 //! to NULL, and with `unclassified = "allow"` they quietly stop being masked.
 
+use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -276,6 +277,13 @@ pub struct Config {
     /// engine metadata, and it is what makes DBeaver and `\d` work.
     #[serde(default = "default_system_catalogs")]
     pub system_catalogs: SystemCatalogs,
+    /// `host:port` to serve Prometheus metrics on, e.g. `"127.0.0.1:9464"`.
+    ///
+    /// Absent means no endpoint is opened. Deliberately not defaulted to a
+    /// port: this process sits in front of sensitive data, and it should not
+    /// start listening on anything the operator did not ask for.
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
 }
 
 fn default_listen() -> String {
@@ -395,7 +403,11 @@ pub struct Catalog {
     rules: Vec<ColumnRule>,
     types: HashMap<String, SemanticType>,
     dsn: String,
-    snapshot: RwLock<Arc<Snapshot>>,
+    /// `ArcSwap` rather than `RwLock<Arc<_>>`: every result set takes this on
+    /// the hot path and the refresher writes it every 30 seconds, so readers
+    /// should not queue behind a writer. It also removes the poisoned-lock
+    /// `expect` from a path that must not panic mid-stream.
+    snapshot: ArcSwap<Snapshot>,
     /// Woken when the hot path sees a relation OID we do not recognise.
     refresh_wanted: Notify,
     pub refreshes: AtomicU64,
@@ -408,7 +420,7 @@ impl Default for Catalog {
             rules: Vec::new(),
             types: HashMap::new(),
             dsn: String::new(),
-            snapshot: RwLock::new(Arc::new(Snapshot::default())),
+            snapshot: ArcSwap::from_pointee(Snapshot::default()),
             refresh_wanted: Notify::new(),
             refreshes: AtomicU64::new(0),
             failed_refreshes: AtomicU64::new(0),
@@ -441,7 +453,7 @@ impl Catalog {
             rules: rules.to_vec(),
             types,
             dsn: dsn.to_string(),
-            snapshot: RwLock::new(Arc::new(resolved)),
+            snapshot: ArcSwap::from_pointee(resolved),
             ..Default::default()
         })
     }
@@ -449,14 +461,14 @@ impl Catalog {
     #[cfg(test)]
     pub fn from_snapshot_for_test(snapshot: Snapshot) -> Self {
         Self {
-            snapshot: RwLock::new(Arc::new(snapshot)),
+            snapshot: ArcSwap::from_pointee(snapshot),
             ..Default::default()
         }
     }
 
     /// A stable view for the duration of one `RowDescription`.
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        self.snapshot.read().expect("catalog lock poisoned").clone()
+        self.snapshot.load_full()
     }
 
     pub fn name_of(&self, table_oid: u32, column_id: i16) -> Option<String> {
@@ -492,9 +504,9 @@ impl Catalog {
                 // Deliberately keep the old snapshot. Clearing it would be
                 // fail-closed in the narrow sense and would mask every column in
                 // the database the moment Postgres blinked.
-                eprintln!(
-                    "catalog refresh FAILED, continuing with the previous snapshot \
-                     ({} classified columns): {err:#}",
+                tracing::error!(
+                    error = format!("{err:#}"),
+                    "catalog refresh failed, continuing with the previous snapshot ({} classified columns)",
                     previous.len()
                 );
                 return Err(err);
@@ -509,23 +521,22 @@ impl Catalog {
                     .map(|(key, _)| *key)
             };
             match (locate(&previous), locate(&next)) {
-                (Some(b), Some(a)) if b != a => eprintln!(
-                    "catalog: {} moved (oid.attnum {}.{} -> {}.{}) — relation recreated, \
-                     classification restored",
+                (Some(b), Some(a)) if b != a => tracing::info!(
+                    "catalog: {} moved (oid.attnum {}.{} -> {}.{}) — relation recreated, classification restored",
                     rule.display(),
                     b.0,
                     b.1,
                     a.0,
                     a.1
                 ),
-                (Some(b), None) => eprintln!(
-                    "catalog: COVERAGE LOST for {} (was oid.attnum {}.{}) — the relation or \
-                     column no longer exists; those values are now unclassified",
+                // Warn, not info: this is the shape of a silent unmasking.
+                (Some(b), None) => tracing::warn!(
+                    "catalog: coverage lost for {} (was oid.attnum {}.{}) — the relation or column no longer exists; those values are now unclassified",
                     rule.display(),
                     b.0,
                     b.1
                 ),
-                (None, Some(a)) => eprintln!(
+                (None, Some(a)) => tracing::info!(
                     "catalog: coverage restored for {} (oid.attnum {}.{})",
                     rule.display(),
                     a.0,
@@ -538,10 +549,10 @@ impl Catalog {
         let changed =
             next.by_column.len() != previous.by_column.len() || next.names != previous.names;
         let count = next.len();
-        *self.snapshot.write().expect("catalog lock poisoned") = Arc::new(next);
+        self.snapshot.store(Arc::new(next));
         self.refreshes.fetch_add(1, Ordering::Relaxed);
         if changed {
-            eprintln!("catalog refreshed: {count} classified column(s)");
+            tracing::debug!(classified_columns = count, "catalog refreshed");
         }
         Ok(())
     }
@@ -697,14 +708,14 @@ async fn resolve_snapshot(
     if let Some(note) = note {
         // Once per resolve is noisy; once per process would need state. The
         // refresh interval is minutes, so this is fine and stays visible.
-        eprintln!("catalog: {note}");
+        tracing::warn!("catalog: {note}");
     }
     let (client, connection) = tokio_postgres::connect(&dsn, connector)
         .await
         .context("connecting with catalog_dsn to resolve column OIDs")?;
     let handle = tokio::spawn(async move {
         if let Err(err) = connection.await {
-            eprintln!("catalog connection error: {err}");
+            tracing::warn!(error = %err, "catalog connection error");
         }
     });
 

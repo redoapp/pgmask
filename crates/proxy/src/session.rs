@@ -986,14 +986,18 @@ pub async fn handle_connection(
         }
     }
 
+    session
+        .policy
+        .metrics
+        .record_session_end(session.masked_fields as u64);
     if session.masked_fields > 0 || session.rejected_result_sets > 0 {
-        eprintln!(
-            "session closed user={user} authenticated={} roles={} \
-             masked_fields={} rejected_result_sets={}",
-            session.authenticated,
-            session.roles.len(),
-            session.masked_fields,
-            session.rejected_result_sets
+        tracing::info!(
+            %user,
+            authenticated = session.authenticated,
+            roles = session.roles.len(),
+            masked_fields = session.masked_fields,
+            rejected_result_sets = session.rejected_result_sets,
+            "session closed"
         );
     }
     Ok(())

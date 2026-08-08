@@ -286,6 +286,38 @@ refute "12m. ...and pgmask does not release the shadowed table" \
 direct "DROP TABLE IF EXISTS public.pg_database;" >/dev/null
 kill "$GUI_PID" 2>/dev/null
 
+# 13 — observability. Counters that only exist in a log line get read once;
+# a scrape endpoint is what makes them operable.
+echo
+echo "observability"
+echo "-----------------------"
+sed -e 's/^listen = .*/listen = "127.0.0.1:6457"/' \
+    -e 's|^opaque = .*|opaque = "reject"\nmetrics_listen = "127.0.0.1:9465"|' \
+    examples/demo/catalog.toml > /tmp/pgmask-obs.toml
+PGMASK_LOG=info ./target/release/pgmask /tmp/pgmask-obs.toml >/tmp/pgmask-obs.log 2>&1 &
+OBS_PID=$!
+sleep 2
+obs() { psql -h localhost -p 6457 -U postgres -d demo -X -tAq -c "$1" 2>&1; }
+obs 'SELECT email, name, city FROM demo.customers LIMIT 5;' >/dev/null
+obs 'SELECT lower(email) FROM demo.customers LIMIT 1;' >/dev/null
+obs 'SELECT 1;' >/dev/null
+sleep 1
+scrape="$(curl -s http://127.0.0.1:9465/metrics)"
+
+check "13a. the scrape endpoint serves"                "pgmask_sessions_total" "$scrape"
+# 5 rows x 2 masked columns. A wrong number here means the plan and the rows
+# disagree, which is the failure that matters.
+check "13b. values masked is counted per value"        "pgmask_values_masked_total 10" "$scrape"
+check "13c. rejections are labelled by cause"          'pgmask_rejections_total{cause=' "$scrape"
+check "13d. a rescued opaque field is counted"         "pgmask_fields_rescued_total 1" "$scrape"
+refute "13e. no metric leaks a column value"           "@example.com" "$scrape"
+refute "13f. ...or the pseudonym key"                  "demo-key-not-for-production" "$scrape"
+
+log="$(cat /tmp/pgmask-obs.log)"
+check  "13g. logs are structured and carry the session peer" "session{peer=" "$log"
+refute "13h. the pseudonym key is never logged"        "demo-key-not-for-production" "$log"
+kill "$OBS_PID" 2>/dev/null
+
 echo
 echo "-----------------------"
 printf 'passed %d, failed %d\n' "$pass" "$fail"
