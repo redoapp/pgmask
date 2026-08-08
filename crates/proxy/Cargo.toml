@@ -30,7 +30,9 @@ pg_query.workspace = true
 jiff.workspace = true
 rust_decimal.workspace = true
 postgres-types.workspace = true
+secrecy = { version = "0.10", features = ["serde"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
 proptest.workspace = true
+pgwire = { version = "0.40", default-features = false }

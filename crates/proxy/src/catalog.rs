@@ -16,6 +16,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use secrecy::SecretString;
 use serde::Deserialize;
 use tokio::sync::Notify;
 
@@ -222,7 +223,14 @@ pub struct Config {
     /// Used to resolve names to OIDs, at startup and on every refresh.
     pub catalog_dsn: String,
     /// HMAC key for pseudonyms. Rotating it invalidates every emitted pseudonym.
-    pub pseudonym_key: String,
+    /// Wrapped so it cannot be printed.
+    ///
+    /// `Config` derives `Debug` — for tests and for a config-dump that has been
+    /// wanted more than once — and the key is what makes pseudonyms unlinkable.
+    /// One `{config:?}` in a log line or a panic message would put it on disk,
+    /// and recovering costs a rotation, which invalidates every pseudonym ever
+    /// issued. `SecretString` prints as `[REDACTED]` and zeroizes on drop.
+    pub pseudonym_key: SecretString,
     #[serde(default = "default_unclassified")]
     pub unclassified: Unclassified,
     #[serde(default = "default_opaque")]
@@ -879,5 +887,31 @@ by_role = { analyst = "partial" }
         assert!(snapshot.lookup(42, 2).is_none());
         // A relation we have never resolved at all.
         assert!(!snapshot.knows_relation(99));
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn debug_printing_the_config_cannot_reveal_the_key() {
+        // `Config` derives Debug and the key is the whole basis of pseudonym
+        // unlinkability, so one `{config:?}` would be a disclosure that costs a
+        // rotation to recover from. This is the guard on that.
+        let config: Config = toml::from_str(
+            r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "correct-horse-battery-staple"
+"#,
+        )
+        .expect("parses");
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("correct-horse-battery-staple"),
+            "the key appeared in Debug output: {rendered}"
+        );
+        assert!(rendered.contains("REDACTED"));
     }
 }

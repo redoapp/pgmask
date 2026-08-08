@@ -39,8 +39,8 @@ HINT:  Select the underlying column directly. Expressions, set operations
 | **Phase 1 — CI gate on catalog drift** | **open, and the largest item left** |
 | Phase 6 — parser rules | open; priority revised by measurement, not guesswork |
 
-232 assertions across seven suites: 173 cargo (99 unit, 30 property, 23
-adversarial, 13 classification, 8 resilience), 52 demo, 7 TLS. The adversarial
+237 assertions across eight suites: 178 cargo (100 unit, 30 property, 23
+adversarial, 13 classification, 8 resilience, 4 differential), 52 demo, 7 TLS. The adversarial
 suite drives a raw wire client and asserts no sentinel byte ever crosses the
 boundary.
 
@@ -66,7 +66,13 @@ statements are all covered without special handling. Exactly two paths emit rows
 both are refused. A `DataRow` arriving with no active plan is never forwarded.
 
 We decode only four message types and forward everything else byte-for-byte.
-Bytes we never interpret are bytes we cannot misinterpret.
+Bytes we never interpret are bytes we cannot misinterpret. That is also why the
+framing is hand-written rather than taken from `pgwire` or `postgres-protocol`:
+both model the protocol as a closed enum, so an unrecognised tag is an error
+rather than something to pass along, and neither can emit the modified backend
+messages a masking proxy exists to produce. `pgwire` is a dev-dependency
+instead — `tests/differential.rs` makes it a second opinion on the
+`RowDescription` fields that decide masking.
 
 Fields with no provenance are refused — except for a short allowlist of
 expression shapes positively known to carry no column value (`SELECT 1`,

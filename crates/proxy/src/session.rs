@@ -32,6 +32,7 @@ use crate::mask::{Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
 use crate::protocol::{self, DescribeTarget, FrameReader, Message};
 use crate::tls::{BackendTls, BoxStream};
+use secrecy::ExposeSecret;
 
 /// What to do with one output field.
 #[derive(Debug, Clone)]
@@ -77,7 +78,9 @@ impl Policy {
         };
         Ok(Self {
             catalog,
-            masker: Arc::new(Masker::new(config.pseudonym_key.clone().into_bytes())),
+            masker: Arc::new(Masker::new(
+                config.pseudonym_key.expose_secret().as_bytes().to_vec(),
+            )),
             unclassified: config.unclassified,
             unclassified_mask: config.unclassified_mask,
             opaque: config.opaque,
