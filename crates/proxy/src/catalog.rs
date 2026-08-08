@@ -214,13 +214,18 @@ impl Classification {
 fn restrictiveness(mask: Mask) -> u8 {
     match mask {
         Mask::None => 0,
-        Mask::Partial | Mask::Inner | Mask::Outer | Mask::Range => 1,
-        Mask::DateMonth | Mask::IpPrefix | Mask::NumericBucket => 2,
-        Mask::DateYear => 3,
-        Mask::Pseudonym => 4,
-        Mask::Hash => 5,
-        Mask::Redact => 6,
-        Mask::Null => 7,
+        // Reveals everything it did not recognise, so it is barely more
+        // restrictive than passing the value through. Ranked here deliberately:
+        // if one of a principal's roles says `scrub` and another says `redact`,
+        // redact has to win.
+        Mask::Scrub => 1,
+        Mask::Partial | Mask::Inner | Mask::Outer | Mask::Range => 2,
+        Mask::DateMonth | Mask::IpPrefix | Mask::NumericBucket => 3,
+        Mask::DateYear => 4,
+        Mask::Pseudonym => 5,
+        Mask::Hash => 6,
+        Mask::Redact => 7,
+        Mask::Null => 8,
     }
 }
 

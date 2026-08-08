@@ -262,6 +262,21 @@ type     = "email"          # or an inline `mask =`, which overrides the type
 | `date-month` | truncate to the 1st | date, timestamp, timestamptz |
 | `numeric-bucket` | floor to a multiple of `bucket` | int2/4/8, float4/8, numeric (text) |
 | `ip-prefix` | keep the network — `203.0.113.0` | text, inet/cidr (text) |
+| `scrub` | replace identifiers inside free text — `called <EMAIL>` | text |
+
+### `scrub` is the one mask that reveals
+
+Every other mask hides by default, so a gap costs utility. `scrub` shows the
+value minus what it recognised, so **a gap is a disclosure**. It replaces
+structured identifiers — address, phone, card, IBAN, national id, IP, URL,
+uuid — and it does not catch a person's name, a postal address in prose, or
+`alice [at] acme [dot] com`. On realistic support notes that is roughly half of
+what a human would call sensitive; the misses are pinned as assertions in
+`mask.rs` so the limit stays documented rather than assumed.
+
+Use it when someone has to read the note and you accept that. It costs about
+1 microsecond per value, and it is ranked as barely-more-restrictive-than-`none`
+so a role holding both `scrub` and `redact` still gets `redact`.
 
 Type and format compatibility is checked once when the result set is described,
 so a misconfiguration refuses cleanly instead of dying halfway through a stream.

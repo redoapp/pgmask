@@ -1356,6 +1356,7 @@ dependencies = [
  "pgwire",
  "postgres-types",
  "proptest",
+ "regex",
  "rust_decimal",
  "rustls-pemfile",
  "secrecy",

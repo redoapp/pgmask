@@ -27,9 +27,9 @@ without special handling. The only two paths that emit rows without one —
 
 ### What it does
 
-- **Thirteen masks**: `none`, `null`, `redact`, `partial`, `inner`, `outer`,
+- **Fourteen masks**: `none`, `null`, `redact`, `partial`, `inner`, `outer`,
   `range`, `hash`, `pseudonym`, `date-year`, `date-month`, `numeric-bucket`,
-  `ip-prefix`. Dates and timestamps go through `postgres-types` with jiff, and
+  `ip-prefix`, `scrub`. Dates and timestamps go through `postgres-types` with jiff, and
   `numeric` through `rust_decimal`, rather than epoch arithmetic of our own.
 - **Deterministic pseudonyms**, so masked data stays joinable. Keyed by HMAC,
   domain-separated per semantic type so unrelated columns cannot be linked.
