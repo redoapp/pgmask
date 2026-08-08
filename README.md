@@ -62,7 +62,11 @@ What pgmask owes them instead:
   parameters are refused, and a classification that stops resolving logs a
   warning rather than silently ceasing to mask.
 
-**What to do next.** A second reviewer on the analysis rules. Phase 6 lineage is done — measured at converting about a third
+**What to do next.** More generated-SQL fuzzing — `./scripts/test-fuzz.sh`
+replays sqlsmith output through the proxy and asserts no masked value reaches
+the client, with a direct connection as the control so a run that never touched
+masked data reports as vacuous instead of passing. 6000 statements: 9082 masked
+values readable without the proxy, none through it. Phase 6 lineage is done — measured at converting about a third
 of refusals, see [docs/lineage-estimate.md](docs/lineage-estimate.md). The
 limits below are real and unchanged.
 
@@ -98,7 +102,8 @@ It cut the false-rejection rate on a real workload from 23% to 6%.
 ## Try it
 
 ```bash
-./examples/demo/verify.sh        # acceptance criteria, 50k rows, 18 assertions
+./examples/demo/verify.sh        # acceptance criteria against a real Postgres
+./scripts/test-fuzz.sh           # generated SQL, asserts no masked value escapes
 ./scripts/test-integration.sh    # canary + adversarial + resilience, 23 tests
 ./scripts/test-tls.sh            # TLS on both legs via a real psql, 7 assertions
 ```

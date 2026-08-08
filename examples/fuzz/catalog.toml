@@ -1,0 +1,275 @@
+listen = "127.0.0.1:6470"
+backend = "127.0.0.1:55432"
+catalog_dsn = "postgres://postgres:demo@localhost:55432/fuzzdb"
+pseudonym_key = "fuzz-fixture-key"
+unclassified = "mask"
+unclassified_mask = "null"
+opaque = "reject"
+lineage = "allow"
+catalog_refresh_seconds = 300
+metrics_interval_seconds = 0
+
+[[column]]
+relation = "fz.t1"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.t1"
+column = "a"
+mask = "redact"
+
+[[column]]
+relation = "fz.t1"
+column = "b"
+mask = "redact"
+
+[[column]]
+relation = "fz.t1"
+column = "n"
+mask = "none"
+
+[[column]]
+relation = "fz.t1"
+column = "d"
+mask = "date-year"
+
+[[column]]
+relation = "fz.t1"
+column = "u"
+mask = "pseudonym"
+
+[[column]]
+relation = "fz.t2"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.t2"
+column = "a"
+mask = "redact"
+
+[[column]]
+relation = "fz.t2"
+column = "b"
+mask = "redact"
+
+[[column]]
+relation = "fz.t2"
+column = "n"
+mask = "none"
+
+[[column]]
+relation = "fz.t2"
+column = "d"
+mask = "date-year"
+
+[[column]]
+relation = "fz.t2"
+column = "u"
+mask = "pseudonym"
+
+[[column]]
+relation = "fz.t3"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.t3"
+column = "a"
+mask = "redact"
+
+[[column]]
+relation = "fz.t3"
+column = "b"
+mask = "redact"
+
+[[column]]
+relation = "fz.t3"
+column = "n"
+mask = "none"
+
+[[column]]
+relation = "fz.t3"
+column = "d"
+mask = "date-year"
+
+[[column]]
+relation = "fz.t3"
+column = "u"
+mask = "pseudonym"
+
+[[column]]
+relation = "fz.t4"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.t4"
+column = "a"
+mask = "redact"
+
+[[column]]
+relation = "fz.t4"
+column = "b"
+mask = "redact"
+
+[[column]]
+relation = "fz.t4"
+column = "n"
+mask = "none"
+
+[[column]]
+relation = "fz.t4"
+column = "d"
+mask = "date-year"
+
+[[column]]
+relation = "fz.t4"
+column = "u"
+mask = "pseudonym"
+
+[[column]]
+relation = "fz.t5"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.t5"
+column = "a"
+mask = "redact"
+
+[[column]]
+relation = "fz.t5"
+column = "b"
+mask = "redact"
+
+[[column]]
+relation = "fz.t5"
+column = "n"
+mask = "none"
+
+[[column]]
+relation = "fz.t5"
+column = "d"
+mask = "date-year"
+
+[[column]]
+relation = "fz.t5"
+column = "u"
+mask = "pseudonym"
+
+[[column]]
+relation = "fz.t6"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.t6"
+column = "a"
+mask = "redact"
+
+[[column]]
+relation = "fz.t6"
+column = "b"
+mask = "redact"
+
+[[column]]
+relation = "fz.t6"
+column = "n"
+mask = "none"
+
+[[column]]
+relation = "fz.t6"
+column = "d"
+mask = "date-year"
+
+[[column]]
+relation = "fz.t6"
+column = "u"
+mask = "pseudonym"
+
+[[column]]
+relation = "fz.t7"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.t7"
+column = "a"
+mask = "redact"
+
+[[column]]
+relation = "fz.t7"
+column = "b"
+mask = "redact"
+
+[[column]]
+relation = "fz.t7"
+column = "n"
+mask = "none"
+
+[[column]]
+relation = "fz.t7"
+column = "d"
+mask = "date-year"
+
+[[column]]
+relation = "fz.t7"
+column = "u"
+mask = "pseudonym"
+
+[[column]]
+relation = "fz.t8"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.t8"
+column = "a"
+mask = "redact"
+
+[[column]]
+relation = "fz.t8"
+column = "b"
+mask = "redact"
+
+[[column]]
+relation = "fz.t8"
+column = "n"
+mask = "none"
+
+[[column]]
+relation = "fz.t8"
+column = "d"
+mask = "date-year"
+
+[[column]]
+relation = "fz.t8"
+column = "u"
+mask = "pseudonym"
+
+[[column]]
+relation = "fz.v_union"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.v_union"
+column = "a"
+mask = "redact"
+
+[[column]]
+relation = "fz.v_join"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.v_join"
+column = "xa"
+mask = "redact"
+
+[[column]]
+relation = "fz.v_join"
+column = "yb"
+mask = "redact"

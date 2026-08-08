@@ -1,0 +1,12 @@
+[package]
+name = "fuzz"
+description = "Replay generated SQL through pgmask and assert no masked value ever escapes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
