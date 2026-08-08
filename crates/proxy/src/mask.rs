@@ -53,41 +53,148 @@ pub const OID_CIDR: u32 = 650;
 ///
 /// Order matters. Longer, more specific shapes go first so that an address is
 /// not first eaten by the phone pattern.
-const SCRUB_PATTERNS: &[(&str, &str)] = &[
-    ("<EMAIL>", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
-    ("<URL>", r"https?://[^\s]+"),
+type Validator = fn(&str) -> bool;
+
+const SCRUB_PATTERNS: &[(&str, &str, Option<Validator>)] = &[
+    (
+        "<EMAIL>",
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        None,
+    ),
+    ("<URL>", r"https?://[^\s]+", None),
     (
         "<UUID>",
         r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        None,
     ),
-    ("<IBAN>", r"\b[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}\b"),
+    ("<MAC>", r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b", None),
+    (
+        "<IBAN>",
+        r"\b[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}\b",
+        Some(is_iban),
+    ),
     // Anchored on a digit at both ends. `(?:[0-9][ -]?){13,19}` let the final
     // repetition swallow the space *after* the number, turning
     // "ending 4111 1111 1111 1111 declined" into "ending <CARD>declined".
-    ("<CARD>", r"\b[0-9](?:[ -]?[0-9]){12,18}\b"),
-    ("<NATIONAL_ID>", r"\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b"),
-    ("<IP>", r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b"),
+    ("<CARD>", r"\b[0-9](?:[ -]?[0-9]){12,18}\b", Some(is_luhn)),
+    ("<NATIONAL_ID>", r"\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b", None),
+    (
+        "<NATIONAL_ID>",
+        r"\b[0-9]{3} ?[0-9]{3} ?[0-9]{4}\b",
+        Some(is_nhs_number),
+    ),
+    (
+        "<NATIONAL_ID>",
+        r"\b[A-CEGHJ-PR-TW-Z]{2}[0-9]{6}[A-D]\b",
+        None,
+    ),
+    (
+        "<POSTCODE>",
+        r"\b[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}\b",
+        None,
+    ),
+    (
+        "<CRYPTO>",
+        r"\b(?:0x[0-9a-fA-F]{40}|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z0-9]{25,62})\b",
+        None,
+    ),
+    ("<IP>", r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", None),
     // Two shapes, both requiring evidence that this is a phone number rather
     // than an order id: either a leading `+`, or internal separators. A bare
     // run of digits is deliberately not matched — "Ref 20201555" becoming
     // <PHONE> would corrupt the readable text this mask exists to preserve.
-    // The old pattern also required 9 digits and so missed "555-0102".
     (
         "<PHONE>",
         r"\+[0-9][0-9 \-().]{6,15}[0-9]|\b[0-9]{3,4}[ \-.][0-9]{3,4}(?:[ \-.][0-9]{2,4})?\b",
+        Some(is_phone_length),
     ),
 ];
+
+/// Luhn, the check digit on payment cards.
+///
+/// Hand-written rather than pulled in: it is ten lines, universally specified,
+/// and a dependency here would be one more thing to read than the algorithm.
+fn is_luhn(candidate: &str) -> bool {
+    let digits: Vec<u32> = candidate.chars().filter_map(|c| c.to_digit(10)).collect();
+    if digits.len() < 13 {
+        return false;
+    }
+    let sum: u32 = digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, d)| {
+            if i % 2 == 1 {
+                let doubled = d * 2;
+                if doubled > 9 {
+                    doubled - 9
+                } else {
+                    doubled
+                }
+            } else {
+                *d
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
+}
+
+/// IBAN mod-97, via `iban_validate`, which also carries the per-country length
+/// table. That table is the part worth a dependency; the checksum alone is not.
+fn is_iban(candidate: &str) -> bool {
+    candidate.replace(' ', "").parse::<iban::Iban>().is_ok()
+}
+
+/// A plausible number of digits for a telephone number.
+///
+/// Runs last, so it sees text the stricter patterns declined — and when a
+/// checksum rejects a candidate, those digits are still sitting there. Without
+/// this bound, a 16-digit batch code that failed Luhn came straight back as
+/// `<PHONE>`, which is the same corruption of readable text the checksum was
+/// added to prevent. E.164 allows 15 digits internationally; a grouped local
+/// number without a country code is at most 11.
+fn is_phone_length(candidate: &str) -> bool {
+    let digits = candidate.chars().filter(char::is_ascii_digit).count();
+    if candidate.trim_start().starts_with('+') {
+        (7..=15).contains(&digits)
+    } else {
+        (7..=11).contains(&digits)
+    }
+}
+
+/// UK NHS number: ten digits with a mod-11 check digit.
+///
+/// Without the checksum this pattern matches any ten digits, which in a support
+/// note is more often an order reference than a patient. Presidio validates it
+/// the same way and for the same reason.
+fn is_nhs_number(candidate: &str) -> bool {
+    let digits: Vec<u32> = candidate.chars().filter_map(|c| c.to_digit(10)).collect();
+    if digits.len() != 10 {
+        return false;
+    }
+    let sum: u32 = digits[..9]
+        .iter()
+        .enumerate()
+        .map(|(i, d)| d * (10 - u32::try_from(i).expect("index fits")))
+        .sum();
+    let check = match 11 - (sum % 11) {
+        11 => 0,
+        10 => return false,
+        other => other,
+    };
+    check == digits[9]
+}
 
 /// Compiled once. `RegexSet` answers "does this value contain anything at all"
 /// in one pass, and most free text contains nothing — measured at 113ns per
 /// value gated this way against 789ns rewriting unconditionally.
 static SCRUB: std::sync::LazyLock<(regex::RegexSet, Vec<regex::Regex>)> =
     std::sync::LazyLock::new(|| {
-        let set = regex::RegexSet::new(SCRUB_PATTERNS.iter().map(|(_, p)| *p))
+        let set = regex::RegexSet::new(SCRUB_PATTERNS.iter().map(|(_, p, _)| *p))
             .expect("static patterns compile");
         let each = SCRUB_PATTERNS
             .iter()
-            .map(|(_, p)| regex::Regex::new(p).expect("static patterns compile"))
+            .map(|(_, p, _)| regex::Regex::new(p).expect("static patterns compile"))
             .collect();
         (set, each)
     });
@@ -103,8 +210,23 @@ fn scrub_free_text(text: &str) -> String {
     // value containing one address costs one rewrite rather than eight.
     let mut out = std::borrow::Cow::Borrowed(text);
     for index in matched.iter() {
-        let (label, _) = SCRUB_PATTERNS[index];
-        out = std::borrow::Cow::Owned(each[index].replace_all(&out, label).into_owned());
+        let (label, _, validator) = SCRUB_PATTERNS[index];
+        out = std::borrow::Cow::Owned(match validator {
+            // A pattern with a checksum only replaces what passes it. In a mask
+            // that reveals, a false positive does not merely over-hide — it
+            // rewrites readable text into a placeholder that was never there.
+            Some(valid) => each[index]
+                .replace_all(&out, |caps: &regex::Captures| {
+                    let hit = &caps[0];
+                    if valid(hit) {
+                        label.to_string()
+                    } else {
+                        hit.to_string()
+                    }
+                })
+                .into_owned(),
+            None => each[index].replace_all(&out, label).into_owned(),
+        });
     }
     out.into_owned()
 }
@@ -1448,7 +1570,6 @@ mod scrub_tests {
     fn what_it_does_not_catch_is_pinned_here() {
         for leaves_intact in [
             "Spoke to Alice Chen in accounts payable",
-            "Her address is 14 Bellevue Terrace, Leeds LS8 2QP",
             "Reach her at alice [at] acme [dot] com",
             "DOB 14th of March, nineteen eighty two",
             "Twitter handle @alicechen_",
@@ -1460,6 +1581,19 @@ mod scrub_tests {
                 "this mask does not claim to catch this; if it now does, update the docs"
             );
         }
+    }
+
+    #[test]
+    fn a_postal_address_is_only_partly_caught() {
+        // Adding the UK postcode pattern moved this case: the postcode now
+        // goes, the street does not. Half an address is not an anonymised
+        // address, and pretending otherwise is how this mask gets misused.
+        let out = scrub_free_text("Her address is 14 Bellevue Terrace, Leeds LS8 2QP");
+        assert!(out.contains("<POSTCODE>"), "{out}");
+        assert!(
+            out.contains("14 Bellevue Terrace"),
+            "the street survives: {out}"
+        );
     }
 
     #[test]
@@ -1531,5 +1665,77 @@ mod scrub_pattern_tests {
         // An IP and a card both look phone-ish; each must get its own label.
         assert_eq!(scrub_free_text("from 203.0.113.44 ok"), "from <IP> ok");
         assert!(scrub_free_text("pay 4111 1111 1111 1111 now").contains("<CARD>"));
+    }
+}
+
+#[cfg(test)]
+mod scrub_validator_tests {
+    use super::*;
+
+    #[test]
+    fn a_checksum_keeps_lookalikes_readable() {
+        // The whole reason validators are here. Both are 16 digits; only one is
+        // a card, and turning the other into <CARD> would corrupt the note.
+        assert_eq!(
+            scrub_free_text("card 4111 1111 1111 1111 declined"),
+            "card <CARD> declined"
+        );
+        let not_a_card = "batch 1234 5678 9012 3456 shipped";
+        assert_eq!(
+            scrub_free_text(not_a_card),
+            not_a_card,
+            "fails Luhn, left alone"
+        );
+    }
+
+    #[test]
+    fn iban_is_validated_not_just_shaped() {
+        assert_eq!(
+            scrub_free_text("IBAN GB33BUKB20201555555555"),
+            "IBAN <IBAN>"
+        );
+        // Right shape, wrong check digits.
+        let bogus = "IBAN GB00BUKB20201555555555";
+        assert_eq!(scrub_free_text(bogus), bogus);
+    }
+
+    #[test]
+    fn nhs_numbers_need_their_check_digit() {
+        // 943 476 5919 is the number the NHS publishes as a valid example.
+        assert_eq!(scrub_free_text("NHS 943 476 5919"), "NHS <NATIONAL_ID>");
+        // A failed check digit must not be labelled a national id. A 3-3-4
+        // grouping is also a common phone shape, so it may still be caught as
+        // <PHONE> — a different and defensible claim about the same digits.
+        let out = scrub_free_text("order 943 476 5910 dispatched");
+        assert!(!out.contains("<NATIONAL_ID>"), "{out}");
+    }
+
+    #[test]
+    fn the_new_distinctive_patterns_match() {
+        assert_eq!(
+            scrub_free_text("nino JG121212C on file"),
+            "nino <NATIONAL_ID> on file"
+        );
+        assert_eq!(
+            scrub_free_text("lives at LS8 2QP now"),
+            "lives at <POSTCODE> now"
+        );
+        assert_eq!(scrub_free_text("mac 00:1B:44:11:3A:B7"), "mac <MAC>");
+        assert_eq!(
+            scrub_free_text("wallet 0x52908400098527886E0F7030069857D2E4169EE7"),
+            "wallet <CRYPTO>"
+        );
+    }
+
+    #[test]
+    fn luhn_and_nhs_agree_with_published_vectors() {
+        assert!(is_luhn("4111111111111111"));
+        assert!(is_luhn("5500 0000 0000 0004"));
+        assert!(!is_luhn("4111111111111112"));
+        assert!(is_nhs_number("9434765919"));
+        assert!(!is_nhs_number("9434765910"));
+        assert!(!is_nhs_number("123456789"));
+        assert!(is_iban("GB33BUKB20201555555555"));
+        assert!(!is_iban("GB00BUKB20201555555555"));
     }
 }

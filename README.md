@@ -268,9 +268,16 @@ type     = "email"          # or an inline `mask =`, which overrides the type
 
 Every other mask hides by default, so a gap costs utility. `scrub` shows the
 value minus what it recognised, so **a gap is a disclosure**. It replaces
-structured identifiers — address, phone, card, IBAN, national id, IP, URL,
-uuid — and it does not catch a person's name, a postal address in prose, or
-`alice [at] acme [dot] com`. On realistic support notes that is roughly half of
+structured identifiers — address, phone, card, IBAN, UK NHS number, NINO, SSN,
+UK postcode, IP, MAC, crypto address, URL, uuid — and it does not catch a
+person's name, a street address, or `alice [at] acme [dot] com`.
+
+Where a checksum exists it is applied, because in a mask that *reveals* a false
+positive rewrites readable text into a placeholder that was never there. Luhn
+for cards, mod-97 for IBANs (via `iban_validate`, which carries the per-country
+length table), mod-11 for NHS numbers. The entity set follows
+[Presidio](https://github.com/microsoft/presidio)'s predefined recognizers,
+which is MIT licensed and validates the same fields for the same reason. On realistic support notes that is roughly half of
 what a human would call sensitive; the misses are pinned as assertions in
 `mask.rs` so the limit stays documented rather than assumed.
 
