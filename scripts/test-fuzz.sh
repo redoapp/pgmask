@@ -37,7 +37,7 @@ export PGPASSWORD=demo
 command -v sqlsmith >/dev/null || { echo "SKIP: sqlsmith not installed (brew install sqlsmith)"; exit 0; }
 
 cleanup() {
-  for pid in ${PROXY_PID:-} ${POISON_PID:-} ${PROXY_PIDS[@]:-}; do kill "$pid" 2>/dev/null; done
+  for pid in ${PROXY_PID:-} ${POISON_PID:-} ${BIN_PID:-} ${ROLE_PID:-} ${DDL_PID:-} ${PROXY_PIDS[@]:-}; do kill "$pid" 2>/dev/null; done
   [[ "${KEEP:-0}" == "1" ]] || podman rm -f "$CONTAINER" >/dev/null 2>&1
 }
 trap cleanup EXIT
@@ -99,6 +99,62 @@ if ! DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb" \
   exit 1
 fi
 kill "$BIN_PID" 2>/dev/null
+
+# --- 1c. Per-principal masking under concurrency -----------------------------
+# Sessions share one Arc<Policy> and one catalog snapshot while resolving masks
+# per principal. A plan escaping its session would be a disclosure invisible to
+# any single-principal test.
+echo "==> per-principal masking under concurrency"
+./target/release/pgmask "/tmp/pgmask-binary.toml" >/tmp/pgmask-roles.log 2>&1 &
+ROLE_PID=$!
+sleep 2
+role_env=(DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb"
+          PROXY_URL="postgres://postgres:demo@localhost:$POISON_PORT/fuzzdb")
+# Prove it can fail before trusting that it did not.
+if env "${role_env[@]}" POISON=1 ./target/release/roles 6 40 >/tmp/roles-poison.out 2>&1; then
+  echo "FAIL: the role check passed with deliberately wrong expectations."
+  kill "$ROLE_PID" 2>/dev/null
+  exit 1
+fi
+echo "    poison run detected $(grep -oE 'VIOLATIONS +[0-9]+' /tmp/roles-poison.out | grep -oE '[0-9]+') violations, as required"
+if ! env "${role_env[@]}" ./target/release/roles 24 300; then
+  kill "$ROLE_PID" 2>/dev/null
+  exit 1
+fi
+kill "$ROLE_PID" 2>/dev/null
+
+# --- 1d. DDL churn while traffic runs ----------------------------------------
+# OIDs change on DROP/CREATE and the catalog refreshes on a timer, so there is a
+# window where a relation the proxy knew is gone and its replacement is
+# unknown. Unknown must mean masked; the risk is that it briefly means allowed.
+echo "==> DDL churn during traffic"
+sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$POISON_PORT\"|" \
+    -e 's/^catalog_refresh_seconds.*/catalog_refresh_seconds = 2/' \
+    -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-ddl.toml
+./target/release/pgmask /tmp/pgmask-ddl.toml >/tmp/pgmask-ddl.log 2>&1 &
+DDL_PID=$!
+sleep 2
+( for _ in $(seq 1 12); do
+    psql -h localhost -p "$PG_PORT" -U postgres -d fuzzdb -q \
+      -c 'DROP VIEW IF EXISTS fz.v_union; CREATE VIEW fz.v_union AS SELECT id, a FROM fz.t1 UNION ALL SELECT id, a FROM fz.t2;' \
+      >/dev/null 2>&1
+    sleep 0.4
+  done ) &
+CHURN_PID=$!
+churn_leaks=0
+churn_reads=0
+for _ in $(seq 1 60); do
+  # A recreated view gets a new OID. Until the catalog catches up the proxy has
+  # never heard of it, and "never heard of it" has to mean masked.
+  out=$(psql -h localhost -p "$POISON_PORT" -U postgres -d fuzzdb -X -tAq \
+        -c 'SELECT a FROM fz.v_union LIMIT 3;' 2>&1 || true)
+  churn_reads=$((churn_reads + 1))
+  case "$out" in *CANARY*) churn_leaks=$((churn_leaks + 1));; esac
+done
+wait "$CHURN_PID" 2>/dev/null
+kill "$DDL_PID" 2>/dev/null
+echo "    $churn_reads reads across 12 view recreations, $churn_leaks leaked"
+[[ "$churn_leaks" -eq 0 ]] || { echo "FAIL: a masked column was readable while the catalog was stale"; exit 1; }
 
 # --- 2. Generate corpora in parallel ----------------------------------------
 echo "==> generating $SEEDS x $PER_SEED statements ($PARALLEL at a time)"

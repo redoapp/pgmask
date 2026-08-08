@@ -74,7 +74,9 @@ harness refusal count is cross-checked against the proxy's own metrics, and the
 fixture is verified unchanged. Beyond that: more fixture shapes,
 and someone other than Claude reading `analysis.rs` and `lineage.rs`.
 
-`scripts/test-fuzz.sh` also runs 11 binary-result-format checks. Everything else
+`scripts/test-fuzz.sh` also runs 11 binary-result-format checks, 21,600
+per-principal assertions across 24 concurrent sessions of three principals, and
+60 reads taken while a view is dropped and recreated underneath the catalog. Everything else
 that drives the proxy end to end speaks the simple query protocol, which is
 text-only — the first suite to ask for binary found two bugs, one of which broke
 every driver that prefers it.

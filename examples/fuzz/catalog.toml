@@ -7,7 +7,16 @@ unclassified_mask = "null"
 opaque = "reject"
 lineage = "allow"
 catalog_refresh_seconds = 300
+
 metrics_interval_seconds = 0
+
+[[role]]
+name = "support"
+members = ["support_sam"]
+
+[[role]]
+name = "analyst"
+members = ["analyst_ann"]
 
 [[column]]
 relation = "fz.t1"
@@ -302,6 +311,7 @@ type = "email"
 relation = "fz.people"
 column = "full_name"
 type = "person_name"
+by_role = { support = "none" }
 
 [[column]]
 relation = "fz.people"
@@ -317,6 +327,7 @@ mask = "none"
 relation = "fz.people"
 column = "birth_date"
 mask = "date-year"
+by_role = { analyst = "date-month" }
 
 [[column]]
 relation = "fz.people"

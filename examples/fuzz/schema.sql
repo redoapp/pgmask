@@ -77,3 +77,17 @@ CREATE VIEW fz.v_join  AS SELECT x.id, x.a AS xa, y.b AS yb FROM fz.t3 x JOIN fz
 
 ANALYZE fz.t1; ANALYZE fz.t2; ANALYZE fz.t3; ANALYZE fz.t4;
 ANALYZE fz.t5; ANALYZE fz.t6; ANALYZE fz.t7; ANALYZE fz.t8;
+
+-- Two principals, so concurrent sessions can be checked for role bleed: the
+-- same column resolves differently per person, and a plan escaping its session
+-- would be a disclosure that no single-principal test can see.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'support_sam') THEN
+    CREATE ROLE support_sam LOGIN PASSWORD 'demo';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'analyst_ann') THEN
+    CREATE ROLE analyst_ann LOGIN PASSWORD 'demo';
+  END IF;
+END $$;
+GRANT USAGE ON SCHEMA fz TO support_sam, analyst_ann;
+GRANT SELECT ON ALL TABLES IN SCHEMA fz TO support_sam, analyst_ann;
