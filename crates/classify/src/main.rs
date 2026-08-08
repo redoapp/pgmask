@@ -15,10 +15,18 @@
 //! and thrown away — only the verdict and the match rate are ever printed. A
 //! discovery tool that echoed the data it found would be self-defeating.
 //!
+//! # Two modes
+//!
+//! Without `--check` it proposes a catalog. With `--check` it compares an
+//! existing catalog against the live schema and exits non-zero on drift, which
+//! is the form you put in CI. Neither mode enforces anything at runtime — the
+//! catalog belongs to whoever deploys the proxy, see docs/responsibilities.md.
+//!
 //! Usage:
 //!   DSN=postgres://... cargo run -p classify -- --schema public [--sample 200]
+//!   DSN=postgres://... cargo run -p classify -- --check --catalog catalog.toml --schema public
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -298,9 +306,96 @@ async fn main() -> Result<()> {
         proposals.push(proposal);
     }
 
+    if args.iter().any(|a| a == "--check") {
+        let path = arg(&args, "--catalog")
+            .context("--check needs --catalog <path> to compare the schema against")?;
+        return check(&path, &schema, &proposals);
+    }
     report(&proposals, &schema, sample, refuted_by_width);
     emit_catalog(&proposals, &schema);
     Ok(())
+}
+
+/// Compare a catalog against the live schema and fail on drift.
+///
+/// Two directions, and they fail for different reasons:
+///
+/// * A column in the database with no rule is **masked** by default-deny, so it
+///   is safe but invisible. Someone finds out when a dashboard goes blank.
+/// * A rule matching nothing means the relation or column was renamed or
+///   dropped. That is not itself a leak — there is nothing left to leak — but it
+///   is a rule you believe is protecting you and is not.
+///
+/// Neither is detectable from inside the proxy at the moment it matters, which
+/// is why this is a build step rather than a runtime warning.
+fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
+    let config =
+        pgmask::catalog::Config::load(path).with_context(|| format!("loading catalog {path}"))?;
+
+    let live: BTreeSet<(String, String)> = proposals
+        .iter()
+        .map(|p| {
+            (
+                format!("{}.{}", p.column.schema, p.column.table),
+                p.column.name.clone(),
+            )
+        })
+        .collect();
+    let ruled: BTreeSet<(String, String)> = config
+        .column
+        .iter()
+        .map(|r| (r.relation.clone(), r.column.clone()))
+        .collect();
+
+    // Only rules pointing at the schema under inspection can be judged here; a
+    // catalog spanning several schemas is checked one `--schema` at a time, and
+    // calling another schema's rules stale would be wrong.
+    let prefix = format!("{schema}.");
+    let stale: Vec<_> = ruled
+        .iter()
+        .filter(|(rel, _)| rel.starts_with(&prefix))
+        .filter(|entry| !live.contains(*entry))
+        .collect();
+    let unclassified: Vec<_> = live.difference(&ruled).collect();
+
+    println!("catalog {path} vs schema `{schema}`");
+    println!("  columns in the database   {}", live.len());
+    println!(
+        "  rules covering them       {}",
+        live.len() - unclassified.len()
+    );
+
+    if !unclassified.is_empty() {
+        println!("\n{} column(s) have no rule. Default-deny masks them, so this is a\ncoverage gap and not an exposure — but nothing here has been decided:", unclassified.len());
+        for (relation, column) in unclassified.iter().take(40) {
+            let hint = proposals
+                .iter()
+                .find(|p| {
+                    format!("{}.{}", p.column.schema, p.column.table) == *relation
+                        && p.column.name == *column
+                })
+                .and_then(|p| p.semantic_type)
+                .map_or(String::new(), |t| format!("   (looks like {t})"));
+            println!("  {relation}.{column}{hint}");
+        }
+        if unclassified.len() > 40 {
+            println!("  ... and {} more", unclassified.len() - 40);
+        }
+    }
+
+    if !stale.is_empty() {
+        println!("\n{} rule(s) match nothing in the database. The column was renamed or\ndropped, and the rule is protecting nothing:", stale.len());
+        for (relation, column) in &stale {
+            println!("  {relation}.{column}");
+        }
+    }
+
+    if unclassified.is_empty() && stale.is_empty() {
+        println!("\nevery column has a rule and every rule matches. no drift.");
+        return Ok(());
+    }
+    // A non-zero exit is the whole point: this is meant to fail a build.
+    std::process::exit(1);
 }
 
 /// Classify one column from its name and declared type alone.

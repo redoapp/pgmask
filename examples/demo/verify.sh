@@ -318,6 +318,46 @@ check  "13g. logs are structured and carry the session peer" "session{peer=" "$l
 refute "13h. the pseudonym key is never logged"        "demo-key-not-for-production" "$log"
 kill "$OBS_PID" 2>/dev/null
 
+# 14 — catalog drift. The catalog belongs to whoever deploys pgmask, so this is
+# a check we ship for their CI, not something the proxy enforces at runtime.
+# See docs/responsibilities.md.
+echo
+echo "catalog drift check"
+echo "-----------------------"
+chk() {
+  DSN="postgres://postgres:demo@localhost:$PG_PORT/demo" \
+    ./target/release/classify --check --catalog "$1" --schema demo 2>&1
+}
+chk_status() {
+  DSN="postgres://postgres:demo@localhost:$PG_PORT/demo" \
+    ./target/release/classify --check --catalog "$1" --schema demo >/dev/null 2>&1
+  echo "$?"
+}
+
+# The demo catalog omits internal_note on purpose, to show default-deny.
+out="$(chk examples/demo/catalog.toml)"
+check "14a. an unclassified column is reported"   "internal_note" "$out"
+check "14b. ...with what it looks like"           "looks like free_text" "$out"
+check "14c. ...and the exit status fails a build" "1" "$(chk_status examples/demo/catalog.toml)"
+# Coverage gaps are not exposures, and saying so keeps the check from being
+# read as an alarm.
+check "14d. ...described as a gap, not a leak"    "not an exposure" "$out"
+
+{ cat examples/demo/catalog.toml
+  printf '\n[[column]]\nrelation = "demo.customers"\ncolumn = "internal_note"\nmask = "null"\n'
+  printf '\n[[column]]\nrelation = "demo.orders"\ncolumn = "internal_note"\nmask = "null"\n'
+} > /tmp/pgmask-complete.toml
+check "14e. a complete catalog passes"            "no drift" "$(chk /tmp/pgmask-complete.toml)"
+check "14f. ...and exits zero"                    "0" "$(chk_status /tmp/pgmask-complete.toml)"
+
+# A rename is the case that matters: the rule still parses, still loads, and
+# protects nothing.
+direct 'ALTER TABLE demo.customers RENAME COLUMN last_ip TO last_ip_addr;' >/dev/null
+renamed="$(chk /tmp/pgmask-complete.toml)"
+check "14g. a renamed column is caught as uncovered" "last_ip_addr" "$renamed"
+check "14h. ...and the orphaned rule is caught too"  "match nothing" "$renamed"
+direct 'ALTER TABLE demo.customers RENAME COLUMN last_ip_addr TO last_ip;' >/dev/null
+
 echo
 echo "-----------------------"
 printf 'passed %d, failed %d\n' "$pass" "$fail"
