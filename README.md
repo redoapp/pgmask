@@ -107,6 +107,28 @@ PROXY_URL=postgres://postgres:demo@localhost:6432/demo \
   cargo run -p bench --release -- 10000 300
 ```
 
+## Deploying it: the part that is not code
+
+**A proxy is only a control if the database is not reachable around it.** Every
+guarantee below assumes the backend's port is closed to the people the masking
+is for. If an analyst can put the real host in their connection string, they get
+unmasked data and pgmask never sees the query. Nothing in this process can
+detect or prevent that, and no amount of hardening here changes it.
+
+So the deployment is the boundary, not the binary:
+
+- The Postgres port reachable **only** from the proxy — security group, network
+  policy, `pg_hba.conf`, or all three.
+- The proxy's own credentials to the backend distinct from anyone else's, so
+  revoking human direct access does not revoke the proxy's.
+- `tls_cert`/`tls_key` set. pgmask warns loudly without them, because a masking
+  proxy reachable in plaintext is a boundary anyone on the path can read around.
+
+Treat the catalog file as production configuration. A column dropped from it
+stops being masked at the next refresh, and the log line saying so is a `warn`
+that nobody reads if nothing is watching `pgmask_rejections_total` and the
+coverage warnings.
+
 ## Operating it
 
 Logs are `tracing`, structured, on stderr, filtered by `PGMASK_LOG` (falling
