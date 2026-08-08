@@ -117,6 +117,7 @@ It cut the false-rejection rate on a real workload from 23% to 6%.
 ./scripts/test-fuzz.sh           # 72k generated statements, asserts nothing leaks
 ./scripts/test-integration.sh    # canary + adversarial + resilience, 23 tests
 ./scripts/test-tls.sh            # TLS on both legs via a real psql, 7 assertions
+./scripts/test-versions.sh       # 23 assertions x Postgres 13,14,15,16,17
 cargo llvm-cov --release --summary-only   # coverage, after running the above
 ```
 
