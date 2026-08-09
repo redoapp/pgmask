@@ -128,6 +128,7 @@ It cut the false-rejection rate on a real workload from 23% to 6%.
 ## Try it
 
 ```bash
+./scripts/test-all.sh            # everything; a skipped suite counts as a failure
 ./examples/demo/verify.sh        # acceptance criteria against a real Postgres
 ./scripts/test-fuzz.sh           # 72k generated statements, asserts nothing leaks
 ./scripts/test-integration.sh    # canary + adversarial + resilience, 23 tests
