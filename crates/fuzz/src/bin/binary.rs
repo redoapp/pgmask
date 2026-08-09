@@ -69,6 +69,22 @@ async fn main() -> Result<()> {
         format!("direct {raw}, proxy {masked}"),
     );
 
+    // --- int8: eight big-endian bytes, the width Postgres's `int` is not ----
+    //
+    // `mask.rs` has handled int8 since it was written and a unit test covers
+    // it, but no end-to-end suite had ever produced one: Postgres's `int` is
+    // int4, so the fixture only made four-byte integers. Running this against
+    // CockroachDB — where a bare `int` is int8 — is what surfaced that, as a
+    // deserialisation failure rather than a masking failure.
+    let sql = "SELECT salary_big FROM fz.people WHERE id = 3";
+    let raw: i64 = direct.query_one(sql, &[]).await?.get(0);
+    let masked: i64 = proxy.query_one(sql, &[]).await?.get(0);
+    push(
+        "int8 decodes as binary and is bucketed",
+        raw != masked && masked % 1_000_000 == 0 && masked <= raw,
+        format!("direct {raw}, proxy {masked}"),
+    );
+
     // --- uuid: sixteen raw bytes, must be a different but valid uuid --------
     let sql = "SELECT account_uuid FROM fz.people WHERE id = 3";
     let raw: uuid::Uuid = direct.query_one(sql, &[]).await?.get(0);

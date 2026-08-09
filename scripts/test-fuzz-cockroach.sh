@@ -107,6 +107,59 @@ else
 fi
 kill "$POISON_PID" 2>/dev/null; POISON_PID=""
 
+# --- binary result format ----------------------------------------------------
+# Everything else here speaks simple query, which is text-only. This is also
+# where the two engines' integer defaults surfaced: a bare `int` is int4 on
+# Postgres and int8 on CockroachDB, so the fixture had different column types
+# per engine and a typed driver could not read both. Widths are explicit now,
+# and int8 gained its first end-to-end coverage as a result.
+echo "==> binary result format"
+mkcfg "$POISON_PORT" /tmp/crdb-binary.toml
+./target/release/pgmask /tmp/crdb-binary.toml >/tmp/crdb-binary.log 2>&1 &
+POISON_PID=$!
+sleep 3
+if ! DIRECT_URL="$CDB" PROXY_URL="postgresql://root@localhost:$POISON_PORT/fuzzdb?sslmode=disable" \
+     ./target/release/binary; then
+  kill "$POISON_PID" 2>/dev/null
+  exit 1
+fi
+kill "$POISON_PID" 2>/dev/null; POISON_PID=""
+
+# --- the same corpus over the extended protocol -------------------------------
+# The two protocols do not agree on this engine — CockroachDB reports the first
+# branch's provenance for a set operation on the simple-query path and zero for
+# the same statement under Describe. Testing one of them is testing half.
+echo "==> extended protocol: the same shapes through Parse/Bind/Execute"
+mkcfg "$POISON_PORT" /tmp/crdb-ext.toml "s|^lineage = .*|lineage = \"allow\"|"
+./target/release/pgmask /tmp/crdb-ext.toml >/tmp/crdb-ext.log 2>&1 &
+POISON_PID=$!
+sleep 3
+ext_url="postgresql://root@localhost:$POISON_PORT/fuzzdb?sslmode=disable"
+if ! DIRECT_URL="$CDB" PROXY_URL="$ext_url" \
+     ./target/release/extended "/tmp/crdb-fuzz-1.sql" >/tmp/crdb-ext.out 2>&1; then
+  echo "FAIL: the extended-protocol replay found a leak"
+  tail -20 /tmp/crdb-ext.out
+  kill "$POISON_PID" 2>/dev/null
+  exit 1
+fi
+grep -E '^RESULT' /tmp/crdb-ext.out | sed 's/^/    /'
+kill "$POISON_PID" 2>/dev/null; POISON_PID=""
+
+# And it has to be able to fail, like every other oracle here.
+sed -e 's/^mask = "redact"/mask = "none"/' /tmp/crdb-ext.toml > /tmp/crdb-ext-poison.toml
+./target/release/pgmask /tmp/crdb-ext-poison.toml >/tmp/crdb-ext-poison.log 2>&1 &
+POISON_PID=$!
+sleep 3
+if ! DIRECT_URL="$CDB" PROXY_URL="$ext_url" EXPECT_LEAKS=1 \
+     ./target/release/extended "/tmp/crdb-fuzz-1.sql" >/tmp/crdb-ext-poison.out 2>&1; then
+  echo "FAIL: masking was removed and the extended oracle saw nothing"
+  tail -8 /tmp/crdb-ext-poison.out
+  kill "$POISON_PID" 2>/dev/null
+  exit 1
+fi
+echo "    poison run tripped the extended oracle, as required"
+kill "$POISON_PID" 2>/dev/null; POISON_PID=""
+
 # --- the campaign -----------------------------------------------------------
 # Two policy combinations rather than the four Postgres gets. `opaque` and
 # `lineage` are engine-independent decisions already covered there; what is

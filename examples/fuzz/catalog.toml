@@ -348,6 +348,15 @@ column = "annual_salary"
 mask = "numeric-bucket"
 bucket = 25000
 
+# int8, so the binary path for a 64-bit integer is exercised end to end. It
+# never was before: Postgres's `int` is int4, so the fixture only ever produced
+# one width.
+[[column]]
+relation = "fz.people"
+column = "salary_big"
+mask = "numeric-bucket"
+bucket = 1000000
+
 [[column]]
 relation = "fz.people"
 column = "last_ip"

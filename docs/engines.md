@@ -167,6 +167,36 @@ The lesson is narrower than "add a guard": a safety property established in one
 decision path is not established in the others, and the two paths here were
 written months apart.
 
+## Both protocols, on both engines
+
+Every end-to-end suite except `binary` spoke simple query. Given that the whole
+first disclosure was a *disagreement between protocols*, that was half a test.
+`crates/fuzz/src/bin/extended.rs` replays a generated corpus through
+Parse/Bind/Execute with binary results and the same canary oracle — driving
+Describe-derived plans, `Bind` result-format re-stamping and the type-aware
+decode/encode path, none of which `simple_query` touches.
+
+Zero leaks on both engines. CockroachDB refuses more of the same corpus than
+Postgres does (141 served of 600 against 179), which is the expected shape of
+distrusting provenance the engine reports more freely.
+
+## Integer widths are not portable, and that hid a gap
+
+A bare `int` is int4 on Postgres and **int8 on CockroachDB**. The fixture used
+bare `int`, so the same file produced different column types per engine and a
+typed driver could not read both — which is how the binary suite failed on
+CockroachDB, as a deserialisation error rather than a masking error.
+
+The interesting part is what it exposed. `mask.rs` has handled int8 since it was
+written and a unit test covers it, but **no end-to-end suite had ever produced
+one**, because Postgres's `int` is int4 and every fixture used it. Widths are
+explicit now, and `fz.people.salary_big int8` gives the 64-bit binary path its
+first end-to-end coverage on either engine.
+
+That is the general form of what porting to a second engine buys: not only
+"does it work there", but "which of our assumptions were the first engine's
+defaults wearing a disguise".
+
 ## Other differences found
 
 | | Postgres | CockroachDB |

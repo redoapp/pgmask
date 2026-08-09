@@ -132,6 +132,44 @@ if ! DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb" \
 fi
 kill "$BIN_PID" 2>/dev/null
 
+# --- 1b2. The shape corpus over the extended protocol ------------------------
+# `binary` covers the extended path with a dozen hand-written assertions; this
+# covers it with a generated corpus and the canary oracle. Postgres agrees with
+# itself across protocols where CockroachDB does not, so this is the control
+# that says so rather than an assumption.
+echo "==> extended protocol: generated shapes through Parse/Bind/Execute"
+./target/release/shapegen 4242 600 > /tmp/pgmask-ext.sql
+sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$POISON_PORT\"|" \
+    -e 's|^lineage = .*|lineage = "allow"|' \
+    -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-ext.toml
+./target/release/pgmask /tmp/pgmask-ext.toml >/tmp/pgmask-ext.log 2>&1 &
+BIN_PID=$!
+sleep 2
+ext_env=(DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb"
+         PROXY_URL="postgres://postgres:demo@localhost:$POISON_PORT/fuzzdb")
+if ! env "${ext_env[@]}" ./target/release/extended /tmp/pgmask-ext.sql >/tmp/pgmask-ext.out 2>&1; then
+  echo "FAIL: the extended-protocol replay found a leak"
+  tail -20 /tmp/pgmask-ext.out
+  kill "$BIN_PID" 2>/dev/null
+  exit 1
+fi
+grep -E '^RESULT' /tmp/pgmask-ext.out | sed 's/^/    /'
+kill "$BIN_PID" 2>/dev/null
+
+sed -e 's/^mask = "redact"/mask = "none"/' /tmp/pgmask-ext.toml > /tmp/pgmask-ext-poison.toml
+./target/release/pgmask /tmp/pgmask-ext-poison.toml >/tmp/pgmask-ext-poison.log 2>&1 &
+BIN_PID=$!
+sleep 2
+if ! env "${ext_env[@]}" EXPECT_LEAKS=1 \
+     ./target/release/extended /tmp/pgmask-ext.sql >/tmp/pgmask-ext-poison.out 2>&1; then
+  echo "FAIL: masking was removed and the extended oracle saw nothing"
+  tail -8 /tmp/pgmask-ext-poison.out
+  kill "$BIN_PID" 2>/dev/null
+  exit 1
+fi
+echo "    poison run tripped the extended oracle, as required"
+kill "$BIN_PID" 2>/dev/null
+
 # --- 1c. Per-principal masking under concurrency -----------------------------
 # Sessions share one Arc<Policy> and one catalog snapshot while resolving masks
 # per principal. A plan escaping its session would be a disclosure invisible to

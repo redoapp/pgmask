@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.4 — the other protocol, and the other integer width
+
+No disclosure this time. Two coverage holes, both found by pointing existing
+suites at the second engine.
+
+### The extended protocol was one twelfth tested
+
+Every end-to-end suite except `binary` speaks simple query. That is one protocol
+of two, and **the two do not agree** — CockroachDB reports the first branch's
+provenance for a set operation on the simple-query path and zero for the same
+statement under `Describe`. A disagreement between protocols is what the first
+disclosure here was made of, so testing one of them was testing half.
+
+New `extended` binary replays a generated corpus through Parse/Bind/Execute with
+binary results and the same canary oracle, with the same non-vacuity and poison
+controls. It runs on both engines: Postgres serves 179 of 600 shapes and
+CockroachDB 141, zero leaks on either, and both poison controls fire.
+
+### int8 had no end-to-end coverage at all
+
+`mask.rs` has handled int8 since it was written and a unit test covers it, but
+no suite had ever produced one: Postgres's `int` is int4, so the fixture only
+ever made four-byte integers. CockroachDB's `int` is int8, which surfaced this
+as a driver deserialisation failure rather than a masking failure.
+
+- Every integer width in the fuzz fixture is now explicit, so the same file
+  produces the same column types on both engines.
+- New `fz.people.salary_big int8` under `numeric-bucket`, asserted in the binary
+  suite. `binary` is now 12 checks and runs on CockroachDB too, where all of
+  them pass — including the pseudonym matching Postgres's byte for byte.
+
 ## 0.1.3 — fuzzing CockroachDB, and a third leak
 
 **Fixes a disclosure reachable under `lineage = "allow"` on both engines.**

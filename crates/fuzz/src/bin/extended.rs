@@ -1,0 +1,188 @@
+//! Replay a corpus over the **extended** protocol, with the same canary oracle.
+//!
+//! # Why this is a separate axis and not more of the same
+//!
+//! The main replay harness uses `simple_query` throughout, and every other
+//! end-to-end suite except `binary` does too. That is one protocol out of two,
+//! and the two do not agree: CockroachDB reports the first branch's provenance
+//! for a set operation on the simple-query path and **zero** for the same
+//! statement under `Describe`. A disagreement between protocols is what the
+//! first disclosure here was made of, so testing one of them is testing half.
+//!
+//! `Client::query` goes through Parse/Bind/Execute and asks for binary results,
+//! so this drives Describe-derived plans, `Bind` result-format re-stamping and
+//! the type-aware decode/encode path — none of which `simple_query` touches.
+//!
+//! The oracle is unchanged: every value in the fixture carries the token
+//! CANARY, masking rewrites all of them, so a CANARY reaching the client is a
+//! leak whatever route it took. Two guards keep a quiet run from reading as a
+//! clean one:
+//!
+//!   - every statement also runs directly, and a run where the corpus never
+//!     reached a masked value at all reports as vacuous
+//!   - `EXPECT_LEAKS=1` inverts the result, for the poison control
+//!
+//! Usage:
+//!   DIRECT_URL=… PROXY_URL=… extended corpus.sql
+
+use anyhow::{bail, Context, Result};
+use tokio_postgres::{Client, NoTls, Row};
+
+/// Tokens that must never reach a client, and what they identify.
+const CANARIES: &[(&str, &str)] = &[("CANARY", "a masked text column in fz")];
+
+async fn connect(url: &str) -> Result<Client> {
+    let (client, connection) = tokio_postgres::connect(url, NoTls)
+        .await
+        .with_context(|| format!("connecting to {}", url.rsplit('@').next().unwrap_or("?")))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok(client)
+}
+
+/// Every value in a row set that can be read as text.
+///
+/// Non-text columns are skipped rather than rendered: a canary is a text token,
+/// and `try_get::<String>` on an `int8` is an error, not a value worth
+/// stringifying. Binary is the point of this harness, so the decode is the
+/// driver's, over the bytes the proxy actually emitted.
+fn text_values(rows: &[Row]) -> Vec<String> {
+    let mut out = Vec::new();
+    for row in rows {
+        for i in 0..row.len() {
+            if let Ok(Some(v)) = row.try_get::<_, Option<String>>(i) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let corpus_path = std::env::args()
+        .nth(1)
+        .context("usage: extended <corpus.sql>")?;
+    let direct_url = std::env::var("DIRECT_URL").context("DIRECT_URL is required")?;
+    let proxy_url = std::env::var("PROXY_URL").context("PROXY_URL is required")?;
+    let expect_leaks = std::env::var("EXPECT_LEAKS").is_ok();
+
+    let corpus =
+        std::fs::read_to_string(&corpus_path).with_context(|| format!("reading {corpus_path}"))?;
+    let statements: Vec<&str> = corpus
+        .split(";\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with("--"))
+        .collect();
+    if statements.is_empty() {
+        bail!("the corpus is empty, so nothing would be checked");
+    }
+
+    let direct = connect(&direct_url).await?;
+    let mut proxy = connect(&proxy_url).await?;
+
+    // Long-running generated shapes would otherwise dominate the wall clock.
+    // 400ms is what the simple-query campaign settled on: enough for a thousand
+    // statements in a couple of seconds, short enough that a pathological join
+    // does not stall the run.
+    for c in [&direct, &proxy] {
+        let _ = c.batch_execute("SET statement_timeout = '400ms'").await;
+    }
+
+    let mut served = 0usize;
+    let mut refused = 0usize;
+    let mut errored = 0usize;
+    let mut reconnects = 0usize;
+    let mut reached_masked = 0usize;
+    let mut visible_directly = 0usize;
+    let mut leaks = 0usize;
+    let mut reported: Vec<String> = Vec::new();
+
+    for sql in &statements {
+        // The control: is there anything to find here at all?
+        if let Ok(rows) = direct.query(*sql, &[]).await {
+            let found = text_values(&rows)
+                .iter()
+                .filter(|v| CANARIES.iter().any(|(t, _)| v.contains(t)))
+                .count();
+            if found > 0 {
+                reached_masked = reached_masked.saturating_add(1);
+                visible_directly = visible_directly.saturating_add(found);
+            }
+        }
+
+        match proxy.query(*sql, &[]).await {
+            Ok(rows) => {
+                served = served.saturating_add(1);
+                for value in text_values(&rows) {
+                    for (token, column) in CANARIES {
+                        if value.contains(token) {
+                            leaks = leaks.saturating_add(1);
+                            if reported.len() < 5 {
+                                reported.push(format!(
+                                    "{column} leaked {value:?}\n    via: {}",
+                                    sql.chars().take(300).collect::<String>()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                // The server's message, not the Display string: matching on the
+                // latter counted every pgmask refusal as an ordinary error in
+                // the simple-query harness, making a working proxy look idle.
+                let is_refusal = err
+                    .as_db_error()
+                    .is_some_and(|db| db.message().starts_with("pgmask:"));
+                if is_refusal {
+                    refused = refused.saturating_add(1);
+                } else {
+                    errored = errored.saturating_add(1);
+                }
+                // A dead connection must not turn the rest of the run into
+                // vacuous passes.
+                if proxy.is_closed() {
+                    proxy = connect(&proxy_url).await?;
+                    reconnects = reconnects.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    println!(
+        "\n{} statements over the extended protocol",
+        statements.len()
+    );
+    println!("  reached masked data      {reached_masked:8}  (direct control)");
+    println!("  masked values visible    {visible_directly:8}  without the proxy");
+    println!("  served                   {served:8}");
+    println!("  refused by pgmask        {refused:8}");
+    println!("  engine error             {errored:8}");
+    println!("  reconnects               {reconnects:8}");
+    println!("  LEAKED                   {leaks:8}");
+    println!(
+        "RESULT statements={} served={served} refused={refused} errors={errored} \
+         control={visible_directly} leaks={leaks}",
+        statements.len()
+    );
+    for line in &reported {
+        println!("\n  {line}");
+    }
+
+    if expect_leaks {
+        if leaks == 0 {
+            bail!("EXPECT_LEAKS: masking was removed and nothing leaked — the oracle is blind");
+        }
+        return Ok(());
+    }
+    // A run that never reached a masked value proves nothing, whatever it says.
+    if reached_masked == 0 {
+        bail!("no statement in the corpus reached a masked value — vacuous run");
+    }
+    if leaks > 0 {
+        bail!("{leaks} masked value(s) reached the client");
+    }
+    Ok(())
+}

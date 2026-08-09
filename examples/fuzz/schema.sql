@@ -1,5 +1,10 @@
 -- Fixture for the generated-SQL fuzzer.
 --
+-- Integer widths are always explicit. A bare `int` is int4 on Postgres and
+-- int8 on CockroachDB, so the same fixture produced different column types per
+-- engine and a typed driver could not read both. `salary_big` is deliberately
+-- int8 on both.
+--
 -- sqlsmith picks relations uniformly, so the schema has to be wide enough that
 -- `--exclude-catalog` does not starve, and every table has to hold rows —
 -- a query against an empty table cannot leak anything, and a run of those is a
@@ -10,14 +15,14 @@
 DROP SCHEMA IF EXISTS fz CASCADE;
 CREATE SCHEMA fz;
 
-CREATE TABLE fz.t1 (id int primary key, a text, b text, n int, d date, u uuid);
-CREATE TABLE fz.t2 (id int primary key, a text, b text, n int, d date, u uuid);
-CREATE TABLE fz.t3 (id int primary key, a text, b text, n int, d date, u uuid);
-CREATE TABLE fz.t4 (id int primary key, a text, b text, n int, d date, u uuid);
-CREATE TABLE fz.t5 (id int primary key, a text, b text, n int, d date, u uuid);
-CREATE TABLE fz.t6 (id int primary key, a text, b text, n int, d date, u uuid);
-CREATE TABLE fz.t7 (id int primary key, a text, b text, n int, d date, u uuid);
-CREATE TABLE fz.t8 (id int primary key, a text, b text, n int, d date, u uuid);
+CREATE TABLE fz.t1 (id int4 primary key, a text, b text, n int4, d date, u uuid);
+CREATE TABLE fz.t2 (id int4 primary key, a text, b text, n int4, d date, u uuid);
+CREATE TABLE fz.t3 (id int4 primary key, a text, b text, n int4, d date, u uuid);
+CREATE TABLE fz.t4 (id int4 primary key, a text, b text, n int4, d date, u uuid);
+CREATE TABLE fz.t5 (id int4 primary key, a text, b text, n int4, d date, u uuid);
+CREATE TABLE fz.t6 (id int4 primary key, a text, b text, n int4, d date, u uuid);
+CREATE TABLE fz.t7 (id int4 primary key, a text, b text, n int4, d date, u uuid);
+CREATE TABLE fz.t8 (id int4 primary key, a text, b text, n int4, d date, u uuid);
 
 -- Small tables, so random joins still return rows instead of exploding.
 --
@@ -71,13 +76,18 @@ SELECT i, 'CANARY-t8-a-' || i, 'CANARY-t8-b-' || i, i * 7,
 -- masked output of each is a shape the raw value never has, which is what lets
 -- the oracle check them without an expected-output file.
 CREATE TABLE fz.people (
-  id            int primary key,
+  id            int4 primary key,
   email         text not null,
   full_name     text not null,
   phone         text not null,
   city          text not null,
   birth_date    date not null,
-  annual_salary int  not null,
+  -- Explicit widths. A bare `int` is int4 on Postgres and int8 on
+  -- CockroachDB, so the binary suite could not decode the same column on
+  -- both engines — and int8 had no end-to-end coverage anywhere as a
+  -- result, though the mask handles it.
+  annual_salary int4 not null,
+  salary_big    int8 not null,
   last_ip       text not null,
   account_uuid  uuid not null,
   note          text
@@ -92,6 +102,7 @@ SELECT i,
        -- never 1 January, so a year-truncated value is distinguishable
        DATE '1975-02-03' + (i * 11),
        41111 + i * 137,
+       9000000000 + i * 137,
        -- never .0, so a /24-masked value is distinguishable
        '198.51.100.' || (1 + (i % 250)),
        ('00000000-0000-4000-a000-' || lpad(i::text, 12, '0'))::uuid,
