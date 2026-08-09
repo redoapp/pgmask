@@ -107,8 +107,11 @@ echo "==> starting pgmask with TLS on both legs"
       examples/demo/catalog.toml
 } > "$CERTS/tls.toml"
 
-cargo build --release -q
-./target/release/pgmask "$CERTS/tls.toml" > /tmp/pgmask-tls.log 2>&1 &
+if ! cargo build --release -q; then
+  echo "FATAL: could not build pgmask"
+  exit 1
+fi
+PGMASK_LOG=info ./target/release/pgmask "$CERTS/tls.toml" > /tmp/pgmask-tls.log 2>&1 &
 PROXY_PID=$!
 sleep 2
 
@@ -155,7 +158,7 @@ check "rejection still applies over TLS" "no column provenance" "$rej"
 if [[ "$BACKEND_TLS" == "disable" ]]; then
   kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null
   sed -i.bak 's|^backend_tls = .*|backend_tls = "require"|' "$CERTS/tls.toml"
-  ./target/release/pgmask "$CERTS/tls.toml" > /tmp/pgmask-tls-cb.log 2>&1 &
+  PGMASK_LOG=info ./target/release/pgmask "$CERTS/tls.toml" > /tmp/pgmask-tls-cb.log 2>&1 &
   PROXY_PID=$!
   sleep 2
   cb="$(psql "host=localhost port=$PROXY_PORT user=postgres dbname=demo sslmode=require" \

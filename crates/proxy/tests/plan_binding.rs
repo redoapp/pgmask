@@ -1,4 +1,4 @@
-//! Regression tests for the plan/statement binding rules.
+//! Regression tests for statement, portal, and result-plan binding.
 //!
 //! The governing rule is that the masking plan is bound to the
 //! `RowDescription`. These three cases each broke it with a protocol-legal
@@ -13,9 +13,9 @@
 //!    pipelined Describes analysed both result sets against one statement's
 //!    text.
 //!
-//! A scripted fake backend, so no Postgres and no containers. The first test is
-//! a positive control: it asserts the harness *can* see an unmasked row, so a
-//! green run of the other three means something.
+//! The scripted fake backend needs no Postgres or containers. A positive
+//! control proves the harness can see an unmasked row; a compatibility control
+//! proves that an identical re-Parse retains valid metadata.
 
 #![allow(
     clippy::unwrap_used,
@@ -23,11 +23,6 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects
 )]
-//! SCRATCH — adversarial audit of session.rs / protocol.rs.
-//!
-//! Drives the real `handle_connection` against a scripted fake backend, so no
-//! Postgres is needed. Every test asserts on the raw bytes the client received.
-
 mod support;
 
 use std::collections::HashMap;
@@ -305,6 +300,59 @@ async fn reparse_of_identical_sql_preserves_its_described_plan() {
     assert!(
         c.received_text().contains(CANARY),
         "same-SQL re-Parse discarded the only available result plan"
+    );
+}
+
+#[tokio::test]
+async fn rejected_named_reparse_cannot_relabel_the_existing_statement() {
+    let backend = fake_backend(vec![
+        // The backend accepts the original opaque statement.
+        cat(&[tagless(b'1'), ready()]),
+        // PostgreSQL rejects redefining a named statement without Close.
+        cat(&[
+            error_response("42P05", "prepared statement \"s\" already exists"),
+            ready(),
+        ]),
+        // Describe still answers for the original, opaque SQL.
+        cat(&[
+            param_description(),
+            row_description(&[("lower", 0, 0, 25)]),
+            ready(),
+        ]),
+        // Even a hostile backend row must not cross after the mismatch.
+        cat(&[
+            tagless(b'2'),
+            data_row(&[CANARY]),
+            command_complete("SELECT 1"),
+            ready(),
+        ]),
+    ])
+    .await;
+    let proxy = start_proxy(backend, Unclassified::Allow, Opaque::Reject).await;
+    let mut c = RawClient::connect(proxy, "db").await.unwrap();
+
+    c.send(parse_msg("s", "SELECT lower(email) FROM public.t"))
+        .await
+        .unwrap();
+    c.send(sync_msg()).await.unwrap();
+    c.read_until_ready().await.unwrap();
+
+    c.send(parse_msg("s", "SELECT 1")).await.unwrap();
+    c.send(sync_msg()).await.unwrap();
+    c.read_until_ready().await.unwrap();
+
+    c.send(describe_statement("s")).await.unwrap();
+    c.send(sync_msg()).await.unwrap();
+    c.read_until_ready().await.unwrap();
+
+    c.send(bind_msg("p", "s")).await.unwrap();
+    c.send(execute_msg("p", 0)).await.unwrap();
+    c.send(sync_msg()).await.unwrap();
+    c.read_until_ready_or_eof().await.unwrap();
+
+    assert!(
+        !c.received_text().contains(CANARY),
+        "LEAK: rejected SQL relabelled the backend's existing named statement"
     );
 }
 

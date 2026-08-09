@@ -84,7 +84,10 @@ psql -h localhost -p "$PG_PORT" -U postgres -d demo -q -c "
   GRANT SELECT ON ALL TABLES IN SCHEMA demo TO analyst_ann, support_sam;" >/dev/null 2>&1
 
 echo "==> building and starting pgmask"
-cargo build --release -q
+if ! cargo build --release -q; then
+  echo "FATAL: could not build pgmask"
+  exit 1
+fi
 ./target/release/pgmask examples/demo/catalog.toml >/tmp/pgmask-verify.log 2>&1 &
 PROXY_PID=$!
 sleep 2
@@ -368,11 +371,7 @@ import pathlib
 base = pathlib.Path("examples/demo/catalog.toml").read_text()
 base = base.replace('listen = "127.0.0.1:6432"', 'listen = "127.0.0.1:6460"')
 base = base.replace('opaque = "reject"', 'opaque = "reject"\nlineage = "allow"')
-extra = ""
-for c in ["id", "customer_id", "status", "order_total", "ship_city", "placed_at"]:
-    extra += f'\n[[column]]\nrelation = "demo.orders"\ncolumn = "{c}"\nmask = "none"\n'
-extra += '\n[[column]]\nrelation = "demo.orders"\ncolumn = "ship_address"\ntype = "street_address"\n'
-pathlib.Path("/tmp/pgmask-lineage.toml").write_text(base + extra)
+pathlib.Path("/tmp/pgmask-lineage.toml").write_text(base)
 PYEOF
 ./target/release/pgmask /tmp/pgmask-lineage.toml >/tmp/pgmask-lineage.log 2>&1 &
 LIN_PID=$!

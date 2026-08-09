@@ -3,7 +3,7 @@
 #
 #   ./scripts/test-all.sh
 #
-# There are eleven suites and they were previously five separate commands run in
+# There are thirteen suites and they were previously separate commands run in
 # whatever order someone remembered. Two things went wrong repeatedly: a suite
 # tore down a container the next one needed, and `cargo test` stopped at the
 # first failing target so the total silently dropped by 21 without anything

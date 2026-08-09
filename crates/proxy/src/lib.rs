@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod lineage;
 pub mod mask;
 pub mod metrics;
+mod plan_state;
 pub mod protocol;
 pub mod session;
 pub mod tls;

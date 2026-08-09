@@ -18,7 +18,7 @@
 //! Corollary, enforced below: a `DataRow` with no active plan is a bug or an
 //! attack. It is never forwarded.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -27,23 +27,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::analysis::{self, Safety};
-use crate::catalog::{Catalog, Config, Lineage, Opaque, Summaries, SystemCatalogs, Unclassified};
+use crate::catalog::{
+    Catalog, Config, Lineage, Opaque, Snapshot, Summaries, SystemCatalogs, Unclassified,
+};
 use crate::lineage::{self, Verdict};
 use crate::mask::{Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
-use crate::protocol::{self, DescribeTarget, FrameReader, Message};
+use crate::plan_state::{FieldPlan, Plan, PlanState};
+use crate::protocol::{self, FrameReader, Message};
 use crate::tls::{BackendTls, BoxStream};
 use secrecy::ExposeSecret;
-
-/// What to do with one output field.
-#[derive(Debug, Clone)]
-struct FieldPlan {
-    spec: MaskSpec,
-    type_oid: u32,
-    format: i16,
-}
-
-type Plan = Arc<Vec<FieldPlan>>;
 
 /// Why a result set was refused: the words the client sees, plus the bucket the
 /// counters see.
@@ -108,13 +101,13 @@ impl Policy {
     /// the session that built it.
     fn plan_for(
         &self,
+        snapshot: &Snapshot,
         fields: &[protocol::FieldDescription],
         roles: &HashSet<String>,
         safety: &[Safety],
         lineage: &[Verdict],
         trust_provenance: bool,
     ) -> Result<Plan, Rejection> {
-        let snapshot = self.catalog.snapshot();
         let mut plan = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
             let provably_safe = safety.get(index).copied() == Some(Safety::Releasable);
@@ -144,7 +137,7 @@ impl Policy {
                             // the difference between a ticket and a rewrite.
                             if let Some(Verdict::Blocked(source)) = lineage.get(index) {
                                 return Err(Rejection {
-                                    cause: Cause::classify_opaque(&field.name, &snapshot),
+                                    cause: Cause::classify_opaque(&field.name, snapshot),
                                     message: format!(
                                         "pgmask: output column \"{}\" derives from {source}, \
                                          which is masked",
@@ -159,7 +152,7 @@ impl Policy {
                                 });
                             }
                             return Err(Rejection {
-                                cause: Cause::classify_opaque(&field.name, &snapshot),
+                                cause: Cause::classify_opaque(&field.name, snapshot),
                                 message: format!(
                                     "pgmask: output column \"{}\" has no column provenance, so it \
                                  cannot be classified",
@@ -315,45 +308,10 @@ impl Batch {
     }
 }
 
-/// A `Describe` the backend has not answered yet, and the SQL it was for.
-struct PendingDescribe {
-    target: DescribeTarget,
-    sql: Option<String>,
-    /// How many `Sync`s the client had sent when this was issued.
-    ///
-    /// An `ErrorResponse` makes the backend skip every remaining message up to
-    /// the next `Sync`, so exactly the Describes sharing the failing one's
-    /// epoch are dead. Anything the client pipelined *after* that `Sync` is
-    /// still live, which is why this cannot simply clear the queue.
-    epoch: u64,
-}
-
 pub struct Session {
     policy: Arc<Policy>,
-    /// Plans keyed by prepared-statement name, populated by `Describe('S')`.
-    statement_plans: HashMap<String, Plan>,
-    /// SQL text per prepared statement, so the analysis can run when the result
-    /// set is described. Bounded by how many statements a client prepares.
-    statement_sql: HashMap<String, String>,
-    /// Portal -> statement, so an `Execute` can find its SQL.
-    portal_statement: HashMap<String, String>,
-    /// SQL of the most recent simple query.
-    simple_sql: Option<String>,
-    /// Plans keyed by portal name, copied from the statement at `Bind`.
-    portal_plans: HashMap<String, Plan>,
-    /// The plan the next `DataRow` will be masked with.
-    active_plan: Option<Plan>,
-    /// `Describe`s awaiting a `RowDescription`/`NoData`, in order, each paired
-    /// with the SQL it was issued for.
-    ///
-    /// The SQL used to be a single `described_sql` field holding the *most
-    /// recent* Describe. With two Describes pipelined before either is
-    /// answered, both result sets were then analysed against the second
-    /// statement's text — so a releasable shape laundered an opaque one. It is
-    /// a queue because the Describes are a queue.
-    pending_describes: VecDeque<PendingDescribe>,
-    /// Frontend `Sync` count, stamped onto each pending Describe.
-    sync_epoch: u64,
+    /// Extended-query statement, portal, Describe, and active-plan lifecycle.
+    plans: PlanState,
     /// Discarding backend traffic after a refusal, until `ReadyForQuery`.
     suppressing: bool,
     pub masked_fields: u64,
@@ -374,14 +332,7 @@ impl Session {
     pub fn new(policy: Arc<Policy>) -> Self {
         Self {
             policy,
-            statement_plans: HashMap::new(),
-            statement_sql: HashMap::new(),
-            portal_statement: HashMap::new(),
-            simple_sql: None,
-            portal_plans: HashMap::new(),
-            active_plan: None,
-            pending_describes: VecDeque::new(),
-            sync_epoch: 0,
+            plans: PlanState::default(),
             suppressing: false,
             masked_fields: 0,
             rejected_result_sets: 0,
@@ -434,7 +385,7 @@ impl Session {
     /// consistent.
     fn reject(&mut self, rejection: Rejection, out: &mut Batch) {
         self.suppressing = true;
-        self.active_plan = None;
+        self.plans.clear_active();
         // Counters saturate rather than wrap: a wrapped rejection count would
         // under-report a refusal, and a u64 cannot reach the ceiling in a
         // connection's lifetime anyway.
@@ -467,114 +418,49 @@ impl Session {
             // A new simple query invalidates everything: if the backend does not
             // describe the next result set, we must not mask it with a stale plan.
             protocol::F_QUERY => {
-                self.active_plan = None;
-                self.pending_describes.clear();
-                self.simple_sql = protocol::parse_simple_query(&msg.body);
+                self.plans
+                    .begin_simple_query(protocol::parse_simple_query(&msg.body));
                 out.backend(msg.encode())
             }
 
             protocol::F_PARSE => {
                 if let Some((name, sql)) = protocol::parse_parse(&msg.body) {
-                    // The name now points at different SQL, so every plan
-                    // derived from the old statement is void.
-                    //
-                    // Without this, `Parse("", "SELECT 1")` + `Describe` then
-                    // `Parse("", "SELECT email …")` + `Bind` + `Execute` served
-                    // the address in the clear: `Execute` emits no
-                    // `RowDescription`, so the governing rule never got a chance
-                    // to fire and the passthrough plan from the first statement
-                    // was still cached. The unnamed statement is implicitly
-                    // re-Parsed by every client that uses the extended protocol,
-                    // so this needed no `Close` and no error.
-                    // Some drivers re-Parse the unnamed statement with the
-                    // exact same SQL and rely on their previously described
-                    // result metadata. Its masking plan is still bound to the
-                    // same shape. A genuinely different statement must lose
-                    // every derived plan before it can Execute without a new
-                    // RowDescription.
-                    if self.statement_sql.get(&name) != Some(&sql) {
-                        self.statement_plans.remove(&name);
-                        let stale: Vec<String> = self
-                            .portal_statement
-                            .iter()
-                            .filter(|(_, statement)| **statement == name)
-                            .map(|(portal, _)| portal.clone())
-                            .collect();
-                        for portal in stale {
-                            self.portal_plans.remove(&portal);
-                        }
-                    }
-                    self.statement_sql.insert(name, sql);
+                    self.plans.parse(name, sql);
                 }
                 out.backend(msg.encode())
             }
 
             protocol::F_BIND => {
                 if let Some((portal, statement)) = protocol::parse_bind(&msg.body) {
-                    self.portal_statement
-                        .insert(portal.clone(), statement.clone());
-                    match self.statement_plans.get(&statement) {
-                        Some(plan) => {
-                            // Re-stamp the plan with the formats this Bind
-                            // actually asked for. The plan was built from a
-                            // Describe(Statement), where every field reads as
-                            // text because the client had not chosen yet.
-                            let formats = protocol::parse_bind_result_formats(&msg.body);
-                            let plan = match formats {
-                                Some(formats) => Arc::new(
-                                    plan.iter()
-                                        .enumerate()
-                                        .map(|(i, field)| FieldPlan {
-                                            format: protocol::format_for(&formats, i),
-                                            ..field.clone()
-                                        })
-                                        .collect::<Vec<_>>(),
-                                ),
-                                // Unparseable Bind: keep the plan as described
-                                // rather than guessing. A wrong format fails to
-                                // decode, which refuses the result set.
-                                None => plan.clone(),
-                            };
-                            self.portal_plans.insert(portal, plan);
-                        }
-                        None => {
-                            self.portal_plans.remove(&portal);
-                        }
-                    }
+                    let formats = protocol::parse_bind_result_formats(&msg.body);
+                    self.plans.bind(portal, statement, formats);
+                }
+                out.backend(msg.encode())
+            }
+
+            protocol::F_CLOSE => {
+                if let Some(target) = protocol::parse_close(&msg.body) {
+                    self.plans.close(target);
                 }
                 out.backend(msg.encode())
             }
 
             protocol::F_DESCRIBE => {
                 if let Some(target) = protocol::parse_describe(&msg.body) {
-                    // The SQL travels with its own Describe, so a pipelined
-                    // pair cannot be analysed against each other's text.
-                    let sql = match &target {
-                        DescribeTarget::Statement(name) => self.statement_sql.get(name).cloned(),
-                        DescribeTarget::Portal(portal) => self
-                            .portal_statement
-                            .get(portal)
-                            .and_then(|stmt| self.statement_sql.get(stmt))
-                            .cloned(),
-                    };
-                    self.pending_describes.push_back(PendingDescribe {
-                        target,
-                        sql,
-                        epoch: self.sync_epoch,
-                    });
+                    self.plans.describe(target);
                 }
                 out.backend(msg.encode())
             }
 
             protocol::F_EXECUTE => {
                 if let Some(portal) = protocol::parse_execute(&msg.body) {
-                    self.active_plan = self.portal_plans.get(&portal).cloned();
+                    self.plans.execute(&portal);
                 }
                 out.backend(msg.encode())
             }
 
             protocol::F_SYNC => {
-                self.sync_epoch = self.sync_epoch.saturating_add(1);
+                self.plans.sync();
                 out.backend(msg.encode())
             }
 
@@ -597,7 +483,7 @@ impl Session {
                 // Same Sync-boundary invariant as the arm below: a refusal ends
                 // the exchange, and any Describe still queued was answered by
                 // the error that caused the refusal.
-                self.pending_describes.clear();
+                self.plans.clear_pending_describes();
                 return out.client(Vetted::control(&msg));
             }
             return;
@@ -662,6 +548,14 @@ impl Session {
 
             protocol::B_ROW_DESCRIPTION => self.handle_row_description(msg, out),
             protocol::B_DATA_ROW => self.handle_data_row(msg, out),
+            protocol::B_PARSE_COMPLETE => {
+                self.plans.finish_parse();
+                out.client(Vetted::control(&msg));
+            }
+            protocol::B_BIND_COMPLETE => {
+                self.plans.finish_bind();
+                out.client(Vetted::control(&msg));
+            }
 
             // The other path that emits rows with no RowDescription. Unrecoverable
             // mid-stream, so the connection goes down rather than the data out.
@@ -697,10 +591,8 @@ impl Session {
             // under pipelining a `ReadyForQuery` for an earlier exchange
             // arrives after a later `Describe` is already queued, and dropping
             // that live slot left a real result set with no plan.
-            protocol::B_ERROR_RESPONSE if !self.pending_describes.is_empty() => {
-                if let Some(dead) = self.pending_describes.front().map(|p| p.epoch) {
-                    self.pending_describes.retain(|p| p.epoch != dead);
-                }
+            protocol::B_ERROR_RESPONSE => {
+                self.plans.discard_failed_epoch();
                 match protocol::scrub_error(&msg.body) {
                     Some(scrubbed) => {
                         out.client(Vetted::synthetic(&Message::new(msg.tag, scrubbed)))
@@ -709,18 +601,14 @@ impl Session {
                 }
             }
 
-            protocol::B_ERROR_RESPONSE | protocol::B_NOTICE_RESPONSE => {
-                match protocol::scrub_error(&msg.body) {
-                    Some(scrubbed) => {
-                        out.client(Vetted::synthetic(&Message::new(msg.tag, scrubbed)))
-                    }
-                    None => out.client(Vetted::control(&msg)),
-                }
-            }
+            protocol::B_NOTICE_RESPONSE => match protocol::scrub_error(&msg.body) {
+                Some(scrubbed) => out.client(Vetted::synthetic(&Message::new(msg.tag, scrubbed))),
+                None => out.client(Vetted::control(&msg)),
+            },
 
             // No result set for this Describe; consume its slot.
             b'n' => {
-                self.pending_describes.pop_front();
+                self.plans.finish_no_data();
                 out.client(Vetted::control(&msg))
             }
 
@@ -781,6 +669,13 @@ impl Session {
             }
         };
 
+        // Every decision for one RowDescription must observe one catalog
+        // generation. A refresh can swap the live snapshot at any time; loading
+        // it separately for system-catalog checks, opaque-view checks, lineage,
+        // and final mask lookup could otherwise combine mutually inconsistent
+        // generations into one plan.
+        let snapshot = self.policy.catalog.snapshot();
+
         // Only consulted for fields with no provenance, and only ever able to
         // turn a refusal into a passthrough for a positively-identified shape.
         // A statement that reads only metadata-only system catalogs carries
@@ -802,18 +697,13 @@ impl Session {
         // OID in the RowDescription is the fact.
         // The SQL for *this* result set: the Describe at the head of the
         // queue, or the simple query if there is no Describe outstanding.
-        let described_sql: Option<String> = self
-            .pending_describes
-            .front()
-            .and_then(|pending| pending.sql.clone())
-            .or_else(|| self.simple_sql.clone());
+        let described_sql = self.plans.described_sql();
 
         let system_catalog = self.policy.system_catalogs == SystemCatalogs::Allow
             && described_sql
                 .as_deref()
                 .is_some_and(analysis::reads_only_server_metadata)
             && {
-                let snapshot = self.policy.catalog.snapshot();
                 // The OID check below only inspects fields that have
                 // provenance, so for a computed field the text check stands
                 // alone — and it walks a tree with known gaps. This closes the
@@ -859,11 +749,7 @@ impl Session {
             None => true,
             Some(sql) => {
                 analysis::provenance_is_trustworthy(sql)
-                    && !self
-                        .policy
-                        .catalog
-                        .snapshot()
-                        .statement_touches_opaque_view(sql)
+                    && !snapshot.statement_touches_opaque_view(sql)
             }
         };
 
@@ -882,12 +768,7 @@ impl Session {
                 (!field.has_provenance() || !trust_provenance) && *safety != Safety::Releasable
             });
         let lineage_verdicts: Vec<Verdict> = match (&described_sql, needs_lineage) {
-            (Some(sql), true) => lineage::resolve(
-                sql,
-                fields.len(),
-                &self.policy.catalog.snapshot(),
-                &self.roles,
-            ),
+            (Some(sql), true) => lineage::resolve(sql, fields.len(), &snapshot, &self.roles),
             _ => Vec::new(),
         };
 
@@ -904,6 +785,7 @@ impl Session {
             ))
         } else {
             self.policy.plan_for(
+                &snapshot,
                 &fields,
                 &self.roles,
                 &safety,
@@ -914,7 +796,7 @@ impl Session {
         let plan = match planned {
             Ok(plan) => plan,
             Err(rejection) => {
-                self.pending_describes.pop_front();
+                self.plans.discard_description();
                 return self.reject(rejection, out);
             }
         };
@@ -928,21 +810,12 @@ impl Session {
 
         // Bind the plan to whatever this RowDescription answers, and make it
         // active — which also covers pipelined Bind-before-Describe ordering.
-        match self.pending_describes.pop_front().map(|p| p.target) {
-            Some(DescribeTarget::Statement(name)) => {
-                self.statement_plans.insert(name, plan.clone());
-            }
-            Some(DescribeTarget::Portal(name)) => {
-                self.portal_plans.insert(name, plan.clone());
-            }
-            None => {}
-        }
-        self.active_plan = Some(plan);
+        self.plans.finish_description(plan);
         out.client(Vetted::control(&msg))
     }
 
     fn handle_data_row(&mut self, msg: Message, out: &mut Batch) {
-        let Some(plan) = self.active_plan.clone() else {
+        let Some(plan) = self.plans.active_plan() else {
             // Rows we were never given the shape of. Refuse rather than guess.
             return self.reject(
                 Rejection {
@@ -1283,7 +1156,14 @@ mod tests {
     fn opaque_field_is_rejected_by_default() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let err = p
-            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[], &[], true)
+            .plan_for(
+                &p.catalog.snapshot(),
+                &[field("lower", 0, 0, 25)],
+                &HashSet::new(),
+                &[],
+                &[],
+                true,
+            )
             .expect_err("must reject");
         assert!(err.message.contains("no column provenance"));
     }
@@ -1292,7 +1172,14 @@ mod tests {
     fn opaque_field_can_be_masked_instead() {
         let p = policy(Unclassified::Allow, Opaque::Mask);
         let plan = p
-            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[], &[], true)
+            .plan_for(
+                &p.catalog.snapshot(),
+                &[field("lower", 0, 0, 25)],
+                &HashSet::new(),
+                &[],
+                &[],
+                true,
+            )
             .ok()
             .expect("must allow");
         assert_eq!(plan[0].spec.kind, Mask::Null);
@@ -1303,6 +1190,7 @@ mod tests {
         let p = policy(Unclassified::Mask, Opaque::Reject);
         let plan = p
             .plan_for(
+                &p.catalog.snapshot(),
                 &[field("email", 16391, 2, 25)],
                 &HashSet::new(),
                 &[],
@@ -1319,6 +1207,7 @@ mod tests {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let plan = p
             .plan_for(
+                &p.catalog.snapshot(),
                 &[field("email", 16391, 2, 25)],
                 &HashSet::new(),
                 &[],
@@ -1351,6 +1240,7 @@ mod tests {
         // int4, not a text type: pseudonym rewrites values as text.
         let err = p
             .plan_for(
+                &p.catalog.snapshot(),
                 &[field("id", 16391, 1, 23)],
                 &HashSet::new(),
                 &[],
@@ -1546,7 +1436,7 @@ mod tests {
     #[test]
     fn a_simple_query_invalidates_the_previous_plan() {
         let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
-        session.active_plan = Some(Arc::new(vec![FieldPlan {
+        session.plans.finish_description(Arc::new(vec![FieldPlan {
             spec: MaskSpec::new(Mask::None),
             type_oid: 25,
             format: 0,
@@ -1554,7 +1444,7 @@ mod tests {
         let query = Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1\0"));
         session.handle_frontend(query, &mut Batch::default());
         assert!(
-            session.active_plan.is_none(),
+            session.plans.active_plan().is_none(),
             "stale plans must not survive a new query"
         );
     }
@@ -1567,7 +1457,11 @@ mod tests {
             type_oid: 25,
             format: 0,
         }]);
-        session.statement_plans.insert("s1".into(), plan);
+        session.plans.parse("s1".into(), "SELECT 1".into());
+        session
+            .plans
+            .describe(protocol::DescribeTarget::Statement("s1".into()));
+        session.plans.finish_description(plan);
 
         let mut body = bytes::BytesMut::new();
         bytes::BufMut::put_slice(&mut body, b"p1\0s1\0");
@@ -1575,8 +1469,6 @@ mod tests {
             Message::new(protocol::F_BIND, body.freeze()),
             &mut Batch::default(),
         );
-        assert!(session.portal_plans.contains_key("p1"));
-
         let mut exec = bytes::BytesMut::new();
         bytes::BufMut::put_slice(&mut exec, b"p1\0");
         bytes::BufMut::put_i32(&mut exec, 0);
@@ -1585,7 +1477,7 @@ mod tests {
             &mut Batch::default(),
         );
         assert!(
-            session.active_plan.is_some(),
+            session.plans.active_plan().is_some(),
             "re-executing a prepared statement must work"
         );
     }
@@ -1607,6 +1499,6 @@ mod tests {
             Message::new(protocol::F_EXECUTE, exec.freeze()),
             &mut Batch::default(),
         );
-        assert!(session.active_plan.is_none(), "fail closed");
+        assert!(session.plans.active_plan().is_none(), "fail closed");
     }
 }

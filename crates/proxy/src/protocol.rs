@@ -24,6 +24,8 @@ pub const B_COPY_BOTH_RESPONSE: u8 = b'W';
 pub const B_ERROR_RESPONSE: u8 = b'E';
 pub const B_NOTICE_RESPONSE: u8 = b'N';
 pub const B_READY_FOR_QUERY: u8 = b'Z';
+pub const B_PARSE_COMPLETE: u8 = b'1';
+pub const B_BIND_COMPLETE: u8 = b'2';
 pub const B_COPY_DATA: u8 = b'd';
 pub const B_COPY_DONE: u8 = b'c';
 
@@ -55,6 +57,7 @@ pub const F_QUERY: u8 = b'Q';
 pub const F_PARSE: u8 = b'P';
 pub const F_SYNC: u8 = b'S';
 pub const F_BIND: u8 = b'B';
+pub const F_CLOSE: u8 = b'C';
 pub const F_DESCRIBE: u8 = b'D';
 pub const F_EXECUTE: u8 = b'E';
 pub const F_FUNCTION_CALL: u8 = b'F';
@@ -593,6 +596,12 @@ pub fn parse_describe(body: &Bytes) -> Option<DescribeTarget> {
     }
 }
 
+/// `Close` has the same `[kind: u8][name: cstring]` target layout as
+/// `Describe`, so share the strict parser rather than maintaining two copies.
+pub fn parse_close(body: &Bytes) -> Option<DescribeTarget> {
+    parse_describe(body)
+}
+
 /// `Bind` starts `[portal: cstring][statement: cstring]`; we need only those.
 pub fn parse_bind(body: &Bytes) -> Option<(String, String)> {
     let mut buf = body.clone();
@@ -820,6 +829,14 @@ mod tests {
         assert_eq!(
             parse_describe(&describe.freeze()),
             Some(DescribeTarget::Statement("stmt1".into()))
+        );
+
+        let mut close = BytesMut::new();
+        close.put_u8(b'P');
+        close.put_slice(b"portal1\0");
+        assert_eq!(
+            parse_close(&close.freeze()),
+            Some(DescribeTarget::Portal("portal1".into()))
         );
     }
 }

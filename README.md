@@ -48,8 +48,8 @@ done, and [LICENSE](LICENSE).
 | Phase 6 — lineage (`lineage = "allow"`) | done, opt-in; TPC-DS refusals 55% → 26% ([measured](docs/lineage-estimate.md)) |
 | CockroachDB v25.4 | supported, fuzzed on both protocols; closed three disclosures ([why](docs/engines.md)) |
 
-`./scripts/test-all.sh` runs twelve suites and reports one line each, with a
-skipped suite counted as a failure: 244 cargo tests, 82 demo assertions, 7 TLS,
+`./scripts/test-all.sh` runs thirteen suites and reports one line each, with a
+skipped suite counted as a failure: 258 cargo tests, 82 demo assertions, 7 TLS,
 115 across Postgres 13–17, 34 against CockroachDB, a 43-shape canary sweep over
 both engines, a generated-SQL campaign on Postgres and a generated-shape campaign
 on CockroachDB, both of which must report zero leaks. The adversarial cargo suite drives a raw wire
@@ -85,7 +85,7 @@ harness refusal count is cross-checked against the proxy's own metrics, and the
 fixture is verified unchanged. Beyond that: more fixture shapes,
 and someone other than Claude reading `analysis.rs` and `lineage.rs`.
 
-`scripts/test-fuzz.sh` also runs 11 binary-result-format checks, 21,600
+`scripts/test-fuzz.sh` also runs 12 binary-result-format checks, 21,600
 per-principal assertions across 24 concurrent sessions of three principals, and
 60 reads taken while a view is dropped and recreated underneath the catalog. Everything else
 that drives the proxy end to end speaks the simple query protocol, which is
@@ -492,7 +492,9 @@ analytical ones, and which you have decides whether Phase 6 is optional.
 - **Non-text types accept only `mask = "null"`.** Text-family types are
   byte-identical in text and binary formats so they mask correctly either way;
   anything else is refused rather than guessed at.
-- **One global policy.** No per-principal exceptions yet.
+- **One catalog with per-principal role overrides.** A principal may receive a
+  stricter mask through any matching role; overlapping roles resolve to the
+  most restrictive mask deterministically.
 - Masking is a disclosure control on the projection. It does not defend against
   predicate oracles, join-key re-identification, small-cell aggregates or
   differencing — recorded as reviewed and accepted in
@@ -507,6 +509,7 @@ docs/benchmarks.md         performance methodology and results
 docs/phase0-results.md     generated provenance spike output
 
 crates/proxy/protocol.rs   wire framing and the message types we decode
+crates/proxy/plan_state.rs statement/portal/Describe plan lifecycle
 crates/proxy/session.rs    the per-connection state machine, and Vetted
 crates/proxy/catalog.rs    config and (OID, attnum) resolution
 crates/proxy/mask.rs       masking algorithms, semantic-type domains
