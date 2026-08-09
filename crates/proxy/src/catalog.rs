@@ -377,6 +377,14 @@ pub struct Snapshot {
     /// unqualified — Harlequin does — and a user may own a `public.pg_database`,
     /// so a name proves nothing. The OID in the `RowDescription` does.
     system_relations: HashSet<u32>,
+    /// Lowercased `schema.relation` of every view whose definition contains a
+    /// set operation, transitively, plus every view we could not read or parse.
+    ///
+    /// A `UNION` inside a view is invisible in the statement that selects from
+    /// it, and CockroachDB reports the first branch's provenance for the result
+    /// either way. Selecting from one of these must be treated exactly like
+    /// writing the set operation out by hand.
+    opaque_views: HashSet<String>,
 }
 
 impl Snapshot {
@@ -398,6 +406,44 @@ impl Snapshot {
     pub fn lookup_by_name(&self, relation: &str, column: &str) -> Option<&Classification> {
         self.by_name
             .get(&(relation.to_ascii_lowercase(), column.to_ascii_lowercase()))
+    }
+
+    /// Whether this relation is a view whose expansion contains a set operation.
+    ///
+    /// An unqualified name matches any schema, because resolving it properly
+    /// needs the session's `search_path` and getting that wrong in the
+    /// permissive direction is a leak. Over-matching costs a refusal.
+    pub fn is_opaque_view(&self, schema: Option<&str>, relation: &str) -> bool {
+        let relation = relation.to_ascii_lowercase();
+        match schema {
+            Some(schema) => self
+                .opaque_views
+                .contains(&format!("{}.{relation}", schema.to_ascii_lowercase())),
+            None => self
+                .opaque_views
+                .iter()
+                .any(|known| known.rsplit_once('.').is_some_and(|(_, n)| n == relation)),
+        }
+    }
+
+    /// Whether any relation the statement names is such a view.
+    pub fn statement_touches_opaque_view(&self, sql: &str) -> bool {
+        if self.opaque_views.is_empty() {
+            return false;
+        }
+        match crate::analysis::referenced_relations(sql) {
+            // Unparseable: we cannot see what it references, so we cannot rule
+            // one out.
+            None => true,
+            Some(refs) => refs
+                .iter()
+                .any(|(schema, name)| self.is_opaque_view(schema.as_deref(), name)),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn insert_opaque_view_for_test(&mut self, relation: &str) {
+        self.opaque_views.insert(relation.to_ascii_lowercase());
     }
 
     /// Whether this OID is a relation in `pg_catalog` or `information_schema`.
@@ -754,6 +800,64 @@ fn classify(rule: &ColumnRule, types: &HashMap<String, SemanticType>) -> Result<
 /// say so once. The proxy-to-backend leg is still encrypted; what is given up is
 /// the ability to *detect* an endpoint that re-originates TLS, which is exactly
 /// what this process is. See `docs/phase4.md`.
+/// Views whose expansion contains a set operation, so their provenance cannot be
+/// believed.
+///
+/// Two passes, because the property is transitive: a view over a view over a
+/// `UNION` reports the union's provenance just as directly as the union does.
+/// The fixpoint is bounded by the number of views, and each round can only add,
+/// so it terminates.
+///
+/// Everything unreadable is opaque. A null definition, an empty one, or one
+/// `pg_query` cannot parse all mean the same thing here — we do not know what is
+/// inside it — and the only safe reading of "do not know" is the one that
+/// refuses.
+fn opaque_views(defs: &HashMap<String, Option<String>>) -> HashSet<String> {
+    let mut opaque: HashSet<String> = HashSet::new();
+    for (name, def) in defs {
+        let unsafe_def = match def {
+            Some(sql) if !sql.trim().is_empty() => !crate::analysis::provenance_is_trustworthy(sql),
+            _ => true,
+        };
+        if unsafe_def {
+            opaque.insert(name.clone());
+        }
+    }
+
+    loop {
+        let mut grew = false;
+        for (name, def) in defs {
+            if opaque.contains(name) {
+                continue;
+            }
+            // Already established as readable and parseable by the pass above,
+            // so `None` here cannot happen; treating it as opaque anyway keeps
+            // the fail-closed reading local rather than depending on that.
+            let touches = match def
+                .as_deref()
+                .map(crate::analysis::referenced_relations)
+                .unwrap_or(None)
+            {
+                None => true,
+                Some(refs) => refs.iter().any(|(schema, relation)| match schema {
+                    Some(schema) => opaque.contains(&format!("{schema}.{relation}")),
+                    None => opaque
+                        .iter()
+                        .any(|known| known.rsplit_once('.').is_some_and(|(_, n)| n == relation)),
+                }),
+            };
+            if touches {
+                opaque.insert(name.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    opaque
+}
+
 pub fn sanitize_catalog_dsn(dsn: &str) -> (String, Option<&'static str>) {
     if !dsn.contains("channel_binding") {
         return (dsn.to_string(), None);
@@ -867,10 +971,38 @@ async fn resolve_snapshot(
             .push(column.to_ascii_lowercase());
     }
 
+    // View definitions, so a set operation hidden inside one is not trusted.
+    // `pg_get_viewdef` is available on both Postgres and CockroachDB; a
+    // definition that comes back null or empty is treated as opaque rather than
+    // as safe, so an engine that declines to tell us costs refusals, not
+    // exposure.
+    let mut view_defs: HashMap<String, Option<String>> = HashMap::new();
+    for row in client
+        .query(
+            "SELECT n.nspname || '.' || c.relname AS relation,
+                    pg_get_viewdef(c.oid)         AS def
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relkind IN ('v', 'm')
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema',
+                                      'pg_toast', 'crdb_internal', 'pg_extension')
+                AND n.nspname NOT LIKE 'pg_temp%'",
+            &[],
+        )
+        .await
+        .context("loading view definitions")?
+    {
+        let relation: String = row.get("relation");
+        let def: Option<String> = row.get("def");
+        view_defs.insert(relation.to_ascii_lowercase(), def);
+    }
+    let opaque_views = opaque_views(&view_defs);
+
     if rules.is_empty() {
         let snapshot = Snapshot {
             system_relations,
             relation_columns,
+            opaque_views,
             ..Default::default()
         };
         drop(client);
@@ -917,6 +1049,7 @@ async fn resolve_snapshot(
     let mut snapshot = Snapshot {
         system_relations,
         relation_columns,
+        opaque_views,
         ..Default::default()
     };
     for rule in rules {
@@ -950,6 +1083,91 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::*;
+
+    fn defs(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn a_view_containing_a_set_operation_is_opaque() {
+        let out = opaque_views(&defs(&[
+            ("s.plain", Some("SELECT city FROM s.t")),
+            (
+                "s.u",
+                Some("SELECT city AS v FROM s.t UNION ALL SELECT email FROM s.t"),
+            ),
+        ]));
+        assert!(out.contains("s.u"));
+        assert!(!out.contains("s.plain"));
+    }
+
+    /// A view over a view over a union reports the union's provenance just as
+    /// directly as the union does, so the property has to be transitive.
+    #[test]
+    fn opacity_is_transitive_through_layers_of_views() {
+        let out = opaque_views(&defs(&[
+            ("s.u", Some("SELECT a FROM s.t UNION SELECT b FROM s.t")),
+            ("s.over", Some("SELECT v FROM s.u")),
+            ("s.over_over", Some("SELECT v FROM s.over")),
+            ("s.unrelated", Some("SELECT x FROM s.t")),
+        ]));
+        assert!(out.contains("s.over"), "one layer up");
+        assert!(out.contains("s.over_over"), "two layers up");
+        assert!(!out.contains("s.unrelated"));
+    }
+
+    /// An engine that will not tell us what is in a view has not told us the
+    /// view is safe.
+    #[test]
+    fn an_unreadable_definition_is_opaque() {
+        let out = opaque_views(&defs(&[
+            ("s.null_def", None),
+            ("s.empty_def", Some("   ")),
+            ("s.garbage", Some("SELECT FROM WHERE ((")),
+        ]));
+        assert!(out.contains("s.null_def"));
+        assert!(out.contains("s.empty_def"));
+        assert!(out.contains("s.garbage"));
+    }
+
+    /// Resolving an unqualified name properly needs `search_path`; matching any
+    /// schema costs a refusal, and guessing wrong would cost a disclosure.
+    #[test]
+    fn an_unqualified_reference_matches_the_view_in_any_schema() {
+        let mut snapshot = Snapshot::default();
+        snapshot.insert_opaque_view_for_test("sw.v_union");
+        assert!(snapshot.is_opaque_view(Some("sw"), "v_union"));
+        assert!(snapshot.is_opaque_view(None, "v_union"));
+        assert!(snapshot.is_opaque_view(None, "V_UNION"), "case-folded");
+        assert!(!snapshot.is_opaque_view(Some("other"), "v_union"));
+        assert!(!snapshot.is_opaque_view(None, "something_else"));
+    }
+
+    #[test]
+    fn a_statement_selecting_from_an_opaque_view_is_flagged() {
+        let mut snapshot = Snapshot::default();
+        snapshot.insert_opaque_view_for_test("sw.v_union");
+        assert!(snapshot.statement_touches_opaque_view("SELECT v FROM sw.v_union"));
+        assert!(snapshot.statement_touches_opaque_view(
+            "SELECT q.v FROM (SELECT v FROM sw.v_union) q JOIN sw.t ON true"
+        ));
+        assert!(!snapshot.statement_touches_opaque_view("SELECT email FROM sw.t"));
+        // Unparseable, with an opaque view present: we cannot see what it
+        // references, so it must not read as clean.
+        assert!(snapshot.statement_touches_opaque_view("SELECT FROM WHERE (("));
+    }
+
+    /// With no opaque views at all, nothing is parsed and nothing is flagged —
+    /// the common case must not pay for the check.
+    #[test]
+    fn no_opaque_views_means_no_statement_is_flagged() {
+        let snapshot = Snapshot::default();
+        assert!(!snapshot.statement_touches_opaque_view("SELECT FROM WHERE (("));
+    }
+
     #[test]
     fn config_parses_semantic_types_roles_and_params() {
         let toml_src = r#"

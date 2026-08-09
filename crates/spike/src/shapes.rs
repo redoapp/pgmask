@@ -160,6 +160,16 @@ pub const SHAPES: &[Shape] = &[
     shape!("view_star", "view", Unknown, "SELECT * FROM v_t"),
     shape!("view_nested", "view", Unknown, "SELECT email FROM v_nested"),
     shape!("matview", "view", Unknown, "SELECT email FROM mv_t"),
+    // A set operation hidden in a view. If this reports provenance, then the
+    // reported column is one of two sources for the field, and any rule on it
+    // releases both — which is a leak on any engine, not just CockroachDB.
+    shape!("view_union", "view", Unknown, "SELECT v FROM v_union"),
+    shape!(
+        "view_over_union",
+        "view",
+        Unknown,
+        "SELECT v FROM v_over_union"
+    ),
     // --- Partitioning ------------------------------------------------------
     // Parent OID or child OID? If child, catalog resolution walks the hierarchy.
     shape!(

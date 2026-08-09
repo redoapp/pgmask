@@ -720,6 +720,12 @@ pub fn reads_only_server_metadata(sql: &str) -> bool {
 ///
 /// Returns false when the statement contains a set operation anywhere, in which
 /// case the caller must treat every field as having no provenance.
+///
+/// **This is not sufficient on its own.** A set operation can be hidden inside a
+/// view, and then the statement text is an innocent `SELECT v FROM v_union`
+/// while CockroachDB still reports the first branch's provenance. The caller
+/// must also check [`referenced_relations`] against the snapshot's set of views
+/// whose definitions contain one; see `Snapshot::is_opaque_view`.
 pub fn provenance_is_trustworthy(sql: &str) -> bool {
     use pg_query::NodeRef;
     let Ok(parsed) = pg_query::parse(sql) else {
@@ -742,6 +748,37 @@ pub fn provenance_is_trustworthy(sql: &str) -> bool {
             }
             _ => false,
         })
+}
+
+/// Every relation the statement names, as `(schema, relation)` with the schema
+/// absent when it was written unqualified.
+///
+/// `None` means the statement did not parse, which the caller must treat as
+/// "could be anything" rather than "names nothing" — returning an empty list
+/// there would let an unparseable statement past a check that exists to catch
+/// what it references.
+///
+/// Names are lowercased, matching the snapshot. Quoted identifiers that are
+/// genuinely case-sensitive will therefore over-match, which costs a refusal
+/// and never a release.
+pub fn referenced_relations(sql: &str) -> Option<Vec<(Option<String>, String)>> {
+    use pg_query::NodeRef;
+    let parsed = pg_query::parse(sql).ok()?;
+    Some(
+        parsed
+            .protobuf
+            .nodes()
+            .iter()
+            .filter_map(|(node, _, _, _)| match node {
+                NodeRef::RangeVar(range) => {
+                    let schema = (!range.schemaname.is_empty())
+                        .then(|| range.schemaname.to_ascii_lowercase());
+                    Some((schema, range.relname.to_ascii_lowercase()))
+                }
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Whether every relation in the statement carries an explicit schema.
@@ -1378,6 +1415,36 @@ mod provenance_trust_tests {
         clippy::arithmetic_side_effects
     )]
     use super::*;
+
+    #[test]
+    fn referenced_relations_finds_every_name() {
+        let refs =
+            referenced_relations("SELECT t.email, u.note FROM sw.t t JOIN u ON u.t_id = t.id")
+                .expect("parses");
+        assert!(refs.contains(&(Some("sw".into()), "t".into())));
+        assert!(refs.contains(&(None, "u".into())));
+    }
+
+    #[test]
+    fn referenced_relations_sees_into_subqueries_and_ctes() {
+        let refs = referenced_relations(
+            "WITH c AS (SELECT v FROM sw.v_union) SELECT v FROM c JOIN (SELECT id FROM sw.t) q ON true",
+        )
+        .expect("parses");
+        assert!(refs.contains(&(Some("sw".into()), "v_union".into())));
+        assert!(refs.contains(&(Some("sw".into()), "t".into())));
+    }
+
+    /// Unparseable must not read as "references nothing".
+    ///
+    /// The caller uses this to decide whether a statement touches a view it
+    /// cannot trust; an empty list would answer "no" for a statement we cannot
+    /// read at all, which is the wrong direction to be wrong in.
+    #[test]
+    fn referenced_relations_is_none_when_it_cannot_parse() {
+        assert!(referenced_relations("SELECT FROM WHERE ((").is_none());
+        assert!(referenced_relations("").is_some_and(|r| r.is_empty()));
+    }
 
     /// Set operations must never be trusted, whatever the engine reports.
     ///

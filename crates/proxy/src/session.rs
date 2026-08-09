@@ -747,10 +747,23 @@ impl Session {
         // operations, CockroachDB reports it on the simple-query path only.
         // Deciding from the statement rather than from the engine makes the
         // behaviour the same on both.
-        let trust_provenance = self
-            .described_sql
-            .as_deref()
-            .is_none_or(analysis::provenance_is_trustworthy);
+        //
+        // The statement alone is not enough. `SELECT v FROM v_union` contains no
+        // set operation and CockroachDB still reports the first branch's
+        // provenance, because the union is in the view. A shape sweep found that
+        // leak after the statement-level check had already been shipped, which
+        // is the argument for the sweep and not for the check.
+        let trust_provenance = match self.described_sql.as_deref() {
+            None => true,
+            Some(sql) => {
+                analysis::provenance_is_trustworthy(sql)
+                    && !self
+                        .policy
+                        .catalog
+                        .snapshot()
+                        .statement_touches_opaque_view(sql)
+            }
+        };
 
         // Only computed when something would otherwise be refused: a query whose
         // every field either has provenance or is already released by shape

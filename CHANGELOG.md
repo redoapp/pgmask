@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.2 — set operations hidden in views
+
+**Fixes a disclosure on Postgres as well as CockroachDB.** 0.1.1 decided
+trustworthiness from the statement text, which cannot see this:
+
+```sql
+CREATE VIEW v_union AS SELECT city AS v FROM t UNION ALL SELECT email FROM t;
+SELECT v FROM v_union;      -- no set operation in sight
+```
+
+Postgres reports provenance here naming `v_union.v` — the view's own column —
+so it is one field with two source columns, and a rule releasing `v` releases
+addresses along with cities. That is the rule an operator would write: `v` looks
+like a city column, and `classify` sampling it sees cities. Run against the
+0.1.1 binary with that rule present, the sweep leaks on **both** engines.
+
+At catalog refresh the proxy now reads every view definition (`pg_get_viewdef`,
+available on both engines), marks those containing a set operation, propagates
+that to views built on them to a fixpoint, and distrusts provenance for any
+statement referencing one. A definition that is null, empty or unparseable is
+marked opaque: an engine that will not say what is in a view has not said the
+view is safe.
+
+Cost on Postgres is one shape moving from served-as-nulls to refused.
+
+- New suite: `scripts/test-shapes.sh`, a canary sweep of 43 query shapes over
+  the **simple-query** protocol against both engines, wired into `test-all.sh`.
+  It asserts on values, not on reported provenance, and its catalog deliberately
+  releases the union view's column so the trap is armed rather than covered by
+  default-deny. `PGMASK_BIN` points it at another build — how the fix was shown
+  to be load-bearing rather than merely present.
+- The Phase 0 spike would **not** have caught either bug: it reads provenance
+  via Parse + Describe, and CockroachDB reports zero there for a set operation.
+  0.1.1 claimed otherwise; that claim was wrong. The spike gains the
+  `view_union` shapes that established what Postgres reports.
+- 229 cargo tests, up from 220.
+
 ## 0.1.1 — CockroachDB
 
 **Fixes a disclosure.** CockroachDB reports the *first branch's* table OID and

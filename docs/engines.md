@@ -80,6 +80,49 @@ direct-connection control proving CockroachDB really does report the
 leak-enabling provenance — so the test fails if a future CockroachDB release
 changes this and the suite quietly stops testing anything.
 
+## The same bug, hidden in a view — and Postgres has it too
+
+Deciding from the statement text is not enough, because the set operation can be
+somewhere the statement cannot see it:
+
+```sql
+CREATE VIEW v_union AS SELECT city AS v FROM t UNION ALL SELECT email FROM t;
+SELECT v FROM v_union;      -- no set operation in sight
+```
+
+`scripts/test-shapes.sh` found this after the statement-level check had already
+shipped. That is the argument for the sweep rather than for the check.
+
+The important part is what Postgres does here. It **reports provenance** — not
+zero — naming `v_union.v`, the view's own column. That is honest as far as it
+goes, and it is still one field with two source columns. Any rule releasing
+`v_union.v` therefore releases addresses along with cities, and `v` is exactly
+the column an operator would release: it looks like a city column, and
+`classify` sampling it sees cities.
+
+Running the sweep against the commit before the fix, with that rule in the
+catalog, leaks on **both** engines:
+
+```
+ postgres     LEAK view_union: portland …
+ cockroach    LEAK view_union: portland …
+```
+
+So this half is not a CockroachDB accommodation. Postgres was exposed by the
+same underlying mistake — trusting a single reported origin for a field that has
+several — and only escaped the first sweep because default-deny happened to
+cover the view.
+
+The fix: at catalog refresh the proxy reads every view definition
+(`pg_get_viewdef`, available on both engines), marks the ones containing a set
+operation, and propagates that to views built on them until it reaches a
+fixpoint. A statement referencing any of them has its provenance distrusted.
+A definition that is null, empty or unparseable is marked opaque — an engine
+that will not tell us what is in a view has not told us the view is safe.
+
+The cost on Postgres is one shape moving from *served as nulls* to *refused*,
+which is the correct trade for closing a disclosure.
+
 ## Other differences found
 
 | | Postgres | CockroachDB |
@@ -105,12 +148,17 @@ assumed.
   SYSTEM TIME`, changefeeds, `SHOW` variants — have not been through the fuzzer.
   A construct that erases or reassigns provenance in a way set operations do not
   would not have been found.
-- **The Phase 0 provenance spike is Postgres-only.** `crates/spike` enumerates
-  which SQL shapes carry provenance and which erase it — precisely the tool that
-  would have found the union leak, had it ever been pointed at CockroachDB. Its
-  fixture uses declarative partitioning, materialized views and plpgsql, none of
-  which port unchanged, so it has not been. That gap is how the leak survived,
-  and it is worth closing before adding a third engine rather than after.
+- **The Phase 0 provenance spike is Postgres-only, and would not have caught
+  this anyway.** `crates/spike` enumerates which SQL shapes carry provenance,
+  but it reads it via Parse + Describe — the *extended* protocol, where
+  CockroachDB reports zero for a set operation. Pointed at CockroachDB it would
+  have said "opaque, safe" about the exact statement that leaked. Sweeping
+  shapes was the right instinct; sweeping them over the wrong protocol is how
+  the disclosure survived being looked for. `scripts/test-shapes.sh` sweeps the
+  simple-query path and asserts on values rather than on reported provenance,
+  which is why it found both bugs. The spike remains useful for *why* a shape
+  behaves as it does, and it now carries the `view_union` shapes that showed
+  Postgres reports the view's own column.
 - **No other pgwire-speaking engine has been tried.** Anything that reports
   provenance more loosely than Postgres does is in the same category as the leak
   above, and the mitigation is the same: distrust the statement shape, do not

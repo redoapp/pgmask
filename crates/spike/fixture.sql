@@ -39,6 +39,12 @@ CREATE VIEW v_t AS SELECT id, email, name, city FROM t;
 CREATE VIEW v_nested AS SELECT id, email, name FROM v_t;
 CREATE MATERIALIZED VIEW mv_t AS SELECT id, email, name FROM t;
 
+-- A view whose *definition* contains a set operation. The statement selecting
+-- from it looks innocent, so whatever provenance the engine reports here is
+-- reported for a field with two different source columns.
+CREATE VIEW v_union AS SELECT city AS v FROM t UNION ALL SELECT email FROM t;
+CREATE VIEW v_over_union AS SELECT v FROM v_union;
+
 -- Partitioned table ---------------------------------------------------------
 
 CREATE TABLE p (
