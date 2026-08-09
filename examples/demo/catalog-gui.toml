@@ -197,41 +197,5 @@ type = "street_address"
 
 # demo.orders.internal_note is deliberately absent: default-deny nulls it.
 
-# --- demo.orders: business facts, released so lineage has something to work with
-
-[[column]]
-relation = "demo.orders"
-column = "id"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "customer_id"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "status"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "order_total"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "ship_city"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "placed_at"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "ship_address"
-type = "street_address"
 
 # demo.orders.internal_note is deliberately absent: default-deny nulls it.

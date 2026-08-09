@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
@@ -192,8 +192,21 @@ impl Classification {
     /// gets the tighter of the two, because the alternative — widening access by
     /// adding a role — is the kind of surprise a security control must not have.
     pub fn for_roles(&self, roles: &HashSet<String>) -> &MaskSpec {
+        // Sorted, because `roles` is a `HashSet` and the iteration order is
+        // randomised per instance. Two roles whose masks rank equally —
+        // `partial` and `outer` both rank 2 — used to resolve to whichever was
+        // seen first, so the same principal running the same query could get a
+        // different masking on the next connection.
+        //
+        // Ranking still ignores mask *parameters*; `by_role` carries only the
+        // kind, so two roles sharing a kind share a spec and there is nothing
+        // to choose between. Where the kinds differ but rank equally, the
+        // lexicographically first role wins — arbitrary, but the same every
+        // time, which is what a security control owes its operator.
+        let mut matching: Vec<&String> = roles.iter().collect();
+        matching.sort();
         let mut chosen: Option<&MaskSpec> = None;
-        for role in roles {
+        for role in matching {
             if let Some(spec) = self.by_role.get(role) {
                 chosen = Some(match chosen {
                     Some(current)
@@ -363,6 +376,52 @@ impl Config {
     /// Both load clean, log `unclassified=Mask`, and return every undeclared
     /// column verbatim. Default-deny becomes default-allow with no warning.
     fn validate(&self) -> Result<()> {
+        self.validate_pseudonym_key()?;
+        self.validate_unique_column_rules()?;
+        self.validate_unclassified_policy()
+    }
+
+    /// Checks that apply regardless of how undeclared columns are handled.
+    fn validate_pseudonym_key(&self) -> Result<()> {
+        // An empty key makes every pseudonym a publicly recomputable
+        // HMAC-SHA256 with a zero key: anyone holding the masked output can
+        // invert the whole domain by dictionary. `hmac` accepts any key length,
+        // so nothing else was going to catch this.
+        let key_len = self.pseudonym_key.expose_secret().len();
+        if key_len < 16 {
+            bail!(
+                "pseudonym_key must be at least 16 bytes, got {key_len}. Pseudonyms are \
+                 keyed HMAC-SHA256; a short or empty key lets anyone holding the masked \
+                 output recompute the whole domain."
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_unique_column_rules(&self) -> Result<()> {
+        // Two rules for one column both land in the same `(oid, attnum)` and
+        // `(relation, column)` keys, so the file order decides — and the second
+        // one silently wins even when it is the more permissive. Nothing warned.
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for rule in &self.column {
+            let key = (
+                rule.relation.to_ascii_lowercase(),
+                rule.column.to_ascii_lowercase(),
+            );
+            if !seen.insert(key) {
+                bail!(
+                    "duplicate rule for {}.{}. Two rules for one column resolve by file \
+                     order, so the later one silently overrides — including when it is the \
+                     more permissive of the two.",
+                    rule.relation,
+                    rule.column
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_unclassified_policy(&self) -> Result<()> {
         if self.unclassified != Unclassified::Mask {
             return Ok(());
         }
@@ -373,6 +432,7 @@ impl Config {
                  Use unclassified = \"allow\" if that is what you want."
             );
         }
+
         // Parameterless by construction, so only masks that are safe with
         // default parameters can be used here.
         validate_spec(&MaskSpec::new(self.unclassified_mask), "unclassified_mask").context(
@@ -1369,7 +1429,7 @@ mod tests {
 listen = "127.0.0.1:1"
 backend = "127.0.0.1:2"
 catalog_dsn = "postgres://x@y/z"
-pseudonym_key = "k"
+pseudonym_key = "a-long-enough-key"
 unclassified = "mask"
 "#;
         for (mask, expect) in [
@@ -1398,6 +1458,41 @@ unclassified = "mask"
             base.replace("mask\"", "allow\"").to_string() + "unclassified_mask = \"none\"\n";
         let config: Config = toml::from_str(&toml_src).expect("parses");
         config.validate().expect("allow is the operator's choice");
+    }
+
+    #[test]
+    fn common_config_checks_run_when_unclassified_columns_are_allowed() {
+        let short_key = r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "short"
+unclassified = "allow"
+"#;
+        let config: Config = toml::from_str(short_key).expect("parses");
+        let err = config.validate().expect_err("short key must be refused");
+        assert!(format!("{err:#}").contains("at least 16 bytes"));
+
+        let duplicate_rule = r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "a-long-enough-key"
+unclassified = "allow"
+
+[[column]]
+relation = "s.t"
+column = "email"
+mask = "redact"
+
+[[column]]
+relation = "S.T"
+column = "EMAIL"
+mask = "none"
+"#;
+        let config: Config = toml::from_str(duplicate_rule).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("duplicate rules must be refused");
+        assert!(format!("{err:#}").contains("duplicate rule"));
     }
 
     #[test]

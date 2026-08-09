@@ -60,10 +60,32 @@ const SIZE_FUNCTIONS: &[&str] = &[
     "pg_total_relation_size",
     "pg_database_size",
     "pg_tablespace_size",
-    "pg_size_pretty",
-    "pg_size_bytes",
-    "pg_column_size",
 ];
+
+// Size-*formatting* functions. Released only when their argument is.
+//
+// These were on the list above, justified by the same sentence — "they take a
+// relation and return a byte count, so there is no argument that could come
+// back out". That is true of the six that remain and false of these three,
+// which take a **value**:
+//
+// ```sql
+// SELECT pg_size_pretty(salary) FROM t;                       -- "4321 bytes"
+// SELECT pg_size_pretty((salary % 10000)::bigint),
+//        pg_size_pretty((salary / 10000)::bigint) FROM t;      -- exact, any bigint
+// SELECT pg_column_size(email) FROM t;                         -- exact byte length
+// ```
+//
+// `pg_size_pretty` renders `|v| < 10240` as `"%lld bytes"`, so a modulo and a
+// divide reconstruct any value exactly. Same shape as the `sum(...) OVER`
+// disclosure: a caller-supplied argument turns an allowlisted "cannot return
+// an input" function into the identity. Found by an audit, confirmed against
+// a live server.
+//
+// They live in [`PURE_SCALARS`] instead, which releases a call only when every
+// argument is releasable. That keeps the case GUI clients actually need —
+// `pg_size_pretty(pg_table_size('t'))`, a formatted *relation* size — and
+// refuses the value ones, without a special case for either.
 
 /// Zero-argument functions returning session or clock context, never table data.
 ///
@@ -163,6 +185,23 @@ const RANKING_WINDOWS: &[&str] = &[
     "ntile",
 ];
 
+/// Set-returning functions allowed in a `FROM` clause of a metadata query.
+///
+/// An allowlist rather than a denylist, because the denylist here is on
+/// *relations*: `LEAKY_SYSTEM_CATALOGS` denies the `pg_stat_activity` and
+/// `pg_stat_statements` views, and the SRFs behind them —
+/// `pg_stat_get_activity()`, `pg_stat_statements()` — return identical rows
+/// while appearing as a `RangeFunction` that no relation rule matches. Naming
+/// those two would leave every other data-bearing SRF, `pg_ls_waldir()`
+/// included.
+///
+/// Everything here computes from its arguments and reads no table. The list is
+/// short on purpose and exists because psql's `\d` genuinely needs
+/// `generate_series` in `FROM`; without it, describing a table stops working
+/// on four of five Postgres versions, which is the whole reason
+/// `system_catalogs = "allow"` exists.
+const GENERATORS_IN_FROM: &[&str] = &["generate_series", "generate_subscripts", "unnest"];
+
 /// Precisions `date_trunc` may coarsen to.
 ///
 /// **The precision is an argument, so it is caller-controlled.**
@@ -210,6 +249,11 @@ const PURE_SCALARS: &[&str] = &[
     "nullif",
     "to_char",
     "to_number",
+    // Size formatters: safe over a size, an identity over a value. See the
+    // note above `SIZE_FUNCTIONS`.
+    "pg_size_pretty",
+    "pg_size_bytes",
+    "pg_column_size",
     "numeric",
     "int4",
     "int8",
@@ -325,6 +369,44 @@ fn positions_are_trustworthy(select: &SelectStmt, field_count: usize) -> bool {
         && select.larg.is_none()
         && select.rarg.is_none()
         && select.target_list.len() == field_count
+        // A star expands to however many columns the relation has, and the
+        // length check above was the only thing standing between that and a
+        // misaligned verdict. It works whenever a star expands to something
+        // other than one column — except that a star over a *zero-column*
+        // relation expands to none, and a second star expanding to two puts
+        // the total back:
+        //
+        //   CREATE TEMP TABLE e();
+        //   SELECT e.*, 1, upper(p.email), q.* FROM e, people p, (…) q
+        //
+        // Four targets, four fields, every position after the zero-expander
+        // shifted by one — so the literal's `Releasable` landed on
+        // `upper(email)`, which has no provenance, and the address was served.
+        // `CREATE TEMP TABLE` is granted to PUBLIC by default.
+        //
+        // Counting cannot distinguish the aligned case from the shifted one, so
+        // a star anywhere in the list means the positions are not ours to
+        // claim. `SELECT *` alone is unaffected: it never matched the length
+        // check to begin with.
+        && !select.target_list.iter().any(target_is_star)
+}
+
+/// Whether a target is `*` or `alias.*`.
+fn target_is_star(node: &pg_query::protobuf::Node) -> bool {
+    let Some(NodeEnum::ResTarget(target)) = &node.node else {
+        return false;
+    };
+    let Some(value) = target.val.as_ref().and_then(|v| v.node.as_ref()) else {
+        return false;
+    };
+    let NodeEnum::ColumnRef(column) = value else {
+        return false;
+    };
+    column
+        .fields
+        .last()
+        .and_then(|f| f.node.as_ref())
+        .is_some_and(|f| matches!(f, NodeEnum::AStar(_)))
 }
 
 /// The allowlist proper.
@@ -699,6 +781,47 @@ pub fn reads_only_server_metadata(sql: &str) -> bool {
                 }
                 saw_relation = true;
             }
+            // A set-returning function in `FROM`.
+            //
+            // `LEAKY_SYSTEM_CATALOGS` denies `pg_stat_activity` and
+            // `pg_stat_statements` — "other sessions' SQL text, literals
+            // included". Those are *views*, and the SRFs behind them produce
+            // identical rows while appearing as a `RangeFunction` that neither
+            // the RangeVar arm nor the escape list matches:
+            //
+            //   SELECT a.query FROM pg_stat_get_activity(NULL) a, pg_class c
+            //
+            // The joined `pg_class` even supplies the `saw_relation` the
+            // function alone would fail on. That is the denylist polarity
+            // problem in its purest form: the same bypass exists for every
+            // data-bearing SRF, named or not. A relation-only rule has no such
+            // hole, and a catalog query that genuinely needs a function in
+            // `FROM` loses the fast path rather than the answer.
+            NodeRef::RangeFunction(range) => {
+                for item in &range.functions {
+                    let Some(NodeEnum::List(list)) = &item.node else {
+                        return false;
+                    };
+                    for element in &list.items {
+                        let Some(NodeEnum::FuncCall(call)) = &element.node else {
+                            continue;
+                        };
+                        let safe = call
+                            .funcname
+                            .last()
+                            .and_then(|n| n.node.as_ref())
+                            .and_then(|n| match n {
+                                NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
+                                _ => None,
+                            })
+                            .is_some_and(|name| GENERATORS_IN_FROM.contains(&name.as_str()));
+                        if !safe {
+                            return false;
+                        }
+                    }
+                }
+            }
+
             NodeRef::FuncCall(call) => {
                 // Compare on the bare name: `pg_catalog.query_to_xml` and
                 // `query_to_xml` are the same function.
@@ -987,6 +1110,24 @@ mod tests {
     }
 
     #[test]
+    fn data_bearing_set_returning_functions_do_not_get_the_metadata_fast_path() {
+        // Range functions can expose the same data as denied catalog views,
+        // while a joined pg_catalog relation supplies the otherwise-required
+        // relation marker. Refuse data-bearing SRFs rather than maintaining a
+        // second, inevitably incomplete denylist.
+        for sql in [
+            "SELECT a.query FROM pg_stat_get_activity(NULL) a, pg_catalog.pg_class c",
+            "SELECT * FROM pg_ls_waldir(), pg_catalog.pg_class",
+        ] {
+            assert!(!reads_only_server_metadata(sql), "must be refused: {sql}");
+        }
+        assert!(reads_only_server_metadata(
+            "SELECT n.nspname, c.relname FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+        ));
+    }
+
+    #[test]
     fn a_cte_may_go_unqualified_but_only_if_it_is_declared_here() {
         assert!(reads_only_server_metadata(
             "WITH cls AS (SELECT oid, relname FROM pg_catalog.pg_class) \
@@ -1003,10 +1144,33 @@ mod tests {
         // Every GUI client shows table sizes. A byte count cannot carry a row.
         for sql in [
             "SELECT pg_total_relation_size('demo.customers')",
-            "SELECT pg_size_pretty(pg_table_size('demo.customers'))",
             "SELECT pg_relation_size(c.oid) FROM pg_catalog.pg_class c",
         ] {
             assert_eq!(analyze(sql, 1, false), vec![Safety::Releasable], "{sql}");
+        }
+        // A formatted size is still released under the default posture. It is
+        // a pure scalar now rather than a size function, so it sits behind the
+        // summaries gate and the strict posture refuses it — which is what the
+        // strict posture is for.
+        assert_eq!(
+            analyze(
+                "SELECT pg_size_pretty(pg_table_size('demo.customers'))",
+                1,
+                true
+            ),
+            vec![Safety::Releasable]
+        );
+        // But the formatters take a *value*, and `pg_size_pretty` renders
+        // anything under 10240 as "%lld bytes" — so a modulo and a divide
+        // reconstruct any bigint exactly. They are released only over a
+        // releasable argument, which is what the GUI case actually is.
+        for sql in [
+            "SELECT pg_size_pretty(salary) FROM t",
+            "SELECT pg_size_pretty((salary % 10000)::bigint) FROM t",
+            "SELECT pg_column_size(email) FROM t",
+            "SELECT pg_size_bytes(note) FROM t",
+        ] {
+            assert_eq!(analyze(sql, 1, true), vec![Safety::Unknown], "{sql}");
         }
         // The neighbouring trap stays shut: these return an actual member.
         for sql in [
@@ -1232,6 +1396,12 @@ mod tests {
             vec![Safety::Unknown; 5],
             "a star expansion must not let a literal claim the wrong position"
         );
+        // Counts can accidentally match again when one star expands to zero
+        // fields and a later star expands to several. Position still is not
+        // trustworthy.
+        let sql = "SELECT e.*, 1, upper(p.email), q.* \
+                   FROM e, fz.people p, (SELECT id, salary FROM fz.people) q";
+        assert_eq!(safety(sql, 4), vec![Safety::Unknown; 4]);
     }
 
     #[test]
