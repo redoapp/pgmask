@@ -84,6 +84,7 @@ use std::sync::Arc;
 
 use sqllineage::types::{AnalyzeOptions, CatalogProvider, ColumnOrigin, Dialect, TableRef};
 
+use crate::analysis::StatementInspection;
 use crate::catalog::Snapshot;
 
 /// What lineage can say about one output field.
@@ -156,6 +157,17 @@ pub fn resolve(
     snapshot: &Arc<Snapshot>,
     roles: &HashSet<String>,
 ) -> Vec<Verdict> {
+    let inspection = StatementInspection::new(sql);
+    resolve_inspected(&inspection, field_count, snapshot, roles)
+}
+
+pub(crate) fn resolve_inspected(
+    inspection: &StatementInspection<'_>,
+    field_count: usize,
+    snapshot: &Arc<Snapshot>,
+    roles: &HashSet<String>,
+) -> Vec<Verdict> {
+    let sql = inspection.sql();
     let unresolved = vec![Verdict::Unresolved; field_count];
 
     let opts = AnalyzeOptions {
@@ -203,7 +215,8 @@ pub fn resolve(
     // The cost is utility, not safety: `SELECT upper(city) FROM people WHERE
     // email = 'x'` no longer releases, because `email` is mentioned. That
     // statement is a predicate oracle anyway.
-    let masked_column_in_statement = snapshot.statement_references_masked_column(sql, roles);
+    let masked_column_in_statement =
+        snapshot.inspection_references_masked_column(inspection, roles);
 
     mappings
         .iter()

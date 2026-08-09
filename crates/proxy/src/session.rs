@@ -712,19 +712,22 @@ impl Session {
         // The SQL for *this* result set: the Describe at the head of the
         // queue, or the simple query if there is no Describe outstanding.
         let described_sql = self.plans.described_sql();
+        let inspection = described_sql
+            .as_deref()
+            .map(analysis::StatementInspection::new);
 
         let system_catalog = self.policy.system_catalogs == SystemCatalogs::Allow
-            && described_sql
-                .as_deref()
-                .is_some_and(analysis::reads_only_server_metadata)
+            && inspection
+                .as_ref()
+                .is_some_and(analysis::StatementInspection::reads_only_server_metadata)
             && {
                 // The OID check below only inspects fields that have
                 // provenance, so for a computed field the text check stands
                 // alone — and it walks a tree with known gaps. This closes the
                 // one that was demonstrable.
-                let mentions_user_relation = described_sql
-                    .as_deref()
-                    .is_some_and(|sql| snapshot.statement_mentions_user_relation(sql));
+                let mentions_user_relation = inspection.as_ref().is_some_and(|inspection| {
+                    snapshot.inspection_mentions_user_relation(inspection)
+                });
                 let mut provenanced = 0usize;
                 let all_system = fields.iter().filter(|f| f.has_provenance()).all(|f| {
                     // Bounded by `fields.len()`, so the saturation is unreachable.
@@ -738,14 +741,14 @@ impl Session {
                 !mentions_user_relation
                     && all_system
                     && (provenanced > 0
-                        || analysis::every_relation_is_qualified(
-                            described_sql.as_deref().unwrap_or_default(),
+                        || inspection.as_ref().is_some_and(
+                            analysis::StatementInspection::every_relation_is_qualified,
                         ))
             };
 
-        let safety = match &described_sql {
-            Some(sql) => {
-                analysis::analyze(sql, fields.len(), self.policy.summaries == Summaries::Allow)
+        let safety = match &inspection {
+            Some(inspection) => {
+                inspection.output_safety(fields.len(), self.policy.summaries == Summaries::Allow)
             }
             None => vec![Safety::Unknown; fields.len()],
         };
@@ -759,14 +762,14 @@ impl Session {
         // provenance, because the union is in the view. A shape sweep found that
         // leak after the statement-level check had already been shipped, which
         // is the argument for the sweep and not for the check.
-        let trust_provenance = match described_sql.as_deref() {
+        let trust_provenance = match inspection.as_ref() {
             // Missing statement identity means provenance cannot be checked
             // against set operations or opaque views. Treat it as unknown,
             // especially on engines that report one branch's OID for a UNION.
             None => false,
-            Some(sql) => {
-                analysis::provenance_is_trustworthy(sql)
-                    && !snapshot.statement_touches_opaque_view(sql)
+            Some(inspection) => {
+                inspection.provenance_is_trustworthy()
+                    && !snapshot.inspection_touches_opaque_view(inspection)
             }
         };
 
@@ -784,8 +787,10 @@ impl Session {
             && fields.iter().zip(&safety).any(|(field, safety)| {
                 (!field.has_provenance() || !trust_provenance) && *safety != Safety::Releasable
             });
-        let lineage_verdicts: Vec<Verdict> = match (&described_sql, needs_lineage) {
-            (Some(sql), true) => lineage::resolve(sql, fields.len(), &snapshot, &self.roles),
+        let lineage_verdicts: Vec<Verdict> = match (&inspection, needs_lineage) {
+            (Some(inspection), true) => {
+                lineage::resolve_inspected(inspection, fields.len(), &snapshot, &self.roles)
+            }
             _ => Vec::new(),
         };
 

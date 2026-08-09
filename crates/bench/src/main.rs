@@ -9,7 +9,7 @@
 //!     could plausibly get wrong.
 //!
 //! Usage:
-//!   DIRECT_URL=... PROXY_URL=... cargo run -p bench --release -- [rows] [iters]
+//!   DIRECT_URL=... PROXY_URL=... cargo run -p bench --bin bench --release -- [rows] [iters]
 
 use std::time::{Duration, Instant};
 

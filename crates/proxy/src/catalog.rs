@@ -562,7 +562,16 @@ impl Snapshot {
     /// the failure mode that has produced three of this project's five
     /// disclosures.
     pub fn statement_references_masked_column(&self, sql: &str, roles: &HashSet<String>) -> bool {
-        let Some(identifiers) = crate::analysis::referenced_identifiers(sql) else {
+        let inspection = crate::analysis::StatementInspection::new(sql);
+        self.inspection_references_masked_column(&inspection, roles)
+    }
+
+    pub(crate) fn inspection_references_masked_column(
+        &self,
+        inspection: &crate::analysis::StatementInspection<'_>,
+        roles: &HashSet<String>,
+    ) -> bool {
+        let Some(identifiers) = inspection.identifiers() else {
             return true;
         };
         identifiers.iter().any(|identifier| {
@@ -609,7 +618,15 @@ impl Snapshot {
     /// to match a user relation's name loses the fast path — and costs a GUI
     /// client one refused introspection query, not a disclosure.
     pub fn statement_mentions_user_relation(&self, sql: &str) -> bool {
-        let Some(identifiers) = crate::analysis::referenced_identifiers(sql) else {
+        let inspection = crate::analysis::StatementInspection::new(sql);
+        self.inspection_mentions_user_relation(&inspection)
+    }
+
+    pub(crate) fn inspection_mentions_user_relation(
+        &self,
+        inspection: &crate::analysis::StatementInspection<'_>,
+    ) -> bool {
+        let Some(identifiers) = inspection.identifiers() else {
             return true;
         };
         identifiers.iter().any(|identifier| {
@@ -623,6 +640,14 @@ impl Snapshot {
 
     /// Whether any relation the statement names is such a view.
     pub fn statement_touches_opaque_view(&self, sql: &str) -> bool {
+        let inspection = crate::analysis::StatementInspection::new(sql);
+        self.inspection_touches_opaque_view(&inspection)
+    }
+
+    pub(crate) fn inspection_touches_opaque_view(
+        &self,
+        inspection: &crate::analysis::StatementInspection<'_>,
+    ) -> bool {
         if self.opaque_views.is_empty() {
             return false;
         }
@@ -638,10 +663,10 @@ impl Snapshot {
         // Names in the token stream cannot go missing that way. The lexer will
         // happily scan nonsense, though, so the parse check stays: a statement
         // we cannot read could reference anything.
-        if !crate::analysis::is_parseable(sql) {
+        if !inspection.is_parseable() {
             return true;
         }
-        match crate::analysis::referenced_identifiers(sql) {
+        match inspection.identifiers() {
             None => true,
             Some(identifiers) => identifiers
                 .iter()

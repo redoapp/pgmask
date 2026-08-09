@@ -1,6 +1,6 @@
 # Benchmarks
 
-Reproduce with `cargo run -p bench --release -- <rows> <iters>`; see the README.
+Reproduce with `cargo run -p bench --bin bench --release -- <rows> <iters>`; see the README.
 Numbers below: Apple silicon, Postgres 17.10 in podman, loopback, release build.
 Loopback flatters the proxy — the extra hop is nearly free here and will not be
 over a real network. Treat the per-row figure as the transferable one.
@@ -28,6 +28,11 @@ Interactive latency is free. Bulk scans cost roughly 2.4× — acceptable for th
 agent and application clients the MVP targets, and the number to re-examine if
 BI tools come into scope (open decision 5).
 
+Result-set planning now parses and scans each statement once. The database-free
+inspection benchmark measures **40.1 µs/result set**, versus **140.5 µs** for
+the former repeated calls on the same representative join/CTE/window query — a
+**3.5× speedup**. This does not change per-row masking cost.
+
 ## How it got there
 
 The first working version cost **3.98 µs/row**. The benchmark existed before the
@@ -51,11 +56,20 @@ before micro-optimising the work between them.
 ## Re-measuring
 
 ```bash
-DIRECT_URL=... PROXY_URL=... cargo run -p bench --release -- 10000 200
+DIRECT_URL=... PROXY_URL=... cargo run -p bench --bin bench --release -- 10000 200
 ```
 
 Run it more than once. Single-run numbers on a laptop vary by ~30%, which is
 wider than several of the optimisations above.
+
+The result-set planning path has a separate database-free microbenchmark:
+
+```bash
+cargo run -p bench --bin inspection --release -- 10000
+```
+
+It compares the former repeated parse/scan shape with one shared statement
+inspection. This is per-result-set work, not per-row work.
 
 ## What is not measured yet
 

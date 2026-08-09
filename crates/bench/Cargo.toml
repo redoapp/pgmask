@@ -5,11 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+default-run = "bench"
 
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+pgmask = { path = "../proxy" }
 
 [lints]
 workspace = true

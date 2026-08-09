@@ -30,6 +30,8 @@
 //! no column data. Anything not on the list stays refused. Adding a shape is a
 //! deliberate, reviewable act; forgetting one costs utility, never safety.
 
+use std::sync::OnceLock;
+
 use pg_query::protobuf::{node::Node as NodeEnum, SelectStmt, SetOperation};
 
 /// What we can say about one output field.
@@ -41,6 +43,64 @@ pub enum Safety {
     /// Everything else. Says nothing about the field; the caller keeps its
     /// existing behaviour.
     Unknown,
+}
+
+/// One parsed and lazily scanned view of a statement for a release decision.
+///
+/// A `RowDescription` asks several independent safety questions. Keeping their
+/// conservative rules separate is useful; reparsing the same SQL for each one
+/// is not. This module gives those checks one deep interface while preserving
+/// their independent implementations.
+pub struct StatementInspection<'sql> {
+    sql: &'sql str,
+    parsed: OnceLock<Option<pg_query::ParseResult>>,
+    identifiers: OnceLock<Option<Vec<String>>>,
+}
+
+impl<'sql> StatementInspection<'sql> {
+    pub fn new(sql: &'sql str) -> Self {
+        Self {
+            sql,
+            parsed: OnceLock::new(),
+            identifiers: OnceLock::new(),
+        }
+    }
+
+    pub fn sql(&self) -> &'sql str {
+        self.sql
+    }
+
+    pub fn is_parseable(&self) -> bool {
+        self.parsed().is_some()
+    }
+
+    pub fn identifiers(&self) -> Option<&[String]> {
+        self.identifiers
+            .get_or_init(|| scan_identifiers(self.sql))
+            .as_deref()
+    }
+
+    pub fn output_safety(&self, field_count: usize, allow_summaries: bool) -> Vec<Safety> {
+        analyze_inspected(self, field_count, allow_summaries)
+    }
+
+    pub fn reads_only_server_metadata(&self) -> bool {
+        reads_only_server_metadata_inspected(self)
+    }
+
+    pub fn provenance_is_trustworthy(&self) -> bool {
+        provenance_is_trustworthy_inspected(self)
+    }
+
+    pub fn every_relation_is_qualified(&self) -> bool {
+        every_relation_is_qualified_inspected(self)
+    }
+
+    fn parsed(&self) -> Option<&pg_query::ParseResult> {
+        self.parsed
+            .get_or_init(|| pg_query::parse(self.sql).ok())
+            .as_ref()
+    }
 }
 
 /// Functions reporting how much storage an object occupies.
@@ -267,9 +327,17 @@ const PURE_SCALARS: &[&str] = &[
 /// statement's target list and the described fields can be established. Any
 /// doubt anywhere collapses the whole analysis to `Unknown`.
 pub fn analyze(sql: &str, field_count: usize, allow_summaries: bool) -> Vec<Safety> {
+    StatementInspection::new(sql).output_safety(field_count, allow_summaries)
+}
+
+fn analyze_inspected(
+    inspection: &StatementInspection<'_>,
+    field_count: usize,
+    allow_summaries: bool,
+) -> Vec<Safety> {
     let unknown = vec![Safety::Unknown; field_count];
 
-    let Ok(parsed) = pg_query::parse(sql) else {
+    let Some(parsed) = inspection.parsed() else {
         return unknown;
     };
     // More than one statement means several result sets from one query string,
@@ -724,9 +792,13 @@ const CATALOG_ESCAPE_FUNCTIONS: &[&str] = &[
 /// relation at all, a CTE reference that is not declared locally, and any
 /// function on [`CATALOG_ESCAPE_FUNCTIONS`] all return `false`.
 pub fn reads_only_server_metadata(sql: &str) -> bool {
+    StatementInspection::new(sql).reads_only_server_metadata()
+}
+
+fn reads_only_server_metadata_inspected(inspection: &StatementInspection<'_>) -> bool {
     use pg_query::NodeRef;
 
-    let Ok(parsed) = pg_query::parse(sql) else {
+    let Some(parsed) = inspection.parsed() else {
         return false;
     };
     if parsed.protobuf.stmts.len() != 1 {
@@ -877,8 +949,12 @@ pub fn reads_only_server_metadata(sql: &str) -> bool {
 /// must also check [`referenced_relations`] against the snapshot's set of views
 /// whose definitions contain one; see `Snapshot::is_opaque_view`.
 pub fn provenance_is_trustworthy(sql: &str) -> bool {
+    StatementInspection::new(sql).provenance_is_trustworthy()
+}
+
+fn provenance_is_trustworthy_inspected(inspection: &StatementInspection<'_>) -> bool {
     use pg_query::NodeRef;
-    let Ok(parsed) = pg_query::parse(sql) else {
+    let Some(parsed) = inspection.parsed() else {
         // Unparseable means we cannot rule a set operation out.
         return false;
     };
@@ -905,7 +981,7 @@ pub fn provenance_is_trustworthy(sql: &str) -> bool {
 /// The lexer scans nonsense happily, so a caller that needs "we could not read
 /// this, so it could reference anything" has to ask the parser separately.
 pub fn is_parseable(sql: &str) -> bool {
-    pg_query::parse(sql).is_ok()
+    StatementInspection::new(sql).is_parseable()
 }
 
 /// Every identifier the statement mentions, from the **lexer**.
@@ -930,6 +1006,10 @@ pub fn is_parseable(sql: &str) -> bool {
 /// `None` when the text cannot even be scanned, which the caller must treat as
 /// "could mention anything".
 pub fn referenced_identifiers(sql: &str) -> Option<Vec<String>> {
+    scan_identifiers(sql)
+}
+
+fn scan_identifiers(sql: &str) -> Option<Vec<String>> {
     let scanned = pg_query::scan(sql).ok()?;
     Some(
         scanned
@@ -976,8 +1056,12 @@ pub fn referenced_identifiers(sql: &str) -> Option<Vec<String>> {
 /// trusted: with no provenance-bearing field, there is no OID to check, so the
 /// name has to have been unambiguous in the first place.
 pub fn every_relation_is_qualified(sql: &str) -> bool {
+    StatementInspection::new(sql).every_relation_is_qualified()
+}
+
+fn every_relation_is_qualified_inspected(inspection: &StatementInspection<'_>) -> bool {
     use pg_query::NodeRef;
-    let Ok(parsed) = pg_query::parse(sql) else {
+    let Some(parsed) = inspection.parsed() else {
         return false;
     };
     let mut cte_names: Vec<String> = Vec::new();
@@ -1006,6 +1090,17 @@ mod tests {
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects
     )]
+
+    #[test]
+    fn inspection_parse_and_scan_failures_make_every_fact_conservative() {
+        let inspection = StatementInspection::new("SELECT \0");
+        assert!(!inspection.is_parseable());
+        assert!(inspection.identifiers().is_none());
+        assert!(!inspection.reads_only_server_metadata());
+        assert!(!inspection.provenance_is_trustworthy());
+        assert!(!inspection.every_relation_is_qualified());
+        assert_eq!(inspection.output_safety(2, true), vec![Safety::Unknown; 2]);
+    }
 
     // --- system catalogs ---------------------------------------------------
 
