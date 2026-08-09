@@ -720,6 +720,14 @@ impl Session {
                 .is_some_and(analysis::reads_only_server_metadata)
             && {
                 let snapshot = self.policy.catalog.snapshot();
+                // The OID check below only inspects fields that have
+                // provenance, so for a computed field the text check stands
+                // alone — and it walks a tree with known gaps. This closes the
+                // one that was demonstrable.
+                let mentions_user_relation = self
+                    .described_sql
+                    .as_deref()
+                    .is_some_and(|sql| snapshot.statement_mentions_user_relation(sql));
                 let mut provenanced = 0usize;
                 let all_system = fields.iter().filter(|f| f.has_provenance()).all(|f| {
                     // Bounded by `fields.len()`, so the saturation is unreachable.
@@ -730,7 +738,8 @@ impl Session {
                 // check no purchase, so it is only trusted when the parse
                 // tree named every relation with an explicit schema. `SHOW`
                 // reads no relation at all and is handled there.
-                all_system
+                !mentions_user_relation
+                    && all_system
                     && (provenanced > 0
                         || analysis::every_relation_is_qualified(
                             self.described_sql.as_deref().unwrap_or_default(),

@@ -479,6 +479,36 @@ impl Snapshot {
         })
     }
 
+    /// Whether the statement mentions the name of any relation the operator's
+    /// catalog knows about.
+    ///
+    /// Guards the `system_catalogs = "allow"` fast path, which serves a whole
+    /// result set unmasked. That path already ANDs a text check with an
+    /// engine-authoritative OID check, but the OID check only inspects fields
+    /// that *have* provenance, so for computed fields the text check stands
+    /// alone — and the text check walks `pg_query`'s tree, which does not enter
+    /// a `WindowDef`. `SELECT relname, count(*) OVER (PARTITION BY (SELECT
+    /// email FROM demo.customers LIMIT 1)) FROM pg_catalog.pg_class` was judged
+    /// metadata-only while reading a user table.
+    ///
+    /// Same remedy as the lineage backstop and the same reasoning: the lexer
+    /// sees every identifier in the text, so it has no traversal gap to fall
+    /// through. Over-refusal is possible — a catalog query whose alias happens
+    /// to match a user relation's name loses the fast path — and costs a GUI
+    /// client one refused introspection query, not a disclosure.
+    pub fn statement_mentions_user_relation(&self, sql: &str) -> bool {
+        let Some(identifiers) = crate::analysis::referenced_identifiers(sql) else {
+            return true;
+        };
+        identifiers.iter().any(|identifier| {
+            self.relation_columns.keys().any(|relation| {
+                relation
+                    .rsplit_once('.')
+                    .is_some_and(|(_, n)| n == identifier)
+            })
+        })
+    }
+
     /// Whether any relation the statement names is such a view.
     pub fn statement_touches_opaque_view(&self, sql: &str) -> bool {
         if self.opaque_views.is_empty() {
@@ -1197,6 +1227,37 @@ mod tests {
         assert!(snapshot.is_opaque_view(None, "V_UNION"), "case-folded");
         assert!(!snapshot.is_opaque_view(Some("other"), "v_union"));
         assert!(!snapshot.is_opaque_view(None, "something_else"));
+    }
+
+    /// The `system_catalogs = "allow"` fast path serves a whole result set
+    /// unmasked, and its text check walks a tree that does not enter a
+    /// `WindowDef`. This is what stops a user relation being smuggled through
+    /// there.
+    #[test]
+    fn a_user_relation_named_anywhere_loses_the_catalog_fast_path() {
+        let mut snapshot = Snapshot::default();
+        snapshot.relation_columns_for_test("demo.customers", &["id", "email"]);
+
+        // The shape the tree walk missed.
+        assert!(snapshot.statement_mentions_user_relation(
+            "SELECT relname, count(*) OVER (PARTITION BY (SELECT email FROM demo.customers LIMIT 1)) \
+             FROM pg_catalog.pg_class"
+        ));
+        assert!(snapshot.statement_mentions_user_relation(
+            "SELECT c.relname, x.email FROM pg_catalog.pg_class c, demo.customers x"
+        ));
+        // A genuine catalog query keeps it.
+        assert!(!snapshot.statement_mentions_user_relation(
+            "SELECT n.nspname, c.relname FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+        ));
+        // psql's introspection passes relation names as *string literals*, not
+        // identifiers, which is why `\d demo.customers` still works.
+        assert!(!snapshot.statement_mentions_user_relation(
+            "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relname = 'customers'"
+        ));
+        // Unscannable text could name anything.
+        assert!(snapshot.statement_mentions_user_relation("SELECT \u{0}"));
     }
 
     #[test]

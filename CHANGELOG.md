@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.7 — the same gap, in the other release path
+
+Having built a tool for the walker gap, the obvious next question was where else
+a *release* decision depends on a tree walk. There are three: the analysis
+allowlist, lineage (backstopped in 0.1.6), and `system_catalogs = "allow"`.
+
+The third had never been fuzzed — nothing generates catalog queries — and it has
+the largest blast radius, because it serves an entire result set unmasked.
+
+**It has the same gap.** This is judged metadata-only while reading a user
+table:
+
+```sql
+SELECT relname, count(*) OVER (PARTITION BY (SELECT email FROM demo.customers LIMIT 1))
+  FROM pg_catalog.pg_class;
+```
+
+Not a value disclosure as it stands. The fast path ANDs the text check with an
+engine-authoritative OID check, and a window clause influences ordering and
+partitioning rather than what is projected — so the values that come back are
+still `pg_class`'s. But the OID check only inspects fields that *have*
+provenance, which leaves the text check standing alone for computed ones, and
+the text check walks a tree with a known hole.
+
+Fixed with the same lexical check as the lineage backstop: a statement naming a
+known user relation as an *identifier* does not get the fast path. GUI clients
+are unaffected, and for a pleasing reason — psql's introspection passes table
+names as string literals, not identifiers, so `\d demo.customers` and `\dt`
+still work.
+
 ## 0.1.6 — stop adding guards shaped like the last bug
 
 No new disclosure. This closes the *class* that produced three of the five.
