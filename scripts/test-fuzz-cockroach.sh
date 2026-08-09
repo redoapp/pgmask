@@ -30,6 +30,7 @@ SEEDS="${2:-3}"
 CRDB_PORT=26262        # the engine under test
 PROXY_PORT=6460
 POISON_PORT=6461
+EXT_PORT=6462
 CRDB=pgmask-fuzz-crdb
 CRDB_VERSION="${CRDB_VERSION:-v25.4.14}"
 
@@ -130,11 +131,19 @@ kill "$POISON_PID" 2>/dev/null; POISON_PID=""
 # branch's provenance for a set operation on the simple-query path and zero for
 # the same statement under Describe. Testing one of them is testing half.
 echo "==> extended protocol: the same shapes through Parse/Bind/Execute"
-mkcfg "$POISON_PORT" /tmp/crdb-ext.toml "s|^lineage = .*|lineage = \"allow\"|"
+mkcfg "$EXT_PORT" /tmp/crdb-ext.toml "s|^lineage = .*|lineage = \"allow\"|"
 ./target/release/pgmask /tmp/crdb-ext.toml >/tmp/crdb-ext.log 2>&1 &
 POISON_PID=$!
 sleep 3
-ext_url="postgresql://root@localhost:$POISON_PORT/fuzzdb?sslmode=disable"
+ext_url="postgresql://root@localhost:$EXT_PORT/fuzzdb?sslmode=disable"
+# Wait for the bind; `kill` does not free a port synchronously and these steps
+# used to share POISON_PORT with the campaign's own poison proxy.
+for _ in $(seq 1 30); do
+  psql -w "$ext_url" -tAc 'select 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+psql -w "$ext_url" -tAc 'select 1' >/dev/null 2>&1 \
+  || { echo "FAIL: extended-protocol proxy did not start"; tail -8 /tmp/crdb-ext.log; exit 1; }
 if ! DIRECT_URL="$CDB" PROXY_URL="$ext_url" \
      ./target/release/extended "/tmp/crdb-fuzz-1.sql" >/tmp/crdb-ext.out 2>&1; then
   echo "FAIL: the extended-protocol replay found a leak"
@@ -146,11 +155,19 @@ grep -E '^RESULT' /tmp/crdb-ext.out | sed 's/^/    /'
 kill "$POISON_PID" 2>/dev/null; POISON_PID=""
 
 # And it has to be able to fail, like every other oracle here.
-sed -e 's/^mask = "redact"/mask = "none"/' /tmp/crdb-ext.toml > /tmp/crdb-ext-poison.toml
+sed -e 's/^mask = "redact"/mask = "none"/' -e "s|:$EXT_PORT\"|:$((EXT_PORT+1))\"|" \
+  /tmp/crdb-ext.toml > /tmp/crdb-ext-poison.toml
+ext_poison_url="postgresql://root@localhost:$((EXT_PORT+1))/fuzzdb?sslmode=disable"
 ./target/release/pgmask /tmp/crdb-ext-poison.toml >/tmp/crdb-ext-poison.log 2>&1 &
 POISON_PID=$!
 sleep 3
-if ! DIRECT_URL="$CDB" PROXY_URL="$ext_url" EXPECT_LEAKS=1 \
+for _ in $(seq 1 30); do
+  psql -w "$ext_poison_url" -tAc 'select 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+psql -w "$ext_poison_url" -tAc 'select 1' >/dev/null 2>&1 \
+  || { echo "FAIL: poisoned extended-protocol proxy did not start"; tail -8 /tmp/crdb-ext-poison.log; exit 1; }
+if ! DIRECT_URL="$CDB" PROXY_URL="$ext_poison_url" EXPECT_LEAKS=1 \
      ./target/release/extended "/tmp/crdb-fuzz-1.sql" >/tmp/crdb-ext-poison.out 2>&1; then
   echo "FAIL: masking was removed and the extended oracle saw nothing"
   tail -8 /tmp/crdb-ext-poison.out

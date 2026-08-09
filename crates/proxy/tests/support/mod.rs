@@ -34,16 +34,34 @@ pub fn backend_dsn(db: &str) -> String {
     format!("postgres://postgres@{host}:{port}/{db}")
 }
 
-/// Skip the test body when no Postgres is configured.
+/// The Postgres address, or fail the test.
+///
+/// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 31
+/// tests behind this macro — every raw-wire adversarial test and every
+/// resilience test, including `negative_control_the_harness_can_see_a_leak` —
+/// reported PASS on every release gate having asserted nothing.
+///
+/// That is the same defect as the old `exit 0` when sqlsmith was missing,
+/// which this repo diagnosed and fixed in `scripts/test-fuzz.sh` and then left
+/// standing in the other release path. A suite that reports success by doing
+/// nothing is the failure this project keeps finding.
+///
+/// `PGMASK_ALLOW_SKIP=1` opts out, for running `cargo test` on a machine with
+/// no Postgres. The gate does not set it.
 #[macro_export]
 macro_rules! require_pg {
     () => {
         match $crate::support::backend_addr() {
             Some(addr) => addr,
-            None => {
-                eprintln!("skipping: set PGMASK_TEST_PG (see scripts/test-integration.sh)");
+            None if std::env::var("PGMASK_ALLOW_SKIP").is_ok() => {
+                eprintln!("skipping by request: PGMASK_ALLOW_SKIP is set");
                 return Ok(());
             }
+            None => panic!(
+                "PGMASK_TEST_PG is not set, so this test would assert nothing. \
+                 Run ./scripts/test-integration.sh, or set PGMASK_ALLOW_SKIP=1 to skip."
+            ),
         }
     };
 }

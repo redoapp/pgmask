@@ -345,7 +345,40 @@ fn default_summaries() -> Summaries {
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-        toml::from_str(&text).with_context(|| format!("parsing {path}"))
+        let config: Self = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Whole-config checks that a per-field deserialiser cannot make.
+    ///
+    /// `unclassified_mask` is the one that matters. It is the mask every
+    /// undeclared column gets — the entire content of "default-deny" — and it
+    /// was never validated, while column rules were. There is also no syntax
+    /// for giving it parameters, so it silently used `MaskSpec::default()`:
+    ///
+    ///   unclassified_mask = "numeric-bucket"   # bucket defaults to 1 -> floor(v,1) == v
+    ///   unclassified_mask = "range"            # start = end = 0 -> masks nothing
+    ///
+    /// Both load clean, log `unclassified=Mask`, and return every undeclared
+    /// column verbatim. Default-deny becomes default-allow with no warning.
+    fn validate(&self) -> Result<()> {
+        if self.unclassified != Unclassified::Mask {
+            return Ok(());
+        }
+        if self.unclassified_mask == Mask::None {
+            bail!(
+                "unclassified = \"mask\" with unclassified_mask = \"none\" is a \
+                 contradiction: every undeclared column would be served in the clear. \
+                 Use unclassified = \"allow\" if that is what you want."
+            );
+        }
+        // Parameterless by construction, so only masks that are safe with
+        // default parameters can be used here.
+        validate_spec(&MaskSpec::new(self.unclassified_mask), "unclassified_mask").context(
+            "unclassified_mask takes no parameters, so a mask that needs them cannot be used \
+             as the default-deny mask",
+        )
     }
 }
 
@@ -473,8 +506,27 @@ impl Snapshot {
             return true;
         };
         identifiers.iter().any(|identifier| {
-            self.by_name.iter().any(|((_, column), classification)| {
-                column == identifier && !classification.for_roles(roles).is_passthrough()
+            self.relation_columns.iter().any(|(relation, columns)| {
+                if !columns.contains(identifier) {
+                    return false;
+                }
+                match self.lookup_by_name(relation, identifier) {
+                    Some(classification) => !classification.for_roles(roles).is_passthrough(),
+                    None => {
+                        // Unclassified columns are masked by default, but a
+                        // bare name that only exists in some unrelated table
+                        // must not disable lineage everywhere. Keep this check
+                        // lexical (and therefore independent of the SQL tree),
+                        // while requiring the owning relation's bare name to
+                        // occur too. The omitted-source regressions all name
+                        // their underlying relation, including inside nested
+                        // subqueries and TABLESAMPLE constructs.
+                        let bare_relation = relation
+                            .rsplit_once('.')
+                            .map_or(relation.as_str(), |(_, name)| name);
+                        identifiers.iter().any(|name| name == bare_relation)
+                    }
+                }
             })
         })
     }
@@ -514,13 +566,26 @@ impl Snapshot {
         if self.opaque_views.is_empty() {
             return false;
         }
-        match crate::analysis::referenced_relations(sql) {
-            // Unparseable: we cannot see what it references, so we cannot rule
-            // one out.
+        // Lexical, for the same reason the masked-column backstop is.
+        //
+        // This used to read `referenced_relations`, a parse-tree walk — and an
+        // audit found `SELECT … FROM base TABLESAMPLE SYSTEM (10)` yields an
+        // *empty* relation list, because the walker does not descend through a
+        // `RangeTableSample`. That silently reopened the CockroachDB
+        // set-operation leak this check exists to close, and it did so for a
+        // construct nobody had thought to test.
+        //
+        // Names in the token stream cannot go missing that way. The lexer will
+        // happily scan nonsense, though, so the parse check stays: a statement
+        // we cannot read could reference anything.
+        if !crate::analysis::is_parseable(sql) {
+            return true;
+        }
+        match crate::analysis::referenced_identifiers(sql) {
             None => true,
-            Some(refs) => refs
+            Some(identifiers) => identifiers
                 .iter()
-                .any(|(schema, name)| self.is_opaque_view(schema.as_deref(), name)),
+                .any(|identifier| self.is_opaque_view(None, identifier)),
         }
     }
 
@@ -916,17 +981,19 @@ fn opaque_views(defs: &HashMap<String, Option<String>>) -> HashSet<String> {
             // Already established as readable and parseable by the pass above,
             // so `None` here cannot happen; treating it as opaque anyway keeps
             // the fail-closed reading local rather than depending on that.
+            // Lexical, matching `statement_touches_opaque_view`: a view whose
+            // body uses TABLESAMPLE reported no relations at all under the
+            // parse-tree walk, so it never inherited its base's opacity.
             let touches = match def
                 .as_deref()
-                .map(crate::analysis::referenced_relations)
+                .map(crate::analysis::referenced_identifiers)
                 .unwrap_or(None)
             {
                 None => true,
-                Some(refs) => refs.iter().any(|(schema, relation)| match schema {
-                    Some(schema) => opaque.contains(&format!("{schema}.{relation}")),
-                    None => opaque
+                Some(identifiers) => identifiers.iter().any(|identifier| {
+                    opaque
                         .iter()
-                        .any(|known| known.rsplit_once('.').is_some_and(|(_, n)| n == relation)),
+                        .any(|known| known.rsplit_once('.').is_some_and(|(_, n)| n == identifier))
                 }),
             };
             if touches {
@@ -979,6 +1046,13 @@ fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
              range returns the value unchanged.",
             spec.start,
             spec.end
+        ),
+        // `outer` keeps `keep` characters at each end and stars the middle, so
+        // `keep = 0` leaves the whole value as the middle. It reads as
+        // configured and masks nothing.
+        Mask::Outer if spec.keep == 0 => bail!(
+            "{what}: outer needs `keep` >= 1. With keep = 0 the whole value is \
+             the surviving middle, so nothing is masked."
         ),
         _ => Ok(()),
     }
@@ -1272,6 +1346,10 @@ mod tests {
         // Unparseable, with an opaque view present: we cannot see what it
         // references, so it must not read as clean.
         assert!(snapshot.statement_touches_opaque_view("SELECT FROM WHERE (("));
+        // TABLESAMPLE erases the relation from the parse-tree walk this check
+        // used to use, which silently un-guarded the set-operation view.
+        assert!(snapshot
+            .statement_touches_opaque_view("SELECT v FROM sw.v_union TABLESAMPLE SYSTEM (10)"));
     }
 
     /// With no opaque views at all, nothing is parsed and nothing is flagged —
@@ -1280,6 +1358,55 @@ mod tests {
     fn no_opaque_views_means_no_statement_is_flagged() {
         let snapshot = Snapshot::default();
         assert!(!snapshot.statement_touches_opaque_view("SELECT FROM WHERE (("));
+    }
+
+    /// `unclassified_mask` is the whole content of default-deny and was the
+    /// one mask never validated. `numeric-bucket` and `range` take parameters
+    /// it has no syntax for, so they used defaults that mask nothing.
+    #[test]
+    fn a_default_deny_mask_that_masks_nothing_is_refused() {
+        let base = r#"
+listen = "127.0.0.1:1"
+backend = "127.0.0.1:2"
+catalog_dsn = "postgres://x@y/z"
+pseudonym_key = "k"
+unclassified = "mask"
+"#;
+        for (mask, expect) in [
+            ("numeric-bucket", "takes no parameters"),
+            ("range", "takes no parameters"),
+            ("none", "contradiction"),
+        ] {
+            let toml_src = format!("{base}unclassified_mask = \"{mask}\"\n");
+            let config: Config = toml::from_str(&toml_src).expect("parses");
+            let err = config
+                .validate()
+                .expect_err(&format!("{mask} must be refused"));
+            let text = format!("{err:#}");
+            assert!(text.contains(expect), "{mask}: got {text}");
+        }
+        // Masks that are safe with default parameters still work.
+        for mask in ["null", "redact", "partial", "hash", "pseudonym"] {
+            let toml_src = format!("{base}unclassified_mask = \"{mask}\"\n");
+            let config: Config = toml::from_str(&toml_src).expect("parses");
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("{mask}: {e:#}"));
+        }
+        // And `unclassified = "allow"` is not second-guessed.
+        let toml_src =
+            base.replace("mask\"", "allow\"").to_string() + "unclassified_mask = \"none\"\n";
+        let config: Config = toml::from_str(&toml_src).expect("parses");
+        config.validate().expect("allow is the operator's choice");
+    }
+
+    #[test]
+    fn outer_with_keep_zero_is_refused() {
+        let mut spec = MaskSpec::new(Mask::Outer);
+        spec.keep = 0;
+        assert!(validate_spec(&spec, "s.t.c").is_err());
+        spec.keep = 1;
+        assert!(validate_spec(&spec, "s.t.c").is_ok());
     }
 
     #[test]

@@ -315,6 +315,19 @@ impl Batch {
     }
 }
 
+/// A `Describe` the backend has not answered yet, and the SQL it was for.
+struct PendingDescribe {
+    target: DescribeTarget,
+    sql: Option<String>,
+    /// How many `Sync`s the client had sent when this was issued.
+    ///
+    /// An `ErrorResponse` makes the backend skip every remaining message up to
+    /// the next `Sync`, so exactly the Describes sharing the failing one's
+    /// epoch are dead. Anything the client pipelined *after* that `Sync` is
+    /// still live, which is why this cannot simply clear the queue.
+    epoch: u64,
+}
+
 pub struct Session {
     policy: Arc<Policy>,
     /// Plans keyed by prepared-statement name, populated by `Describe('S')`.
@@ -326,14 +339,21 @@ pub struct Session {
     portal_statement: HashMap<String, String>,
     /// SQL of the most recent simple query.
     simple_sql: Option<String>,
-    /// The SQL the next `RowDescription` belongs to.
-    described_sql: Option<String>,
     /// Plans keyed by portal name, copied from the statement at `Bind`.
     portal_plans: HashMap<String, Plan>,
     /// The plan the next `DataRow` will be masked with.
     active_plan: Option<Plan>,
-    /// `Describe` targets awaiting a `RowDescription`/`NoData`, in order.
-    pending_describes: VecDeque<DescribeTarget>,
+    /// `Describe`s awaiting a `RowDescription`/`NoData`, in order, each paired
+    /// with the SQL it was issued for.
+    ///
+    /// The SQL used to be a single `described_sql` field holding the *most
+    /// recent* Describe. With two Describes pipelined before either is
+    /// answered, both result sets were then analysed against the second
+    /// statement's text — so a releasable shape laundered an opaque one. It is
+    /// a queue because the Describes are a queue.
+    pending_describes: VecDeque<PendingDescribe>,
+    /// Frontend `Sync` count, stamped onto each pending Describe.
+    sync_epoch: u64,
     /// Discarding backend traffic after a refusal, until `ReadyForQuery`.
     suppressing: bool,
     pub masked_fields: u64,
@@ -358,10 +378,10 @@ impl Session {
             statement_sql: HashMap::new(),
             portal_statement: HashMap::new(),
             simple_sql: None,
-            described_sql: None,
             portal_plans: HashMap::new(),
             active_plan: None,
             pending_describes: VecDeque::new(),
+            sync_epoch: 0,
             suppressing: false,
             masked_fields: 0,
             rejected_result_sets: 0,
@@ -450,12 +470,40 @@ impl Session {
                 self.active_plan = None;
                 self.pending_describes.clear();
                 self.simple_sql = protocol::parse_simple_query(&msg.body);
-                self.described_sql = self.simple_sql.clone();
                 out.backend(msg.encode())
             }
 
             protocol::F_PARSE => {
                 if let Some((name, sql)) = protocol::parse_parse(&msg.body) {
+                    // The name now points at different SQL, so every plan
+                    // derived from the old statement is void.
+                    //
+                    // Without this, `Parse("", "SELECT 1")` + `Describe` then
+                    // `Parse("", "SELECT email …")` + `Bind` + `Execute` served
+                    // the address in the clear: `Execute` emits no
+                    // `RowDescription`, so the governing rule never got a chance
+                    // to fire and the passthrough plan from the first statement
+                    // was still cached. The unnamed statement is implicitly
+                    // re-Parsed by every client that uses the extended protocol,
+                    // so this needed no `Close` and no error.
+                    // Some drivers re-Parse the unnamed statement with the
+                    // exact same SQL and rely on their previously described
+                    // result metadata. Its masking plan is still bound to the
+                    // same shape. A genuinely different statement must lose
+                    // every derived plan before it can Execute without a new
+                    // RowDescription.
+                    if self.statement_sql.get(&name) != Some(&sql) {
+                        self.statement_plans.remove(&name);
+                        let stale: Vec<String> = self
+                            .portal_statement
+                            .iter()
+                            .filter(|(_, statement)| **statement == name)
+                            .map(|(portal, _)| portal.clone())
+                            .collect();
+                        for portal in stale {
+                            self.portal_plans.remove(&portal);
+                        }
+                    }
                     self.statement_sql.insert(name, sql);
                 }
                 out.backend(msg.encode())
@@ -499,9 +547,9 @@ impl Session {
 
             protocol::F_DESCRIBE => {
                 if let Some(target) = protocol::parse_describe(&msg.body) {
-                    // Remember which statement's SQL the coming RowDescription
-                    // belongs to, so the analysis looks at the right text.
-                    self.described_sql = match &target {
+                    // The SQL travels with its own Describe, so a pipelined
+                    // pair cannot be analysed against each other's text.
+                    let sql = match &target {
                         DescribeTarget::Statement(name) => self.statement_sql.get(name).cloned(),
                         DescribeTarget::Portal(portal) => self
                             .portal_statement
@@ -509,7 +557,11 @@ impl Session {
                             .and_then(|stmt| self.statement_sql.get(stmt))
                             .cloned(),
                     };
-                    self.pending_describes.push_back(target);
+                    self.pending_describes.push_back(PendingDescribe {
+                        target,
+                        sql,
+                        epoch: self.sync_epoch,
+                    });
                 }
                 out.backend(msg.encode())
             }
@@ -518,6 +570,11 @@ impl Session {
                 if let Some(portal) = protocol::parse_execute(&msg.body) {
                     self.active_plan = self.portal_plans.get(&portal).cloned();
                 }
+                out.backend(msg.encode())
+            }
+
+            protocol::F_SYNC => {
+                self.sync_epoch = self.sync_epoch.saturating_add(1);
                 out.backend(msg.encode())
             }
 
@@ -537,6 +594,10 @@ impl Session {
         if self.suppressing {
             if msg.tag == protocol::B_READY_FOR_QUERY {
                 self.suppressing = false;
+                // Same Sync-boundary invariant as the arm below: a refusal ends
+                // the exchange, and any Describe still queued was answered by
+                // the error that caused the refusal.
+                self.pending_describes.clear();
                 return out.client(Vetted::control(&msg));
             }
             return;
@@ -621,7 +682,33 @@ impl Session {
                 }
             }
 
-            // Error DETAIL/HINT can echo column values verbatim.
+            // Every free-text diagnostic field can be SQL-controlled (`RAISE`
+            // accepts expressions for Message, Detail, Hint and object names),
+            // so rebuild the message from constrained fields plus fixed text.
+            // An errored `Describe` never produces a `RowDescription` or
+            // `NoData`, so its slot used to sit in the FIFO forever and the
+            // next result set's plan was filed under that stale name: describe
+            // a statement that does not exist, then describe a harmless one,
+            // and its passthrough plan lands on a name of your choosing.
+            //
+            // The backend skips to the next `Sync` after an error, so exactly
+            // the Describes sharing the failing exchange's epoch are dead.
+            // Clearing the whole queue instead looked right and was not —
+            // under pipelining a `ReadyForQuery` for an earlier exchange
+            // arrives after a later `Describe` is already queued, and dropping
+            // that live slot left a real result set with no plan.
+            protocol::B_ERROR_RESPONSE if !self.pending_describes.is_empty() => {
+                if let Some(dead) = self.pending_describes.front().map(|p| p.epoch) {
+                    self.pending_describes.retain(|p| p.epoch != dead);
+                }
+                match protocol::scrub_error(&msg.body) {
+                    Some(scrubbed) => {
+                        out.client(Vetted::synthetic(&Message::new(msg.tag, scrubbed)))
+                    }
+                    None => out.client(Vetted::control(&msg)),
+                }
+            }
+
             protocol::B_ERROR_RESPONSE | protocol::B_NOTICE_RESPONSE => {
                 match protocol::scrub_error(&msg.body) {
                     Some(scrubbed) => {
@@ -713,9 +800,16 @@ impl Session {
         // unqualified, `CREATE TABLE public.pg_database` is allowed, and
         // `search_path` is the client's to set — so the name is a hint and the
         // OID in the RowDescription is the fact.
+        // The SQL for *this* result set: the Describe at the head of the
+        // queue, or the simple query if there is no Describe outstanding.
+        let described_sql: Option<String> = self
+            .pending_describes
+            .front()
+            .and_then(|pending| pending.sql.clone())
+            .or_else(|| self.simple_sql.clone());
+
         let system_catalog = self.policy.system_catalogs == SystemCatalogs::Allow
-            && self
-                .described_sql
+            && described_sql
                 .as_deref()
                 .is_some_and(analysis::reads_only_server_metadata)
             && {
@@ -724,8 +818,7 @@ impl Session {
                 // provenance, so for a computed field the text check stands
                 // alone — and it walks a tree with known gaps. This closes the
                 // one that was demonstrable.
-                let mentions_user_relation = self
-                    .described_sql
+                let mentions_user_relation = described_sql
                     .as_deref()
                     .is_some_and(|sql| snapshot.statement_mentions_user_relation(sql));
                 let mut provenanced = 0usize;
@@ -742,11 +835,11 @@ impl Session {
                     && all_system
                     && (provenanced > 0
                         || analysis::every_relation_is_qualified(
-                            self.described_sql.as_deref().unwrap_or_default(),
+                            described_sql.as_deref().unwrap_or_default(),
                         ))
             };
 
-        let safety = match &self.described_sql {
+        let safety = match &described_sql {
             Some(sql) => {
                 analysis::analyze(sql, fields.len(), self.policy.summaries == Summaries::Allow)
             }
@@ -762,7 +855,7 @@ impl Session {
         // provenance, because the union is in the view. A shape sweep found that
         // leak after the statement-level check had already been shipped, which
         // is the argument for the sweep and not for the check.
-        let trust_provenance = match self.described_sql.as_deref() {
+        let trust_provenance = match described_sql.as_deref() {
             None => true,
             Some(sql) => {
                 analysis::provenance_is_trustworthy(sql)
@@ -788,7 +881,7 @@ impl Session {
             && fields.iter().zip(&safety).any(|(field, safety)| {
                 (!field.has_provenance() || !trust_provenance) && *safety != Safety::Releasable
             });
-        let lineage_verdicts: Vec<Verdict> = match (&self.described_sql, needs_lineage) {
+        let lineage_verdicts: Vec<Verdict> = match (&described_sql, needs_lineage) {
             (Some(sql), true) => lineage::resolve(
                 sql,
                 fields.len(),
@@ -835,7 +928,7 @@ impl Session {
 
         // Bind the plan to whatever this RowDescription answers, and make it
         // active — which also covers pipelined Bind-before-Describe ordering.
-        match self.pending_describes.pop_front() {
+        match self.pending_describes.pop_front().map(|p| p.target) {
             Some(DescribeTarget::Statement(name)) => {
                 self.statement_plans.insert(name, plan.clone());
             }
@@ -973,6 +1066,19 @@ async fn read_startup_packet<S: AsyncReadExt + Unpin>(
     }))
 }
 
+fn startup_principal(startup: &protocol::StartupPacket) -> String {
+    // PostgreSQL keeps the last value for duplicate startup parameters. Use
+    // the same occurrence for role policy, or a client could present a
+    // privileged name first and authenticate as a different user last.
+    startup
+        .parameters()
+        .into_iter()
+        .rev()
+        .find(|(key, _)| key == "user")
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| "<unknown>".into())
+}
+
 /// Startup negotiation on both legs, then the message pump.
 pub async fn handle_connection(
     client: TcpStream,
@@ -1050,12 +1156,7 @@ pub async fn handle_connection(
     let mut client_frames = FrameReader::new(client_read);
     let mut backend_frames = FrameReader::new(backend_read);
 
-    let user = startup
-        .parameters()
-        .into_iter()
-        .find(|(k, _)| k == "user")
-        .map(|(_, v)| v)
-        .unwrap_or_else(|| "<unknown>".into());
+    let user = startup_principal(&startup);
 
     // --- Message pump -------------------------------------------------------
     let mut session = Session::new(policy)
@@ -1364,6 +1465,15 @@ mod tests {
         );
         assert!(session.authenticated);
         assert!(session.roles.is_empty(), "unknown principals get nothing");
+    }
+
+    #[test]
+    fn duplicate_startup_users_follow_the_backends_last_value() {
+        let startup = protocol::StartupPacket {
+            code: 196_608,
+            body: Bytes::from_static(b"user\0privileged\0database\0db\0user\0actual\0\0"),
+        };
+        assert_eq!(startup_principal(&startup), "actual");
     }
 
     #[test]

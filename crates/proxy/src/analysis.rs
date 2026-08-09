@@ -777,72 +777,12 @@ pub fn provenance_is_trustworthy(sql: &str) -> bool {
         })
 }
 
-/// Whether the statement contains a scalar subquery anywhere.
+/// Whether `pg_query` can parse the statement at all.
 ///
-/// **This gates lineage, and its absence was a disclosure.** `sqllineage` does
-/// not enumerate the sources inside a `SubLink`, so for
-///
-/// ```sql
-/// SELECT min((SELECT d FROM fz.t8 LIMIT 1 OFFSET 3)) OVER (PARTITION BY subq.c0)
-///   FROM (SELECT id AS c0 FROM fz.v_join) subq
-/// ```
-///
-/// it reported the field's only source as `fz.v_join.id` — released — and
-/// lineage handed over a raw date from `fz.t8.d`, which is masked and which
-/// appears nowhere in the sources it enumerated.
-///
-/// The general rule this encodes: **lineage may only release a field when the
-/// source set it enumerated is complete.** A construct it does not descend into
-/// makes that set a subset, and releasing on a subset is releasing on absence
-/// of evidence.
-///
-/// Statement-level rather than per-target, deliberately. Locating which output
-/// field owns a given `SubLink` means reproducing the target-list
-/// correspondence this module builds elsewhere, and getting *that* wrong is a
-/// leak; a whole-statement check costs lineage on `WHERE id IN (SELECT …)`,
-/// which is utility, not safety. `pg_query` failing to parse also counts,
-/// because then we cannot rule one out.
-pub fn contains_scalar_subquery(sql: &str) -> bool {
-    use pg_query::NodeRef;
-    let Ok(parsed) = pg_query::parse(sql) else {
-        return true;
-    };
-    parsed
-        .protobuf
-        .nodes()
-        .iter()
-        .any(|(node, _, _, _)| matches!(node, NodeRef::SubLink(_)))
-}
-
-/// Every relation the statement names, as `(schema, relation)` with the schema
-/// absent when it was written unqualified.
-///
-/// `None` means the statement did not parse, which the caller must treat as
-/// "could be anything" rather than "names nothing" — returning an empty list
-/// there would let an unparseable statement past a check that exists to catch
-/// what it references.
-///
-/// Names are lowercased, matching the snapshot. Quoted identifiers that are
-/// genuinely case-sensitive will therefore over-match, which costs a refusal
-/// and never a release.
-pub fn referenced_relations(sql: &str) -> Option<Vec<(Option<String>, String)>> {
-    use pg_query::NodeRef;
-    let parsed = pg_query::parse(sql).ok()?;
-    Some(
-        parsed
-            .protobuf
-            .nodes()
-            .iter()
-            .filter_map(|(node, _, _, _)| match node {
-                NodeRef::RangeVar(range) => {
-                    let schema = (!range.schemaname.is_empty())
-                        .then(|| range.schemaname.to_ascii_lowercase());
-                    Some((schema, range.relname.to_ascii_lowercase()))
-                }
-                _ => None,
-            })
-            .collect(),
-    )
+/// The lexer scans nonsense happily, so a caller that needs "we could not read
+/// this, so it could reference anything" has to ask the parser separately.
+pub fn is_parseable(sql: &str) -> bool {
+    pg_query::parse(sql).is_ok()
 }
 
 /// Every identifier the statement mentions, from the **lexer**.
@@ -872,13 +812,36 @@ pub fn referenced_identifiers(sql: &str) -> Option<Vec<String>> {
         scanned
             .tokens
             .iter()
-            .filter(|token| token.token() == pg_query::protobuf::Token::Ident)
             .filter_map(|token| {
-                let (start, end) = (
-                    usize::try_from(token.start).ok()?,
-                    usize::try_from(token.end).ok()?,
-                );
-                sql.get(start..end).map(str::to_ascii_lowercase)
+                let start = usize::try_from(token.start).ok()?;
+                let end = usize::try_from(token.end).ok()?;
+                let text = sql.get(start..end)?;
+                // Not `token() == Ident`. Two whole classes of name are not
+                // `Ident`, and an audit found both:
+                //
+                //   * a *quoted* name's span includes its quotes, so `"email"`
+                //     never matched the catalog's `email`
+                //   * pg_query lexes unreserved keywords as their own token
+                //     types, so a column called `value`, `source`, `name`,
+                //     `comment`, `owner` or `year` produced no token at all
+                //
+                // Either one silently reopened the hole this function exists to
+                // close, and neither is exotic — every ORM quotes identifiers,
+                // and `comment` and `source` are ordinary column names.
+                //
+                // So the rule is textual rather than grammatical: anything
+                // shaped like a name counts, keyword or not. Over-naming costs
+                // a refusal; under-naming is a disclosure.
+                if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+                    // `""` is an escaped quote inside a quoted identifier.
+                    return Some(inner.replace("\"\"", "\"").to_ascii_lowercase());
+                }
+                let word = !text.is_empty()
+                    && text.starts_with(|c: char| c.is_alphabetic() || c == '_')
+                    && text
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+                word.then(|| text.to_ascii_lowercase())
             })
             .collect(),
     )
@@ -1576,70 +1539,6 @@ mod provenance_trust_tests {
         clippy::arithmetic_side_effects
     )]
     use super::*;
-
-    /// The gate that stops lineage releasing on a partial source set.
-    #[test]
-    fn scalar_subqueries_are_detected_wherever_they_sit() {
-        for sql in [
-            "SELECT (SELECT d FROM t8 LIMIT 1) FROM t1",
-            "SELECT min((SELECT d FROM t8 LIMIT 1)) OVER (PARTITION BY c0) FROM q",
-            "SELECT a FROM t WHERE id IN (SELECT id FROM u)",
-            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)",
-        ] {
-            assert!(contains_scalar_subquery(sql), "must be detected: {sql}");
-        }
-    }
-
-    #[test]
-    fn ordinary_statements_have_no_scalar_subquery() {
-        for sql in [
-            "SELECT email FROM t",
-            "SELECT upper(city) FROM people",
-            "SELECT a FROM (SELECT a FROM t) q",
-            "SELECT a FROM t JOIN u ON u.id = t.id",
-        ] {
-            assert!(
-                !contains_scalar_subquery(sql),
-                "must not be detected: {sql}"
-            );
-        }
-    }
-
-    /// Unparseable counts as containing one: we cannot rule it out.
-    #[test]
-    fn an_unparseable_statement_is_treated_as_containing_one() {
-        assert!(contains_scalar_subquery("SELECT FROM WHERE (("));
-    }
-
-    #[test]
-    fn referenced_relations_finds_every_name() {
-        let refs =
-            referenced_relations("SELECT t.email, u.note FROM sw.t t JOIN u ON u.t_id = t.id")
-                .expect("parses");
-        assert!(refs.contains(&(Some("sw".into()), "t".into())));
-        assert!(refs.contains(&(None, "u".into())));
-    }
-
-    #[test]
-    fn referenced_relations_sees_into_subqueries_and_ctes() {
-        let refs = referenced_relations(
-            "WITH c AS (SELECT v FROM sw.v_union) SELECT v FROM c JOIN (SELECT id FROM sw.t) q ON true",
-        )
-        .expect("parses");
-        assert!(refs.contains(&(Some("sw".into()), "v_union".into())));
-        assert!(refs.contains(&(Some("sw".into()), "t".into())));
-    }
-
-    /// Unparseable must not read as "references nothing".
-    ///
-    /// The caller uses this to decide whether a statement touches a view it
-    /// cannot trust; an empty list would answer "no" for a statement we cannot
-    /// read at all, which is the wrong direction to be wrong in.
-    #[test]
-    fn referenced_relations_is_none_when_it_cannot_parse() {
-        assert!(referenced_relations("SELECT FROM WHERE ((").is_none());
-        assert!(referenced_relations("").is_some_and(|r| r.is_empty()));
-    }
 
     /// Set operations must never be trusted, whatever the engine reports.
     ///

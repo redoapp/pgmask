@@ -654,6 +654,13 @@ fn inner(text: &str, keep: usize) -> String {
 
 fn outer(text: &str, keep: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
+    // `keep = 0` keeps *nothing at each end*, which under the mirror below
+    // makes the surviving middle the entire value — a passthrough that reads as
+    // configured. `partial` and `inner` both full-mask at 0; `outer` inverted.
+    // Rejected at config load too; this is the second line.
+    if keep == 0 {
+        return "*".repeat(chars.len());
+    }
     // Mirror of `inner`: `kept` is the middle that survives, and a value with no
     // middle left is masked outright.
     let Some(kept) = keep
@@ -669,6 +676,17 @@ fn outer(text: &str, keep: usize) -> String {
 
 fn range(text: &str, start: usize, end: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
+    // A window that starts past the end of the value masked *nothing* and
+    // returned it verbatim: `range(start=4, end=8)` on `"1234"` clamped both
+    // bounds to 4, so the loop never fired. A rule sized for a 16-digit account
+    // number silently passed through every short one, and because the failure
+    // is value-dependent no config check could catch it.
+    //
+    // Too short for the window is the same situation `partial`, `inner` and
+    // `outer` each answer by masking outright.
+    if start >= chars.len() {
+        return "*".repeat(chars.len());
+    }
     let start = start.min(chars.len());
     let end = end.clamp(start, chars.len());
     let mut out = String::with_capacity(chars.len());
@@ -1142,6 +1160,25 @@ mod tests {
         let mut s = spec(Mask::Outer);
         s.keep = 2;
         assert_eq!(apply_text(&s, "123456"), "**34**");
+    }
+
+    /// Both string masks that used to fail open on a short value.
+    ///
+    /// `range` clamped a window past the end to an empty window and returned
+    /// the value; `outer` at `keep = 0` made the whole value the surviving
+    /// middle. Every other string mask answers "too short for these
+    /// parameters" by masking outright, and now these do too.
+    #[test]
+    fn string_masks_never_fail_open_on_a_short_value() {
+        assert_eq!(range("1234", 4, 8), "****");
+        assert_eq!(range("abc", 10, 20), "***");
+        assert_eq!(range("", 4, 8), "");
+        // Still masks the overlapping part when the window does reach.
+        assert_eq!(range("123456", 4, 99), "1234**");
+        assert_eq!(outer("topsecret", 0), "*********");
+        assert_eq!(outer("", 0), "");
+        // ...and still keeps the ends when asked to.
+        assert_eq!(outer("topsecret", 2), "**psecr**");
     }
 
     #[test]

@@ -123,3 +123,18 @@ fn the_backstop_sees_every_column_the_resolver_reports() {
     );
     println!("compared {checked} reported source columns, all seen by the backstop");
 }
+
+#[test]
+fn the_lexical_backstop_keeps_every_postgres_identifier_shape() {
+    let seen = analysis::referenced_identifiers(
+        r#"SELECT "email", value, source, "a""b", émail FROM customer"#,
+    )
+    .expect("valid PostgreSQL must scan");
+
+    for identifier in ["email", "value", "source", "a\"b", "émail"] {
+        assert!(
+            seen.iter().any(|seen| seen == identifier),
+            "backstop missed {identifier:?}; it saw {seen:?}"
+        );
+    }
+}

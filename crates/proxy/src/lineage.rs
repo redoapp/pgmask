@@ -357,6 +357,39 @@ mod tests {
         assert_ne!(v[0], Verdict::Release);
     }
 
+    #[test]
+    fn the_lexical_backstop_includes_unclassified_default_denied_columns() {
+        let mut snapshot = Snapshot::default();
+        snapshot.insert_relation_for_test("demo.orders", &[("id", Mask::None)]);
+        snapshot.relation_columns_for_test("demo.hidden", &["secret"]);
+        let verdict = resolve(
+            "SELECT min((SELECT secret FROM demo.hidden LIMIT 1)) \
+             OVER (PARTITION BY q.id) FROM (SELECT id FROM demo.orders) q",
+            1,
+            &Arc::new(snapshot),
+            &HashSet::new(),
+        );
+        assert_ne!(
+            verdict[0],
+            Verdict::Release,
+            "unclassified is masked, so silence from the resolver cannot release it"
+        );
+    }
+
+    #[test]
+    fn an_unclassified_name_on_an_unrelated_relation_does_not_block_release() {
+        let mut snapshot = Snapshot::default();
+        snapshot.insert_relation_for_test("demo.people", &[("city", Mask::None)]);
+        snapshot.relation_columns_for_test("demo.unrelated", &["city"]);
+        let verdict = resolve(
+            "SELECT upper(city) FROM demo.people",
+            1,
+            &Arc::new(snapshot),
+            &HashSet::new(),
+        );
+        assert_eq!(verdict[0], Verdict::Release);
+    }
+
     // --- the guards ------------------------------------------------------
 
     #[test]

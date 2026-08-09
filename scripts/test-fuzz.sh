@@ -29,7 +29,12 @@ SEEDS="${2:-8}"
 PARALLEL="${3:-4}"
 PG_PORT=55433   # not 55432: verify.sh keeps a container there under KEEP=1
 PROXY_PORT=6470
+EXT_PORT=6469
 POISON_PORT=6471
+BINARY_PORT=6468
+EXT_POISON_PORT=6467
+ROLE_PORT=6466
+DDL_PORT=6465
 METRICS_PORT=9470
 CONTAINER=pgmask-fuzz
 export PGPASSWORD=demo
@@ -100,7 +105,12 @@ sed -e 's/^mask = "ip-prefix"/mask = "none"/' -e 's/^mask = "date-year"/mask = "
     -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-poison.toml
 ./target/release/pgmask /tmp/pgmask-poison.toml >/tmp/pgmask-poison.log 2>&1 &
 POISON_PID=$!
-sleep 2
+for _ in $(seq 1 30); do
+  psql -h localhost -p "$POISON_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+psql -h localhost -p "$POISON_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 \
+  || { echo "FAIL: poison proxy did not start"; tail -8 /tmp/pgmask-poison.log; exit 1; }
 gen 11 1200 /tmp/pgmask-poison.sql
 if ! EXPECT_LEAKS=1 \
      DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb" \
@@ -119,13 +129,18 @@ kill "$POISON_PID" 2>/dev/null; POISON_PID=""
 # Coverage showed no end-to-end suite had ever asked for binary results, and the
 # first one that did found two bugs.
 echo "==> binary result format"
-sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$POISON_PORT\"|" \
+sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$BINARY_PORT\"|" \
     -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-binary.toml
 ./target/release/pgmask /tmp/pgmask-binary.toml >/tmp/pgmask-binary.log 2>&1 &
 BIN_PID=$!
-sleep 2
+for _ in $(seq 1 30); do
+  psql -h localhost -p "$BINARY_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+psql -h localhost -p "$BINARY_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 \
+  || { echo "FAIL: binary proxy did not start"; tail -8 /tmp/pgmask-binary.log; exit 1; }
 if ! DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb" \
-     PROXY_URL="postgres://postgres:demo@localhost:$POISON_PORT/fuzzdb" \
+     PROXY_URL="postgres://postgres:demo@localhost:$BINARY_PORT/fuzzdb" \
      ./target/release/binary; then
   kill "$BIN_PID" 2>/dev/null
   exit 1
@@ -139,14 +154,23 @@ kill "$BIN_PID" 2>/dev/null
 # that says so rather than an assumption.
 echo "==> extended protocol: generated shapes through Parse/Bind/Execute"
 ./target/release/shapegen 4242 600 > /tmp/pgmask-ext.sql
-sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$POISON_PORT\"|" \
+sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$EXT_PORT\"|" \
     -e 's|^lineage = .*|lineage = "allow"|' \
     -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-ext.toml
 ./target/release/pgmask /tmp/pgmask-ext.toml >/tmp/pgmask-ext.log 2>&1 &
 BIN_PID=$!
 sleep 2
 ext_env=(DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb"
-         PROXY_URL="postgres://postgres:demo@localhost:$POISON_PORT/fuzzdb")
+         PROXY_URL="postgres://postgres:demo@localhost:$EXT_PORT/fuzzdb")
+# Wait for the listener rather than sleeping: these steps shared POISON_PORT
+# with the roles check, and `kill` does not free a port synchronously, so the
+# next proxy silently lost the bind and 24 role sessions died on connect.
+for _ in $(seq 1 30); do
+  psql -h localhost -p "$EXT_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+psql -h localhost -p "$EXT_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 \
+  || { echo "FAIL: extended-protocol proxy did not start"; tail -8 /tmp/pgmask-ext.log; exit 1; }
 if ! env "${ext_env[@]}" ./target/release/extended /tmp/pgmask-ext.sql >/tmp/pgmask-ext.out 2>&1; then
   echo "FAIL: the extended-protocol replay found a leak"
   tail -20 /tmp/pgmask-ext.out
@@ -156,11 +180,20 @@ fi
 grep -E '^RESULT' /tmp/pgmask-ext.out | sed 's/^/    /'
 kill "$BIN_PID" 2>/dev/null
 
-sed -e 's/^mask = "redact"/mask = "none"/' /tmp/pgmask-ext.toml > /tmp/pgmask-ext-poison.toml
+sed -e 's/^mask = "redact"/mask = "none"/' \
+    -e "s|:$EXT_PORT\"|:$EXT_POISON_PORT\"|" \
+    /tmp/pgmask-ext.toml > /tmp/pgmask-ext-poison.toml
 ./target/release/pgmask /tmp/pgmask-ext-poison.toml >/tmp/pgmask-ext-poison.log 2>&1 &
 BIN_PID=$!
-sleep 2
-if ! env "${ext_env[@]}" EXPECT_LEAKS=1 \
+ext_poison_env=(DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb"
+                PROXY_URL="postgres://postgres:demo@localhost:$EXT_POISON_PORT/fuzzdb")
+for _ in $(seq 1 30); do
+  psql -h localhost -p "$EXT_POISON_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+psql -h localhost -p "$EXT_POISON_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 \
+  || { echo "FAIL: poisoned extended-protocol proxy did not start"; tail -8 /tmp/pgmask-ext-poison.log; exit 1; }
+if ! env "${ext_poison_env[@]}" EXPECT_LEAKS=1 \
      ./target/release/extended /tmp/pgmask-ext.sql >/tmp/pgmask-ext-poison.out 2>&1; then
   echo "FAIL: masking was removed and the extended oracle saw nothing"
   tail -8 /tmp/pgmask-ext-poison.out
@@ -175,11 +208,17 @@ kill "$BIN_PID" 2>/dev/null
 # per principal. A plan escaping its session would be a disclosure invisible to
 # any single-principal test.
 echo "==> per-principal masking under concurrency"
-./target/release/pgmask "/tmp/pgmask-binary.toml" >/tmp/pgmask-roles.log 2>&1 &
+sed -e "s|:$BINARY_PORT\"|:$ROLE_PORT\"|" /tmp/pgmask-binary.toml > /tmp/pgmask-roles.toml
+./target/release/pgmask "/tmp/pgmask-roles.toml" >/tmp/pgmask-roles.log 2>&1 &
 ROLE_PID=$!
-sleep 2
 role_env=(DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb"
-          PROXY_URL="postgres://postgres:demo@localhost:$POISON_PORT/fuzzdb")
+          PROXY_URL="postgres://postgres:demo@localhost:$ROLE_PORT/fuzzdb")
+for _ in $(seq 1 30); do
+  psql -h localhost -p "$ROLE_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+psql -h localhost -p "$ROLE_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 \
+  || { echo "FAIL: role-concurrency proxy did not start"; tail -8 /tmp/pgmask-roles.log; exit 1; }
 # Prove it can fail before trusting that it did not.
 if env "${role_env[@]}" POISON=1 ./target/release/roles 6 40 >/tmp/roles-poison.out 2>&1; then
   echo "FAIL: the role check passed with deliberately wrong expectations."
@@ -209,12 +248,17 @@ kill "$ROLE_PID" 2>/dev/null
 # window where a relation the proxy knew is gone and its replacement is
 # unknown. Unknown must mean masked; the risk is that it briefly means allowed.
 echo "==> DDL churn during traffic"
-sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$POISON_PORT\"|" \
+sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$DDL_PORT\"|" \
     -e 's/^catalog_refresh_seconds.*/catalog_refresh_seconds = 2/' \
     -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-ddl.toml
 ./target/release/pgmask /tmp/pgmask-ddl.toml >/tmp/pgmask-ddl.log 2>&1 &
 DDL_PID=$!
-sleep 2
+for _ in $(seq 1 30); do
+  psql -h localhost -p "$DDL_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+psql -h localhost -p "$DDL_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 \
+  || { echo "FAIL: DDL-churn proxy did not start"; tail -8 /tmp/pgmask-ddl.log; exit 1; }
 ( for _ in $(seq 1 12); do
     psql -h localhost -p "$PG_PORT" -U postgres -d fuzzdb -q \
       -c 'DROP VIEW IF EXISTS fz.v_union; CREATE VIEW fz.v_union AS SELECT id, a FROM fz.t1 UNION ALL SELECT id, a FROM fz.t2;' \
@@ -227,7 +271,7 @@ churn_reads=0
 for _ in $(seq 1 60); do
   # A recreated view gets a new OID. Until the catalog catches up the proxy has
   # never heard of it, and "never heard of it" has to mean masked.
-  out=$(psql -h localhost -p "$POISON_PORT" -U postgres -d fuzzdb -X -tAq \
+  out=$(psql -h localhost -p "$DDL_PORT" -U postgres -d fuzzdb -X -tAq \
         -c 'SELECT a FROM fz.v_union LIMIT 3;' 2>&1 || true)
   churn_reads=$((churn_reads + 1))
   case "$out" in *CANARY*) churn_leaks=$((churn_leaks + 1));; esac

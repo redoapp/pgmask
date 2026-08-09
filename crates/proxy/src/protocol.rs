@@ -53,6 +53,7 @@ pub const BACKEND_CONTROL_TAGS: &[u8] = &[
 // Frontend (client -> server) message tags we act on.
 pub const F_QUERY: u8 = b'Q';
 pub const F_PARSE: u8 = b'P';
+pub const F_SYNC: u8 = b'S';
 pub const F_BIND: u8 = b'B';
 pub const F_DESCRIBE: u8 = b'D';
 pub const F_EXECUTE: u8 = b'E';
@@ -333,7 +334,10 @@ pub fn parse_row_description(body: &Bytes) -> Result<Vec<FieldDescription>> {
         bail!("truncated RowDescription");
     }
     let count = buf.get_i16();
-    let mut fields = Vec::with_capacity(count.max(0) as usize);
+    if count < 0 {
+        bail!("negative RowDescription field count");
+    }
+    let mut fields = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let name = read_cstring(&mut buf).ok_or_else(|| anyhow::anyhow!("bad field name"))?;
         if buf.remaining() < 18 {
@@ -353,6 +357,9 @@ pub fn parse_row_description(body: &Bytes) -> Result<Vec<FieldDescription>> {
             format,
         });
     }
+    if !buf.is_empty() {
+        bail!("trailing bytes in RowDescription");
+    }
     Ok(fields)
 }
 
@@ -365,14 +372,19 @@ pub fn parse_data_row(body: &Bytes) -> Result<Vec<Option<Bytes>>> {
         bail!("truncated DataRow");
     }
     let count = buf.get_i16();
-    let mut out = Vec::with_capacity(count.max(0) as usize);
+    if count < 0 {
+        bail!("negative DataRow field count");
+    }
+    let mut out = Vec::with_capacity(count as usize);
     for _ in 0..count {
         if buf.remaining() < 4 {
             bail!("truncated DataRow field length");
         }
         let len = buf.get_i32();
-        if len < 0 {
+        if len == -1 {
             out.push(None);
+        } else if len < -1 {
+            bail!("invalid negative DataRow field length");
         } else {
             let len = len as usize;
             if buf.remaining() < len {
@@ -380,6 +392,9 @@ pub fn parse_data_row(body: &Bytes) -> Result<Vec<Option<Bytes>>> {
             }
             out.push(Some(buf.split_to(len)));
         }
+    }
+    if !buf.is_empty() {
+        bail!("trailing bytes in DataRow");
     }
     Ok(out)
 }
@@ -667,6 +682,25 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::*;
+
+    #[test]
+    fn row_parsers_reject_unaccounted_bytes_and_negative_counts() {
+        let mut trailing = BytesMut::new();
+        trailing.put_i16(0);
+        trailing.put_slice(b"unvetted suffix");
+        assert!(parse_data_row(&trailing.clone().freeze()).is_err());
+        assert!(parse_row_description(&trailing.freeze()).is_err());
+
+        let mut negative = BytesMut::new();
+        negative.put_i16(-1);
+        assert!(parse_data_row(&negative.clone().freeze()).is_err());
+        assert!(parse_row_description(&negative.freeze()).is_err());
+
+        let mut bad_length = BytesMut::new();
+        bad_length.put_i16(1);
+        bad_length.put_i32(-2);
+        assert!(parse_data_row(&bad_length.freeze()).is_err());
+    }
 
     #[test]
     fn frames_a_tagged_message() {

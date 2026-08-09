@@ -3,7 +3,7 @@
 #
 #   ./scripts/test-all.sh
 #
-# There are ten suites and they were previously five separate commands run in
+# There are eleven suites and they were previously five separate commands run in
 # whatever order someone remembered. Two things went wrong repeatedly: a suite
 # tore down a container the next one needed, and `cargo test` stopped at the
 # first failing target so the total silently dropped by 21 without anything
@@ -40,7 +40,7 @@ run() { # name command...
   # Containers and proxies from a previous suite are the most common cause of a
   # confusing failure, so every suite starts from nothing.
   pkill -f 'target/release/pgmask' 2>/dev/null
-  podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb >/dev/null 2>&1
+  podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls >/dev/null 2>&1
   sleep 1
   local out
   out=$("$@" 2>&1)
@@ -59,14 +59,23 @@ cargo audit >/dev/null 2>&1; record "cargo audit" "$?"
 
 echo "=== rust tests ==="
 # --no-fail-fast, or one failing target hides every target after it.
-out=$(cargo test --workspace --no-fail-fast -q 2>&1)
+#
+# PGMASK_ALLOW_SKIP is set here on purpose: 31 of these tests need a live
+# Postgres, and they are run for real by the "adversarial (real Postgres)"
+# suite below, which supplies one. Without the variable `require_pg!` now
+# panics rather than returning Ok — it used to return Ok, which meant those 31
+# reported PASS on every gate run having asserted nothing, the adversarial
+# raw-wire suite among them.
+out=$(PGMASK_ALLOW_SKIP=1 cargo test --workspace --no-fail-fast -q 2>&1)
 status=$?
 total=$(printf '%s\n' "$out" | grep -E '^test result' | awk '{s+=$4} END {print s+0}')
-record "cargo test" "$status" "$total tests"
+skipped=$(printf '%s\n' "$out" | grep -c 'skipping by request')
+record "cargo test" "$status" "$total tests ($skipped need Postgres)"
 [[ "$status" == "0" ]] || printf '%s\n' "$out" | grep -E 'FAILED|panicked' | head -8
 
 echo "=== end to end ==="
 cargo build --release -q || { echo "release build failed"; exit 1; }
+run "adversarial (real Postgres)" ./scripts/test-integration.sh
 run "demo (verify.sh)"        env KEEP=0 ./examples/demo/verify.sh
 run "TLS"                     ./scripts/test-tls.sh
 run "Postgres 13-17"          ./scripts/test-versions.sh
@@ -77,7 +86,7 @@ run "generated shapes (CockroachDB)" ./scripts/test-fuzz-cockroach.sh 1200 3
 run "cross-engine differential" ./scripts/test-differential.sh 800
 
 pkill -f 'target/release/pgmask' 2>/dev/null
-podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb >/dev/null 2>&1
+podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls >/dev/null 2>&1
 
 echo
 echo "-------------------------------------------------------------"
