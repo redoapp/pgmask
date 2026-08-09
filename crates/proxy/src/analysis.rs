@@ -699,6 +699,51 @@ pub fn reads_only_server_metadata(sql: &str) -> bool {
     saw_relation
 }
 
+/// Whether the engine's per-field provenance can be believed at all.
+///
+/// **Found against CockroachDB, and it is a leak, not a nicety.** For
+/// `SELECT city FROM t UNION ALL SELECT email FROM t`, CockroachDB's simple-query
+/// `RowDescription` reports the *first branch's* table OID and attnum for the
+/// single output field — so a released column's classification was applied to a
+/// masked column's values and `user7@example.com` came back in the clear. Its
+/// extended-protocol `Describe` reports zero for the same statement, so the two
+/// protocols disagree and only one of them is safe.
+///
+/// Postgres zeroes provenance for set operations, which is why this never
+/// showed up in five major versions of testing.
+///
+/// The rule this establishes is worth stating plainly: **provenance is
+/// necessary but not sufficient.** A field may carry a table OID and still not
+/// come from that column. Where one output field can draw from more than one
+/// source column, the OID identifies at most one of them, and acting on it
+/// masks the wrong column.
+///
+/// Returns false when the statement contains a set operation anywhere, in which
+/// case the caller must treat every field as having no provenance.
+pub fn provenance_is_trustworthy(sql: &str) -> bool {
+    use pg_query::NodeRef;
+    let Ok(parsed) = pg_query::parse(sql) else {
+        // Unparseable means we cannot rule a set operation out.
+        return false;
+    };
+    // Exactly one statement, matching the rest of this module: zero tells us
+    // nothing, and several mean we do not know which one this RowDescription
+    // belongs to.
+    if parsed.protobuf.stmts.len() != 1 {
+        return false;
+    }
+    !parsed
+        .protobuf
+        .nodes()
+        .iter()
+        .any(|(node, _, _, _)| match node {
+            NodeRef::SelectStmt(select) => {
+                select.op() != pg_query::protobuf::SetOperation::SetopNone
+            }
+            _ => false,
+        })
+}
+
 /// Whether every relation in the statement carries an explicit schema.
 ///
 /// Used only to decide whether a result set made entirely of expressions can be
@@ -1321,5 +1366,57 @@ mod tests {
             safety("SELECT date_trunc(some_unit, birth_date) FROM t", 1),
             vec![Safety::Unknown]
         );
+    }
+}
+
+#[cfg(test)]
+mod provenance_trust_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
+    use super::*;
+
+    /// Set operations must never be trusted, whatever the engine reports.
+    ///
+    /// CockroachDB's simple-query RowDescription gives a UNION the first
+    /// branch's table OID, so `SELECT city … UNION ALL SELECT email …` applied
+    /// `city`'s "released" classification to `email`'s values and returned a
+    /// real address. Postgres zeroes it, which is why five major versions of
+    /// testing never showed this.
+    #[test]
+    fn set_operations_are_never_trusted() {
+        for sql in [
+            "SELECT city FROM t UNION ALL SELECT email FROM t",
+            "SELECT city FROM t UNION SELECT email FROM t",
+            "SELECT city FROM t INTERSECT SELECT email FROM t",
+            "SELECT city FROM t EXCEPT SELECT email FROM t",
+            "SELECT x FROM (SELECT city AS x FROM t UNION ALL SELECT email FROM t) q",
+            "WITH u AS (SELECT city FROM t UNION SELECT email FROM t) SELECT * FROM u",
+        ] {
+            assert!(!provenance_is_trustworthy(sql), "must distrust: {sql}");
+        }
+    }
+
+    #[test]
+    fn ordinary_statements_keep_their_provenance() {
+        for sql in [
+            "SELECT email FROM t",
+            "SELECT a.email, b.city FROM t a JOIN t b ON b.id = a.id",
+            "SELECT email FROM t WHERE id = 1 ORDER BY id LIMIT 5",
+            "WITH q AS (SELECT email FROM t) SELECT email FROM q",
+            "SELECT * FROM t",
+        ] {
+            assert!(provenance_is_trustworthy(sql), "must trust: {sql}");
+        }
+    }
+
+    #[test]
+    fn unparseable_sql_is_not_trusted() {
+        // We cannot rule a set operation out, so we do not claim to.
+        assert!(!provenance_is_trustworthy("this is not sql"));
+        assert!(!provenance_is_trustworthy(""));
     }
 }

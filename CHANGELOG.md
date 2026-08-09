@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.1 — CockroachDB
+
+**Fixes a disclosure.** CockroachDB reports the *first branch's* table OID and
+attnum for a set operation's output field on the simple-query path, where
+Postgres reports zero. Believing it applied one column's classification to
+another column's values:
+
+```sql
+SELECT city FROM customers UNION ALL SELECT email FROM customers
+```
+
+returned real addresses in the clear. Five major Postgres versions of testing
+never showed this, because Postgres declines to name an origin for a field that
+has several.
+
+The fix decides from the statement rather than from the engine: a parsed
+statement containing a set operation — or one that will not parse, since that
+cannot rule one out — has its provenance distrusted for every field, which are
+then handled as computed fields already were. **Postgres behaviour is
+unchanged**; the check only fires where Postgres had already zeroed provenance.
+A `UNION` over released columns is still served under `lineage = "allow"` on
+both engines.
+
+- CockroachDB v25.4 is now a supported and tested engine, with a suite of 34
+  assertions (`scripts/test-cockroach.sh`) wired into `test-all.sh`. It includes
+  a direct-connection control proving CockroachDB really does report the
+  leak-enabling provenance, so the suite cannot quietly stop testing anything.
+- The lineage gate now asks whether a field *will be planned* without
+  provenance, not whether the engine reported it as computed. Those are the same
+  set on Postgres and are not on CockroachDB, where every set operation was
+  being refused — safe, and needlessly worse than Postgres.
+- New: [docs/engines.md](docs/engines.md).
+
 ## 0.1.0 — first release
 
 MIT licensed.
@@ -59,7 +92,7 @@ without special handling. The only two paths that emit rows without one —
 
 | suite | what it covers |
 |---|---|
-| 217 cargo tests | units, properties, adversarial wire client, differential vs `pgwire` |
+| 220 cargo tests | units, properties, adversarial wire client, differential vs `pgwire` |
 | 82 demo assertions | end-to-end against a real Postgres, 50k rows |
 | 115 version assertions | 23 checks x Postgres 13, 14, 15, 16, 17 |
 | 7 TLS assertions | TLS on both legs through a real psql |

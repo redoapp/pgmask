@@ -46,11 +46,13 @@ done, and [LICENSE](LICENSE).
 | GUI clients — Harlequin, Beekeeper's stack, psql `\d` | done, opt-in ([how](docs/gui-clients.md)) |
 | `classify --check` — CI gate on catalog drift | done ([who owns what](docs/responsibilities.md)) |
 | Phase 6 — lineage (`lineage = "allow"`) | done, opt-in; TPC-DS refusals 55% → 26% ([measured](docs/lineage-estimate.md)) |
+| CockroachDB v25.4 | supported and tested; closed a union disclosure ([why](docs/engines.md)) |
 
-276 assertions across eight suites: 187 cargo (109 unit, 30 property, 23
-adversarial, 13 classification, 8 resilience, 4 differential), 82 demo, 7 TLS. The adversarial
-suite drives a raw wire client and asserts no sentinel byte ever crosses the
-boundary.
+`./scripts/test-all.sh` runs nine suites and reports one line each, with a
+skipped suite counted as a failure: 220 cargo tests, 82 demo assertions, 7 TLS,
+115 across Postgres 13–17, 34 against CockroachDB, and a generated-SQL campaign
+that must report zero leaks. The adversarial cargo suite drives a raw wire
+client and asserts no sentinel byte ever crosses the boundary.
 
 ### Who owns what
 
@@ -125,6 +127,14 @@ references because it converts refusals into acceptances, so unsoundness there
 means a leak; see [`crates/proxy/src/analysis.rs`](crates/proxy/src/analysis.rs).
 It cut the false-rejection rate on a real workload from 23% to 6%.
 
+**Provenance is necessary but not sufficient.** Where one output field draws
+from several source columns, the reported OID names at most one of them.
+Postgres declines to answer in that case and reports zero; CockroachDB answers
+with the first branch, which leaked a masked column through a `UNION` until
+v0.1.1. The proxy now distrusts provenance for any statement containing a set
+operation, on every engine, and handles those fields as computed ones. See
+[docs/engines.md](docs/engines.md).
+
 ## Try it
 
 ```bash
@@ -134,6 +144,7 @@ It cut the false-rejection rate on a real workload from 23% to 6%.
 ./scripts/test-integration.sh    # canary + adversarial + resilience, 23 tests
 ./scripts/test-tls.sh            # TLS on both legs via a real psql, 7 assertions
 ./scripts/test-versions.sh       # 23 assertions x Postgres 13,14,15,16,17
+./scripts/test-cockroach.sh      # 34 assertions against CockroachDB v25.4
 cargo llvm-cov --release --summary-only   # coverage, after running the above
 cargo audit && cargo machete              # advisories and unused deps
 ```

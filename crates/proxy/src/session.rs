@@ -112,12 +112,18 @@ impl Policy {
         roles: &HashSet<String>,
         safety: &[Safety],
         lineage: &[Verdict],
+        trust_provenance: bool,
     ) -> Result<Plan, Rejection> {
         let snapshot = self.catalog.snapshot();
         let mut plan = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
             let provably_safe = safety.get(index).copied() == Some(Safety::Releasable);
-            let spec = if !field.has_provenance() {
+            // A set operation can put values from several columns into one
+            // output field, and CockroachDB reports the first branch's OID for
+            // the whole thing. Believing it applies one column's mask to
+            // another column's values, which is how a released `city` let a
+            // masked `email` through in the clear. Treat the field as opaque.
+            let spec = if !field.has_provenance() || !trust_provenance {
                 // An expression we positively identified as carrying no column
                 // value — `SELECT 1`, `now()`, `count(*)`. Passing it through is
                 // the point of the analysis; see analysis.rs for why the rule is
@@ -737,14 +743,29 @@ impl Session {
             }
             None => vec![Safety::Unknown; fields.len()],
         };
+        // Engines disagree about this: Postgres zeroes provenance for set
+        // operations, CockroachDB reports it on the simple-query path only.
+        // Deciding from the statement rather than from the engine makes the
+        // behaviour the same on both.
+        let trust_provenance = self
+            .described_sql
+            .as_deref()
+            .is_none_or(analysis::provenance_is_trustworthy);
+
         // Only computed when something would otherwise be refused: a query whose
         // every field either has provenance or is already released by shape
         // never pays for the analysis.
+        //
+        // "Has provenance" is not the same question as "will be planned from
+        // provenance" — a distrusted set-op field is treated as opaque even
+        // though the engine reported an OID, and needs lineage exactly as much
+        // as a genuinely computed one. Asking only the first question left
+        // CockroachDB refusing unions that Postgres serves, because there the
+        // fields carry provenance right up until we decline to believe it.
         let needs_lineage = self.policy.lineage == Lineage::Allow
-            && fields
-                .iter()
-                .zip(&safety)
-                .any(|(field, safety)| !field.has_provenance() && *safety != Safety::Releasable);
+            && fields.iter().zip(&safety).any(|(field, safety)| {
+                (!field.has_provenance() || !trust_provenance) && *safety != Safety::Releasable
+            });
         let lineage_verdicts: Vec<Verdict> = match (&self.described_sql, needs_lineage) {
             (Some(sql), true) => lineage::resolve(
                 sql,
@@ -767,8 +788,13 @@ impl Session {
                     .collect::<Vec<_>>(),
             ))
         } else {
-            self.policy
-                .plan_for(&fields, &self.roles, &safety, &lineage_verdicts)
+            self.policy.plan_for(
+                &fields,
+                &self.roles,
+                &safety,
+                &lineage_verdicts,
+                trust_provenance,
+            )
         };
         let plan = match planned {
             Ok(plan) => plan,
@@ -1134,7 +1160,7 @@ mod tests {
     fn opaque_field_is_rejected_by_default() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let err = p
-            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[], &[])
+            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[], &[], true)
             .expect_err("must reject");
         assert!(err.message.contains("no column provenance"));
     }
@@ -1143,7 +1169,7 @@ mod tests {
     fn opaque_field_can_be_masked_instead() {
         let p = policy(Unclassified::Allow, Opaque::Mask);
         let plan = p
-            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[], &[])
+            .plan_for(&[field("lower", 0, 0, 25)], &HashSet::new(), &[], &[], true)
             .ok()
             .expect("must allow");
         assert_eq!(plan[0].spec.kind, Mask::Null);
@@ -1153,7 +1179,13 @@ mod tests {
     fn unclassified_columns_are_masked_by_default() {
         let p = policy(Unclassified::Mask, Opaque::Reject);
         let plan = p
-            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new(), &[], &[])
+            .plan_for(
+                &[field("email", 16391, 2, 25)],
+                &HashSet::new(),
+                &[],
+                &[],
+                true,
+            )
             .ok()
             .unwrap();
         assert_eq!(plan[0].spec.kind, Mask::Null, "default-deny");
@@ -1163,7 +1195,13 @@ mod tests {
     fn allow_mode_passes_unclassified_columns() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let plan = p
-            .plan_for(&[field("email", 16391, 2, 25)], &HashSet::new(), &[], &[])
+            .plan_for(
+                &[field("email", 16391, 2, 25)],
+                &HashSet::new(),
+                &[],
+                &[],
+                true,
+            )
             .ok()
             .unwrap();
         assert_eq!(plan[0].spec.kind, Mask::None);
@@ -1189,7 +1227,13 @@ mod tests {
         });
         // int4, not a text type: pseudonym rewrites values as text.
         let err = p
-            .plan_for(&[field("id", 16391, 1, 23)], &HashSet::new(), &[], &[])
+            .plan_for(
+                &[field("id", 16391, 1, 23)],
+                &HashSet::new(),
+                &[],
+                &[],
+                true,
+            )
             .expect_err("must reject");
         assert!(
             err.message.contains("cannot be applied to type OID 23"),

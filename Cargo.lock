@@ -139,7 +139,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "tokio",
@@ -385,7 +385,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "classify"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "pgmask",
@@ -421,7 +421,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "corpus"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "tokio",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "fuzz"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "jiff",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "pgmask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2168,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "spike"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "tokio",
