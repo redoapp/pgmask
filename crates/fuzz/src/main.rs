@@ -86,6 +86,25 @@ fn shape_leak(value: &str) -> Option<&'static str> {
             return Some("fz.people.birth_date (not truncated to its year)");
         }
     }
+    // A salary that is not on a bucket boundary.
+    //
+    // There was no numeric detector here, and it cost something real: the
+    // windowed-aggregate disclosure — `sum(annual_salary) OVER (… ROWS BETWEEN
+    // CURRENT ROW AND CURRENT ROW)` returning exact salaries — was caught only
+    // because the same shape also reached a *date* column. A campaign that
+    // happened to reach only salaries would have reported clean.
+    //
+    // The fixture makes this exact: salaries are `41111 + i * 137` for
+    // i in 1..=60, so every raw value lies in a known range and none is a
+    // multiple of its bucket, while every masked value is.
+    if let Ok(v) = value.trim().parse::<i64>() {
+        if (41_111..=49_331).contains(&v) && v % 25_000 != 0 {
+            return Some("fz.people.annual_salary (not floored to its bucket)");
+        }
+        if (9_000_000_000..=9_000_008_220).contains(&v) && v % 1_000_000 != 0 {
+            return Some("fz.people.salary_big (not floored to its bucket)");
+        }
+    }
     None
 }
 

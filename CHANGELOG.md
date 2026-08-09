@@ -1,5 +1,113 @@
 # Changelog
 
+## 0.1.5 — a windowed aggregate is not a summary
+
+**Fixes the most serious disclosure so far.** It needs no unusual
+configuration, no view, and no second engine:
+
+```sql
+SELECT sum(annual_salary)
+         OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW)
+  FROM fz.people;
+```
+
+returned **exact salaries** through a `numeric-bucket` column — 41248, 41385,
+41522, where the plain column reads 25000. Under the *strictest* settings,
+`lineage = "refuse"` and `opaque = "reject"`, because a `Releasable` verdict
+short-circuits both.
+
+`sum` is on the reducing-aggregate allowlist: it cannot return a value it
+consumed, so what is inside it does not matter. That reasoning is sound for an
+aggregate and false for a window function, where **the caller chooses the
+frame** and a frame of one row makes every reducing aggregate the identity.
+`count(*)` in the arm above already tested `over`; this arm did not.
+
+This is not the group-of-one trade the module header accepts. A group of one is
+incidental to the data; a frame of one is a thing the client writes down.
+
+Every windowed aggregate is now refused — analysing frames to find the safe ones
+is exactly the prove-absence reasoning the module refuses to do. `count(*) OVER
+(…)` is deliberately still released: a frame changes which rows it counts, never
+that it returns a count. Two existing tests asserted the vulnerable behaviour and
+have been corrected.
+
+### And a fifth: lineage released on a partial source set
+
+The same campaign run also leaked a raw `date`, by a different route. Reduced:
+
+```sql
+SELECT min((SELECT d FROM fz.t8 LIMIT 1 OFFSET 3)) OVER (PARTITION BY subq.c0)
+  FROM (SELECT id AS c0 FROM fz.v_join) subq
+```
+
+`sqllineage` does not descend into a `SubLink`, so the only source it reported
+was `fz.v_join.id` — released. Lineage released the field on that basis, and the
+value came from `fz.t8.d`, which is masked and which appears nowhere in the
+sources it enumerated.
+
+This is the third bug of one shape: **lineage releasing on an incomplete source
+set** (after the set-operation view, and the view column released by rule).
+`resolve` now refuses any statement containing a scalar subquery (guard 6). The
+check is statement-level on purpose — locating which output field owns a given
+`SubLink` means reproducing the target-list correspondence built elsewhere, and
+getting *that* wrong is a leak. It costs lineage on `WHERE id IN (SELECT …)`,
+which is utility, not safety. `upper(city)` still resolves and releases.
+
+### How it was found, and what that says
+
+The generated campaign found it, not review — and only by accident. The
+statement that surfaced it reached a *date* column as well as a salary, and the
+harness had a date detector and **no numeric one**. A campaign that reached only
+salaries would have reported clean.
+
+- The harness gains bucket detectors for `annual_salary` and `salary_big`.
+- `shapegen` gains a windowed-aggregate arm; it had none, so no generated shape
+  could reach this. Verified by reverting the fix: the corpus now reports 62
+  leaks, correctly attributed, and 0 with the fix.
+
+### The cross-engine differential
+
+Every other oracle here needs someone to have predicted the bug: the canary
+oracle needs a token planted in the right column, the shape matrix needs the
+shape to have been thought of. `shapegen` closed one gap and opened another —
+it explores what its author imagined, so its blind spots are his.
+
+`scripts/test-differential.sh` needs no prediction. Both engines hold
+byte-identical fixture data, and **masking is a property of the data and the
+catalog, not of the engine**, so for any statement both proxies serve the masked
+output must match. A difference is a defect by construction.
+
+It matters most for pseudonyms: they are deterministic so a Postgres copy and a
+CockroachDB cluster of the same data stay joinable. Until now that property was
+asserted on one row in one suite; it is now checked across 157 served statements
+of a generated corpus, and the run verifies the two fixtures really are
+identical before comparing rather than assuming one file produced the same rows.
+
+Result: 157 compared, 0 value mismatches, 84 decision mismatches — all in the
+direction of CockroachDB refusing what Postgres serves, which is what
+distrusting its provenance is supposed to look like. The control, a deliberately
+skewed catalog, produces 141 mismatches, so the comparison can fail.
+
+### Coverage said where the generator was not looking
+
+Measured against the decision modules, a 2000-statement generated corpus reached
+**19.6% of `mask.rs`**. The cause was one line of the generator: its column pool
+was text and small integers, so no generated shape ever selected a `date`,
+`uuid`, `inet` or `int8`. `date-year`, `ip-prefix`, uuid pseudonyms and 64-bit
+bucketing had unit tests and fixed end-to-end checks, but no *shape* variety at
+all — and shape variety is where all three leaks so far have lived.
+
+Widening the pool took `mask.rs` from 19.6% to **33.1%** under the same corpus.
+Projecting typed columns naively also put 230 engine errors into a corpus that
+had been running at zero (a `date` in a `UNION` against text, `string_agg` over
+a date), so the generator now tracks whether its projected column may be
+non-text and keeps set operations and `string_agg` on text. Errors: 19 of 2000.
+
+The lesson worth keeping: *"the fuzzer found nothing"* and *"the fuzzer never
+executed that code"* look identical from the outside. Coverage is what tells
+them apart, and it should be measured against the generated corpus alone rather
+than the whole suite, which hides the gap behind unit tests.
+
 ## 0.1.4 — the other protocol, and the other integer width
 
 No disclosure this time. Two coverage holes, both found by pointing existing

@@ -129,6 +129,17 @@ pub fn resolve(
         catalog: Some(Box::new(SnapshotCatalog(Arc::clone(snapshot)))),
         normalize_case: true,
     };
+    // Guard 6: a scalar subquery anywhere.
+    //
+    // `sqllineage` does not descend into a `SubLink`, so the sources it
+    // enumerates for such a statement are a subset of the real ones — and
+    // releasing on a subset is releasing on absence of evidence. A generated
+    // statement returned a raw date from `fz.t8.d` because the only source
+    // reported was `fz.v_join.id`, which is released and which the value never
+    // came from. See `analysis::contains_scalar_subquery`.
+    if crate::analysis::contains_scalar_subquery(sql) {
+        return unresolved;
+    }
     // Guard 4: anything the parser cannot read.
     let Ok(results) = sqllineage::analyze(sql, opts) else {
         return unresolved;
@@ -409,6 +420,42 @@ mod tests {
         assert_eq!(
             resolve(
                 "SELECT upper(city) FROM fz.v_plain",
+                1,
+                &snapshot,
+                &HashSet::new()
+            )[0],
+            Verdict::Release
+        );
+    }
+
+    /// Lineage must not release when its source enumeration is incomplete.
+    ///
+    /// `sqllineage` does not descend into a `SubLink`, so for a target built
+    /// from a scalar subquery it reports only the outer relation's columns. A
+    /// generated statement returned a raw date on exactly that basis: the only
+    /// source it named was released, and the value came from a masked column
+    /// that appeared nowhere in the list.
+    #[test]
+    fn a_scalar_subquery_stops_lineage_releasing() {
+        let mut s = Snapshot::default();
+        s.insert_relation_for_test("demo.pub_t", &[("shared", Mask::None)]);
+        let snapshot = Arc::new(s);
+        for sql in [
+            "SELECT min((SELECT x FROM other LIMIT 1)) OVER (PARTITION BY shared) FROM demo.pub_t",
+            "SELECT (SELECT x FROM other LIMIT 1) FROM demo.pub_t",
+            "SELECT upper(shared) FROM demo.pub_t WHERE shared IN (SELECT x FROM other)",
+        ] {
+            assert_ne!(
+                resolve(sql, 1, &snapshot, &HashSet::new())[0],
+                Verdict::Release,
+                "must not release with a scalar subquery present: {sql}"
+            );
+        }
+        // ...and the same shape without one still resolves, so the guard is a
+        // subquery check rather than a retreat from lineage.
+        assert_eq!(
+            resolve(
+                "SELECT upper(shared) FROM demo.pub_t",
                 1,
                 &snapshot,
                 &HashSet::new()

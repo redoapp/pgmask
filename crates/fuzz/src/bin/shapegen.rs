@@ -72,12 +72,25 @@ impl Rng {
 
 /// A relation and the columns worth selecting from it.
 ///
-/// Only text-ish and numeric columns, because the oracle looks for a token in
-/// text and the masks under test are on these.
+/// `text` feeds expressions and the canary scan; `nums` feeds predicates;
+/// `typed` is projected as-is.
+///
+/// The `typed` list exists because measuring coverage said it had to. With only
+/// text and small ints, a 2000-statement corpus reached **19.6% of mask.rs**:
+/// no generated shape ever selected a date, uuid, inet or int8, so `date-year`,
+/// `ip-prefix`, uuid pseudonyms and 64-bit bucketing were never exercised by a
+/// generated query at all. They have unit tests and fixed end-to-end checks;
+/// what they lacked was any shape variety, which is precisely where the leaks
+/// found so far have lived.
+///
+/// The oracle already knows their raw forms — `00000000-0000-4000-a000-` and
+/// `555-77` are canaries — so a leak through one of these is detected, not just
+/// executed.
 struct Relation {
     name: &'static str,
     text: &'static [&'static str],
     nums: &'static [&'static str],
+    typed: &'static [&'static str],
 }
 
 const RELATIONS: &[Relation] = &[
@@ -85,36 +98,43 @@ const RELATIONS: &[Relation] = &[
         name: "fz.t1",
         text: &["a", "b"],
         nums: &["id", "n"],
+        typed: &["d", "u"],
     },
     Relation {
         name: "fz.t2",
         text: &["a", "b"],
         nums: &["id", "n"],
+        typed: &["d", "u"],
     },
     Relation {
         name: "fz.t3",
         text: &["a", "b"],
         nums: &["id", "n"],
+        typed: &["d", "u"],
     },
     Relation {
         name: "fz.t4",
         text: &["a", "b"],
         nums: &["id", "n"],
+        typed: &["d", "u"],
     },
     Relation {
         name: "fz.t5",
         text: &["a", "b"],
         nums: &["id", "n"],
+        typed: &["d", "u"],
     },
     Relation {
         name: "fz.t6",
         text: &["a", "b"],
         nums: &["id", "n"],
+        typed: &["d", "u"],
     },
     Relation {
         name: "fz.people",
         text: &["email", "full_name", "phone", "city", "last_ip", "note"],
         nums: &["id", "annual_salary"],
+        typed: &["birth_date", "account_uuid", "salary_big"],
     },
     // The views matter more than the tables: a set operation inside one is
     // invisible in the statement that selects from it, and that was a leak on
@@ -123,18 +143,34 @@ const RELATIONS: &[Relation] = &[
         name: "fz.v_union",
         text: &["a"],
         nums: &["id"],
+        typed: &[],
     },
     Relation {
         name: "fz.v_join",
         text: &["xa", "yb"],
         nums: &["id"],
+        typed: &[],
     },
     Relation {
         name: "fz.v_mixed",
         text: &["v"],
         nums: &["id"],
+        typed: &[],
     },
 ];
+
+/// A generated query and what it projects.
+///
+/// `typed` says the first output column may not be text. Two arms need to know:
+/// a set operation requires both branches to agree on type, and `string_agg`
+/// only takes text. Getting this wrong is not a masking bug but it is a wasted
+/// statement — projecting dates without tracking it put 230 engine errors into
+/// a 2000-statement corpus that had been running at zero.
+struct Shape {
+    sql: String,
+    cols: Vec<String>,
+    typed: bool,
+}
 
 /// One relation reference: `fz.people p3`.
 struct Source {
@@ -148,6 +184,16 @@ impl Source {
     }
     fn num_col(&self, rng: &mut Rng) -> String {
         format!("{}.{}", self.alias, rng.pick(self.relation.nums))
+    }
+    /// A date/uuid/int8 column when the relation has one, else a text column.
+    ///
+    /// Projected bare rather than wrapped: these are type-aware masks, and an
+    /// expression over one is refused before the mask ever runs.
+    fn typed_col(&self, rng: &mut Rng) -> String {
+        if self.relation.typed.is_empty() {
+            return self.text_col(rng);
+        }
+        format!("{}.{}", self.alias, rng.pick(self.relation.typed))
     }
 }
 
@@ -176,13 +222,17 @@ fn scalar(rng: &mut Rng, s: &Source) -> String {
 }
 
 /// A single-relation select, the leaf every larger shape is built from.
-fn leaf(rng: &mut Rng, depth: usize, n: usize) -> (String, Vec<String>) {
+fn leaf(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
     let s = source(rng, n.wrapping_add(depth.wrapping_mul(10)));
     let mut cols = Vec::new();
+    let mut typed = false;
     let count = rng.below(3).saturating_add(1);
     for i in 0..count {
-        let expr = if rng.chance(35) {
+        let expr = if rng.chance(30) {
             scalar(rng, &s)
+        } else if allow_typed && rng.chance(30) {
+            typed = true;
+            s.typed_col(rng)
         } else {
             s.text_col(rng)
         };
@@ -203,7 +253,11 @@ fn leaf(rng: &mut Rng, depth: usize, n: usize) -> (String, Vec<String>) {
         );
     }
     let names: Vec<String> = (0..count).map(|i| format!("c{i}")).collect();
-    (sql, names)
+    Shape {
+        sql,
+        cols: names,
+        typed,
+    }
 }
 
 /// Wrap a query in one more relational operator.
@@ -211,112 +265,146 @@ fn leaf(rng: &mut Rng, depth: usize, n: usize) -> (String, Vec<String>) {
 /// Each arm is a construct that either preserves provenance, erases it, or —
 /// the interesting case — makes one output field draw from several source
 /// columns. Those last are the ones that have found bugs.
-fn compose(rng: &mut Rng, depth: usize, n: usize) -> (String, Vec<String>) {
+fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
     if depth == 0 {
-        return leaf(rng, depth, n);
+        return leaf(rng, depth, n, allow_typed);
     }
     let next = depth.saturating_sub(1);
-    match rng.below(10) {
+    // Every arm below projects `inner`'s first column onward, so the type flag
+    // travels with it unless the arm changes the type.
+    let wrap = |sql: String, cols: Vec<String>, typed: bool| Shape { sql, cols, typed };
+
+    match rng.below(11) {
         // Subquery.
         0 => {
-            let (inner, cols) = compose(rng, next, n);
-            let projected = cols.first().cloned().unwrap_or_else(|| "c0".into());
-            (
-                format!("SELECT {projected} FROM ({inner}) q{n}"),
-                vec![projected],
-            )
+            let inner = compose(rng, next, n, allow_typed);
+            let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
+            let sql = format!("SELECT {lc} FROM ({}) q{n}", inner.sql);
+            wrap(sql, vec![lc], inner.typed)
         }
         // CTE.
         1 => {
-            let (inner, cols) = compose(rng, next, n);
-            let projected = cols.first().cloned().unwrap_or_else(|| "c0".into());
-            (
-                format!("WITH w{n} AS ({inner}) SELECT {projected} FROM w{n}"),
-                vec![projected],
-            )
+            let inner = compose(rng, next, n, allow_typed);
+            let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
+            let sql = format!("WITH w{n} AS ({}) SELECT {lc} FROM w{n}", inner.sql);
+            wrap(sql, vec![lc], inner.typed)
         }
         // Set operations: one output field, two source columns. Both leaks
         // found so far were here.
         2 | 3 => {
             let op = rng.pick(&["UNION ALL", "UNION", "INTERSECT", "EXCEPT"]);
-            let (left, lcols) = compose(rng, next, n);
-            let (right, _) = compose(rng, next, n.wrapping_add(1));
-            // Set operations require matching arity; project both to one column.
-            let lc = lcols.first().cloned().unwrap_or_else(|| "c0".into());
-            (
-                format!("SELECT {lc} FROM ({left}) a{n} {op} SELECT c0 FROM ({right}) b{n}"),
-                vec![lc],
-            )
+            // Text on both sides. A set operation needs the branches to agree
+            // on type, and pairing a date with text is an engine error, not a
+            // test — it put 230 of them into a corpus that ran at zero.
+            let left = compose(rng, next, n, false);
+            let right = compose(rng, next, n.wrapping_add(1), false);
+            let lc = left.cols.first().cloned().unwrap_or_else(|| "c0".into());
+            let sql = format!(
+                "SELECT {lc} FROM ({}) a{n} {op} SELECT c0 FROM ({}) b{n}",
+                left.sql, right.sql
+            );
+            wrap(sql, vec![lc], false)
         }
         // Join.
         4 => {
             let s = source(rng, n.wrapping_add(50));
-            let (inner, cols) = compose(rng, next, n);
-            let lc = cols.first().cloned().unwrap_or_else(|| "c0".into());
-            (
-                format!(
-                    "SELECT q{n}.{lc}, {} AS c1 FROM ({inner}) q{n} JOIN {} {} ON true",
-                    s.text_col(rng),
-                    s.relation.name,
-                    s.alias
-                ),
-                vec![lc, "c1".into()],
-            )
+            let inner = compose(rng, next, n, allow_typed);
+            let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
+            let sql = format!(
+                "SELECT q{n}.{lc}, {} AS c1 FROM ({}) q{n} JOIN {} {} ON true",
+                s.text_col(rng),
+                inner.sql,
+                s.relation.name,
+                s.alias
+            );
+            wrap(sql, vec![lc, "c1".into()], inner.typed)
         }
         // DISTINCT.
         5 => {
-            let (inner, cols) = compose(rng, next, n);
-            let lc = cols.first().cloned().unwrap_or_else(|| "c0".into());
-            (
-                format!("SELECT DISTINCT {lc} FROM ({inner}) q{n}"),
-                vec![lc],
-            )
+            let inner = compose(rng, next, n, allow_typed);
+            let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
+            let sql = format!("SELECT DISTINCT {lc} FROM ({}) q{n}", inner.sql);
+            wrap(sql, vec![lc], inner.typed)
         }
         // ORDER BY / LIMIT.
         6 => {
-            let (inner, cols) = compose(rng, next, n);
-            let lc = cols.first().cloned().unwrap_or_else(|| "c0".into());
-            (
-                format!(
-                    "SELECT {lc} FROM ({inner}) q{n} ORDER BY 1 LIMIT {}",
-                    rng.below(20).saturating_add(1)
-                ),
-                vec![lc],
-            )
+            let inner = compose(rng, next, n, allow_typed);
+            let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
+            let sql = format!(
+                "SELECT {lc} FROM ({}) q{n} ORDER BY 1 LIMIT {}",
+                inner.sql,
+                rng.below(20).saturating_add(1)
+            );
+            wrap(sql, vec![lc], inner.typed)
         }
         // Window function: the value passes through untouched beside a rank.
         7 => {
-            let (inner, cols) = compose(rng, next, n);
-            let lc = cols.first().cloned().unwrap_or_else(|| "c0".into());
-            (
-                format!("SELECT {lc}, row_number() OVER (ORDER BY {lc}) AS c1 FROM ({inner}) q{n}"),
-                vec![lc, "c1".into()],
-            )
+            let inner = compose(rng, next, n, allow_typed);
+            let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
+            let sql = format!(
+                "SELECT {lc}, row_number() OVER (ORDER BY {lc}) AS c1 FROM ({}) q{n}",
+                inner.sql
+            );
+            wrap(sql, vec![lc, "c1".into()], inner.typed)
         }
-        // Value-returning aggregates. min/max/string_agg return one of their
-        // inputs, which is exactly what must stay refused.
+        // Value-returning aggregates: they return one of their inputs, which is
+        // exactly what must stay refused.
         8 => {
-            let (inner, cols) = compose(rng, next, n);
-            let lc = cols.first().cloned().unwrap_or_else(|| "c0".into());
-            let agg = rng.pick(&["min", "max", "string_agg"]);
-            let call = if *agg == "string_agg" {
+            let inner = compose(rng, next, n, allow_typed);
+            let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
+            // `string_agg` only takes text, so it is off the table when the
+            // projected column might be a date or a uuid.
+            let agg = if inner.typed {
+                *rng.pick(&["min", "max"])
+            } else {
+                *rng.pick(&["min", "max", "string_agg"])
+            };
+            let call = if agg == "string_agg" {
                 format!("string_agg({lc}, ',')")
             } else {
                 format!("{agg}({lc})")
             };
-            (
-                format!("SELECT {call} AS c0 FROM ({inner}) q{n}"),
-                vec!["c0".into()],
-            )
+            let sql = format!("SELECT {call} AS c0 FROM ({}) q{n}", inner.sql);
+            wrap(sql, vec!["c0".into()], inner.typed && agg != "string_agg")
+        }
+        // A reducing aggregate used as a *window* function.
+        //
+        // This arm exists because its absence was a disclosure. `sum(x)` is
+        // released as a summary, but over `ROWS BETWEEN CURRENT ROW AND CURRENT
+        // ROW` it is the identity function and returned exact salaries through
+        // a bucketed column. The generator had no windowed aggregates at all,
+        // so no generated shape could reach it; a sqlsmith statement did, by
+        // accident, once the fixture changed.
+        9 => {
+            let s = source(rng, n.wrapping_add(70));
+            let frame = rng.pick(&[
+                "ROWS BETWEEN CURRENT ROW AND CURRENT ROW",
+                "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW",
+                "",
+            ]);
+            let agg = rng.pick(&["sum", "avg", "count", "min", "max"]);
+            let sql = format!(
+                "SELECT {agg}({}) OVER (ORDER BY {} {frame}) AS c0 FROM {} {}",
+                s.num_col(rng),
+                s.num_col(rng),
+                s.relation.name,
+                s.alias
+            );
+            Shape {
+                sql,
+                cols: vec!["c0".into()],
+                typed: false,
+            }
         }
         // GROUP BY, keeping the grouped value in the output.
         _ => {
-            let (inner, cols) = compose(rng, next, n);
-            let lc = cols.first().cloned().unwrap_or_else(|| "c0".into());
-            (
-                format!("SELECT {lc}, count(*) AS c1 FROM ({inner}) q{n} GROUP BY {lc}"),
-                vec![lc, "c1".into()],
-            )
+            let inner = compose(rng, next, n, allow_typed);
+            let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
+            let sql = format!(
+                "SELECT {lc}, count(*) AS c1 FROM ({}) q{n} GROUP BY {lc}",
+                inner.sql
+            );
+            wrap(sql, vec![lc, "c1".into()], inner.typed)
         }
     }
 }
@@ -332,8 +420,8 @@ fn main() {
         // Depth 1..=3. Deeper nests mostly repeat shapes while getting slower to
         // plan, and CockroachDB starts timing out on the wide ones.
         let depth = rng.below(3).saturating_add(1);
-        let (sql, _) = compose(&mut rng, depth, i);
-        let _ = writeln!(out, "{sql};");
+        let shape = compose(&mut rng, depth, i, true);
+        let _ = writeln!(out, "{};", shape.sql);
     }
     print!("{out}");
 }

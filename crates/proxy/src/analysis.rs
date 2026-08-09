@@ -365,7 +365,12 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
             }
             // count(*) is releasable even under the strict setting: it consumes
             // no column at all.
-            if call.agg_star && call.over.is_none() && name == "count" {
+            //
+            // Deliberately not conditioned on `over`, unlike the aggregate arm
+            // below. A frame changes *which rows* `count(*)` counts, never what
+            // it returns — a row count, never a value from a row. The general
+            // aggregates cannot say that: `sum(x)` over a one-row frame is `x`.
+            if call.agg_star && name == "count" {
                 return Safety::Releasable;
             }
             if !allow_summaries {
@@ -376,7 +381,29 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
             // is inside it does not matter. A FILTER clause is allowed for the
             // same reason a WHERE clause is: the predicate oracle it creates
             // already exists in the query itself and is an accepted limitation.
-            if REDUCING_AGGREGATES.contains(&name) {
+            //
+            // **`over.is_none()` is load-bearing, and its absence was a
+            // disclosure.** As a window function the same name does not reduce
+            // anything: the frame is chosen by the caller, and
+            //
+            //   SELECT sum(annual_salary)
+            //            OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW)
+            //     FROM fz.people
+            //
+            // returned exact salaries through a bucketed column under the
+            // strictest configuration — `lineage = "refuse"`, `opaque =
+            // "reject"` — because `Releasable` short-circuits both. A frame of
+            // one row makes every "reducing" aggregate the identity function.
+            //
+            // That is not the accepted group-of-one trade recorded in the module
+            // header. A group of one is incidental to the data; a frame of one
+            // is a thing the client writes down. `count(*)` above already tests
+            // `over`; this arm did not.
+            //
+            // Analysing the frame to spot the safe ones is precisely the
+            // prove-absence reasoning this module refuses to do, so every
+            // windowed aggregate is refused.
+            if call.over.is_none() && REDUCING_AGGREGATES.contains(&name) {
                 return Safety::Releasable;
             }
             // Ranking windows emit a position, not a value — but only when
@@ -750,6 +777,43 @@ pub fn provenance_is_trustworthy(sql: &str) -> bool {
         })
 }
 
+/// Whether the statement contains a scalar subquery anywhere.
+///
+/// **This gates lineage, and its absence was a disclosure.** `sqllineage` does
+/// not enumerate the sources inside a `SubLink`, so for
+///
+/// ```sql
+/// SELECT min((SELECT d FROM fz.t8 LIMIT 1 OFFSET 3)) OVER (PARTITION BY subq.c0)
+///   FROM (SELECT id AS c0 FROM fz.v_join) subq
+/// ```
+///
+/// it reported the field's only source as `fz.v_join.id` — released — and
+/// lineage handed over a raw date from `fz.t8.d`, which is masked and which
+/// appears nowhere in the sources it enumerated.
+///
+/// The general rule this encodes: **lineage may only release a field when the
+/// source set it enumerated is complete.** A construct it does not descend into
+/// makes that set a subset, and releasing on a subset is releasing on absence
+/// of evidence.
+///
+/// Statement-level rather than per-target, deliberately. Locating which output
+/// field owns a given `SubLink` means reproducing the target-list
+/// correspondence this module builds elsewhere, and getting *that* wrong is a
+/// leak; a whole-statement check costs lineage on `WHERE id IN (SELECT …)`,
+/// which is utility, not safety. `pg_query` failing to parse also counts,
+/// because then we cannot rule one out.
+pub fn contains_scalar_subquery(sql: &str) -> bool {
+    use pg_query::NodeRef;
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return true;
+    };
+    parsed
+        .protobuf
+        .nodes()
+        .iter()
+        .any(|(node, _, _, _)| matches!(node, NodeRef::SubLink(_)))
+}
+
 /// Every relation the statement names, as `(schema, relation)` with the schema
 /// absent when it was written unqualified.
 ///
@@ -992,6 +1056,60 @@ mod tests {
         safety(sql, 1) == vec![Safety::Releasable]
     }
 
+    /// A reducing aggregate used as a *window* function reduces nothing.
+    ///
+    /// The frame belongs to the caller, and `ROWS BETWEEN CURRENT ROW AND
+    /// CURRENT ROW` makes `sum` the identity function. Before this was fixed,
+    ///
+    ///   SELECT sum(annual_salary)
+    ///            OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW)
+    ///     FROM fz.people
+    ///
+    /// returned exact salaries through a bucketed column under the *strictest*
+    /// configuration, because `Releasable` short-circuits `lineage` and
+    /// `opaque` alike. Found by the generated campaign, not by review.
+    #[test]
+    fn a_reducing_aggregate_over_a_window_is_not_releasable() {
+        for sql in [
+            "SELECT sum(salary) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW) FROM t",
+            "SELECT sum(salary) OVER () FROM t",
+            "SELECT avg(salary) OVER (PARTITION BY dept) FROM t",
+            "SELECT count(salary) OVER (ORDER BY id) FROM t",
+            "SELECT bool_or(flag) OVER (ORDER BY id) FROM t",
+        ] {
+            assert!(
+                !is_safe(sql),
+                "a windowed aggregate must not be released: {sql}"
+            );
+        }
+    }
+
+    /// The same names without `OVER` are still summaries, so the fix is a
+    /// window check and not a retreat from releasing aggregates.
+    #[test]
+    fn plain_reducing_aggregates_are_still_releasable() {
+        for sql in [
+            "SELECT sum(salary) FROM t",
+            "SELECT avg(salary) FROM t",
+            "SELECT count(*) FROM t",
+            "SELECT count(salary) FROM t",
+        ] {
+            assert!(
+                is_safe(sql),
+                "a plain summary must still be released: {sql}"
+            );
+        }
+    }
+
+    /// Ranking windows keep working: they emit a position, whatever the frame.
+    #[test]
+    fn ranking_windows_are_still_releasable() {
+        assert!(is_safe("SELECT row_number() OVER (ORDER BY salary) FROM t"));
+        assert!(is_safe(
+            "SELECT rank() OVER (PARTITION BY dept ORDER BY salary) FROM t"
+        ));
+    }
+
     // --- What the rule exists to rescue -------------------------------------
 
     #[test]
@@ -1149,7 +1267,11 @@ mod tests {
             "SELECT count(DISTINCT email) FROM t",
             "SELECT stddev(salary) FROM t",
             "SELECT sum(CASE WHEN email = 'x' THEN 1 ELSE 0 END) FROM t",
-            "SELECT sum(salary) OVER (PARTITION BY dept) FROM t",
+            // `sum(salary) OVER (PARTITION BY dept)` was here, asserting the
+            // behaviour that turned out to be a disclosure: as a window
+            // function the caller picks the frame, and a frame of one row makes
+            // `sum` the identity. See
+            // `a_reducing_aggregate_over_a_window_is_not_releasable`.
             "SELECT sum(a) / sum(b) FROM t",
             "SELECT sum(salary) + 1 FROM t",
         ] {
@@ -1415,6 +1537,40 @@ mod provenance_trust_tests {
         clippy::arithmetic_side_effects
     )]
     use super::*;
+
+    /// The gate that stops lineage releasing on a partial source set.
+    #[test]
+    fn scalar_subqueries_are_detected_wherever_they_sit() {
+        for sql in [
+            "SELECT (SELECT d FROM t8 LIMIT 1) FROM t1",
+            "SELECT min((SELECT d FROM t8 LIMIT 1)) OVER (PARTITION BY c0) FROM q",
+            "SELECT a FROM t WHERE id IN (SELECT id FROM u)",
+            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)",
+        ] {
+            assert!(contains_scalar_subquery(sql), "must be detected: {sql}");
+        }
+    }
+
+    #[test]
+    fn ordinary_statements_have_no_scalar_subquery() {
+        for sql in [
+            "SELECT email FROM t",
+            "SELECT upper(city) FROM people",
+            "SELECT a FROM (SELECT a FROM t) q",
+            "SELECT a FROM t JOIN u ON u.id = t.id",
+        ] {
+            assert!(
+                !contains_scalar_subquery(sql),
+                "must not be detected: {sql}"
+            );
+        }
+    }
+
+    /// Unparseable counts as containing one: we cannot rule it out.
+    #[test]
+    fn an_unparseable_statement_is_treated_as_containing_one() {
+        assert!(contains_scalar_subquery("SELECT FROM WHERE (("));
+    }
 
     #[test]
     fn referenced_relations_finds_every_name() {
