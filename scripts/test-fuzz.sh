@@ -34,7 +34,21 @@ METRICS_PORT=9470
 CONTAINER=pgmask-fuzz
 export PGPASSWORD=demo
 
-command -v sqlsmith >/dev/null || { echo "SKIP: sqlsmith not installed (brew install sqlsmith)"; exit 0; }
+# Exit 3, not 0. This script is the whole generated-SQL campaign — poison run,
+# mirror oracle, role bleed, DDL churn, binary format — and on a machine without
+# sqlsmith the old `exit 0` reported all of it as passing while running none of
+# it. A suite that reports success by doing nothing is the exact failure this
+# repo keeps finding; it should not be in the harness that looks for it.
+# Set PGMASK_ALLOW_SKIP=1 to opt into the old behaviour deliberately.
+if ! command -v sqlsmith >/dev/null; then
+  echo "sqlsmith is not installed (brew install sqlsmith)"
+  if [[ "${PGMASK_ALLOW_SKIP:-0}" == "1" ]]; then
+    echo "PGMASK_ALLOW_SKIP=1 — skipping, and this run proves nothing"
+    exit 0
+  fi
+  echo "FAIL: refusing to report success for a campaign that did not run."
+  exit 3
+fi
 
 cleanup() {
   for pid in ${PROXY_PID:-} ${POISON_PID:-} ${BIN_PID:-} ${ROLE_PID:-} ${DDL_PID:-} ${PROXY_PIDS[@]:-}; do kill "$pid" 2>/dev/null; done

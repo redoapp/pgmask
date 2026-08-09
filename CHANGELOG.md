@@ -45,13 +45,21 @@ without special handling. The only two paths that emit rows without one —
 - **Structured logging** via `tracing`, and a Prometheus endpoint.
 - **`classify`**, which reads a live schema and proposes a catalog, naming what
   it cannot decide rather than guessing. `classify --check` fails a build on
-  catalog drift.
+  catalog drift, including a column type change that would make a mask
+  unapplicable — the one migration that otherwise surfaces as a production
+  outage.
+- **`scrub`**, which replaces identifiers inside free text with placeholders
+  (`called <EMAIL>`) while leaving the sentence readable. Structured
+  identifiers only, with checksums where one exists; it does not catch a
+  person's name, and its limits are asserted as tests rather than described.
+- **One command to verify everything**: `./scripts/test-all.sh`. A skipped
+  suite counts as a failure.
 
 ### Verified
 
 | suite | what it covers |
 |---|---|
-| 190 cargo tests | units, properties, adversarial wire client, differential vs `pgwire` |
+| 217 cargo tests | units, properties, adversarial wire client, differential vs `pgwire` |
 | 82 demo assertions | end-to-end against a real Postgres, 50k rows |
 | 115 version assertions | 23 checks x Postgres 13, 14, 15, 16, 17 |
 | 7 TLS assertions | TLS on both legs through a real psql |
@@ -68,6 +76,16 @@ masks nothing so the proxy must be a byte-exact mirror.
 
 Coverage across all suites is 79%, with the modules that decide masking highest:
 `analysis.rs` 98%, `lineage.rs` 97%, `mask.rs` 94%, `session.rs` 85%.
+
+### Hardening
+
+`overflow-checks` is on in release, `unsafe_code` is forbidden, and `unwrap`
+and `panic` are denied in the library and binaries. Clearing the resulting
+lints found three reachable panics — a zero-length `Describe` frame, a
+`numeric` at the decimal limit under `numeric-bucket`, and a UTF-8 boundary in
+the test harness — each reproduced against the pre-fix code before being
+fixed. A fourth, pre-existing, was found by a property test: bucket masking
+clamped an out-of-range boundary and served a value that was not a bucket.
 
 ### What is not done
 
