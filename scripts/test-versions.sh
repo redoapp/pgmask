@@ -76,7 +76,7 @@ cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
   [[ -n "$GUI_PID" ]] && kill "$GUI_PID" 2>/dev/null
   if [[ "${KEEP:-0}" != "1" ]]; then
-    for v in $VERSIONS; do podman rm -f "pgver-$v" >/dev/null 2>&1; done
+    for v in $VERSIONS; do podman rm -f -v "pgver-$v" >/dev/null 2>&1; done
   fi
 }
 trap cleanup EXIT
@@ -166,7 +166,7 @@ for V in $VERSIONS; do
   gui()     { psql -h localhost -p "$GUI_PORT"   -U postgres -d demo -X       -c "$1" 2>&1; }
   as_role() { psql -h localhost -p "$PROXY_PORT" -U "$1"     -d demo -X -tAq -c "$2" 2>&1; }
 
-  podman rm -f "$CONTAINER" >/dev/null 2>&1
+  podman rm -f -v "$CONTAINER" >/dev/null 2>&1
   if ! podman run -d --name "$CONTAINER" \
        -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=demo \
        -p "$PG_PORT":5432 "$IMAGE_PREFIX:$V" >/dev/null 2>/tmp/pgmask-ver-$V-podman.err; then
@@ -186,7 +186,7 @@ for V in $VERSIONS; do
   if [[ "$up" != 1 ]]; then
     abort_version "postgres $V never accepted a connection on $PG_PORT"
     podman logs "$CONTAINER" 2>&1 | tail -20
-    podman rm -f "$CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$CONTAINER" >/dev/null 2>&1
     continue
   fi
 
@@ -195,7 +195,7 @@ for V in $VERSIONS; do
   case "$server_version" in
     "$V"*) ;;
     *) abort_version "image $IMAGE_PREFIX:$V reports server_version '$server_version'"
-       podman rm -f "$CONTAINER" >/dev/null 2>&1; continue ;;
+       podman rm -f -v "$CONTAINER" >/dev/null 2>&1; continue ;;
   esac
   echo "    password_encryption = $(direct 'SHOW password_encryption;')"
 
@@ -204,13 +204,13 @@ for V in $VERSIONS; do
        -f examples/demo/schema.sql > "/tmp/pgmask-ver-$V-schema.log" 2>&1; then
     abort_version "demo schema failed to load; see /tmp/pgmask-ver-$V-schema.log"
     tail -20 "/tmp/pgmask-ver-$V-schema.log"
-    podman rm -f "$CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$CONTAINER" >/dev/null 2>&1
     continue
   fi
   rows="$(direct 'SELECT count(*) FROM demo.customers;')"
   if [[ "$rows" != "50000" ]]; then
     abort_version "demo schema loaded but demo.customers holds '$rows' rows, not 50000"
-    podman rm -f "$CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$CONTAINER" >/dev/null 2>&1
     continue
   fi
 
@@ -223,7 +223,7 @@ for V in $VERSIONS; do
         > "/tmp/pgmask-ver-$V-roles.log" 2>&1; then
     abort_version "could not create demo principals; see /tmp/pgmask-ver-$V-roles.log"
     tail -20 "/tmp/pgmask-ver-$V-roles.log"
-    podman rm -f "$CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$CONTAINER" >/dev/null 2>&1
     continue
   fi
 
@@ -240,7 +240,7 @@ for V in $VERSIONS; do
   if ! grep -q "127.0.0.1:$PROXY_PORT" "$CAT" || ! grep -q "127.0.0.1:$PG_PORT" "$CAT" \
      || ! grep -q "127.0.0.1:$GUI_PORT" "$GUICAT" || ! grep -q 'system_catalogs = "allow"' "$GUICAT"; then
     abort_version "catalog rendering did not take effect"
-    podman rm -f "$CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$CONTAINER" >/dev/null 2>&1
     continue
   fi
 
@@ -262,7 +262,7 @@ for V in $VERSIONS; do
     echo "--- $LOG"; tail -20 "$LOG"
     echo "--- $GUILOG"; tail -20 "$GUILOG"
     kill "$PROXY_PID" "$GUI_PID" 2>/dev/null
-    podman rm -f "$CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$CONTAINER" >/dev/null 2>&1
     continue
   fi
 
@@ -316,7 +316,7 @@ for V in $VERSIONS; do
   kill "$PROXY_PID" "$GUI_PID" 2>/dev/null
   PROXY_PID=""; GUI_PID=""
   if [[ "${KEEP:-0}" != "1" ]]; then
-    podman rm -f "$CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$CONTAINER" >/dev/null 2>&1
   fi
 done
 

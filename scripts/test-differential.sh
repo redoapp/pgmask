@@ -34,14 +34,14 @@ CRDB_VERSION="${CRDB_VERSION:-v25.4.14}"
 
 cleanup() {
   for pid in ${PG_PID:-} ${CRDB_PID:-} ${SKEW_PID:-}; do kill "$pid" 2>/dev/null; done
-  [[ "${KEEP:-0}" == "1" ]] || podman rm -f "$PG" "$CRDB" >/dev/null 2>&1
+  [[ "${KEEP:-0}" == "1" ]] || podman rm -f -v "$PG" "$CRDB" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
 command -v podman >/dev/null || { echo "FAIL: podman is required"; exit 3; }
 
 echo "==> starting both engines"
-podman rm -f "$PG" "$CRDB" >/dev/null 2>&1
+podman rm -f -v "$PG" "$CRDB" >/dev/null 2>&1
 podman run -d --name "$PG" -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=fuzzdb \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null 2>&1
 podman run -d --name "$CRDB" -p "$CRDB_PORT":26257 \

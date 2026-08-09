@@ -12,6 +12,13 @@
 #
 # A SKIP is a FAILURE here. A release gate that passes because a tool was
 # missing is the same bug as a test that passes because the fixture was empty.
+#
+# Every `podman rm` here passes `-v`. The postgres image declares a VOLUME for
+# its data directory, so each `podman run` creates an anonymous volume and a
+# plain `podman rm` leaves it behind. Running this gate repeatedly accumulated
+# 384 orphaned volumes and filled the podman machine's 150 GB disk, at which
+# point CockroachDB refused to start — "out of disk space" — and three suites
+# failed for reasons that had nothing to do with masking.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -33,7 +40,7 @@ run() { # name command...
   # Containers and proxies from a previous suite are the most common cause of a
   # confusing failure, so every suite starts from nothing.
   pkill -f 'target/release/pgmask' 2>/dev/null
-  podman rm -f pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb >/dev/null 2>&1
+  podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb >/dev/null 2>&1
   sleep 1
   local out
   out=$("$@" 2>&1)
@@ -70,7 +77,7 @@ run "generated shapes (CockroachDB)" ./scripts/test-fuzz-cockroach.sh 1200 3
 run "cross-engine differential" ./scripts/test-differential.sh 800
 
 pkill -f 'target/release/pgmask' 2>/dev/null
-podman rm -f pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb >/dev/null 2>&1
+podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb >/dev/null 2>&1
 
 echo
 echo "-------------------------------------------------------------"

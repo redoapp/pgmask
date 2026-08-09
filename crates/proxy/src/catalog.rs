@@ -442,6 +442,43 @@ impl Snapshot {
         self.is_opaque_view(None, bare)
     }
 
+    /// Whether the statement mentions the name of any column this principal
+    /// may not read.
+    ///
+    /// **The soundness backstop for lineage.** Three disclosures came from
+    /// `sqllineage` under-reporting which base columns feed an output field — a
+    /// set operation, a view column, and a scalar subquery — and each was closed
+    /// by a guard aimed at that construct. Guards aimed at constructs only cover
+    /// the constructs someone thought of.
+    ///
+    /// This asks a cruder question that does not depend on per-field precision:
+    /// is the name of a masked column present in this statement at all? If not,
+    /// no output field can carry a masked value, however the expressions are
+    /// arranged and whatever the resolver did or did not resolve.
+    ///
+    /// **It deliberately does not resolve names to relations.** An earlier
+    /// version matched each name against the relations the statement mentions,
+    /// which made it depend on `pg_query`'s tree walk finding every `RangeVar` —
+    /// exactly the kind of completeness assumption that has failed here twice.
+    /// Comparing bare names against every masked column in the catalog needs no
+    /// traversal to be complete and cannot be wrong in the unsafe direction.
+    ///
+    /// The cost is over-refusal, and it is real: if `city` is masked in *any*
+    /// relation, lineage will not release an expression over a different,
+    /// released `city`. That is utility, on an opt-in feature, in exchange for
+    /// the failure mode that has produced three of this project's five
+    /// disclosures.
+    pub fn statement_references_masked_column(&self, sql: &str, roles: &HashSet<String>) -> bool {
+        let Some(identifiers) = crate::analysis::referenced_identifiers(sql) else {
+            return true;
+        };
+        identifiers.iter().any(|identifier| {
+            self.by_name.iter().any(|((_, column), classification)| {
+                column == identifier && !classification.for_roles(roles).is_passthrough()
+            })
+        })
+    }
+
     /// Whether any relation the statement names is such a view.
     pub fn statement_touches_opaque_view(&self, sql: &str) -> bool {
         if self.opaque_views.is_empty() {

@@ -101,14 +101,14 @@ run_engine() {
   case "$engine" in
     postgres)
       container=pgmask-shapes-pg; port=55439; proxy_port=6450
-      podman rm -f "$container" >/dev/null 2>&1
+      podman rm -f -v "$container" >/dev/null 2>&1
       podman run -d --name "$container" -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=demo \
         -p "$port":5432 docker.io/library/postgres:17 >/dev/null 2>&1
       dsn="postgresql://postgres:demo@localhost:$port/demo"
       ;;
     cockroach)
       container=pgmask-shapes-crdb; port=26259; proxy_port=6452
-      podman rm -f "$container" >/dev/null 2>&1
+      podman rm -f -v "$container" >/dev/null 2>&1
       podman run -d --name "$container" -p "$port":26257 \
         docker.io/cockroachdb/cockroach:v25.4.14 start-single-node --insecure \
         --accept-sql-without-tls >/dev/null 2>&1
@@ -124,13 +124,30 @@ run_engine() {
 
   local boot="$dsn"
   [[ "$engine" == cockroach ]] && boot="postgresql://root@localhost:$port/defaultdb?sslmode=disable"
-  local ok=0
-  for _ in $(seq 1 60); do PGPASSWORD=demo psql -w "$boot" -tAc 'select 1' >/dev/null 2>&1 && { ok=1; break; }; sleep 2; done
-  [[ "$ok" == 1 ]] || { echo "FAIL: $engine did not start"; podman rm -f "$container" >/dev/null 2>&1; return 1; }
+  # Two attempts, and the container's own log on failure.
+  #
+  # This suite runs sixth in the gate, behind five other container-heavy ones,
+  # and CockroachDB failed to come up once under that load — reported as
+  # "did not start" with nothing to diagnose it by. A release gate that flakes
+  # teaches people to re-run it, which is the opposite of what it is for.
+  local ok=0 attempt
+  for attempt in 1 2; do
+    for _ in $(seq 1 60); do
+      PGPASSWORD=demo psql -w "$boot" -tAc 'select 1' >/dev/null 2>&1 && { ok=1; break; }
+      sleep 2
+    done
+    [[ "$ok" == 1 ]] && break
+    echo "    $engine did not answer on attempt $attempt; container log:"
+    podman logs --tail 8 "$container" 2>&1 | sed 's/^/      /'
+    [[ "$attempt" == 2 ]] && break
+    echo "    restarting it"
+    podman restart "$container" >/dev/null 2>&1
+  done
+  [[ "$ok" == 1 ]] || { echo "FAIL: $engine did not start"; podman rm -f -v "$container" >/dev/null 2>&1; return 1; }
   [[ "$engine" == cockroach ]] && psql -w "$boot" -q -c 'CREATE DATABASE IF NOT EXISTS demo' >/dev/null 2>&1
 
   export PGPASSWORD=demo
-  psql -w "$dsn" -q -v ON_ERROR_STOP=1 >/dev/null <<SQL || { echo "FAIL: fixture did not load"; podman rm -f "$container" >/dev/null 2>&1; return 1; }
+  psql -w "$dsn" -q -v ON_ERROR_STOP=1 >/dev/null <<SQL || { echo "FAIL: fixture did not load"; podman rm -f -v "$container" >/dev/null 2>&1; return 1; }
 CREATE SCHEMA IF NOT EXISTS sw;
 CREATE TABLE sw.t (id int primary key, email text not null, city text not null);
 CREATE TABLE sw.u (id int primary key, t_id int not null, note text not null);
@@ -215,7 +232,7 @@ CFG
   [[ "$engine" == cockroach ]] && P="postgresql://root@localhost:$proxy_port/demo?sslmode=disable"
   psql -w "$P" -X -tAc 'select 1' >/dev/null 2>&1 || {
     echo "FAIL: proxy did not come up"; tail -5 "/tmp/pgmask-shapes-$engine.log"
-    kill "$pid" 2>/dev/null; podman rm -f "$container" >/dev/null 2>&1; return 1; }
+    kill "$pid" 2>/dev/null; podman rm -f -v "$container" >/dev/null 2>&1; return 1; }
 
   local clean=0 leaked=0 refused=0 vacuous=0 unsupported=0 executed=0
   local -a leaks=() vacuums=()
@@ -256,7 +273,7 @@ CFG
   done <<< "$SHAPES"
 
   kill "$pid" 2>/dev/null
-  [[ "${KEEP:-0}" == "1" ]] || podman rm -f "$container" >/dev/null 2>&1
+  [[ "${KEEP:-0}" == "1" ]] || podman rm -f -v "$container" >/dev/null 2>&1
 
   printf '  shapes that reached the sentinel   %3d\n' "$executed"
   printf '    masked or otherwise clean        %3d\n' "$clean"

@@ -52,12 +52,12 @@ fi
 
 cleanup() {
   for pid in ${PROXY_PID:-} ${POISON_PID:-} ${BIN_PID:-} ${ROLE_PID:-} ${DDL_PID:-} ${PROXY_PIDS[@]:-}; do kill "$pid" 2>/dev/null; done
-  [[ "${KEEP:-0}" == "1" ]] || podman rm -f "$CONTAINER" >/dev/null 2>&1
+  [[ "${KEEP:-0}" == "1" ]] || podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
 echo "==> postgres + fixture"
-podman rm -f "$CONTAINER" >/dev/null 2>&1
+podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 podman run -d --name "$CONTAINER" -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=fuzzdb \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null 2>&1
 for _ in $(seq 1 40); do

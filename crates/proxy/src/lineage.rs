@@ -44,6 +44,40 @@
 //!    ours to claim.
 //! 4. A parse failure is unresolved. `sqlparser-rs` is not the Postgres grammar
 //!    and does not have to be — anything it cannot read, we refuse.
+//! 5. A source that is a column of a view whose definition contains a set
+//!    operation is unresolved. Such a column is several columns, so a rule
+//!    releasing it releases all of them.
+//! 6. **The backstop.** If a masked column's *name* appears anywhere in the
+//!    statement, nothing is released — whatever the resolver reported.
+//!
+//! # Why 6 exists, and why it is the last one
+//!
+//! Guards 1-5 are each shaped like the bug that produced them. Three of this
+//! project's five disclosures were the same mistake in different clothes:
+//!
+//! - a set operation, where one field draws from two columns
+//! - a view whose definition contains one, invisible in the statement
+//! - a scalar subquery, which `sqllineage` does not descend into
+//!
+//! Each was closed by asking "did the resolver under-report *this* construct".
+//! That approach can only ever cover constructs someone has thought of, and the
+//! third arrived after the first two were fixed.
+//!
+//! Guard 6 does not ask about constructs. It asks whether a masked column is
+//! named in the statement at all, using the **lexer** — every identifier in the
+//! text is a token, with none of the traversal gaps a tree walk has. If no
+//! masked name is present, no field can carry a masked value however the
+//! expressions nest. The resolver and the backstop must both agree before
+//! anything is released, and they fail independently.
+//!
+//! The premise — that the backstop sees everything the resolver can name — is
+//! asserted in `tests/lineage_superset.rs` rather than assumed. That test has
+//! already caught one violation: the backstop's first implementation walked the
+//! parse tree and missed `id` in `sum(n) OVER (ORDER BY id …)`, because
+//! `pg_query`'s walker does not enter a `WindowDef`.
+//!
+//! **This is a mitigation, not a proof.** Lineage inverts the safety property
+//! and no amount of guarding changes that; it stays opt-in and off by default.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -129,17 +163,6 @@ pub fn resolve(
         catalog: Some(Box::new(SnapshotCatalog(Arc::clone(snapshot)))),
         normalize_case: true,
     };
-    // Guard 6: a scalar subquery anywhere.
-    //
-    // `sqllineage` does not descend into a `SubLink`, so the sources it
-    // enumerates for such a statement are a subset of the real ones — and
-    // releasing on a subset is releasing on absence of evidence. A generated
-    // statement returned a raw date from `fz.t8.d` because the only source
-    // reported was `fz.v_join.id`, which is released and which the value never
-    // came from. See `analysis::contains_scalar_subquery`.
-    if crate::analysis::contains_scalar_subquery(sql) {
-        return unresolved;
-    }
     // Guard 4: anything the parser cannot read.
     let Ok(results) = sqllineage::analyze(sql, opts) else {
         return unresolved;
@@ -156,6 +179,31 @@ pub fn resolve(
     if mappings.len() != field_count {
         return unresolved;
     }
+
+    // Guard 6: a masked column mentioned anywhere in the statement.
+    //
+    // **This is the backstop, and it is the reason to stop adding guards shaped
+    // like the last bug.** Guards 1-5 each answer "did `sqllineage`
+    // under-report *this* construct" — a set operation, a view, a scalar
+    // subquery — and each was written after a disclosure of exactly that shape.
+    // A guard per construct only ever covers constructs someone thought of, and
+    // three of the five disclosures in this repo were this same mistake.
+    //
+    // This asks a question `sqllineage` is not involved in: does the statement
+    // mention a masked column at all? If it does not, no output field can carry
+    // a masked value however the expressions nest and whatever the resolver
+    // saw. It is computed from `pg_query`'s tree, independently of the
+    // resolver, so both have to miss the same column for a release to be wrong.
+    //
+    // Applied as a *downgrade of `Release`* rather than an early return, so a
+    // field `sqllineage` correctly identified as `Blocked` still names the
+    // column it derives from. That message is the difference between a ticket
+    // and a rewrite, and an early return threw it away.
+    //
+    // The cost is utility, not safety: `SELECT upper(city) FROM people WHERE
+    // email = 'x'` no longer releases, because `email` is mentioned. That
+    // statement is a predicate oracle anyway.
+    let masked_column_in_statement = snapshot.statement_references_masked_column(sql, roles);
 
     mappings
         .iter()
@@ -213,6 +261,7 @@ pub fn resolve(
             }
             match blocked {
                 Some(column) => Verdict::Blocked(column),
+                None if masked_column_in_statement => Verdict::Unresolved,
                 None => Verdict::Release,
             }
         })
@@ -428,40 +477,63 @@ mod tests {
         );
     }
 
-    /// Lineage must not release when its source enumeration is incomplete.
+    /// The backstop: a masked column mentioned anywhere blocks release.
     ///
-    /// `sqllineage` does not descend into a `SubLink`, so for a target built
-    /// from a scalar subquery it reports only the outer relation's columns. A
-    /// generated statement returned a raw date on exactly that basis: the only
-    /// source it named was released, and the value came from a masked column
-    /// that appeared nowhere in the list.
+    /// Three disclosures came from `sqllineage` under-reporting which base
+    /// columns feed a field — a set operation, a view column, and a scalar
+    /// subquery. Each was closed by a guard aimed at that construct, which only
+    /// ever covers constructs someone thought of. This rule does not care about
+    /// the construct: if a masked column is named in the statement at all,
+    /// nothing is released.
+    ///
+    /// The scalar-subquery case is the one that leaked. `d` is masked and lives
+    /// two levels down inside a `SubLink`, where the resolver does not look —
+    /// but `pg_query` sees it, and that is enough.
     #[test]
-    fn a_scalar_subquery_stops_lineage_releasing() {
+    fn a_masked_column_anywhere_blocks_release() {
         let mut s = Snapshot::default();
-        s.insert_relation_for_test("demo.pub_t", &[("shared", Mask::None)]);
+        s.insert_relation_for_test(
+            "demo.t",
+            &[("shared", Mask::None), ("secret", Mask::Redact)],
+        );
         let snapshot = Arc::new(s);
         for sql in [
-            "SELECT min((SELECT x FROM other LIMIT 1)) OVER (PARTITION BY shared) FROM demo.pub_t",
-            "SELECT (SELECT x FROM other LIMIT 1) FROM demo.pub_t",
-            "SELECT upper(shared) FROM demo.pub_t WHERE shared IN (SELECT x FROM other)",
+            "SELECT min((SELECT secret FROM demo.t LIMIT 1)) OVER (PARTITION BY shared) FROM demo.t",
+            "SELECT upper(shared) FROM demo.t WHERE secret = 'x'",
+            "SELECT shared FROM demo.t ORDER BY secret",
         ] {
             assert_ne!(
                 resolve(sql, 1, &snapshot, &HashSet::new())[0],
                 Verdict::Release,
-                "must not release with a scalar subquery present: {sql}"
+                "a masked column is named here, so nothing may be released: {sql}"
             );
         }
-        // ...and the same shape without one still resolves, so the guard is a
-        // subquery check rather than a retreat from lineage.
-        assert_eq!(
-            resolve(
-                "SELECT upper(shared) FROM demo.pub_t",
-                1,
-                &snapshot,
-                &HashSet::new()
-            )[0],
-            Verdict::Release
+    }
+
+    /// ...and a statement naming only released columns still resolves, so the
+    /// backstop is a masked-column check rather than a retreat from lineage.
+    ///
+    /// The subquery here reads a relation the catalog has never heard of, which
+    /// is deliberate: the field's value comes from `shared` alone, and the
+    /// `IN` is a predicate oracle of the kind already accepted everywhere else.
+    #[test]
+    fn released_columns_still_resolve_even_beside_a_subquery() {
+        let mut s = Snapshot::default();
+        s.insert_relation_for_test(
+            "demo.t",
+            &[("shared", Mask::None), ("secret", Mask::Redact)],
         );
+        let snapshot = Arc::new(s);
+        for sql in [
+            "SELECT upper(shared) FROM demo.t",
+            "SELECT upper(shared) FROM demo.t WHERE shared IN (SELECT x FROM elsewhere)",
+        ] {
+            assert_eq!(
+                resolve(sql, 1, &snapshot, &HashSet::new())[0],
+                Verdict::Release,
+                "only released columns are named here: {sql}"
+            );
+        }
     }
 
     #[test]

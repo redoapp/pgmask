@@ -15,13 +15,13 @@ PORT=55433
 
 cleanup() {
   if [[ "${KEEP:-0}" != "1" ]]; then
-    podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    podman rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 echo "==> starting postgres (trust auth) on :$PORT"
-podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+podman rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
 podman run -d --name "$CONTAINER" \
   -e POSTGRES_HOST_AUTH_METHOD=trust \
   -p "$PORT":5432 docker.io/library/postgres:17 >/dev/null

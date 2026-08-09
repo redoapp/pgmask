@@ -36,14 +36,14 @@ refute() { if [[ "$3" != *"$2"* ]]; then printf '  \033[32mPASS\033[0m  %s\n' "$
 
 cleanup() {
   [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null
-  [[ "${KEEP:-0}" == "1" ]] || podman rm -f "$CONTAINER" >/dev/null 2>&1
+  [[ "${KEEP:-0}" == "1" ]] || podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
 command -v podman >/dev/null || { echo "FAIL: podman is required"; exit 3; }
 
 echo "==> starting CockroachDB $VERSION"
-podman rm -f "$CONTAINER" >/dev/null 2>&1
+podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 podman run -d --name "$CONTAINER" -p "$CRDB_PORT":26257 \
   "docker.io/cockroachdb/cockroach:$VERSION" start-single-node --insecure --accept-sql-without-tls >/dev/null 2>&1
 D="postgresql://root@localhost:$CRDB_PORT/demo?sslmode=disable"

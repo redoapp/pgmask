@@ -845,6 +845,45 @@ pub fn referenced_relations(sql: &str) -> Option<Vec<(Option<String>, String)>> 
     )
 }
 
+/// Every identifier the statement mentions, from the **lexer**.
+///
+/// Table names, aliases, function names and column names, undifferentiated.
+/// That is deliberate: this is a backstop, and over-naming costs a refusal
+/// while under-naming costs a disclosure.
+///
+/// **Why the lexer and not the parse tree.** The first version of this walked
+/// `pg_query`'s node tree for `ColumnRef`s, and the containment test in
+/// `tests/lineage_superset.rs` immediately caught it missing `id` in
+///
+/// ```sql
+/// SELECT sum(n) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW) FROM t
+/// ```
+///
+/// — the walker does not descend into a `WindowDef`. That is the traversal gap
+/// this module's header warns about, and a backstop with a blind spot is not a
+/// backstop. The token stream has no such gap: every identifier in the text is
+/// a token, whatever the grammar does with it afterwards.
+///
+/// `None` when the text cannot even be scanned, which the caller must treat as
+/// "could mention anything".
+pub fn referenced_identifiers(sql: &str) -> Option<Vec<String>> {
+    let scanned = pg_query::scan(sql).ok()?;
+    Some(
+        scanned
+            .tokens
+            .iter()
+            .filter(|token| token.token() == pg_query::protobuf::Token::Ident)
+            .filter_map(|token| {
+                let (start, end) = (
+                    usize::try_from(token.start).ok()?,
+                    usize::try_from(token.end).ok()?,
+                );
+                sql.get(start..end).map(str::to_ascii_lowercase)
+            })
+            .collect(),
+    )
+}
+
 /// Whether every relation in the statement carries an explicit schema.
 ///
 /// Used only to decide whether a result set made entirely of expressions can be
@@ -1641,5 +1680,43 @@ mod provenance_trust_tests {
         // We cannot rule a set operation out, so we do not claim to.
         assert!(!provenance_is_trustworthy("this is not sql"));
         assert!(!provenance_is_trustworthy(""));
+    }
+}
+
+#[cfg(test)]
+mod referenced_identifier_probe {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    /// The statement that leaked. `d` must be in the set even though it only
+    /// appears inside a scalar subquery two levels down.
+    #[test]
+    fn columns_inside_scalar_subqueries_are_seen() {
+        let sql = "SELECT min((SELECT d FROM fz.t8 LIMIT 1 OFFSET 3)) OVER (PARTITION BY subq.c0) \
+                   FROM (SELECT id AS c0 FROM fz.v_join) subq";
+        let cols = referenced_identifiers(sql).expect("scans");
+        assert!(cols.contains(&"d".to_string()), "got {cols:?}");
+        assert!(cols.contains(&"id".to_string()), "got {cols:?}");
+    }
+
+    /// The case that made this lexical: the tree walk does not enter a
+    /// `WindowDef`, so `id` was invisible to it.
+    #[test]
+    fn columns_in_a_window_clause_are_seen() {
+        let sql =
+            "SELECT sum(n) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW) FROM t";
+        let cols = referenced_identifiers(sql).expect("scans");
+        assert!(cols.contains(&"id".to_string()), "got {cols:?}");
+        assert!(cols.contains(&"n".to_string()), "got {cols:?}");
+    }
+
+    #[test]
+    fn columns_in_case_arms_casts_and_where_are_seen() {
+        let sql = "SELECT CASE WHEN n > 0 THEN cast(email AS text) ELSE note END \
+                   FROM t WHERE last_ip IS NOT NULL ORDER BY birth_date";
+        let cols = referenced_identifiers(sql).expect("scans");
+        for want in ["n", "email", "note", "last_ip", "birth_date"] {
+            assert!(cols.contains(&want.to_string()), "missing {want}: {cols:?}");
+        }
     }
 }

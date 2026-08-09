@@ -35,14 +35,14 @@ CRDB_VERSION="${CRDB_VERSION:-v25.4.14}"
 
 cleanup() {
   for pid in ${PROXY_PID:-} ${POISON_PID:-}; do kill "$pid" 2>/dev/null; done
-  [[ "${KEEP:-0}" == "1" ]] || podman rm -f "$CRDB" >/dev/null 2>&1
+  [[ "${KEEP:-0}" == "1" ]] || podman rm -f -v "$CRDB" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
 command -v podman >/dev/null || { echo "FAIL: podman is required"; exit 3; }
 
 echo "==> starting CockroachDB"
-podman rm -f "$CRDB" >/dev/null 2>&1
+podman rm -f -v "$CRDB" >/dev/null 2>&1
 podman run -d --name "$CRDB" -p "$CRDB_PORT":26257 \
   "docker.io/cockroachdb/cockroach:$CRDB_VERSION" start-single-node --insecure \
   --accept-sql-without-tls >/dev/null 2>&1

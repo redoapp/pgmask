@@ -20,7 +20,7 @@ fail=0
 cleanup() {
   [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null
   if [[ "${KEEP:-0}" != "1" ]]; then
-    podman rm -f "$CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$CONTAINER" >/dev/null 2>&1
   fi
 }
 trap cleanup EXIT
@@ -53,7 +53,7 @@ refute() {
 }
 
 echo "==> starting postgres"
-podman rm -f "$CONTAINER" >/dev/null 2>&1
+podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 podman run -d --name "$CONTAINER" \
   -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=demo \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null

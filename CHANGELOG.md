@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.1.6 — stop adding guards shaped like the last bug
+
+No new disclosure. This closes the *class* that produced three of the five.
+
+Lineage inverts the safety property: everywhere else a shape pgmask fails to
+recognise is a shape it refuses, but here a source column the resolver fails to
+notice becomes "nothing masked found, release it". Three disclosures came from
+exactly that — a set operation, a view whose definition contained one, and a
+scalar subquery `sqllineage` does not descend into — and each was closed with a
+guard aimed at that construct. Guards aimed at constructs only ever cover the
+constructs someone thought of, and the third arrived after the first two were
+fixed.
+
+**Guard 6 does not ask about constructs.** It asks whether a masked column's
+name appears in the statement at all. If none does, no output field can carry a
+masked value however the expressions nest and whatever the resolver resolved.
+The resolver and the backstop must both agree before anything is released, and
+they fail independently.
+
+Two design choices worth stating:
+
+- **Lexical, not syntactic.** The first implementation walked `pg_query`'s parse
+  tree for column references. The new containment test caught it missing `id` in
+  `sum(n) OVER (ORDER BY id …)` — the walker does not enter a `WindowDef`, which
+  is the traversal gap `analysis.rs` has warned about since it was written. A
+  backstop with a blind spot is not a backstop, so it now reads the **token
+  stream**, where every identifier in the text is present by construction.
+- **No name resolution.** An earlier version matched each name against the
+  relations the statement mentions, which made it depend on the tree walk
+  finding every `RangeVar` — the same completeness assumption that had already
+  failed twice. Comparing bare names against every masked column in the catalog
+  needs no traversal to be complete.
+- Applied as a **downgrade of `Release`**, not an early return, so a field the
+  resolver correctly identified as `Blocked` still names the column it derives
+  from. An early return threw that message away.
+
+Guard 5 (the scalar-subquery check from 0.1.5) is **removed** — the backstop
+subsumes it and is not construct-shaped, and keeping both would be exactly the
+accumulation this release is about. `SELECT upper(city) FROM t WHERE x IN
+(SELECT …)` releases again as a result.
+
+### The premise is tested, not assumed
+
+`tests/lineage_superset.rs` asserts that every source column `sqllineage`
+reports is one the backstop saw, across every construct the generator emits plus
+the three that leaked. 37 comparisons, no violations. `SELECT *` is skipped and
+documented: there the resolver names columns absent from the text and is the
+complete side of the pair.
+
+Verified to be able to fail: crippling the backstop makes it report 4
+violations.
+
+### Cost
+
+Measured on a 1000-statement generated corpus: `lineage = "refuse"` serves 245,
+`lineage = "allow"` serves 348. Unchanged by the backstop — the utility lineage
+adds survives it. Over-refusal is real in principle (a masked `city` in one
+relation blocks an expression over a released `city` in another) and did not
+bite on this corpus.
+
+**Lineage remains opt-in and off by default.** No amount of guarding changes
+that it inverts the safety property; this makes the inversion survivable, not
+sound.
+
 ## 0.1.5 — a windowed aggregate is not a summary
 
 **Fixes the most serious disclosure so far.** It needs no unusual
