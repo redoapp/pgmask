@@ -171,6 +171,23 @@ pub fn resolve(
                 if !columns.contains(&wanted) {
                     return Verdict::Unresolved;
                 }
+                // Guard 5: the source must not be a column of a view whose
+                // definition contains a set operation.
+                //
+                // Such a column is itself several columns. `v_mixed.v` is a
+                // city on one branch and an address on the other, so a rule
+                // releasing it releases both — and lineage resolving an
+                // expression down to `v_mixed.v` and finding it released is
+                // exactly how a masked address reached a client after the
+                // provenance-level check for this was already in place.
+                //
+                // The generated-shape campaign found it in its first run, via
+                //   SELECT c0, row_number() OVER (…) FROM (… FROM fz.v_mixed …)
+                // where distrusting the provenance sent the field to lineage,
+                // and lineage released what provenance had just refused to.
+                if snapshot.relation_is_opaque_view(&relation) {
+                    return Verdict::Unresolved;
+                }
                 let released = snapshot
                     .lookup_by_name(&relation, &wanted)
                     // Unclassified is masked under default-deny. Treating "not
@@ -347,6 +364,57 @@ mod tests {
             &[("shared", Mask::Redact), ("secret", Mask::Redact)],
         );
         Arc::new(s)
+    }
+
+    /// A released column of a set-operation view must not be released by
+    /// lineage, however explicitly the catalog releases it.
+    ///
+    /// This is the third disclosure in this area and the first that lineage
+    /// caused on its own: distrusting the engine's provenance sends the field
+    /// down the opaque path, and lineage then resolved it to `v_mixed.v`, found
+    /// a `mask = "none"` rule, and released what provenance had just refused
+    /// to. The generated-shape campaign hit it in its first run.
+    ///
+    /// Removing the `relation_is_opaque_view` guard in `resolve` makes this
+    /// test fail, which is the only reason to trust that it is doing anything.
+    #[test]
+    fn a_column_of_a_set_operation_view_is_never_released_by_lineage() {
+        let mut s = Snapshot::default();
+        // Released as far as the catalog is concerned — the rule an operator
+        // writes because `v` looks like a city column.
+        s.insert_relation_for_test("fz.v_mixed", &[("v", Mask::None)]);
+        s.insert_opaque_view_for_test("fz.v_mixed");
+        let snapshot = Arc::new(s);
+
+        for sql in [
+            "SELECT upper(v) FROM fz.v_mixed",
+            "SELECT c0 FROM (SELECT v AS c0 FROM fz.v_mixed) q",
+            "WITH w AS (SELECT v FROM fz.v_mixed) SELECT lower(v) FROM w",
+        ] {
+            assert_ne!(
+                resolve(sql, 1, &snapshot, &HashSet::new())[0],
+                Verdict::Release,
+                "must not release through a set-operation view: {sql}"
+            );
+        }
+    }
+
+    /// The same shape over an ordinary view still resolves, so the guard is
+    /// specific rather than a blanket refusal of views.
+    #[test]
+    fn an_ordinary_view_still_resolves_through_lineage() {
+        let mut s = Snapshot::default();
+        s.insert_relation_for_test("fz.v_plain", &[("city", Mask::None)]);
+        let snapshot = Arc::new(s);
+        assert_eq!(
+            resolve(
+                "SELECT upper(city) FROM fz.v_plain",
+                1,
+                &snapshot,
+                &HashSet::new()
+            )[0],
+            Verdict::Release
+        );
     }
 
     #[test]

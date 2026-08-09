@@ -20,21 +20,50 @@ CREATE TABLE fz.t7 (id int primary key, a text, b text, n int, d date, u uuid);
 CREATE TABLE fz.t8 (id int primary key, a text, b text, n int, d date, u uuid);
 
 -- Small tables, so random joins still return rows instead of exploding.
-DO $$
-DECLARE t text;
-BEGIN
-  FOREACH t IN ARRAY ARRAY['t1','t2','t3','t4','t5','t6','t7','t8'] LOOP
-    EXECUTE format($f$
-      INSERT INTO fz.%I (id, a, b, n, d, u)
-      SELECT i,
-             'CANARY-%s-a-' || i,
-             'CANARY-%s-b-' || i,
-             i * 7,
-             DATE '1980-03-04' + i,
-             ('00000000-0000-4000-9000-' || lpad(i::text, 12, '0'))::uuid
-        FROM generate_series(1, 40) AS i$f$, t, t, t);
-  END LOOP;
-END $$;
+--
+-- Written out rather than looped in plpgsql: CockroachDB has no DO block, and
+-- this fixture has to load on both engines from one file.
+
+INSERT INTO fz.t1 (id, a, b, n, d, u)
+SELECT i, 'CANARY-t1-a-' || i, 'CANARY-t1-b-' || i, i * 7,
+       DATE '1980-03-04' + i,
+       ('00000000-0000-4000-9000-' || lpad(i::text, 12, '0'))::uuid
+  FROM generate_series(1, 40) AS i;
+INSERT INTO fz.t2 (id, a, b, n, d, u)
+SELECT i, 'CANARY-t2-a-' || i, 'CANARY-t2-b-' || i, i * 7,
+       DATE '1980-03-04' + i,
+       ('00000000-0000-4000-9000-' || lpad(i::text, 12, '0'))::uuid
+  FROM generate_series(1, 40) AS i;
+INSERT INTO fz.t3 (id, a, b, n, d, u)
+SELECT i, 'CANARY-t3-a-' || i, 'CANARY-t3-b-' || i, i * 7,
+       DATE '1980-03-04' + i,
+       ('00000000-0000-4000-9000-' || lpad(i::text, 12, '0'))::uuid
+  FROM generate_series(1, 40) AS i;
+INSERT INTO fz.t4 (id, a, b, n, d, u)
+SELECT i, 'CANARY-t4-a-' || i, 'CANARY-t4-b-' || i, i * 7,
+       DATE '1980-03-04' + i,
+       ('00000000-0000-4000-9000-' || lpad(i::text, 12, '0'))::uuid
+  FROM generate_series(1, 40) AS i;
+INSERT INTO fz.t5 (id, a, b, n, d, u)
+SELECT i, 'CANARY-t5-a-' || i, 'CANARY-t5-b-' || i, i * 7,
+       DATE '1980-03-04' + i,
+       ('00000000-0000-4000-9000-' || lpad(i::text, 12, '0'))::uuid
+  FROM generate_series(1, 40) AS i;
+INSERT INTO fz.t6 (id, a, b, n, d, u)
+SELECT i, 'CANARY-t6-a-' || i, 'CANARY-t6-b-' || i, i * 7,
+       DATE '1980-03-04' + i,
+       ('00000000-0000-4000-9000-' || lpad(i::text, 12, '0'))::uuid
+  FROM generate_series(1, 40) AS i;
+INSERT INTO fz.t7 (id, a, b, n, d, u)
+SELECT i, 'CANARY-t7-a-' || i, 'CANARY-t7-b-' || i, i * 7,
+       DATE '1980-03-04' + i,
+       ('00000000-0000-4000-9000-' || lpad(i::text, 12, '0'))::uuid
+  FROM generate_series(1, 40) AS i;
+INSERT INTO fz.t8 (id, a, b, n, d, u)
+SELECT i, 'CANARY-t8-a-' || i, 'CANARY-t8-b-' || i, i * 7,
+       DATE '1980-03-04' + i,
+       ('00000000-0000-4000-9000-' || lpad(i::text, 12, '0'))::uuid
+  FROM generate_series(1, 40) AS i;
 
 -- PII-shaped, so the type-aware masks are exercised and not just `redact`.
 -- Values are chosen so the masked form is *recognisably different*: dates are
@@ -75,19 +104,18 @@ ANALYZE fz.people;
 CREATE VIEW fz.v_union AS SELECT id, a FROM fz.t1 UNION ALL SELECT id, a FROM fz.t2;
 CREATE VIEW fz.v_join  AS SELECT x.id, x.a AS xa, y.b AS yb FROM fz.t3 x JOIN fz.t4 y ON y.id = x.id;
 
+-- The armed trap: one output column drawing from a released column and a masked
+-- one. Both engines report provenance for `v` — Postgres names the view's own
+-- column, CockroachDB names the first branch's base column — so releasing `v`
+-- releases addresses. The catalog does release it, deliberately.
+--
+-- fz.v_union was not this: its `a` is masked by an explicit `redact` rule, so
+-- the campaign had generated queries against a union view for as long as this
+-- fixture existed without ever being able to catch the bug.
+CREATE VIEW fz.v_mixed AS
+  SELECT id, city AS v FROM fz.people
+  UNION ALL
+  SELECT id, email FROM fz.people;
+
 ANALYZE fz.t1; ANALYZE fz.t2; ANALYZE fz.t3; ANALYZE fz.t4;
 ANALYZE fz.t5; ANALYZE fz.t6; ANALYZE fz.t7; ANALYZE fz.t8;
-
--- Two principals, so concurrent sessions can be checked for role bleed: the
--- same column resolves differently per person, and a plan escaping its session
--- would be a disclosure that no single-principal test can see.
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'support_sam') THEN
-    CREATE ROLE support_sam LOGIN PASSWORD 'demo';
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'analyst_ann') THEN
-    CREATE ROLE analyst_ann LOGIN PASSWORD 'demo';
-  END IF;
-END $$;
-GRANT USAGE ON SCHEMA fz TO support_sam, analyst_ann;
-GRANT SELECT ON ALL TABLES IN SCHEMA fz TO support_sam, analyst_ann;

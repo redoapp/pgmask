@@ -3,7 +3,7 @@
 #
 #   ./scripts/test-all.sh
 #
-# There are eight suites and they were previously five separate commands run in
+# There are nine suites and they were previously five separate commands run in
 # whatever order someone remembered. Two things went wrong repeatedly: a suite
 # tore down a container the next one needed, and `cargo test` stopped at the
 # first failing target so the total silently dropped by 21 without anything
@@ -33,7 +33,7 @@ run() { # name command...
   # Containers and proxies from a previous suite are the most common cause of a
   # confusing failure, so every suite starts from nothing.
   pkill -f 'target/release/pgmask' 2>/dev/null
-  podman rm -f pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb >/dev/null 2>&1
+  podman rm -f pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb >/dev/null 2>&1
   sleep 1
   local out
   out=$("$@" 2>&1)
@@ -66,9 +66,10 @@ run "Postgres 13-17"          ./scripts/test-versions.sh
 run "CockroachDB"             ./scripts/test-cockroach.sh
 run "shape sweep (both engines)" ./scripts/test-shapes.sh
 run "generated SQL campaign"  ./scripts/test-fuzz.sh 1500 3 3
+run "generated shapes (CockroachDB)" ./scripts/test-fuzz-cockroach.sh 1200 3
 
 pkill -f 'target/release/pgmask' 2>/dev/null
-podman rm -f pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb >/dev/null 2>&1
+podman rm -f pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb >/dev/null 2>&1
 
 echo
 echo "-------------------------------------------------------------"

@@ -123,6 +123,50 @@ that will not tell us what is in a view has not told us the view is safe.
 The cost on Postgres is one shape moving from *served as nulls* to *refused*,
 which is the correct trade for closing a disclosure.
 
+## Fuzzing it: a third leak, and why sqlsmith was the wrong tool
+
+sqlsmith cannot read a CockroachDB schema — it loads `pg_catalog` and dies at
+`Generating indexes...unknown type:`. Generating against Postgres and replaying
+looked like the obvious workaround and does not work either: **395 of 400
+statements errored**, because sqlsmith draws functions and operators from the
+target's catalog and Postgres has thousands CockroachDB lacks. A campaign
+erroring on 98.75% of its corpus is vacuous however it reports, and the poison
+control caught exactly that.
+
+Function soup was never what needed fuzzing. What decides masking is whether
+per-field provenance can be believed, and that is a property of a query's
+*shape* — how many source columns can reach one output field — not of which
+scalar sits on top. Both leaks above were shapes.
+
+`crates/fuzz/src/bin/shapegen.rs` therefore generates compositions of relational
+operators (subquery, CTE, set operation, join, DISTINCT, window, aggregate,
+GROUP BY, ORDER BY/LIMIT) over the fixture, in SQL both engines accept. Seeded
+xorshift, no dependency, and a seed reproduces a corpus exactly. On CockroachDB
+it produces **zero engine errors** where sqlsmith's corpus produced 98.75%.
+
+It found a third disclosure on its first run:
+
+```sql
+SELECT c0, row_number() OVER (ORDER BY c0) AS c1
+  FROM (SELECT c0, count(*) AS c1
+          FROM (SELECT r5.v AS c0 FROM fz.v_mixed r5) q5
+         GROUP BY c0) q5
+```
+
+Only under `lineage = "allow"`. The view-taint check worked: it distrusted the
+provenance and sent the field down the opaque path. **Lineage then released
+it** — it resolved the expression to `fz.v_mixed.v`, found the catalog's
+`mask = "none"` rule, and handed over what provenance had just refused to.
+
+The taint had reached the provenance decision and not the lineage decision.
+`resolve` now refuses any source column belonging to a set-operation view
+(guard 5). This is engine-independent — shared code, no engine branch — and is
+pinned by a unit test that fails when the guard is removed.
+
+The lesson is narrower than "add a guard": a safety property established in one
+decision path is not established in the others, and the two paths here were
+written months apart.
+
 ## Other differences found
 
 | | Postgres | CockroachDB |
@@ -143,10 +187,10 @@ assumed.
 
 - **CockroachDB is tested on one version**, v25.4.14, pinned in the suite and
   checked at startup. Postgres gets 13 through 17.
-- **No CockroachDB-specific SQL surface has been swept.** The generated-SQL
-  campaign runs against Postgres only, so CockroachDB's own extensions — `AS OF
-  SYSTEM TIME`, changefeeds, `SHOW` variants — have not been through the fuzzer.
-  A construct that erases or reassigns provenance in a way set operations do not
+- **CockroachDB's own SQL extensions are unswept.** The generated campaign now
+  runs against CockroachDB (see below), but its corpus is portable by
+  construction, so `AS OF SYSTEM TIME`, changefeeds and `SHOW` variants have
+  never been generated. A CockroachDB-only construct that reassigns provenance
   would not have been found.
 - **The Phase 0 provenance spike is Postgres-only, and would not have caught
   this anyway.** `crates/spike` enumerates which SQL shapes carry provenance,

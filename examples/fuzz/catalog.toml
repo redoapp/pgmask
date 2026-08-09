@@ -268,6 +268,19 @@ relation = "fz.v_union"
 column = "a"
 mask = "redact"
 
+# Deliberately released, and deliberately wrong to release: `v` looks like a
+# city column and is sometimes an address. This is the rule an operator writes,
+# and the proxy must refuse the query rather than honour it.
+[[column]]
+relation = "fz.v_mixed"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "fz.v_mixed"
+column = "v"
+mask = "none"
+
 [[column]]
 relation = "fz.v_join"
 column = "id"

@@ -29,7 +29,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.2**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.3**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -46,12 +46,13 @@ done, and [LICENSE](LICENSE).
 | GUI clients — Harlequin, Beekeeper's stack, psql `\d` | done, opt-in ([how](docs/gui-clients.md)) |
 | `classify --check` — CI gate on catalog drift | done ([who owns what](docs/responsibilities.md)) |
 | Phase 6 — lineage (`lineage = "allow"`) | done, opt-in; TPC-DS refusals 55% → 26% ([measured](docs/lineage-estimate.md)) |
-| CockroachDB v25.4 | supported and tested; closed a union disclosure ([why](docs/engines.md)) |
+| CockroachDB v25.4 | supported, tested and fuzzed; closed three disclosures ([why](docs/engines.md)) |
 
-`./scripts/test-all.sh` runs ten suites and reports one line each, with a
-skipped suite counted as a failure: 229 cargo tests, 82 demo assertions, 7 TLS,
+`./scripts/test-all.sh` runs eleven suites and reports one line each, with a
+skipped suite counted as a failure: 231 cargo tests, 82 demo assertions, 7 TLS,
 115 across Postgres 13–17, 34 against CockroachDB, a 43-shape canary sweep over
-both engines, and a generated-SQL campaign that must report zero leaks. The adversarial cargo suite drives a raw wire
+both engines, a generated-SQL campaign on Postgres and a generated-shape campaign
+on CockroachDB, both of which must report zero leaks. The adversarial cargo suite drives a raw wire
 client and asserts no sentinel byte ever crosses the boundary.
 
 ### Who owns what
@@ -146,6 +147,7 @@ operation, on every engine, and handles those fields as computed ones. See
 ./scripts/test-versions.sh       # 23 assertions x Postgres 13,14,15,16,17
 ./scripts/test-cockroach.sh      # 34 assertions against CockroachDB v25.4
 ./scripts/test-shapes.sh         # 43 query shapes, canary sweep, both engines
+./scripts/test-fuzz-cockroach.sh # generated query shapes against CockroachDB
 cargo llvm-cov --release --summary-only   # coverage, after running the above
 cargo audit && cargo machete              # advisories and unused deps
 ```

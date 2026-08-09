@@ -426,6 +426,22 @@ impl Snapshot {
         }
     }
 
+    /// The same question for an already-qualified `schema.relation`.
+    ///
+    /// Falls back to the bare name, because lineage qualifies an unqualified
+    /// reference by guessing `public.` — a guess that must not be able to turn
+    /// "opaque" into "fine".
+    pub fn relation_is_opaque_view(&self, qualified: &str) -> bool {
+        let qualified = qualified.to_ascii_lowercase();
+        if self.opaque_views.contains(&qualified) {
+            return true;
+        }
+        let bare = qualified
+            .rsplit_once('.')
+            .map_or(qualified.as_str(), |(_, n)| n);
+        self.is_opaque_view(None, bare)
+    }
+
     /// Whether any relation the statement names is such a view.
     pub fn statement_touches_opaque_view(&self, sql: &str) -> bool {
         if self.opaque_views.is_empty() {

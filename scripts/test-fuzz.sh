@@ -66,6 +66,13 @@ for _ in $(seq 1 40); do
 done
 psql -h localhost -p "$PG_PORT" -U postgres -d fuzzdb -q -v ON_ERROR_STOP=1 \
   -f examples/fuzz/schema.sql >/dev/null 2>&1 || { echo "FATAL: fixture failed to load"; exit 1; }
+# Roles live in their own file because there is no portable spelling of
+# "create it if absent" across Postgres and CockroachDB. Applied without
+# ON_ERROR_STOP so a kept container is not an error.
+psql -h localhost -p "$PG_PORT" -U postgres -d fuzzdb -q \
+  -f examples/fuzz/roles.sql >/dev/null 2>&1
+psql -h localhost -p "$PG_PORT" -U support_sam -d fuzzdb -tAc 'SELECT 1' >/dev/null 2>&1 \
+  || { echo "FATAL: support_sam cannot log in — the role-bleed check would not run"; exit 1; }
 cargo build --release -q || exit 1
 
 
@@ -75,8 +82,19 @@ gen() { # seed count outfile
 }
 
 # --- 1. Prove the oracle can fail -------------------------------------------
-echo "==> poison run: masking removed from two columns, the oracle must fire"
+#
+# Unmask the 20 `redact` columns as well as the two shaped ones. Those carry the
+# CANARY token directly, so the oracle fires on any query that reads one.
+#
+# It used to unmask only `ip-prefix` and `date-year` — two columns out of sixty —
+# and that made the control depend on a random corpus happening to touch them.
+# Adding one view to the fixture changed what sqlsmith generates for the fixed
+# seed (it enumerates relations from the catalog), the new corpus missed both
+# columns, and the control reported the oracle as broken. The control's job is
+# to prove detection works, so it should not be a subtle test.
+echo "==> poison run: masking removed, the oracle must fire"
 sed -e 's/^mask = "ip-prefix"/mask = "none"/' -e 's/^mask = "date-year"/mask = "none"/' \
+    -e 's/^mask = "redact"/mask = "none"/' \
     -e "s|55432|$PG_PORT|g" \
     -e "s/^listen = .*/listen = \"127.0.0.1:$POISON_PORT\"/" \
     -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-poison.toml
@@ -130,7 +148,18 @@ if env "${role_env[@]}" POISON=1 ./target/release/roles 6 40 >/tmp/roles-poison.
   kill "$ROLE_PID" 2>/dev/null
   exit 1
 fi
-echo "    poison run detected $(grep -oE 'VIOLATIONS +[0-9]+' /tmp/roles-poison.out | grep -oE '[0-9]+') violations, as required"
+# Non-zero is not enough: a run where every session failed to *connect* also
+# exits non-zero, and did, reporting a broken fixture as a working oracle. The
+# poison run has to have detected actual violations.
+poison_violations=$(grep -oE 'VIOLATIONS +[0-9]+' /tmp/roles-poison.out | grep -oE '[0-9]+' || echo 0)
+if [[ "${poison_violations:-0}" -eq 0 ]]; then
+  echo "FAIL: the poison run exited non-zero but detected no violations —"
+  echo "      it failed for some other reason and is proving nothing."
+  grep -E 'session failed|Error' /tmp/roles-poison.out | head -3
+  kill "$ROLE_PID" 2>/dev/null
+  exit 1
+fi
+echo "    poison run detected $poison_violations violations, as required"
 if ! env "${role_env[@]}" ./target/release/roles 24 300; then
   kill "$ROLE_PID" 2>/dev/null
   exit 1

@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.1.3 — fuzzing CockroachDB, and a third leak
+
+**Fixes a disclosure reachable under `lineage = "allow"` on both engines.**
+0.1.2 distrusted provenance for statements touching a set-operation view, which
+sends those fields down the opaque path — where lineage decides them. Lineage
+had not been told:
+
+```sql
+SELECT c0, row_number() OVER (ORDER BY c0) AS c1
+  FROM (SELECT c0, count(*) AS c1
+          FROM (SELECT r5.v AS c0 FROM fz.v_mixed r5) q5
+         GROUP BY c0) q5
+```
+
+It resolved the expression to `fz.v_mixed.v`, found the catalog's `mask =
+"none"` rule, and released what the provenance check had just refused to.
+`resolve` now refuses any source column belonging to a set-operation view
+(guard 5), pinned by a unit test that fails when the guard is removed.
+
+A safety property established in one decision path is not established in the
+others. The two paths here were written months apart.
+
+### CockroachDB is now fuzzed
+
+sqlsmith cannot read a CockroachDB schema (`Generating indexes...unknown
+type:`), and generating against Postgres then replaying does not work either —
+**395 of 400 statements errored**, because sqlsmith draws functions from the
+target's catalog. A campaign erroring on 98.75% of its corpus is vacuous however
+it reports; the poison control caught it.
+
+New `shapegen` generates compositions of relational operators — subquery, CTE,
+set operation, join, DISTINCT, window, value-returning aggregate, GROUP BY,
+ORDER BY/LIMIT — in SQL both engines accept. Seeded xorshift, no new dependency.
+On CockroachDB it produces **zero engine errors**, and it found the leak above
+on its first run.
+
+- New suite `scripts/test-fuzz-cockroach.sh`, wired into `test-all.sh`.
+- `examples/fuzz/schema.sql` is now portable (no plpgsql `DO` blocks) and loads
+  on both engines; roles moved to `examples/fuzz/roles.sql`, since neither
+  `CREATE ROLE IF NOT EXISTS` nor `DO` is portable.
+- The fuzz fixture gains `fz.v_mixed`, a union view mixing a released and a
+  masked column, with the catalog deliberately releasing its output column. The
+  existing `fz.v_union` was masked by an explicit `redact` rule, so the campaign
+  had been generating queries against a union view for as long as the fixture
+  existed without being able to catch the bug.
+- **The role-bleed poison check accepted any non-zero exit.** When the roles
+  fixture broke, 16 failed *connections* read as "violations detected" and the
+  check reported the oracle as working. It now requires the poison run to have
+  detected actual violations.
+- **The campaign's poison control was too narrow to be reliable.** It unmasked
+  two columns out of sixty and so depended on a random corpus happening to touch
+  them. Adding one view to the fixture changed what sqlsmith generates for the
+  fixed seed — it enumerates relations from the catalog — the new corpus missed
+  both, and the control reported the oracle as broken on a run where nothing was
+  wrong. It now also unmasks the twenty `redact` columns, which carry the canary
+  token directly: 572 leaks detected where there had been 0. A control whose job
+  is to prove detection works should not itself be a subtle test.
+
 ## 0.1.2 — set operations hidden in views
 
 **Fixes a disclosure on Postgres as well as CockroachDB.** 0.1.1 decided
