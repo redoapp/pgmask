@@ -25,16 +25,13 @@
 )]
 mod support;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use pgmask::catalog::{Lineage, Opaque, Summaries, SystemCatalogs, Unclassified};
-use pgmask::mask::{Mask, Masker};
-use pgmask::metrics::Metrics;
+use pgmask::catalog::{Config, Lineage, Opaque, Summaries, SystemCatalogs, Unclassified};
+use pgmask::mask::Mask;
 use pgmask::protocol::{FrameReader, Message};
-use pgmask::tls::BackendTls;
 use pgmask::{Catalog, Policy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -118,11 +115,48 @@ fn cat(parts: &[Bytes]) -> Vec<u8> {
     out
 }
 
+fn parse_raw_name(name: &[u8], sql: &str) -> Message {
+    let mut body = BytesMut::new();
+    body.put_slice(name);
+    body.put_u8(0);
+    body.put_slice(sql.as_bytes());
+    body.put_u8(0);
+    body.put_i16(0);
+    Message::new(b'P', body.freeze())
+}
+
+fn describe_raw_statement(name: &[u8]) -> Message {
+    let mut body = BytesMut::new();
+    body.put_u8(b'S');
+    body.put_slice(name);
+    body.put_u8(0);
+    Message::new(b'D', body.freeze())
+}
+
+fn bind_raw_statement(portal: &str, statement: &[u8]) -> Message {
+    let mut body = BytesMut::new();
+    body.put_slice(portal.as_bytes());
+    body.put_u8(0);
+    body.put_slice(statement);
+    body.put_u8(0);
+    body.put_i16(0);
+    body.put_i16(0);
+    body.put_i16(0);
+    Message::new(b'B', body.freeze())
+}
+
 // --- scripted fake backend ---------------------------------------------------
 
 /// Accepts one connection, answers startup with AuthenticationOk + ReadyForQuery,
 /// then writes `blocks[i]` after the i-th `Sync` or `Query` it receives.
 async fn fake_backend(blocks: Vec<Vec<u8>>) -> SocketAddr {
+    fake_backend_releasing_after(blocks, 1).await
+}
+
+/// Delay backend replies until `release_after` query cycles have arrived. This
+/// makes cross-`Sync` pipelining deterministic: the proxy must ingest the later
+/// frontend epoch before it can see the earlier backend result.
+async fn fake_backend_releasing_after(blocks: Vec<Vec<u8>>, release_after: usize) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -146,13 +180,18 @@ async fn fake_backend(blocks: Vec<Vec<u8>>) -> SocketAddr {
         let (r, mut w) = sock.into_split();
         let mut frames = FrameReader::new(r);
         let mut i = 0usize;
+        let mut queued = Vec::new();
         while let Ok(Some(msg)) = frames.read_message().await {
             if msg.tag == b'S' || msg.tag == b'Q' {
                 if let Some(block) = blocks.get(i) {
-                    let _ = w.write_all(block).await;
-                    let _ = w.flush().await;
+                    queued.extend_from_slice(block);
                 }
                 i += 1;
+                if i >= release_after {
+                    let _ = w.write_all(&queued).await;
+                    let _ = w.flush().await;
+                    queued.clear();
+                }
             }
             if msg.tag == b'X' {
                 return;
@@ -167,20 +206,32 @@ async fn start_proxy(
     unclassified: Unclassified,
     opaque: Opaque,
 ) -> SocketAddr {
-    let policy = Arc::new(Policy {
-        catalog: Arc::new(Catalog::default()),
-        masker: Arc::new(Masker::new(b"test-key".to_vec())),
+    let config = Config {
+        listen: "127.0.0.1:0".into(),
+        backend: backend.to_string(),
+        catalog_dsn: "postgres://unused".into(),
+        pseudonym_key: "test-key-long-enough".into(),
         unclassified,
         unclassified_mask: Mask::Null,
         opaque,
-        metrics: Arc::new(Metrics::default()),
+        column: Vec::new(),
+        semantic_type: Vec::new(),
+        role: Vec::new(),
+        tls_cert: None,
+        tls_key: None,
+        backend_tls: Default::default(),
+        catalog_refresh_seconds: 30,
+        catalog_refresh_min_seconds: 5,
+        metrics_interval_seconds: 0,
         summaries: Summaries::Allow,
         system_catalogs: SystemCatalogs::Refuse,
         lineage: Lineage::Refuse,
-        roles: HashMap::new(),
-        tls: None,
-        backend_tls: BackendTls::Disable,
-    });
+        metrics_listen: None,
+    };
+    let policy = Arc::new(
+        Policy::from_config(&config, Arc::new(Catalog::default()))
+            .expect("test policy must validate"),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let backend = backend.to_string();
@@ -353,6 +404,108 @@ async fn rejected_named_reparse_cannot_relabel_the_existing_statement() {
     assert!(
         !c.received_text().contains(CANARY),
         "LEAK: rejected SQL relabelled the backend's existing named statement"
+    );
+}
+
+#[tokio::test]
+async fn non_utf8_statement_names_do_not_alias_through_lossy_decoding() {
+    let backend = fake_backend(vec![
+        cat(&[tagless(b'1'), ready()]),
+        cat(&[
+            tagless(b'1'),
+            param_description(),
+            row_description(&[("?column?", 0, 0, 23)]),
+            ready(),
+        ]),
+        cat(&[
+            tagless(b'2'),
+            data_row(&[CANARY]),
+            command_complete("SELECT 1"),
+            ready(),
+        ]),
+    ])
+    .await;
+    let proxy = start_proxy(backend, Unclassified::Allow, Opaque::Reject).await;
+    let mut c = RawClient::connect(proxy, "db").await.unwrap();
+
+    c.send(parse_raw_name(b"\x80", "SELECT lower(email) FROM public.t"))
+        .await
+        .unwrap();
+    c.send(sync_msg()).await.unwrap();
+    c.read_until_ready().await.unwrap();
+
+    c.send(parse_raw_name(b"\x81", "SELECT 1")).await.unwrap();
+    c.send(describe_raw_statement(b"\x81")).await.unwrap();
+    c.send(sync_msg()).await.unwrap();
+    c.read_until_ready().await.unwrap();
+
+    c.send(bind_raw_statement("p", b"\x80")).await.unwrap();
+    c.send(execute_msg("p", 0)).await.unwrap();
+    c.send(sync_msg()).await.unwrap();
+    c.read_until_ready_or_eof().await.unwrap();
+
+    assert!(
+        !c.received_text().contains(CANARY),
+        "LEAK: distinct raw statement names shared one lossy-decoded plan"
+    );
+}
+
+#[tokio::test]
+async fn local_rejection_preserves_later_pipelined_describe_sql() {
+    let backend = fake_backend_releasing_after(
+        vec![
+            cat(&[
+                tagless(b'1'),
+                param_description(),
+                row_description(&[("lower", 0, 0, 25)]),
+                ready(),
+            ]),
+            cat(&[
+                tagless(b'1'),
+                param_description(),
+                // CockroachDB can report the first UNION branch's provenance.
+                row_description(&[("city", 16_391, 1, 25)]),
+                ready(),
+            ]),
+            cat(&[
+                tagless(b'2'),
+                data_row(&[CANARY]),
+                command_complete("SELECT 1"),
+                ready(),
+            ]),
+        ],
+        2,
+    )
+    .await;
+    let proxy = start_proxy(backend, Unclassified::Allow, Opaque::Reject).await;
+    let mut c = RawClient::connect(proxy, "db").await.unwrap();
+
+    let mut pipelined = Vec::new();
+    for message in [
+        parse_msg("reject", "SELECT lower(email) FROM public.t"),
+        describe_statement("reject"),
+        sync_msg(),
+        parse_msg(
+            "later",
+            "SELECT city FROM public.t UNION ALL SELECT email FROM public.t",
+        ),
+        describe_statement("later"),
+        sync_msg(),
+    ] {
+        pipelined.extend_from_slice(&message.encode());
+    }
+    c.send_raw(&pipelined).await.unwrap();
+    c.read_until_ready().await.unwrap();
+    c.read_until_ready().await.unwrap();
+
+    c.send(bind_msg("p", "later")).await.unwrap();
+    c.send(execute_msg("p", 0)).await.unwrap();
+    c.send(sync_msg()).await.unwrap();
+    c.read_until_ready_or_eof().await.unwrap();
+
+    assert!(
+        !c.received_text().contains(CANARY),
+        "LEAK: local rejection discarded a later epoch's SQL and trusted mixed provenance"
     );
 }
 

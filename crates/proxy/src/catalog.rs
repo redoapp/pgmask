@@ -375,7 +375,7 @@ impl Config {
     ///
     /// Both load clean, log `unclassified=Mask`, and return every undeclared
     /// column verbatim. Default-deny becomes default-allow with no warning.
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.validate_pseudonym_key()?;
         self.validate_unique_column_rules()?;
         self.validate_unclassified_policy()

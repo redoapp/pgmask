@@ -49,7 +49,7 @@ done, and [LICENSE](LICENSE).
 | CockroachDB v25.4 | supported, fuzzed on both protocols; closed three disclosures ([why](docs/engines.md)) |
 
 `./scripts/test-all.sh` runs thirteen suites and reports one line each, with a
-skipped suite counted as a failure: 258 cargo tests, 82 demo assertions, 7 TLS,
+skipped suite counted as a failure: 264 cargo tests, 82 demo assertions, 7 TLS,
 115 across Postgres 13–17, 34 against CockroachDB, a 43-shape canary sweep over
 both engines, a generated-SQL campaign on Postgres and a generated-shape campaign
 on CockroachDB, both of which must report zero leaks. The adversarial cargo suite drives a raw wire

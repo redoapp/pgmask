@@ -54,6 +54,20 @@ proptest! {
         let _ = parse_simple_query(&body);
     }
 
+    /// Statement and portal names are opaque protocol identities. Every
+    /// NUL-free byte string must survive parsing exactly, including invalid
+    /// UTF-8 that lossy decoding would collapse onto U+FFFD.
+    #[test]
+    fn protocol_names_round_trip_byte_exactly(
+        name in proptest::collection::vec(any::<u8>().prop_filter("cstring byte", |b| *b != 0), 0..64)
+    ) {
+        let mut body = BytesMut::new();
+        body.put_slice(&name);
+        body.put_u8(0);
+        body.put_i32(0);
+        prop_assert_eq!(parse_execute(&body.freeze()), Some(Bytes::from(name)));
+    }
+
     /// Indexing into the result-format codes must hold for any index, since the
     /// field count comes from the server and the codes come from the client.
     #[test]

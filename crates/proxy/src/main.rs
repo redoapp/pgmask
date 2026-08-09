@@ -57,16 +57,16 @@ async fn main() -> Result<()> {
         classified_columns = catalog.len(),
         semantic_types = config.semantic_type.len(),
         roles = config.role.len(),
-        principals_with_a_role = policy.roles.len(),
+        principals_with_a_role = policy.role_count(),
         unclassified = ?config.unclassified,
         opaque = ?config.opaque,
         system_catalogs = ?config.system_catalogs,
         summaries = ?config.summaries,
-        tls = policy.tls.is_some(),
+        tls = policy.has_client_tls(),
         backend_tls = ?config.backend_tls,
         "pgmask listening"
     );
-    if policy.tls.is_none() {
+    if !policy.has_client_tls() {
         tracing::warn!(
             "no tls_cert/tls_key — clients connect in plaintext, and a masking proxy \
              reachable in plaintext is not a security boundary"
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
     // Rejection counters, bucketed by cause. These are the numbers that decide
     // whether the Phase 6 parser is worth building; see docs/handoff.md.
     if config.metrics_interval_seconds > 0 {
-        let metrics = policy.metrics.clone();
+        let metrics = policy.metrics();
         let interval = Duration::from_secs(config.metrics_interval_seconds);
         tokio::spawn(async move {
             loop {

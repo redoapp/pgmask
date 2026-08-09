@@ -182,7 +182,7 @@ pub async fn start_proxy_at(
         listen: "127.0.0.1:0".into(),
         backend: backend.clone(),
         catalog_dsn: backend_dsn(db),
-        pseudonym_key: "test-key".into(),
+        pseudonym_key: "test-key-long-enough".into(),
         unclassified,
         opaque,
         unclassified_mask: Mask::Null,
@@ -209,7 +209,7 @@ pub async fn start_proxy_at(
         std::time::Duration::from_secs(config.catalog_refresh_min_seconds),
     ));
     let policy = Arc::new(Policy::from_config(&config, catalog)?);
-    let metrics = policy.metrics.clone();
+    let metrics = policy.metrics();
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

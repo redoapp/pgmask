@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::mask::MaskSpec;
 use crate::protocol::{self, DescribeTarget};
 
@@ -39,18 +41,19 @@ struct PendingDescribe {
 /// but must be invalidated if the backend rejects the command. Otherwise the
 /// proxy and backend can assign different SQL or plans to the same name.
 struct PendingMutation {
-    name: String,
+    name: Bytes,
     epoch: u64,
 }
 
 /// All state that binds SQL, statements, portals, descriptions, and row plans.
 #[derive(Default)]
 pub(crate) struct PlanState {
-    statement_plans: HashMap<String, Plan>,
-    statement_sql: HashMap<String, String>,
-    portal_statement: HashMap<String, String>,
-    portal_plans: HashMap<String, Plan>,
+    statement_plans: HashMap<Bytes, Plan>,
+    statement_sql: HashMap<Bytes, String>,
+    portal_statement: HashMap<Bytes, Bytes>,
+    portal_plans: HashMap<Bytes, Plan>,
     active_plan: Option<Plan>,
+    active_epoch: Option<u64>,
     pending_describes: VecDeque<PendingDescribe>,
     pending_parses: VecDeque<PendingMutation>,
     pending_binds: VecDeque<PendingMutation>,
@@ -65,21 +68,23 @@ impl PlanState {
 
     pub(crate) fn clear_active(&mut self) {
         self.active_plan = None;
+        self.active_epoch = None;
     }
 
     pub(crate) fn begin_simple_query(&mut self, sql: Option<String>) {
         self.active_plan = None;
+        self.active_epoch = None;
         self.pending_describes.clear();
         self.simple_sql = sql;
     }
 
-    pub(crate) fn parse(&mut self, name: String, sql: String) {
+    pub(crate) fn parse(&mut self, name: Bytes, sql: String) {
         // A genuinely different statement invalidates every plan derived from
         // the old SQL. Some drivers re-Parse the unnamed statement with the
         // same SQL and reuse its described result metadata, which remains valid.
         if self.statement_sql.get(&name) != Some(&sql) {
             self.statement_plans.remove(&name);
-            let stale_portals: Vec<String> = self
+            let stale_portals: Vec<Bytes> = self
                 .portal_statement
                 .iter()
                 .filter(|(_, statement)| **statement == name)
@@ -96,7 +101,7 @@ impl PlanState {
         });
     }
 
-    pub(crate) fn bind(&mut self, portal: String, statement: String, formats: Option<Vec<i16>>) {
+    pub(crate) fn bind(&mut self, portal: Bytes, statement: Bytes, formats: Option<Vec<i16>>) {
         self.portal_statement
             .insert(portal.clone(), statement.clone());
         self.pending_binds.push_back(PendingMutation {
@@ -144,8 +149,9 @@ impl PlanState {
         });
     }
 
-    pub(crate) fn execute(&mut self, portal: &str) {
+    pub(crate) fn execute(&mut self, portal: &Bytes) {
         self.active_plan = self.portal_plans.get(portal).cloned();
+        self.active_epoch = Some(self.sync_epoch);
     }
 
     /// Mirror PostgreSQL's resource lifetime after a frontend `Close`.
@@ -159,7 +165,7 @@ impl PlanState {
                 self.statement_sql.remove(&statement);
                 self.statement_plans.remove(&statement);
 
-                let portals: Vec<String> = self
+                let portals: Vec<Bytes> = self
                     .portal_statement
                     .iter()
                     .filter(|(_, bound_statement)| **bound_statement == statement)
@@ -189,8 +195,24 @@ impl PlanState {
         self.pending_binds.pop_front();
     }
 
-    pub(crate) fn clear_pending_describes(&mut self) {
-        self.pending_describes.clear();
+    /// Epoch whose backend traffic must be suppressed after a local refusal.
+    pub(crate) fn rejection_epoch(&self) -> u64 {
+        self.pending_describes
+            .front()
+            .map_or(self.active_epoch.unwrap_or(self.sync_epoch), |pending| {
+                pending.epoch
+            })
+    }
+
+    /// Finish one locally suppressed exchange without deleting later
+    /// pipelined work. Unlike [`discard_failed_epoch`](Self::discard_failed_epoch),
+    /// the backend did execute these mutations; only their responses were
+    /// suppressed, so their provisional state remains valid.
+    pub(crate) fn finish_suppressed_epoch(&mut self, epoch: u64) {
+        self.pending_describes
+            .retain(|pending| pending.epoch != epoch);
+        self.pending_parses.retain(|pending| pending.epoch != epoch);
+        self.pending_binds.retain(|pending| pending.epoch != epoch);
     }
 
     /// Remove provisional state from a failed exchange while preserving later
@@ -211,39 +233,39 @@ impl PlanState {
         // A later pipelined epoch may already have reused the same name. Keep
         // its provisional state; its own acknowledgement or error will decide
         // whether it survives.
-        let later_statements: HashSet<String> = self
+        let later_statements: HashSet<Bytes> = self
             .pending_parses
             .iter()
             .filter(|pending| pending.epoch > failed_epoch)
             .map(|pending| pending.name.clone())
             .collect();
-        let failed_statements: Vec<String> = self
+        let failed_statements: Vec<Bytes> = self
             .pending_parses
             .iter()
             .filter(|pending| pending.epoch == failed_epoch)
             .map(|pending| pending.name.clone())
             .collect();
         for statement in failed_statements {
-            if !later_statements.contains(statement.as_str()) {
+            if !later_statements.contains(&statement) {
                 self.statement_sql.remove(&statement);
                 self.statement_plans.remove(&statement);
             }
         }
 
-        let later_portals: HashSet<String> = self
+        let later_portals: HashSet<Bytes> = self
             .pending_binds
             .iter()
             .filter(|pending| pending.epoch > failed_epoch)
             .map(|pending| pending.name.clone())
             .collect();
-        let failed_portals: Vec<String> = self
+        let failed_portals: Vec<Bytes> = self
             .pending_binds
             .iter()
             .filter(|pending| pending.epoch == failed_epoch)
             .map(|pending| pending.name.clone())
             .collect();
         for portal in failed_portals {
-            if !later_portals.contains(portal.as_str()) {
+            if !later_portals.contains(&portal) {
                 self.portal_statement.remove(&portal);
                 self.portal_plans.remove(&portal);
             }
@@ -275,7 +297,11 @@ impl PlanState {
     /// Bind a completed plan to the described target and activate it for the
     /// DataRows that follow the RowDescription.
     pub(crate) fn finish_description(&mut self, plan: Plan) {
-        match self.pending_describes.pop_front().map(|p| p.target) {
+        let pending = self.pending_describes.pop_front();
+        let epoch = pending
+            .as_ref()
+            .map_or(self.sync_epoch, |pending| pending.epoch);
+        match pending.map(|p| p.target) {
             Some(DescribeTarget::Statement(name)) => {
                 self.statement_plans.insert(name, plan.clone());
             }
@@ -285,6 +311,7 @@ impl PlanState {
             None => {}
         }
         self.active_plan = Some(plan);
+        self.active_epoch = Some(epoch);
     }
 }
 
@@ -303,47 +330,64 @@ mod tests {
         }])
     }
 
+    fn name(value: &'static str) -> Bytes {
+        Bytes::from_static(value.as_bytes())
+    }
+
     #[test]
     fn different_sql_invalidates_but_identical_sql_preserves_a_plan() {
         let mut state = PlanState::default();
-        state.parse("s".into(), "SELECT 1".into());
-        state.describe(DescribeTarget::Statement("s".into()));
+        state.parse(name("s"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("s")));
         state.finish_description(plan());
 
-        state.parse("s".into(), "SELECT 1".into());
-        state.bind("p".into(), "s".into(), Some(vec![1]));
-        state.execute("p");
+        state.parse(name("s"), "SELECT 1".into());
+        state.bind(name("p"), name("s"), Some(vec![1]));
+        state.execute(&name("p"));
         assert_eq!(state.active_plan().unwrap().first().unwrap().format, 1);
 
-        state.parse("s".into(), "SELECT secret FROM t".into());
-        state.bind("p".into(), "s".into(), Some(vec![0]));
-        state.execute("p");
+        state.parse(name("s"), "SELECT secret FROM t".into());
+        state.bind(name("p"), name("s"), Some(vec![0]));
+        state.execute(&name("p"));
         assert!(state.active_plan().is_none());
     }
 
     #[test]
     fn a_failed_epoch_does_not_discard_a_later_pipelined_describe() {
         let mut state = PlanState::default();
-        state.parse("bad".into(), "SELECT bad".into());
-        state.describe(DescribeTarget::Statement("bad".into()));
+        state.parse(name("bad"), "SELECT bad".into());
+        state.describe(DescribeTarget::Statement(name("bad")));
         state.sync();
-        state.parse("good".into(), "SELECT 1".into());
-        state.describe(DescribeTarget::Statement("good".into()));
+        state.parse(name("good"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("good")));
 
         state.discard_failed_epoch();
         assert_eq!(state.described_sql().as_deref(), Some("SELECT 1"));
     }
 
     #[test]
+    fn a_locally_suppressed_epoch_preserves_later_pipelined_describes() {
+        let mut state = PlanState::default();
+        state.parse(name("reject"), "SELECT lower(secret) FROM t".into());
+        state.describe(DescribeTarget::Statement(name("reject")));
+        state.sync();
+        state.parse(name("later"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("later")));
+
+        state.finish_suppressed_epoch(0);
+        assert_eq!(state.described_sql().as_deref(), Some("SELECT 1"));
+    }
+
+    #[test]
     fn a_rejected_reparse_cannot_replace_the_backends_sql_identity() {
         let mut state = PlanState::default();
-        state.parse("s".into(), "SELECT lower(secret) FROM t".into());
+        state.parse(name("s"), "SELECT lower(secret) FROM t".into());
         state.finish_parse();
 
-        state.parse("s".into(), "SELECT 1".into());
+        state.parse(name("s"), "SELECT 1".into());
         state.sync();
         state.discard_failed_epoch();
-        state.describe(DescribeTarget::Statement("s".into()));
+        state.describe(DescribeTarget::Statement(name("s")));
 
         assert_eq!(
             state.described_sql(),
@@ -355,20 +399,20 @@ mod tests {
     #[test]
     fn close_releases_proxy_state_without_discarding_in_flight_rows() {
         let mut state = PlanState::default();
-        state.parse("s".into(), "SELECT 1".into());
-        state.describe(DescribeTarget::Statement("s".into()));
+        state.parse(name("s"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("s")));
         state.finish_description(plan());
-        state.bind("p".into(), "s".into(), Some(vec![0]));
-        state.execute("p");
+        state.bind(name("p"), name("s"), Some(vec![0]));
+        state.execute(&name("p"));
 
-        state.close(DescribeTarget::Statement("s".into()));
+        state.close(DescribeTarget::Statement(name("s")));
         assert!(
             state.active_plan().is_some(),
             "an Execute pipelined before Close still has rows in flight"
         );
 
         state.clear_active();
-        state.execute("p");
+        state.execute(&name("p"));
         assert!(
             state.active_plan().is_none(),
             "closing a statement must implicitly release its portals"

@@ -47,25 +47,29 @@ struct Rejection {
 }
 
 pub struct Policy {
-    pub catalog: Arc<Catalog>,
-    pub masker: Arc<Masker>,
-    pub unclassified: Unclassified,
-    pub unclassified_mask: Mask,
-    pub opaque: Opaque,
-    pub metrics: Arc<Metrics>,
-    pub summaries: Summaries,
-    pub system_catalogs: SystemCatalogs,
-    pub lineage: Lineage,
+    catalog: Arc<Catalog>,
+    masker: Arc<Masker>,
+    unclassified: Unclassified,
+    unclassified_mask: Mask,
+    opaque: Opaque,
+    metrics: Arc<Metrics>,
+    summaries: Summaries,
+    system_catalogs: SystemCatalogs,
+    lineage: Lineage,
     /// Principal -> roles, from `[[role]]`.
-    pub roles: HashMap<String, HashSet<String>>,
+    roles: HashMap<String, HashSet<String>>,
     /// Present when `tls_cert`/`tls_key` are configured. Absent means we answer
     /// `SSLRequest` with `N` and clients using `sslmode=prefer` fall back.
-    pub tls: Option<tokio_rustls::TlsAcceptor>,
-    pub backend_tls: BackendTls,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    backend_tls: BackendTls,
 }
 
 impl Policy {
     pub fn from_config(config: &Config, catalog: Arc<Catalog>) -> Result<Self> {
+        // `Config` is public because the classifier and test adapters build it
+        // programmatically. File loading validates it, but runtime policy must
+        // not depend on which construction path the caller used.
+        config.validate()?;
         let tls = match (&config.tls_cert, &config.tls_key) {
             (Some(cert), Some(key)) => Some(crate::tls::load_acceptor(cert, key)?),
             (None, None) => None,
@@ -92,6 +96,18 @@ impl Policy {
     /// Roles held by a verified principal.
     pub fn roles_of(&self, principal: &str) -> HashSet<String> {
         self.roles.get(principal).cloned().unwrap_or_default()
+    }
+
+    pub fn role_count(&self) -> usize {
+        self.roles.len()
+    }
+
+    pub fn has_client_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Decide the plan for a described result set, or refuse it.
@@ -312,8 +328,9 @@ pub struct Session {
     policy: Arc<Policy>,
     /// Extended-query statement, portal, Describe, and active-plan lifecycle.
     plans: PlanState,
-    /// Discarding backend traffic after a refusal, until `ReadyForQuery`.
-    suppressing: bool,
+    /// Exchange whose backend traffic is discarded after a local refusal,
+    /// until its `ReadyForQuery`.
+    suppressing: Option<u64>,
     pub masked_fields: u64,
     pub rejected_result_sets: u64,
     /// Whether this client connection is itself TLS. Decides whether channel
@@ -333,7 +350,7 @@ impl Session {
         Self {
             policy,
             plans: PlanState::default(),
-            suppressing: false,
+            suppressing: None,
             masked_fields: 0,
             rejected_result_sets: 0,
             client_tls: false,
@@ -384,7 +401,7 @@ impl Session {
     /// rows, and let the real `ReadyForQuery` through so transaction state stays
     /// consistent.
     fn reject(&mut self, rejection: Rejection, out: &mut Batch) {
-        self.suppressing = true;
+        self.suppressing = Some(self.plans.rejection_epoch());
         self.plans.clear_active();
         // Counters saturate rather than wrap: a wrapped rejection count would
         // under-report a refusal, and a u64 cannot reach the ceiling in a
@@ -477,13 +494,10 @@ impl Session {
         self.note_backend_auth(&msg);
 
         // While suppressing, everything is dropped until the cycle ends.
-        if self.suppressing {
+        if let Some(suppressed_epoch) = self.suppressing {
             if msg.tag == protocol::B_READY_FOR_QUERY {
-                self.suppressing = false;
-                // Same Sync-boundary invariant as the arm below: a refusal ends
-                // the exchange, and any Describe still queued was answered by
-                // the error that caused the refusal.
-                self.plans.clear_pending_describes();
+                self.suppressing = None;
+                self.plans.finish_suppressed_epoch(suppressed_epoch);
                 return out.client(Vetted::control(&msg));
             }
             return;
@@ -746,7 +760,10 @@ impl Session {
         // leak after the statement-level check had already been shipped, which
         // is the argument for the sweep and not for the check.
         let trust_provenance = match described_sql.as_deref() {
-            None => true,
+            // Missing statement identity means provenance cannot be checked
+            // against set operations or opaque views. Treat it as unknown,
+            // especially on engines that report one branch's OID for a UNION.
+            None => false,
             Some(sql) => {
                 analysis::provenance_is_trustworthy(sql)
                     && !snapshot.statement_touches_opaque_view(sql)
@@ -1153,6 +1170,47 @@ mod tests {
     }
 
     #[test]
+    fn runtime_policy_construction_cannot_bypass_config_validation() {
+        for text in [
+            r#"
+backend = "h:1"
+catalog_dsn = "postgres://unused"
+pseudonym_key = "short"
+unclassified = "allow"
+"#,
+            r#"
+backend = "h:1"
+catalog_dsn = "postgres://unused"
+pseudonym_key = "a-long-enough-key"
+unclassified = "mask"
+unclassified_mask = "none"
+"#,
+            r#"
+backend = "h:1"
+catalog_dsn = "postgres://unused"
+pseudonym_key = "a-long-enough-key"
+unclassified = "allow"
+
+[[column]]
+relation = "s.t"
+column = "email"
+mask = "redact"
+
+[[column]]
+relation = "S.T"
+column = "EMAIL"
+mask = "none"
+"#,
+        ] {
+            let config: Config = toml::from_str(text).expect("fixture parses");
+            assert!(
+                Policy::from_config(&config, Arc::new(Catalog::default())).is_err(),
+                "programmatic Config must cross the same validated policy seam"
+            );
+        }
+    }
+
+    #[test]
     fn opaque_field_is_rejected_by_default() {
         let p = policy(Unclassified::Allow, Opaque::Reject);
         let err = p
@@ -1388,15 +1446,41 @@ mod tests {
         );
         assert!(text.contains("no described result set"));
         assert!(
-            session.suppressing,
+            session.suppressing.is_some(),
             "must swallow the rest of the result set"
+        );
+    }
+
+    #[test]
+    fn missing_statement_sql_distrusts_reported_provenance() {
+        let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
+        let mut body = bytes::BytesMut::new();
+        bytes::BufMut::put_i16(&mut body, 1);
+        bytes::BufMut::put_slice(&mut body, b"city\0");
+        bytes::BufMut::put_u32(&mut body, 16_391);
+        bytes::BufMut::put_i16(&mut body, 1);
+        bytes::BufMut::put_u32(&mut body, 25);
+        bytes::BufMut::put_i16(&mut body, -1);
+        bytes::BufMut::put_i32(&mut body, -1);
+        bytes::BufMut::put_i16(&mut body, 0);
+
+        let mut out = Batch::default();
+        session.handle_row_description(
+            Message::new(protocol::B_ROW_DESCRIPTION, body.freeze()),
+            &mut out,
+        );
+
+        assert!(session.suppressing.is_some());
+        assert!(
+            String::from_utf8_lossy(&out.to_client).contains("no column provenance"),
+            "without SQL, a reported OID cannot be checked for set-operation ambiguity"
         );
     }
 
     #[test]
     fn suppression_swallows_rows_and_releases_on_ready_for_query() {
         let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
-        session.suppressing = true;
+        session.suppressing = Some(0);
 
         let row = protocol::build_data_row(&[Some(Bytes::from_static(b"secret"))]);
         let mut out = Batch::default();
@@ -1407,7 +1491,7 @@ mod tests {
         let mut out = Batch::default();
         session.handle_backend(ready, &mut out);
         assert!(!out.to_client.is_empty());
-        assert!(!session.suppressing);
+        assert!(session.suppressing.is_none());
     }
 
     #[test]
@@ -1460,7 +1544,9 @@ mod tests {
         session.plans.parse("s1".into(), "SELECT 1".into());
         session
             .plans
-            .describe(protocol::DescribeTarget::Statement("s1".into()));
+            .describe(protocol::DescribeTarget::Statement(Bytes::from_static(
+                b"s1",
+            )));
         session.plans.finish_description(plan);
 
         let mut body = bytes::BytesMut::new();

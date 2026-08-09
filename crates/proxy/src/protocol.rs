@@ -302,13 +302,28 @@ fn read_i32(buf: &mut Bytes) -> Option<i32> {
 }
 
 pub fn read_cstring(buf: &mut Bytes) -> Option<String> {
+    Some(String::from_utf8_lossy(&read_cstring_bytes(buf)?).into_owned())
+}
+
+/// Read a protocol cstring without interpreting its bytes.
+///
+/// Prepared-statement and portal names are protocol identities, not text for
+/// pgmask to normalize. Lossy UTF-8 decoding collapses distinct byte strings
+/// onto the same replacement character and therefore cannot be used as a map
+/// key.
+fn read_cstring_bytes(buf: &mut Bytes) -> Option<Bytes> {
     let end = buf.iter().position(|b| *b == 0)?;
     // `position` found the NUL inside the buffer, so `end` is a valid split
-    // point and `end + 1` (the NUL itself) is still in bounds. `get` keeps the
-    // no-NUL case on the `None` path rather than on a slice panic.
-    let s = String::from_utf8_lossy(buf.get(..end)?).into_owned();
-    buf.advance(end.saturating_add(1));
-    Some(s)
+    // point and one byte remains for the terminator.
+    let value = buf.split_to(end);
+    buf.advance(1);
+    Some(value)
+}
+
+/// SQL is analyzed as UTF-8. Unsupported client encodings stay unknown so the
+/// release decision fails closed instead of analyzing replacement characters.
+fn read_utf8_cstring(buf: &mut Bytes) -> Option<String> {
+    String::from_utf8(read_cstring_bytes(buf)?.to_vec()).ok()
 }
 
 // --- RowDescription ---------------------------------------------------------
@@ -573,8 +588,8 @@ pub fn scrub_error(body: &Bytes) -> Option<Bytes> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescribeTarget {
-    Statement(String),
-    Portal(String),
+    Statement(Bytes),
+    Portal(Bytes),
 }
 
 /// `Describe` is `[kind: u8][name: cstring]`.
@@ -588,7 +603,7 @@ pub fn parse_describe(body: &Bytes) -> Option<DescribeTarget> {
         return None;
     }
     let kind = buf.get_u8();
-    let name = read_cstring(&mut buf)?;
+    let name = read_cstring_bytes(&mut buf)?;
     match kind {
         b'S' => Some(DescribeTarget::Statement(name)),
         b'P' => Some(DescribeTarget::Portal(name)),
@@ -603,10 +618,10 @@ pub fn parse_close(body: &Bytes) -> Option<DescribeTarget> {
 }
 
 /// `Bind` starts `[portal: cstring][statement: cstring]`; we need only those.
-pub fn parse_bind(body: &Bytes) -> Option<(String, String)> {
+pub fn parse_bind(body: &Bytes) -> Option<(Bytes, Bytes)> {
     let mut buf = body.clone();
-    let portal = read_cstring(&mut buf)?;
-    let statement = read_cstring(&mut buf)?;
+    let portal = read_cstring_bytes(&mut buf)?;
+    let statement = read_cstring_bytes(&mut buf)?;
     Some((portal, statement))
 }
 
@@ -626,8 +641,8 @@ pub fn parse_bind(body: &Bytes) -> Option<(String, String)> {
 /// one code applies to every column".
 pub fn parse_bind_result_formats(body: &Bytes) -> Option<Vec<i16>> {
     let mut buf = body.clone();
-    let _portal = read_cstring(&mut buf)?;
-    let _statement = read_cstring(&mut buf)?;
+    let _portal = read_cstring_bytes(&mut buf)?;
+    let _statement = read_cstring_bytes(&mut buf)?;
 
     let n_param_formats = read_i16(&mut buf)?;
     for _ in 0..n_param_formats.max(0) {
@@ -665,21 +680,21 @@ pub fn format_for(formats: &[i16], index: usize) -> i16 {
 /// A simple `Query` is a single cstring.
 pub fn parse_simple_query(body: &Bytes) -> Option<String> {
     let mut buf = body.clone();
-    read_cstring(&mut buf)
+    read_utf8_cstring(&mut buf)
 }
 
 /// `Parse` is `[statement: cstring][query: cstring][...]`.
-pub fn parse_parse(body: &Bytes) -> Option<(String, String)> {
+pub fn parse_parse(body: &Bytes) -> Option<(Bytes, String)> {
     let mut buf = body.clone();
-    let name = read_cstring(&mut buf)?;
-    let sql = read_cstring(&mut buf)?;
+    let name = read_cstring_bytes(&mut buf)?;
+    let sql = read_utf8_cstring(&mut buf)?;
     Some((name, sql))
 }
 
 /// `Execute` starts `[portal: cstring]`.
-pub fn parse_execute(body: &Bytes) -> Option<String> {
+pub fn parse_execute(body: &Bytes) -> Option<Bytes> {
     let mut buf = body.clone();
-    read_cstring(&mut buf)
+    read_cstring_bytes(&mut buf)
 }
 
 #[cfg(test)]
@@ -820,7 +835,7 @@ mod tests {
         bind.put_slice(b"portal1\0stmt1\0");
         assert_eq!(
             parse_bind(&bind.freeze()),
-            Some(("portal1".into(), "stmt1".into()))
+            Some((Bytes::from_static(b"portal1"), Bytes::from_static(b"stmt1")))
         );
 
         let mut describe = BytesMut::new();
@@ -828,7 +843,7 @@ mod tests {
         describe.put_slice(b"stmt1\0");
         assert_eq!(
             parse_describe(&describe.freeze()),
-            Some(DescribeTarget::Statement("stmt1".into()))
+            Some(DescribeTarget::Statement(Bytes::from_static(b"stmt1")))
         );
 
         let mut close = BytesMut::new();
@@ -836,7 +851,12 @@ mod tests {
         close.put_slice(b"portal1\0");
         assert_eq!(
             parse_close(&close.freeze()),
-            Some(DescribeTarget::Portal("portal1".into()))
+            Some(DescribeTarget::Portal(Bytes::from_static(b"portal1")))
         );
+
+        let mut distinct = Bytes::from_static(b"\x80\0\x81\0");
+        let first = read_cstring_bytes(&mut distinct).expect("first name");
+        let second = read_cstring_bytes(&mut distinct).expect("second name");
+        assert_ne!(first, second, "protocol identities must remain byte-exact");
     }
 }
