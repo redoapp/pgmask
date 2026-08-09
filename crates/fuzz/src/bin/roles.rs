@@ -98,8 +98,10 @@ async fn main() -> Result<()> {
     let poison = std::env::var("POISON").is_ok();
 
     let mut tasks = Vec::new();
-    for i in 0..sessions {
-        let base_expect = &PRINCIPALS[i % PRINCIPALS.len()];
+    // Round-robin over the principals, as `PRINCIPALS[i % len]` did. An empty
+    // `PRINCIPALS` now yields no sessions, and the `checks == 0` guard below
+    // catches that, rather than the run dividing by zero.
+    for base_expect in PRINCIPALS.iter().cycle().take(sessions) {
         let expect = Expectation {
             user: base_expect.user,
             name_is_clear: base_expect.name_is_clear || poison,
@@ -121,9 +123,9 @@ async fn main() -> Result<()> {
                 let _ = connection.await;
             });
 
-            for n in 0..iterations {
-                // Vary the row so plans are rebuilt rather than trivially reused.
-                let id = (n % 40 + 1) as i32;
+            // Vary the row so plans are rebuilt rather than trivially reused.
+            // Ids cycle 1..=40, as `(n % 40 + 1)` did.
+            for (n, id) in (1..=40i32).cycle().take(iterations).enumerate() {
                 let row = client
                     .query_one(
                         // Not `birth_date::text`: a cast is an expression over
@@ -173,11 +175,13 @@ async fn main() -> Result<()> {
         }));
     }
 
-    let mut failed = 0;
+    let mut failed = 0usize;
     for task in tasks {
         if let Err(err) = task.await.expect("task panicked") {
             eprintln!("session failed: {err:#}");
-            failed += 1;
+            // Saturating, not wrapping: a failure count that wrapped to zero
+            // would report a run where every session died as a clean one.
+            failed = failed.saturating_add(1);
         }
     }
 

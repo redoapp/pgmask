@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 //! Property tests for the maskers.
 //!
 //! Three rounds of attacking the masks by hand produced findings every time —
@@ -102,10 +108,23 @@ proptest! {
     fn integer_buckets_are_sound(v in any::<i32>(), bucket in 2i64..1_000_000) {
         let mut s = spec(Mask::NumericBucket);
         s.bucket = bucket;
-        let out = masker()
+        // Refusal is a legitimate outcome near the type's minimum: flooring
+        // can land below i32::MIN, and no in-range value is both a bucket
+        // boundary and <= the input. Clamping used to paper over that and
+        // served a value that was not a multiple of anything — the one thing a
+        // bucket mask promises. So refusing is allowed, but only when it is
+        // genuinely unrepresentable, and everything served still gets the full
+        // assertions below.
+        let Ok(Some(out)) = masker()
             .apply(&s, OID_INT4, FORMAT_BINARY, Some(Bytes::copy_from_slice(&v.to_be_bytes())))
-            .expect("must not error")
-            .expect("must produce a value");
+        else {
+            let floored = i64::from(v).div_euclid(bucket) * bucket;
+            prop_assert!(
+                floored < i64::from(i32::MIN),
+                "refused a value it could have bucketed: {} with bucket {}", v, bucket
+            );
+            return Ok(());
+        };
         prop_assert_eq!(out.len(), 4, "int4 must stay four bytes");
         let got = i32::from_be_bytes([out[0], out[1], out[2], out[3]]) as i64;
         prop_assert!(got <= v as i64, "bucketing must round down: {v} -> {got}");
@@ -118,12 +137,22 @@ proptest! {
     fn small_integer_buckets_do_not_wrap(v in any::<i16>(), bucket in 2i64..100_000) {
         let mut s = spec(Mask::NumericBucket);
         s.bucket = bucket;
-        let out = masker()
+        // Same rule as int4, and it bites sooner here: an i16 spans only
+        // 65536 values, so any bucket bigger than the distance from the input
+        // to i16::MIN has no representable boundary below it.
+        let Ok(Some(out)) = masker()
             .apply(&s, OID_INT2, FORMAT_BINARY, Some(Bytes::copy_from_slice(&v.to_be_bytes())))
-            .expect("must not error")
-            .expect("must produce a value");
+        else {
+            let floored = i64::from(v).div_euclid(bucket) * bucket;
+            prop_assert!(
+                floored < i64::from(i16::MIN),
+                "refused a value it could have bucketed: {} with bucket {}", v, bucket
+            );
+            return Ok(());
+        };
         let got = i16::from_be_bytes([out[0], out[1]]);
-        prop_assert!(got <= v, "bucketing must round down, never wrap: {v} -> {got}");
+        prop_assert!(got <= v, "bucketing must round down, never wrap: {} -> {}", v, got);
+        prop_assert_eq!(i64::from(got).rem_euclid(bucket), 0, "served value must be a bucket");
     }
 
     /// Date truncation must produce a real date, and must be idempotent.

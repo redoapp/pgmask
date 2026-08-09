@@ -109,3 +109,48 @@ process as the migrations it tracks. Two things follow from that:
   from the catalog comes back blank, so "only list the sensitive ones" produces
   a database where most columns are empty. `classify` emits an entry for every
   column for this reason.
+
+## Build-time checks
+
+These are configured in the workspace, so `cargo build` and `cargo clippy`
+enforce them without anyone remembering to pass a flag.
+
+```toml
+[profile.release]
+overflow-checks = true      # release arithmetic panics instead of wrapping
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"        # zero in the library and binaries
+panic = "deny"              # zero in the library and binaries
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+```
+
+`overflow-checks` in release is the one that is easy to skip and shouldn't be.
+This binary does date and bucket arithmetic on attacker-influenced bytes, and
+fuzzing already found an overflow in `floor_to` at `i64::MIN` — caught only
+because the *debug* build panics. Without this the release build would have
+wrapped silently and masked the wrong value. A panic kills one session; a
+wrapped integer is a wrong answer nobody notices.
+
+Test code carries an `#![allow(...)]` for these: an assertion is a deliberate
+panic, and denying `unwrap` in tests buys nothing.
+
+### Supply chain
+
+```bash
+cargo audit      # advisories against Cargo.lock
+cargo machete    # unused dependencies
+```
+
+`.cargo/audit.toml` holds the ignore list. There is exactly one entry, and the
+rule for adding another is that it must be justified by evidence rather than by
+convenience — the current one records that `rkyv` reaches the lockfile as an
+unactivated optional feature of `rust_decimal`, verified by `cargo tree -i`
+returning nothing and a full release build producing zero rkyv artifacts.
+
+`cargo machete` reports `iban_validate` as unused. That is a false positive: the
+crate's library name is `iban`, and it is used as `parse::<iban::Iban>()`.

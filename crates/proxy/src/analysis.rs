@@ -289,12 +289,22 @@ fn unwrap_star_over_subquery(select: &SelectStmt) -> Option<&SelectStmt> {
     let Some(NodeEnum::ColumnRef(col)) = target.val.as_ref().and_then(|v| v.node.as_ref()) else {
         return None;
     };
-    let is_bare_star =
-        col.fields.len() == 1 && matches!(col.fields[0].node.as_ref(), Some(NodeEnum::AStar(_)));
-    if !is_bare_star {
+    // Slice patterns rather than a length check plus an index: the compiler
+    // enforces the correspondence, where `len() == 1` followed by `[0]` only
+    // reads as if it does.
+    let [NodeEnum::AStar(_)] = [col
+        .fields
+        .as_slice()
+        .first()
+        .and_then(|f| f.node.as_ref())
+        .filter(|_| col.fields.len() == 1)?]
+    else {
         return None;
-    }
-    match select.from_clause[0].node.as_ref() {
+    };
+    let [only_from] = select.from_clause.as_slice() else {
+        return None;
+    };
+    match only_from.node.as_ref() {
         Some(NodeEnum::RangeSubselect(sub)) => {
             match sub.subquery.as_ref().and_then(|q| q.node.as_ref()) {
                 Some(NodeEnum::SelectStmt(inner)) => Some(inner),
@@ -383,7 +393,9 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
             // `width_bucket` is absent for the same reason: the bucket count is
             // caller-controlled and can be made lossless.
             if call.over.is_none() && name == "date_trunc" && call.args.len() >= 2 {
-                if coarse_unit_literal(&call.args[0]) {
+                // `first()` cannot be None here, but expressing that as a
+                // fallible read costs nothing and removes the panic entirely.
+                if call.args.first().is_some_and(coarse_unit_literal) {
                     return Safety::Releasable;
                 }
                 return Safety::Unknown;
@@ -490,10 +502,10 @@ fn coarse_unit_literal(arg: &pg_query::protobuf::Node) -> bool {
 /// telling them apart means resolving search_path. Refusing qualified names
 /// costs a little utility and removes the question.
 fn function_name(parts: &[pg_query::protobuf::Node]) -> Option<String> {
-    if parts.len() != 1 {
+    let [only] = parts else {
         return None;
-    }
-    match parts[0].node.as_ref()? {
+    };
+    match only.node.as_ref()? {
         NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
         _ => None,
     }
@@ -717,6 +729,12 @@ pub fn every_relation_is_qualified(sql: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
 
     // --- system catalogs ---------------------------------------------------
 

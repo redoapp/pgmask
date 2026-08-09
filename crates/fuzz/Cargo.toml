@@ -12,3 +12,6 @@ jiff.workspace = true
 tokio.workspace = true
 tokio-postgres = { workspace = true, features = ["with-uuid-1", "with-jiff-0_2"] }
 uuid = "1.24.0"
+
+[lints]
+workspace = true

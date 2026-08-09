@@ -24,7 +24,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-
 tokio-postgres.workspace = true
 toml.workspace = true
 tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
 tokio-postgres-rustls.workspace = true
 pg_query.workspace = true
 jiff.workspace = true
@@ -39,8 +38,12 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false, feat
 sqllineage = "0.2"
 regex = "1.13.1"
 iban_validate = "5.0.1"
+rustls-pki-types = "1.15.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
 proptest.workspace = true
 pgwire = { version = "0.40", default-features = false }
+
+[lints]
+workspace = true

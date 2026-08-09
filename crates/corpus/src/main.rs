@@ -120,7 +120,10 @@ async fn main() -> Result<()> {
                     .map(|e| e.message().to_string())
                     .unwrap_or_else(|| err.to_string());
                 if msg.contains("pgmask:") {
-                    *causes.entry(cause_of(&msg)).or_default() += 1;
+                    causes
+                        .entry(cause_of(&msg))
+                        .and_modify(|n| *n = n.saturating_add(1))
+                        .or_insert(1);
                     refused_names.push(name.clone());
                     Outcome::Refused
                 } else {
@@ -129,13 +132,18 @@ async fn main() -> Result<()> {
                 }
             }
         };
-        *counts.entry(outcome).or_default() += 1;
+        counts
+            .entry(outcome)
+            .and_modify(|n| *n = n.saturating_add(1))
+            .or_insert(1);
     }
 
     let described = *counts.get(&Outcome::Described).unwrap_or(&0);
     let refused = *counts.get(&Outcome::Refused).unwrap_or(&0);
     let skipped = *counts.get(&Outcome::NotOurFault).unwrap_or(&0);
-    let judged = described + refused;
+    // Saturating: the denominator of the rejection rate. Wrapping it to zero
+    // would suppress the rate line entirely rather than report a wrong one.
+    let judged = described.saturating_add(refused);
 
     println!("\n{} file(s) in {dir}", files.len());
     println!("{}", "-".repeat(56));

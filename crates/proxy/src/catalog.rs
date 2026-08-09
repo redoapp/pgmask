@@ -664,9 +664,14 @@ impl Catalog {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = self.refresh_wanted.notified() => {
+                    // `saturating_sub`: the guard above already establishes
+                    // `since < min_interval`, but Duration subtraction panics
+                    // on underflow and a panic here would stop the refresher
+                    // for the life of the process — the catalog would then
+                    // silently stop tracking DDL.
                     let since = last.elapsed();
                     if since < min_interval {
-                        tokio::time::sleep(min_interval - since).await;
+                        tokio::time::sleep(min_interval.saturating_sub(since)).await;
                     }
                 }
             }
@@ -938,6 +943,12 @@ async fn resolve_snapshot(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
     #[test]
     fn config_parses_semantic_types_roles_and_params() {
@@ -1039,6 +1050,12 @@ by_role = { analyst = "partial" }
 
 #[cfg(test)]
 mod secret_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     #[test]

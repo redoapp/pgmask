@@ -89,9 +89,17 @@ pub struct Message {
 impl Message {
     /// Build a message from a tag and body, encoding the frame once.
     pub fn new(tag: u8, body: Bytes) -> Self {
-        let mut raw = BytesMut::with_capacity(body.len() + 5);
+        // The length word counts itself plus the body. Every body is either a
+        // slice of a frame that an i32 length already bounded, or short text
+        // pgmask generated itself, so neither sum can overflow — the saturating
+        // forms make that provable rather than assumed.
+        let mut raw = BytesMut::with_capacity(body.len().saturating_add(5));
         raw.put_u8(tag);
-        raw.put_i32(body.len() as i32 + 4);
+        raw.put_i32(
+            i32::try_from(body.len())
+                .unwrap_or(i32::MAX)
+                .saturating_add(4),
+        );
         raw.put_slice(&body);
         let raw = raw.freeze();
         let body = raw.slice(5..);
@@ -99,8 +107,10 @@ impl Message {
     }
 
     /// Wrap a complete frame already read off the wire.
-    fn from_frame(raw: Bytes) -> Self {
-        let tag = raw[0];
+    ///
+    /// The tag is passed in rather than re-read from `raw[0]`: both callers have
+    /// already established it, so there is no length assumption to restate here.
+    fn from_frame(tag: u8, raw: Bytes) -> Self {
         let body = raw.slice(5..);
         Self { tag, body, raw }
     }
@@ -124,8 +134,14 @@ pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 
 impl StartupPacket {
     pub fn encode(&self) -> Bytes {
-        let mut out = BytesMut::with_capacity(self.body.len() + 8);
-        out.put_i32(self.body.len() as i32 + 8);
+        // A startup body only ever comes from a packet whose length was already
+        // range-checked to at most 1 MiB, so these sums cannot overflow.
+        let mut out = BytesMut::with_capacity(self.body.len().saturating_add(8));
+        out.put_i32(
+            i32::try_from(self.body.len())
+                .unwrap_or(i32::MAX)
+                .saturating_add(8),
+        );
         out.put_i32(self.code);
         out.put_slice(&self.body);
         out.freeze()
@@ -220,25 +236,36 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 }
 
 fn try_take_message(buf: &mut BytesMut) -> Result<Option<Message>> {
-    if buf.len() < 5 {
+    // Nothing can be decided until the whole `[tag][len]` header is buffered;
+    // a short buffer is "not yet", not "malformed".
+    let Some(&[tag, l0, l1, l2, l3]) = buf.get(..5) else {
         return Ok(None);
-    }
-    let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    };
+    let len = i32::from_be_bytes([l0, l1, l2, l3]);
     if len < 4 {
         bail!("invalid message length {len}");
     }
-    let total = 1 + len as usize;
+    // `len` is attacker-controlled and counts itself but not the tag byte. A
+    // total that does not fit a usize is refused rather than wrapped into a
+    // small one, which would frame the next bytes as a message of our choosing.
+    let Some(total) = usize::try_from(len).ok().and_then(|n| n.checked_add(1)) else {
+        bail!("message length {len} does not fit this platform");
+    };
     if buf.len() < total {
         return Ok(None);
     }
-    Ok(Some(Message::from_frame(buf.split_to(total).freeze())))
+    Ok(Some(Message::from_frame(tag, buf.split_to(total).freeze())))
 }
 
 fn try_take_startup(buf: &mut BytesMut) -> Result<Option<StartupPacket>> {
     if buf.len() < 8 {
         return Ok(None);
     }
-    let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    // The `< 8` guard above means the four length bytes are always present.
+    let Some(&[l0, l1, l2, l3]) = buf.get(..4) else {
+        return Ok(None);
+    };
+    let len = i32::from_be_bytes([l0, l1, l2, l3]);
     if !(8..=1_048_576).contains(&len) {
         bail!("implausible startup packet length {len}");
     }
@@ -272,8 +299,11 @@ fn read_i32(buf: &mut Bytes) -> Option<i32> {
 
 pub fn read_cstring(buf: &mut Bytes) -> Option<String> {
     let end = buf.iter().position(|b| *b == 0)?;
-    let s = String::from_utf8_lossy(&buf[..end]).into_owned();
-    buf.advance(end + 1);
+    // `position` found the NUL inside the buffer, so `end` is a valid split
+    // point and `end + 1` (the NUL itself) is still in bounds. `get` keeps the
+    // no-NUL case on the `None` path rather than on a slice panic.
+    let s = String::from_utf8_lossy(buf.get(..end)?).into_owned();
+    buf.advance(end.saturating_add(1));
     Some(s)
 }
 
@@ -360,13 +390,18 @@ pub fn parse_data_row(body: &Bytes) -> Result<Vec<Option<Bytes>>> {
 /// letting `Message::new` copy it again — this runs once per masked row, so the
 /// second copy is not free.
 pub fn build_data_row(values: &[Option<Bytes>]) -> Message {
-    let size: usize = values
-        .iter()
-        .map(|v| 4 + v.as_ref().map_or(0, |b| b.len()))
-        .sum();
-    let mut frame = BytesMut::with_capacity(7 + size);
+    // Each field costs a 4-byte length plus its bytes. The values came out of a
+    // frame that an i32 length already bounded and masks do not grow a row by
+    // orders of magnitude, so these sums cannot approach `usize::MAX`;
+    // saturating keeps the arithmetic total on a path that has no caller-visible
+    // failure mode.
+    let size = values.iter().fold(0usize, |acc, v| {
+        acc.saturating_add(4)
+            .saturating_add(v.as_ref().map_or(0, |b| b.len()))
+    });
+    let mut frame = BytesMut::with_capacity(size.saturating_add(7));
     frame.put_u8(B_DATA_ROW);
-    frame.put_i32((6 + size) as i32);
+    frame.put_i32(i32::try_from(size).unwrap_or(i32::MAX).saturating_add(6));
     frame.put_i16(values.len() as i16);
     for v in values {
         match v {
@@ -377,7 +412,7 @@ pub fn build_data_row(values: &[Option<Bytes>]) -> Message {
             }
         }
     }
-    Message::from_frame(frame.freeze())
+    Message::from_frame(B_DATA_ROW, frame.freeze())
 }
 
 // --- SASL mechanism negotiation ---------------------------------------------
@@ -527,6 +562,13 @@ pub enum DescribeTarget {
 /// `Describe` is `[kind: u8][name: cstring]`.
 pub fn parse_describe(body: &Bytes) -> Option<DescribeTarget> {
     let mut buf = body.clone();
+    // `get_u8` panics on an empty body, and a zero-length Describe is one frame
+    // a hostile client can send. Treat it like any other unparseable Describe:
+    // no target, so no slot is queued and the coming RowDescription is planned
+    // from scratch instead of inheriting one.
+    if buf.is_empty() {
+        return None;
+    }
     let kind = buf.get_u8();
     let name = read_cstring(&mut buf)?;
     match kind {
@@ -588,9 +630,10 @@ pub fn parse_bind_result_formats(body: &Bytes) -> Option<Vec<i16>> {
 
 /// The format for output field `index`, given a `Bind`'s result format codes.
 pub fn format_for(formats: &[i16], index: usize) -> i16 {
-    match formats.len() {
-        0 => 0,
-        1 => formats[0],
+    match formats {
+        [] => 0,
+        // One code applies to every column, per the Bind message spec.
+        [only] => *only,
         _ => formats.get(index).copied().unwrap_or(0),
     }
 }
@@ -617,6 +660,12 @@ pub fn parse_execute(body: &Bytes) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     #[test]

@@ -11,6 +11,8 @@ use std::io;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::PrivateKeyDer;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::rustls::client::danger::{
@@ -44,7 +46,11 @@ pub type BoxStream = Box<dyn Stream>;
 pub fn load_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
     let certs: Vec<CertificateDer<'static>> = {
         let bytes = std::fs::read(cert_path).with_context(|| format!("reading {cert_path}"))?;
-        rustls_pemfile::certs(&mut bytes.as_slice())
+        // `rustls-pki-types` rather than `rustls-pemfile`: the latter is
+        // flagged unmaintained (RUSTSEC-2025-0134) and its PEM parsing moved
+        // into pki-types, which rustls already depends on. One fewer
+        // unmaintained crate on the path that terminates TLS.
+        CertificateDer::pem_slice_iter(&bytes)
             .collect::<std::result::Result<Vec<_>, _>>()
             .with_context(|| format!("parsing certificates from {cert_path}"))?
     };
@@ -54,9 +60,8 @@ pub fn load_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
 
     let key = {
         let bytes = std::fs::read(key_path).with_context(|| format!("reading {key_path}"))?;
-        rustls_pemfile::private_key(&mut bytes.as_slice())
-            .with_context(|| format!("parsing a private key from {key_path}"))?
-            .with_context(|| format!("{key_path} contained no private key"))?
+        PrivateKeyDer::from_pem_slice(&bytes)
+            .with_context(|| format!("no usable private key in {key_path}"))?
     };
 
     let config = ServerConfig::builder()

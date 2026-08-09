@@ -163,7 +163,11 @@ pub fn describe() {
 /// rejection-cause question got answered in the first place.
 #[derive(Debug, Default)]
 pub struct Metrics {
-    counters: [AtomicU64; 11],
+    // Sized from the enum, not from a literal. `[AtomicU64; 11]` indexed by
+    // `Cause::index()` was correct only for as long as nobody added a variant,
+    // and the failure would have been a panic on the rejection path — the one
+    // place the proxy most needs to keep working.
+    counters: [AtomicU64; Cause::ALL.len()],
     result_sets_masked: AtomicU64,
     fields_masked: AtomicU64,
     /// Opaque fields passed through because they were positively identified as
@@ -173,7 +177,9 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn record(&self, cause: Cause) {
-        self.counters[cause.index()].fetch_add(1, Ordering::Relaxed);
+        if let Some(counter) = self.counters.get(cause.index()) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         // A label rather than a metric per cause, so a new `Cause` variant
         // needs no exporter change and queries can sum across causes.
         metrics::counter!("pgmask_rejections_total", "cause" => cause.label()).increment(1);
@@ -232,14 +238,20 @@ impl Metrics {
             ),
         ];
         for cause in Cause::ALL {
-            let n = self.counters[cause.index()].load(Ordering::Relaxed);
+            let n = self
+                .counters
+                .get(cause.index())
+                .map_or(0, |c| c.load(Ordering::Relaxed));
             if n > 0 {
                 parts.push(format!("{}={n}", cause.label()));
             }
         }
         // The number the Phase 6 decision actually turns on.
         if total > 0 {
-            let setop = self.counters[Cause::OpaqueNamedLikeColumn.index()].load(Ordering::Relaxed);
+            let setop = self
+                .counters
+                .get(Cause::OpaqueNamedLikeColumn.index())
+                .map_or(0, |c| c.load(Ordering::Relaxed));
             parts.push(format!(
                 "set_op_like_share={:.0}%",
                 (setop as f64 / total as f64) * 100.0
@@ -251,6 +263,12 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
     use crate::mask::Mask;
 

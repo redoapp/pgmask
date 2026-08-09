@@ -70,20 +70,20 @@ fn shape_leak(value: &str) -> Option<&'static str> {
         }
     }
     // 1975-02-03 escaped; 1975-01-01 is correctly masked.
+    //
+    // Matched over bytes rather than by slicing the `&str`: a ten-byte window
+    // starting at a `19` can end in the middle of a multi-byte character, and
+    // `&value[i..i + 10]` panics there rather than declining to match.
+    let bytes = value.as_bytes();
     for (i, _) in value.match_indices("19") {
-        let window = &value[i..];
-        if window.len() >= 10 {
-            let d = &window[..10];
-            let bytes = d.as_bytes();
-            if bytes[4] == b'-'
-                && bytes[7] == b'-'
-                && d[..4].chars().all(|c| c.is_ascii_digit())
-                && d[5..7].chars().all(|c| c.is_ascii_digit())
-                && d[8..].chars().all(|c| c.is_ascii_digit())
-                && &d[5..] != "01-01"
-            {
-                return Some("fz.people.birth_date (not truncated to its year)");
-            }
+        let Some(&[_, _, y2, y3, b'-', m0, m1, b'-', d0, d1]) = bytes.get(i..i.saturating_add(10))
+        else {
+            continue;
+        };
+        // `19` is already known; the remaining eight bytes have to be a date,
+        // and `01-01` is what year truncation produces.
+        if [y2, y3, m0, m1, d0, d1].iter().all(u8::is_ascii_digit) && [m0, m1, d0, d1] != *b"0101" {
+            return Some("fz.people.birth_date (not truncated to its year)");
         }
     }
     None
@@ -103,7 +103,7 @@ fn shape_from(response: &[SimpleQueryMessage]) -> (usize, Vec<String>) {
         let SimpleQueryMessage::Row(row) = message else {
             continue;
         };
-        rows += 1;
+        rows = rows.saturating_add(1);
         for i in 0..row.len() {
             values.push(match row.try_get(i) {
                 Ok(Some(v)) => v.to_string(),
@@ -125,7 +125,7 @@ async fn shape_of_result(
         let SimpleQueryMessage::Row(row) = message else {
             continue;
         };
-        rows += 1;
+        rows = rows.saturating_add(1);
         for i in 0..row.len() {
             values.push(match row.try_get(i) {
                 Ok(Some(v)) => v.to_string(),
@@ -183,6 +183,10 @@ async fn main() -> Result<()> {
     let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
     let queries = statements(&text);
 
+    // Every counter below is bumped with `saturating_add`. A wrapped counter
+    // reads as zero, and zero is not a small number here: it is what the
+    // vacuity guards take as "this run proved nothing", and what the leak
+    // count would have to be for the run to be reported clean.
     let mut served = 0usize;
     let mut refused = 0usize;
     let mut errored = 0usize;
@@ -244,7 +248,7 @@ async fn main() -> Result<()> {
         let skip_mirror = NONDETERMINISTIC.iter().any(|k| lowered.contains(k));
 
         if mirror && skip_mirror {
-            nondeterministic += 1;
+            nondeterministic = nondeterministic.saturating_add(1);
         } else if mirror {
             // Run the query twice against the database first. Generated SQL is
             // not all deterministic — volatile functions, LIMIT with no ORDER
@@ -255,7 +259,7 @@ async fn main() -> Result<()> {
             let baseline = shape_of_result(&direct, sql).await;
             let repeat = shape_of_result(&direct2, sql).await;
             if baseline.is_some() && baseline != repeat {
-                nondeterministic += 1;
+                nondeterministic = nondeterministic.saturating_add(1);
             } else {
                 // Compared below, against the single proxy call the main path
                 // makes. Querying the proxy twice here made its own rejection
@@ -267,8 +271,8 @@ async fn main() -> Result<()> {
 
         if let Some(found) = tokens_in_result(&direct, sql).await {
             if !found.is_empty() {
-                queries_reaching_masked_data += 1;
-                tokens_visible_directly += found.len();
+                queries_reaching_masked_data = queries_reaching_masked_data.saturating_add(1);
+                tokens_visible_directly = tokens_visible_directly.saturating_add(found.len());
             }
         }
 
@@ -283,27 +287,27 @@ async fn main() -> Result<()> {
                     .as_db_error()
                     .is_some_and(|db| db.message().starts_with("pgmask:"));
                 if is_refusal {
-                    refused += 1;
+                    refused = refused.saturating_add(1);
                 } else {
-                    errored += 1;
+                    errored = errored.saturating_add(1);
                 }
                 // A dead connection must not silently turn the rest of the run
                 // into vacuous passes.
                 if client.is_closed() {
                     client = connect(&url).await?;
-                    reconnects += 1;
+                    reconnects = reconnects.saturating_add(1);
                 }
                 continue;
             }
         };
 
-        served += 1;
+        served = served.saturating_add(1);
         if mirror {
             if let Some((dr, dv)) = mirror_baseline.take() {
                 let (pr, pv) = shape_from(&response);
-                compared += 1;
+                compared = compared.saturating_add(1);
                 if dr != pr {
-                    row_count_mismatch += 1;
+                    row_count_mismatch = row_count_mismatch.saturating_add(1);
                     if value_mismatch.len() < 5 {
                         value_mismatch.push((
                             format!("{dr} rows"),
@@ -432,7 +436,10 @@ async fn main() -> Result<()> {
     if !leaks.is_empty() {
         let mut by_column: BTreeMap<&str, usize> = BTreeMap::new();
         for (column, _, _) in &leaks {
-            *by_column.entry(column.as_str()).or_default() += 1;
+            by_column
+                .entry(column.as_str())
+                .and_modify(|n| *n = n.saturating_add(1))
+                .or_insert(1);
         }
         println!("\nmasked values reached the client:");
         for (column, count) in by_column {

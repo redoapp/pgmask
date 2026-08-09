@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 //! Phase 4 criteria 2 and 3: the canary property test and the adversarial suite.
 //!
 //! Every test drives the proxy from a raw wire client and asserts that no

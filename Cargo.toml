@@ -3,6 +3,31 @@ resolver = "2"
 members = ["crates/spike", "crates/proxy", "crates/bench", "crates/corpus",
     "crates/fuzz", "crates/classify"]
 
+[profile.release]
+# Arithmetic that overflows wraps silently in release by default. This binary
+# decodes attacker-influenced bytes and does date and bucket arithmetic on
+# them, and fuzzing already found an overflow in `floor_to` at i64::MIN — that
+# one was caught because the debug build panicked. Paying a few percent to make
+# the release build behave the same way is the right trade for a masking proxy:
+# a panic kills one session, a wrapped integer silently masks the wrong value.
+overflow-checks = true
+
+[workspace.lints.rust]
+# Zero today, and there is no reason for this crate ever to need it.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Both are already zero in the library and binaries. Denying them costs nothing
+# now and stops the first one arriving unnoticed on a path where a panic takes
+# out a live session.
+unwrap_used = "deny"
+panic = "deny"
+# 50 and 31 hits respectively, all in code that parses untrusted bytes, so
+# each one is a potential panic or a silent wrap. Too many to fix in one go;
+# warn keeps them visible rather than pretending they are not there.
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -19,7 +44,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
 toml = "0.8"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pemfile = "2"
 tokio-postgres-rustls = "0.13"
 pg_query = "6"
 proptest = "1"

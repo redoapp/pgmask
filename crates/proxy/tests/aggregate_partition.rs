@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 //! Pins which of Postgres's aggregates pgmask releases.
 //!
 //! The list of value-returning functions is the load-bearing artifact of the

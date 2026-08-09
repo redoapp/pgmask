@@ -292,7 +292,7 @@ async fn main() -> Result<()> {
     for column in columns {
         let mut proposal = classify_by_name(&rules, column);
         if proposal.refuted_by_width {
-            refuted_by_width += 1;
+            refuted_by_width = refuted_by_width.saturating_add(1);
         }
 
         // Confirm against the data where a check exists and sampling is on.
@@ -429,7 +429,9 @@ fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
     println!("  columns in the database   {}", live.len());
     println!(
         "  rules covering them       {}",
-        live.len() - unclassified.len()
+        // `unclassified` is a subset of `live`, so this never saturates; if it
+        // somehow did it would under-report coverage, not over-report it.
+        live.len().saturating_sub(unclassified.len())
     );
 
     if !unclassified.is_empty() {
@@ -446,7 +448,7 @@ fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
             println!("  {relation}.{column}{hint}");
         }
         if unclassified.len() > 40 {
-            println!("  ... and {} more", unclassified.len() - 40);
+            println!("  ... and {} more", unclassified.len().saturating_sub(40));
         }
     }
 
@@ -553,12 +555,12 @@ async fn sample_column(
         column.name, column.schema, column.table, column.name
     );
     let rows = client.query(&sql, &[]).await?;
-    let mut matching = 0;
+    let mut matching = 0usize;
     for row in &rows {
         let value: Option<String> = row.get(0);
         if let Some(value) = value {
             if validator(&value) {
-                matching += 1;
+                matching = matching.saturating_add(1);
             }
         }
     }
@@ -665,12 +667,18 @@ fn emit_catalog(proposals: &[Proposal], schema: &str) {
 fn arg(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
+        .and_then(|i| args.get(i.saturating_add(1)))
         .cloned()
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     /// Classify a bare (name, type) pair the way a schema walk would.

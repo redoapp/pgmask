@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 //! Property tests for the wire parsers and the SQL analysis.
 //!
 //! Different stakes from the mask fuzzing. A wrong mask returns a wrong value;
@@ -30,6 +36,34 @@ proptest! {
     }
 
     #[test]
+    /// Every remaining frontend parser, against arbitrary bytes.
+    ///
+    /// The four parsers above had this property and six did not, and the gap is
+    /// exactly where a bug lived: `parse_describe` called `Bytes::get_u8()`
+    /// with no length check, so a bare `Describe` with a zero-length body —
+    /// one frame, no authentication required — panicked the connection task.
+    /// Covering some parsers and not others is how that survives.
+    #[test]
+    fn every_frontend_parser_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+        let body = Bytes::from(bytes);
+        let _ = parse_describe(&body);
+        let _ = parse_bind(&body);
+        let _ = parse_bind_result_formats(&body);
+        let _ = parse_execute(&body);
+        let _ = parse_parse(&body);
+        let _ = parse_simple_query(&body);
+    }
+
+    /// Indexing into the result-format codes must hold for any index, since the
+    /// field count comes from the server and the codes come from the client.
+    #[test]
+    fn format_lookup_never_panics(
+        formats in proptest::collection::vec(any::<i16>(), 0..8),
+        index in 0usize..32,
+    ) {
+        let _ = format_for(&formats, index);
+    }
+
     fn startup_parameter_parsing_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
         let packet = StartupPacket { code: 196608, body: Bytes::from(bytes) };
         let _ = packet.parameters();
@@ -152,4 +186,15 @@ fn framing_reassembles_across_arbitrary_splits() {
         }
         let _ = &mut std::io::Cursor::new(Vec::<u8>::new()).read_u8();
     });
+}
+
+/// The exact body that used to take down a connection.
+///
+/// Framing accepts a `Describe` with `len == 4`, i.e. an empty body, and the
+/// parser read a tag byte out of it with no length check. One frame, no
+/// authentication required, and the connection task panicked. Verified against
+/// the pre-fix code: `Bytes::new().get_u8()` panics.
+#[test]
+fn a_zero_length_describe_is_refused_rather_than_fatal() {
+    assert!(parse_describe(&Bytes::new()).is_none());
 }

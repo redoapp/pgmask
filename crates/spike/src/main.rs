@@ -225,7 +225,8 @@ async fn main() -> Result<()> {
     let md_path = args
         .iter()
         .position(|a| a == "--md")
-        .and_then(|i| args.get(i + 1))
+        .and_then(|i| i.checked_add(1))
+        .and_then(|i| args.get(i))
         .cloned();
 
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
@@ -297,7 +298,8 @@ async fn main() -> Result<()> {
     println!("\n{}", "=".repeat(110));
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for r in &records {
-        *counts.entry(r.verdict().label()).or_default() += 1;
+        let n: &mut usize = counts.entry(r.verdict().label()).or_default();
+        *n = n.saturating_add(1);
     }
     let mut totals: Vec<_> = counts.iter().collect();
     totals.sort();

@@ -134,6 +134,7 @@ It cut the false-rejection rate on a real workload from 23% to 6%.
 ./scripts/test-tls.sh            # TLS on both legs via a real psql, 7 assertions
 ./scripts/test-versions.sh       # 23 assertions x Postgres 13,14,15,16,17
 cargo llvm-cov --release --summary-only   # coverage, after running the above
+cargo audit && cargo machete              # advisories and unused deps
 ```
 
 Or by hand:

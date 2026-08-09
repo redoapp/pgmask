@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 //! Phase 4 criteria 5 and 6: cancellation, and failing closed under stress.
 //!
 //! The theme: every one of these paths must end in "no data" rather than "some

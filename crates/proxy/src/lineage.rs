@@ -135,10 +135,12 @@ pub fn resolve(
     };
     // More than one statement means several result sets, and we would have to
     // know which one this `RowDescription` belongs to.
-    if results.len() != 1 {
+    // A slice pattern rather than a count check plus an index: the same
+    // "exactly one statement" rule, enforced by the compiler.
+    let [result] = results.as_slice() else {
         return unresolved;
-    }
-    let mappings = &results[0].columns.mappings;
+    };
+    let mappings = &result.columns.mappings;
     // Guard 3: positional correspondence, or nothing.
     if mappings.len() != field_count {
         return unresolved;
@@ -191,6 +193,12 @@ pub fn resolve(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
     use crate::mask::Mask;
 

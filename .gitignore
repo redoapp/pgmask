@@ -23,3 +23,4 @@ secrets/
 
 # TPC-DS corpus is TPC-licensed; fetched, never vendored.
 examples/tpcds/corpus/
+/**/*.proptest-regressions

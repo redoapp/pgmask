@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 //! Cross-check our wire decoder against an independent implementation.
 //!
 //! `crates/proxy/src/protocol.rs` is hand-written, and the case for that is in

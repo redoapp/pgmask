@@ -125,9 +125,12 @@ fn is_luhn(candidate: &str) -> bool {
         .enumerate()
         .map(|(i, d)| {
             if i % 2 == 1 {
-                let doubled = d * 2;
+                // `to_digit(10)` bounds each digit to 0..=9, so the double is at
+                // most 18 and the fold-back at least 1. The saturating forms
+                // state that bound rather than relying on it going unchecked.
+                let doubled = d.saturating_mul(2);
                 if doubled > 9 {
-                    doubled - 9
+                    doubled.saturating_sub(9)
                 } else {
                     doubled
                 }
@@ -169,18 +172,27 @@ fn is_phone_length(candidate: &str) -> bool {
 /// the same way and for the same reason.
 fn is_nhs_number(candidate: &str) -> bool {
     let digits: Vec<u32> = candidate.chars().filter_map(|c| c.to_digit(10)).collect();
-    if digits.len() != 10 {
+    // Held as a fixed array so the weighted sum and the check digit read out
+    // without a bounds check, and so a length other than ten declines here.
+    let Ok(digits) = <[u32; 10]>::try_from(digits.as_slice()) else {
         return false;
-    }
+    };
+    // Weights run 10 down to 2 across the first nine digits. Each digit is 0..=9
+    // and each weight at most 10, so no product exceeds 90 and the sum cannot
+    // reach the saturation bound.
     let sum: u32 = digits[..9]
         .iter()
-        .enumerate()
-        .map(|(i, d)| d * (10 - u32::try_from(i).expect("index fits")))
+        .zip((2..=10u32).rev())
+        .map(|(d, weight)| d.saturating_mul(weight))
         .sum();
-    let check = match 11 - (sum % 11) {
-        11 => 0,
-        10 => return false,
-        other => other,
+    // Matching on the remainder instead of on `11 - remainder` keeps the
+    // subtraction inside the arm where it is provably positive.
+    let check = match sum % 11 {
+        0 => 0,
+        // A remainder of 1 wants check digit 10, which no single digit can be.
+        1 => return false,
+        // `sum % 11` is 2..=10 here, so this never reaches zero.
+        remainder => 11u32.saturating_sub(remainder),
     };
     check == digits[9]
 }
@@ -209,13 +221,21 @@ fn scrub_free_text(text: &str) -> String {
     // Only the patterns that actually hit are run again to substitute, so a
     // value containing one address costs one rewrite rather than eight.
     let mut out = std::borrow::Cow::Borrowed(text);
-    for index in matched.iter() {
-        let (label, _, validator) = SCRUB_PATTERNS[index];
+    // Walked as a zip of the pattern table and its compiled regexes rather than
+    // by index: the `RegexSet` was built from `SCRUB_PATTERNS` in this order, and
+    // pairing them here means no lookup that could fall out of range and skip a
+    // pattern that was supposed to run.
+    for (index, (&(label, _, validator), regex)) in
+        SCRUB_PATTERNS.iter().zip(each.iter()).enumerate()
+    {
+        if !matched.matched(index) {
+            continue;
+        }
         out = std::borrow::Cow::Owned(match validator {
             // A pattern with a checksum only replaces what passes it. In a mask
             // that reveals, a false positive does not merely over-hide — it
             // rewrites readable text into a placeholder that was never there.
-            Some(valid) => each[index]
+            Some(valid) => regex
                 .replace_all(&out, |caps: &regex::Captures| {
                     let hit = &caps[0];
                     if valid(hit) {
@@ -225,7 +245,7 @@ fn scrub_free_text(text: &str) -> String {
                     }
                 })
                 .into_owned(),
-            None => each[index].replace_all(&out, label).into_owned(),
+            None => regex.replace_all(&out, label).into_owned(),
         });
     }
     out.into_owned()
@@ -247,7 +267,11 @@ fn canonical_uuid(bytes: &[u8], format: i16) -> Option<[u8; 16]> {
     for byte in &mut out {
         let hi = nibbles.next()?.to_digit(16)?;
         let lo = nibbles.next()?.to_digit(16)?;
-        *byte = u8::try_from(hi * 16 + lo).ok()?;
+        // Both nibbles are 0..=15 out of `to_digit(16)`, so the recombination
+        // cannot overflow; checked arithmetic keeps the impossible case on the
+        // same `None` path as a malformed digit, which the caller turns into
+        // `Undecodable` rather than a guessed byte.
+        *byte = u8::try_from(hi.checked_mul(16)?.checked_add(lo)?).ok()?;
     }
     // Anything left over is not a uuid, and guessing would mask two different
     // values to the same pseudonym.
@@ -569,7 +593,13 @@ impl Masker {
                 out
             }
             Some((_, domain)) => {
-                let mut out = String::with_capacity(PSEUDONYM_HEX_CHARS + 1 + domain.len());
+                // A capacity hint only, so saturating at `usize::MAX` would cost
+                // a reallocation and nothing else.
+                let mut out = String::with_capacity(
+                    PSEUDONYM_HEX_CHARS
+                        .saturating_add(1)
+                        .saturating_add(domain.len()),
+                );
                 hex_into(&digest[..PSEUDONYM_HEX_CHARS / 2], &mut out);
                 out.push('@');
                 out.push_str(domain);
@@ -592,29 +622,48 @@ fn text_op(bytes: &Bytes, f: impl Fn(&str) -> String) -> Bytes {
 
 fn partial(text: &str, keep: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= keep {
+    // The masked run is what is left after the kept tail. `checked_sub` filtered
+    // to a non-zero remainder is exactly the old `len <= keep` guard: with
+    // nothing left to star, the whole value is starred rather than revealed.
+    let Some(masked) = chars.len().checked_sub(keep).filter(|n| *n > 0) else {
         return "*".repeat(chars.len());
-    }
-    let tail: String = chars[chars.len() - keep..].iter().collect();
-    format!("{}{}", "*".repeat(chars.len() - keep), tail)
+    };
+    let tail: String = chars.iter().skip(masked).collect();
+    format!("{}{tail}", "*".repeat(masked))
 }
 
 fn inner(text: &str, keep: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= keep * 2 {
+    // `keep` characters at each end. A value too short to spare both ends — or a
+    // `keep` wide enough to overflow the doubling — is masked outright, which is
+    // the same answer the unchecked `len <= keep * 2` gave for every value it
+    // could compute.
+    let Some(masked) = keep
+        .checked_mul(2)
+        .and_then(|ends| chars.len().checked_sub(ends))
+        .filter(|n| *n > 0)
+    else {
         return "*".repeat(chars.len());
-    }
-    let head: String = chars[..keep].iter().collect();
-    let tail: String = chars[chars.len() - keep..].iter().collect();
-    format!("{head}{}{tail}", "*".repeat(chars.len() - keep * 2))
+    };
+    let head: String = chars.iter().take(keep).collect();
+    // Skipping the head and then the masked run lands on the last `keep`
+    // characters without recomputing an offset.
+    let tail: String = chars.iter().skip(keep).skip(masked).collect();
+    format!("{head}{}{tail}", "*".repeat(masked))
 }
 
 fn outer(text: &str, keep: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= keep * 2 {
+    // Mirror of `inner`: `kept` is the middle that survives, and a value with no
+    // middle left is masked outright.
+    let Some(kept) = keep
+        .checked_mul(2)
+        .and_then(|ends| chars.len().checked_sub(ends))
+        .filter(|n| *n > 0)
+    else {
         return "*".repeat(chars.len());
-    }
-    let middle: String = chars[keep..chars.len() - keep].iter().collect();
+    };
+    let middle: String = chars.iter().skip(keep).take(kept).collect();
     format!("{}{middle}{}", "*".repeat(keep), "*".repeat(keep))
 }
 
@@ -782,7 +831,15 @@ fn bucket_number(
         // accept; a decimal keeps the digits and renders a valid literal.
         if let Ok(v) = trimmed.parse::<rust_decimal::Decimal>() {
             let b = rust_decimal::Decimal::from(bucket);
-            let floored = (v / b).floor() * b;
+            // `Decimal`'s operators panic on overflow, which for a value near the
+            // 96-bit limit would take the connection down mid-stream. The checked
+            // forms refuse the value instead, and `bucket` is at least 1 so the
+            // division has no zero divisor.
+            let floored = v
+                .checked_div(b)
+                .map(|quotient| quotient.floor())
+                .and_then(|q| q.checked_mul(b))
+                .ok_or(MaskError::Undecodable { type_oid, format })?;
             return Ok(Bytes::from(floored.normalize().to_string()));
         }
         if let Ok(v) = trimmed.parse::<f64>() {
@@ -805,27 +862,36 @@ fn bucket_number(
         return Err(MaskError::Undecodable { type_oid, format });
     }
 
+    // `<[u8; N]>::try_from` on a slice succeeds only at exactly N bytes, so it
+    // carries the width check the arm guards used to do. A payload of the wrong
+    // size refuses with the same `Undecodable` the unmatched arm returns rather
+    // than decoding a prefix of a value it does not understand.
+    let undecodable = || MaskError::Undecodable { type_oid, format };
     match type_oid {
-        OID_INT2 if bytes.len() == 2 => {
-            let v = i16::from_be_bytes([bytes[0], bytes[1]]) as i64;
-            let out = floor_within(v, bucket, i16::MIN as i64, i16::MAX as i64);
-            let out = i16::try_from(out).expect("clamped into range above");
+        OID_INT2 => {
+            let raw = <[u8; 2]>::try_from(bytes.as_ref()).map_err(|_| undecodable())?;
+            let v = i64::from(i16::from_be_bytes(raw));
+            let out = floor_within(v, bucket, i64::from(i16::MIN), i64::from(i16::MAX))
+                .ok_or_else(undecodable)?;
+            let out = i16::try_from(out).map_err(|_| undecodable())?;
             Ok(Bytes::copy_from_slice(&out.to_be_bytes()))
         }
-        OID_INT4 if bytes.len() == 4 => {
-            let v = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64;
-            let out = floor_within(v, bucket, i32::MIN as i64, i32::MAX as i64);
-            let out = i32::try_from(out).expect("clamped into range above");
+        OID_INT4 => {
+            let raw = <[u8; 4]>::try_from(bytes.as_ref()).map_err(|_| undecodable())?;
+            let v = i64::from(i32::from_be_bytes(raw));
+            let out = floor_within(v, bucket, i64::from(i32::MIN), i64::from(i32::MAX))
+                .ok_or_else(undecodable)?;
+            let out = i32::try_from(out).map_err(|_| undecodable())?;
             Ok(Bytes::copy_from_slice(&out.to_be_bytes()))
         }
-        OID_INT8 if bytes.len() == 8 => {
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(&bytes[..8]);
+        OID_INT8 => {
+            let raw = <[u8; 8]>::try_from(bytes.as_ref()).map_err(|_| undecodable())?;
             let v = i64::from_be_bytes(raw);
             Ok(Bytes::copy_from_slice(&floor_to(v, bucket).to_be_bytes()))
         }
-        OID_FLOAT4 if bytes.len() == 4 => {
-            let v = f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64;
+        OID_FLOAT4 => {
+            let raw = <[u8; 4]>::try_from(bytes.as_ref()).map_err(|_| undecodable())?;
+            let v = f64::from(f32::from_be_bytes(raw));
             let b = bucket as f64;
             // Flooring a float4 near its minimum can push the result past what
             // an f32 holds, turning a masked value into -inf.
@@ -836,9 +902,8 @@ fn bucket_number(
             let narrowed = bucketed as f32;
             Ok(Bytes::copy_from_slice(&narrowed.to_be_bytes()))
         }
-        OID_FLOAT8 if bytes.len() == 8 => {
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(&bytes[..8]);
+        OID_FLOAT8 => {
+            let raw = <[u8; 8]>::try_from(bytes.as_ref()).map_err(|_| undecodable())?;
             let v = f64::from_be_bytes(raw);
             let b = bucket as f64;
             Ok(Bytes::copy_from_slice(&((v / b).floor() * b).to_be_bytes()))
@@ -863,8 +928,23 @@ fn floor_to(v: i64, bucket: i64) -> i64 {
 /// everything" — but the floor then sits below the type's minimum, and the cast
 /// wrapped it to a large positive number. `-1` with a bucket of 32769 came back
 /// as `32767`. Clamping keeps the guarantee that matters: never above the input.
-fn floor_within(v: i64, bucket: i64, min: i64, max: i64) -> i64 {
-    floor_to(v, bucket).clamp(min, max)
+/// Floor to a bucket boundary, or `None` if the boundary is out of range.
+///
+/// This used to `clamp`, and clamping breaks the one property a bucket mask
+/// promises: that the value you see is a bucket boundary. `-2146760705` with a
+/// bucket of `759365` floors to `-2147484220`, below `i32::MIN`, and the
+/// clamped `i32::MIN` is not a multiple of anything — so the output silently
+/// stopped being a bucket and started being "somewhere near the bottom of the
+/// range", which is a narrower statement about the real value than a bucket is.
+/// Found by `integer_buckets_are_sound` once proptest drew a large enough
+/// bucket; it predates the lint work.
+///
+/// Refusing is right: the proxy cannot represent the masked value in this
+/// column's type, and emitting something that is not a bucket is worse than
+/// emitting nothing.
+fn floor_within(v: i64, bucket: i64, min: i64, max: i64) -> Option<i64> {
+    let floored = floor_to(v, bucket);
+    (min..=max).contains(&floored).then_some(floored)
 }
 
 // --- Helpers ----------------------------------------------------------------
@@ -873,10 +953,20 @@ fn floor_within(v: i64, bucket: i64, min: i64, max: i64) -> i64 {
 /// version allocated a `String` for every byte of every digest, which showed up
 /// as roughly half the per-row masking cost in the throughput benchmark.
 fn hex_into(bytes: &[u8], out: &mut String) {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    for &byte in bytes {
+        for nibble in [byte >> 4, byte & 0x0f] {
+            // Derived rather than looked up in a digit table: a nibble is 0..=15
+            // by construction, but a table index the compiler cannot bound needs
+            // a miss branch, and there is no character a hex encoder could put
+            // there that would not corrupt the digest it is writing. The
+            // saturating forms only restate the bound — `b'0' + 9` and
+            // `b'a' + 5` are both far inside ASCII.
+            out.push(char::from(if nibble < 10 {
+                b'0'.saturating_add(nibble)
+            } else {
+                b'a'.saturating_add(nibble.saturating_sub(10))
+            }));
+        }
     }
 }
 
@@ -945,6 +1035,12 @@ impl std::fmt::Display for MaskError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     const TEXT: u32 = 25;
@@ -1442,6 +1538,12 @@ mod tests {
 
 #[cfg(test)]
 mod uuid_format_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     const RAW: [u8; 16] = [
@@ -1507,6 +1609,12 @@ mod uuid_format_tests {
 
 #[cfg(test)]
 mod scrub_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     fn scrub(text: &str) -> String {
@@ -1626,6 +1734,12 @@ mod scrub_tests {
 
 #[cfg(test)]
 mod scrub_pattern_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     #[test]
@@ -1670,6 +1784,12 @@ mod scrub_pattern_tests {
 
 #[cfg(test)]
 mod scrub_validator_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     #[test]
@@ -1737,5 +1857,70 @@ mod scrub_validator_tests {
         assert!(!is_nhs_number("123456789"));
         assert!(is_iban("GB33BUKB20201555555555"));
         assert!(!is_iban("GB00BUKB20201555555555"));
+    }
+}
+
+#[cfg(test)]
+mod overflow_regression_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
+    use super::*;
+
+    /// `numeric-bucket` on a `numeric` near the 96-bit limit used to panic.
+    ///
+    /// `(v / b).floor() * b` on `rust_decimal` panics on overflow, and the
+    /// value comes off the wire — so a single row could kill the connection
+    /// task mid-result-set. Verified against rust_decimal 1.42.1: the old
+    /// expression panics with "Multiplication overflowed". Refusing is the
+    /// right answer; a masking proxy that cannot mask a value must not emit it.
+    #[test]
+    fn a_numeric_at_the_limit_refuses_instead_of_panicking() {
+        let masker = Masker::new(b"k".to_vec());
+        let mut spec = MaskSpec::new(Mask::NumericBucket);
+        spec.bucket = 1000;
+        // Only the negative extreme overflows: flooring rounds towards minus
+        // infinity, so MIN goes past the limit while MAX floors safely inward.
+        let min = masker.apply(
+            &spec,
+            OID_NUMERIC,
+            FORMAT_TEXT,
+            Some(Bytes::from(rust_decimal::Decimal::MIN.to_string())),
+        );
+        assert!(
+            matches!(min, Err(MaskError::Undecodable { .. })),
+            "Decimal::MIN should refuse, got {min:?}"
+        );
+
+        let max = masker
+            .apply(
+                &spec,
+                OID_NUMERIC,
+                FORMAT_TEXT,
+                Some(Bytes::from(rust_decimal::Decimal::MAX.to_string())),
+            )
+            .expect("MAX floors inward and still buckets")
+            .expect("not null");
+        assert!(
+            String::from_utf8_lossy(&max).ends_with("000"),
+            "still bucketed: {:?}",
+            String::from_utf8_lossy(&max)
+        );
+    }
+
+    /// The ordinary case must still work, or the fix above is just a break.
+    #[test]
+    fn ordinary_numerics_still_bucket() {
+        let masker = Masker::new(b"k".to_vec());
+        let mut spec = MaskSpec::new(Mask::NumericBucket);
+        spec.bucket = 25_000;
+        let out = masker
+            .apply(&spec, OID_NUMERIC, FORMAT_TEXT, Some(Bytes::from("62200")))
+            .expect("masks")
+            .expect("not null");
+        assert_eq!(&out[..], b"50000");
     }
 }

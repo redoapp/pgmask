@@ -37,10 +37,15 @@ impl Stats {
         let mut sorted = self.samples.clone();
         sorted.sort();
         let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
-        sorted[idx]
+        // `measure` refuses to build an empty `Stats`, so the fallback is
+        // unreachable; a reported 0.000ms is not a plausible measurement and
+        // so cannot be mistaken for a fast one.
+        sorted.get(idx).copied().unwrap_or(Duration::ZERO)
     }
     fn mean(&self) -> Duration {
-        self.samples.iter().sum::<Duration>() / self.samples.len() as u32
+        let total: Duration = self.samples.iter().sum();
+        let n = u32::try_from(self.samples.len()).unwrap_or(u32::MAX);
+        total.checked_div(n).unwrap_or(Duration::ZERO)
     }
 }
 
@@ -49,6 +54,9 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<usize>>,
 {
+    // A zero-iteration run has no percentiles and no mean, and a table of
+    // 0.000ms would read as a measurement rather than as the absence of one.
+    anyhow::ensure!(iters > 0, "iters must be greater than zero");
     // Warm up: connection setup, plan caching, and the proxy's first-use paths.
     for _ in 0..(iters / 10).max(5) {
         op().await?;
@@ -132,8 +140,18 @@ async fn main() -> Result<()> {
     let p_stmt = proxy.prepare(&many).await?;
 
     // Confirm the proxy really is masking, so we are not benchmarking a no-op.
-    let direct_first: String = direct.query(&d_stmt, &[]).await?[0].get(0);
-    let proxy_first: String = proxy.query(&p_stmt, &[]).await?[0].get(0);
+    // No rows means there is nothing to compare and the check would pass by
+    // being empty, so it is an error rather than a skip.
+    let direct_rows = direct.query(&d_stmt, &[]).await?;
+    let proxy_rows = proxy.query(&p_stmt, &[]).await?;
+    let direct_first: String = direct_rows
+        .first()
+        .context("the throughput query returned no rows directly; the fixture is empty")?
+        .get(0);
+    let proxy_first: String = proxy_rows
+        .first()
+        .context("the throughput query returned no rows through the proxy")?
+        .get(0);
     println!(
         "\nsanity: direct={direct_first:?} proxy={proxy_first:?} -> {}",
         if direct_first == proxy_first {

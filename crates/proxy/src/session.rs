@@ -382,11 +382,16 @@ impl Session {
     /// ran with no roles. Same shape as the CopyData bug: logic in the outer
     /// read that the drain loop never saw.
     fn note_backend_auth(&mut self, msg: &Message) {
-        if self.authenticated
-            || msg.tag != protocol::B_AUTHENTICATION
-            || msg.body.len() < 4
-            || i32::from_be_bytes([msg.body[0], msg.body[1], msg.body[2], msg.body[3]]) != 0
-        {
+        if self.authenticated || msg.tag != protocol::B_AUTHENTICATION {
+            return;
+        }
+        // AuthenticationOk is sub-code 0. A body too short to carry the sub-code
+        // is not one, so the session stays unauthenticated and keeps the empty
+        // role set — the most restrictive classification.
+        let Some(&[c0, c1, c2, c3]) = msg.body.get(..4) else {
+            return;
+        };
+        if i32::from_be_bytes([c0, c1, c2, c3]) != 0 {
             return;
         }
         self.authenticated = true;
@@ -404,7 +409,10 @@ impl Session {
     fn reject(&mut self, rejection: Rejection, out: &mut Batch) {
         self.suppressing = true;
         self.active_plan = None;
-        self.rejected_result_sets += 1;
+        // Counters saturate rather than wrap: a wrapped rejection count would
+        // under-report a refusal, and a u64 cannot reach the ceiling in a
+        // connection's lifetime anyway.
+        self.rejected_result_sets = self.rejected_result_sets.saturating_add(1);
         self.policy.metrics.record(rejection.cause);
         let err = protocol::build_error(
             protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -591,7 +599,7 @@ impl Session {
             // The other path that emits rows with no RowDescription. Unrecoverable
             // mid-stream, so the connection goes down rather than the data out.
             protocol::B_COPY_OUT_RESPONSE | protocol::B_COPY_BOTH_RESPONSE => {
-                self.rejected_result_sets += 1;
+                self.rejected_result_sets = self.rejected_result_sets.saturating_add(1);
                 self.policy.metrics.record(Cause::CopyStream);
                 let err = protocol::build_error(
                     protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -627,7 +635,7 @@ impl Session {
             // past, but this is the byte-carrying message, so it is denied on
             // its own account rather than trusting the earlier check.
             protocol::B_COPY_DATA | protocol::B_COPY_DONE => {
-                self.rejected_result_sets += 1;
+                self.rejected_result_sets = self.rejected_result_sets.saturating_add(1);
                 self.policy.metrics.record(Cause::CopyStream);
                 let err = protocol::build_error(
                     protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -649,7 +657,7 @@ impl Session {
             }
 
             unknown => {
-                self.rejected_result_sets += 1;
+                self.rejected_result_sets = self.rejected_result_sets.saturating_add(1);
                 self.policy.metrics.record(Cause::UnknownBackendMessage);
                 let err = protocol::build_error(
                     protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -708,7 +716,8 @@ impl Session {
                 let snapshot = self.policy.catalog.snapshot();
                 let mut provenanced = 0usize;
                 let all_system = fields.iter().filter(|f| f.has_provenance()).all(|f| {
-                    provenanced += 1;
+                    // Bounded by `fields.len()`, so the saturation is unreachable.
+                    provenanced = provenanced.saturating_add(1);
                     snapshot.is_system_relation(f.table_oid)
                 });
                 // A result set of nothing but expressions gives the OID
@@ -851,7 +860,7 @@ impl Session {
             {
                 Ok(new_value) => {
                     changed = true;
-                    self.masked_fields += 1;
+                    self.masked_fields = self.masked_fields.saturating_add(1);
                     masked.push(new_value);
                 }
                 Err(err) => {
@@ -894,9 +903,22 @@ async fn read_startup_packet<S: AsyncReadExt + Unpin>(
     if !(8..=1_048_576).contains(&len) {
         anyhow::bail!("implausible startup packet length {len}");
     }
-    let mut rest = vec![0u8; len as usize - 4];
+    // `len` counts its own four bytes, so the remainder is `len - 4`. The range
+    // check above already guarantees at least four bytes remain; subtracting
+    // through `checked_sub` keeps the bound and the arithmetic from drifting
+    // apart if that check is ever loosened.
+    let body_len = usize::try_from(len)
+        .ok()
+        .and_then(|n| n.checked_sub(4))
+        .ok_or_else(|| anyhow::anyhow!("implausible startup packet length {len}"))?;
+    let mut rest = vec![0u8; body_len];
     stream.read_exact(&mut rest).await?;
-    let code = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    // Those four bytes are the request code. Refuse rather than guess one: the
+    // code is what decides SSLRequest vs CancelRequest vs StartupMessage.
+    let Some(&[c0, c1, c2, c3]) = rest.get(..4) else {
+        anyhow::bail!("startup packet too short to carry a request code");
+    };
+    let code = i32::from_be_bytes([c0, c1, c2, c3]);
     Ok(Some(protocol::StartupPacket {
         code,
         body: Bytes::from(rest).slice(4..),
@@ -1072,6 +1094,12 @@ pub async fn handle_connection(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
     use crate::protocol::FieldDescription;
 
