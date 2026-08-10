@@ -540,6 +540,14 @@ fn analyze_inspected(
 /// shape. `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT` on the outer query do not change
 /// which columns come out, so they are not obstacles.
 fn unwrap_star_over_subquery(select: &SelectStmt) -> Option<&SelectStmt> {
+    // Both halves are re-enforced structurally below, so this early return is
+    // defensive duplication rather than the load-bearing check: a set operation
+    // carries no top-level target list and fails the `[only]` pattern, and the
+    // `[only_from]` pattern admits exactly one source. `cargo mutants` reports
+    // flipping this `||` to `&&` as a survivor for that reason — it is an
+    // equivalent mutant, not a hole, and it is left in place rather than
+    // deleted because reading the guard here is cheaper than deriving it from
+    // two slice patterns forty lines apart.
     if select.op != SetOperation::SetopNone as i32 || select.from_clause.len() != 1 {
         return None;
     }
@@ -871,8 +879,11 @@ fn grouping_may_reference(
         targets: &[pg_query::protobuf::Node],
         into: &mut Vec<String>,
         depth: u32,
-        // Resolve output aliases here? True at the top of a grouping element,
-        // false once inside a target's value. Without it `SELECT city AS city
+        // Is this node a grouping *element* — the position where Postgres
+        // resolves both an output alias and an ordinal? True at the top of an
+        // item and through `ROLLUP`/`CUBE`/`GROUPING SETS`, which nest grouping
+        // elements; false inside any expression, and false below a resolved
+        // target. Without it `SELECT city AS city
         // … GROUP BY city` chases its own alias to the depth cap and reports
         // "unbounded", refusing six honest aggregations in the fixture.
         resolve_alias: bool,
@@ -904,7 +915,18 @@ fn grouping_may_reference(
                 Some(())
             }
             NodeEnum::AConst(constant) => {
-                // An ordinal names a target; anything else is a literal.
+                // An integer is an ordinal only as a grouping *element*.
+                // Nested in an expression it is an ordinary literal, and
+                // reading it as an ordinal was wrong in both directions:
+                // `GROUP BY coalesce(gcol, 0)` resolved `0` to nothing and
+                // declared the whole grouping unbounded — refusing an honest
+                // aggregate — while `GROUP BY gcol + 1` resolved `1` to the
+                // first target and dragged that target's columns in. Safe
+                // both times, wrong both times, and found by asserting that
+                // each arm actually reads what it claims to.
+                if !resolve_alias {
+                    return Some(());
+                }
                 if let Some(pg_query::protobuf::a_const::Val::Ival(value)) = constant.val.as_ref() {
                     let position = usize::try_from(value.ival).ok()?.checked_sub(1)?;
                     let Some(NodeEnum::ResTarget(target)) = targets.get(position)?.node.as_ref()
@@ -915,39 +937,37 @@ fn grouping_may_reference(
                 }
                 Some(())
             }
-            NodeEnum::TypeCast(cast) => walk(cast.arg.as_ref()?, targets, into, d, resolve_alias),
-            NodeEnum::CollateClause(c) => walk(c.arg.as_ref()?, targets, into, d, resolve_alias),
+            NodeEnum::TypeCast(cast) => walk(cast.arg.as_ref()?, targets, into, d, false),
+            NodeEnum::CollateClause(c) => walk(c.arg.as_ref()?, targets, into, d, false),
             NodeEnum::AExpr(expr) => {
                 for side in [expr.lexpr.as_ref(), expr.rexpr.as_ref()]
                     .into_iter()
                     .flatten()
                 {
-                    walk(side, targets, into, d, resolve_alias)?;
+                    walk(side, targets, into, d, false)?;
                 }
                 Some(())
             }
             NodeEnum::BoolExpr(expr) => {
                 for arg in &expr.args {
-                    walk(arg, targets, into, d, resolve_alias)?;
+                    walk(arg, targets, into, d, false)?;
                 }
                 Some(())
             }
             NodeEnum::CoalesceExpr(expr) => {
                 for arg in &expr.args {
-                    walk(arg, targets, into, d, resolve_alias)?;
+                    walk(arg, targets, into, d, false)?;
                 }
                 Some(())
             }
             NodeEnum::MinMaxExpr(expr) => {
                 for arg in &expr.args {
-                    walk(arg, targets, into, d, resolve_alias)?;
+                    walk(arg, targets, into, d, false)?;
                 }
                 Some(())
             }
-            NodeEnum::NullTest(test) => walk(test.arg.as_ref()?, targets, into, d, resolve_alias),
-            NodeEnum::BooleanTest(test) => {
-                walk(test.arg.as_ref()?, targets, into, d, resolve_alias)
-            }
+            NodeEnum::NullTest(test) => walk(test.arg.as_ref()?, targets, into, d, false),
+            NodeEnum::BooleanTest(test) => walk(test.arg.as_ref()?, targets, into, d, false),
             NodeEnum::FuncCall(call) => {
                 if call.over.is_some()
                     || call.agg_filter.is_some()
@@ -957,23 +977,23 @@ fn grouping_may_reference(
                     return None;
                 }
                 for arg in &call.args {
-                    walk(arg, targets, into, d, resolve_alias)?;
+                    walk(arg, targets, into, d, false)?;
                 }
                 Some(())
             }
             NodeEnum::CaseExpr(expr) => {
                 if let Some(arg) = expr.arg.as_ref() {
-                    walk(arg, targets, into, d, resolve_alias)?;
+                    walk(arg, targets, into, d, false)?;
                 }
                 for when in &expr.args {
                     let Some(NodeEnum::CaseWhen(when)) = when.node.as_ref() else {
                         return None;
                     };
-                    walk(when.expr.as_ref()?, targets, into, d, resolve_alias)?;
-                    walk(when.result.as_ref()?, targets, into, d, resolve_alias)?;
+                    walk(when.expr.as_ref()?, targets, into, d, false)?;
+                    walk(when.result.as_ref()?, targets, into, d, false)?;
                 }
                 if let Some(default) = expr.defresult.as_ref() {
-                    walk(default, targets, into, d, resolve_alias)?;
+                    walk(default, targets, into, d, false)?;
                 }
                 Some(())
             }
@@ -2691,6 +2711,183 @@ mod referenced_identifier_probe {
         assert_eq!(
             permitted("SELECT date_trunc(u, birth_date) FROM t"),
             vec![Safety::Unknown]
+        );
+    }
+
+    /// Every node type `grouping_may_reference` claims to read, read.
+    ///
+    /// Deleting any arm makes it fall to `_ => None`, which the caller treats
+    /// as "could reference anything" and refuses — the safe direction, so no
+    /// leak, and therefore nothing failed. `cargo mutants` reported fourteen
+    /// such survivors in this one function: every arm was precision-only and
+    /// none was pinned.
+    ///
+    /// Precision is the whole point of the arms. Without them a grouping like
+    /// `date_trunc('month', ts)` is unbounded, the aggregate over it is
+    /// refused, and ordinary time bucketing stops working — which is exactly
+    /// the regression 0.1.23 was fixed to avoid.
+    #[test]
+    fn every_grouping_node_this_claims_to_read_is_read() {
+        let bounded = |sql: &str| -> Option<Vec<String>> {
+            let parsed = pg_query::parse(sql).expect("fixture parses");
+            let statement = parsed.protobuf.stmts.first().expect("one statement");
+            let Some(NodeEnum::SelectStmt(select)) =
+                statement.stmt.as_ref().and_then(|s| s.node.as_ref())
+            else {
+                panic!("fixture is a SELECT");
+            };
+            grouping_may_reference(select, &select.target_list)
+        };
+
+        // (label, statement, a column the grouping must be seen to reference)
+        let cases = [
+            (
+                "column reference",
+                "SELECT sum(v) FROM t GROUP BY gcol",
+                "gcol",
+            ),
+            ("ordinal", "SELECT gcol, sum(v) FROM t GROUP BY 1", "gcol"),
+            ("cast", "SELECT sum(v) FROM t GROUP BY gcol::text", "gcol"),
+            (
+                "collate",
+                "SELECT sum(v) FROM t GROUP BY gcol COLLATE \"C\"",
+                "gcol",
+            ),
+            (
+                "arithmetic",
+                "SELECT sum(v) FROM t GROUP BY gcol + 1",
+                "gcol",
+            ),
+            (
+                "boolean",
+                "SELECT sum(v) FROM t GROUP BY (gcol AND other)",
+                "gcol",
+            ),
+            (
+                "coalesce",
+                "SELECT sum(v) FROM t GROUP BY coalesce(gcol, 0)",
+                "gcol",
+            ),
+            (
+                "greatest/least",
+                "SELECT sum(v) FROM t GROUP BY greatest(gcol, 0)",
+                "gcol",
+            ),
+            (
+                "null test",
+                "SELECT sum(v) FROM t GROUP BY (gcol IS NULL)",
+                "gcol",
+            ),
+            (
+                "boolean test",
+                "SELECT sum(v) FROM t GROUP BY (gcol IS TRUE)",
+                "gcol",
+            ),
+            (
+                "function call",
+                "SELECT sum(v) FROM t GROUP BY lower(gcol)",
+                "gcol",
+            ),
+            (
+                "case expression",
+                "SELECT sum(v) FROM t GROUP BY CASE WHEN p THEN gcol ELSE q END",
+                "gcol",
+            ),
+            (
+                "grouping set",
+                "SELECT sum(v) FROM t GROUP BY GROUPING SETS ((gcol))",
+                "gcol",
+            ),
+            (
+                "row expression",
+                "SELECT sum(v) FROM t GROUP BY GROUPING SETS ((gcol, other))",
+                "gcol",
+            ),
+            (
+                "output alias",
+                "SELECT gcol AS g, sum(v) FROM t GROUP BY g",
+                "gcol",
+            ),
+        ];
+
+        for (label, sql, expected) in cases {
+            let found = bounded(sql).unwrap_or_else(|| {
+                panic!("{label}: grouping reported unbounded, so the aggregate is refused: {sql}")
+            });
+            assert!(
+                found.iter().any(|c| c == expected),
+                "{label}: {found:?} does not mention {expected:?} — {sql}",
+            );
+        }
+
+        // And the converse still holds: a node this does not model is
+        // unbounded, which is what makes the walk sound.
+        assert_eq!(bounded("SELECT sum(v) FROM t GROUP BY ARRAY[a, b]"), None);
+        assert_eq!(
+            bounded("SELECT sum(v) FROM t GROUP BY (SELECT max(h) FROM u)"),
+            None
+        );
+    }
+
+    /// Found by `cargo mutants`, not by review: two guards no test detected
+    /// being broken. The code was right; nothing said so.
+    ///
+    /// Mechanical mutation is worth more than the hand-picked table in
+    /// `scripts/test-mutations.py` here, because the table only contains guards
+    /// someone already thought to protect — the same blind spot as an inference
+    /// suite that only knows the spellings it was given.
+    #[test]
+    fn guards_that_no_test_was_watching() {
+        const FINE: Relaxations = Relaxations {
+            summaries: true,
+            fine_date_trunc: true,
+        };
+        let safety = |sql: &str, n: usize| analyze(sql, n, FINE);
+
+        // `bare` is `args.is_empty() && agg_filter.is_none() && over.is_none()`,
+        // and flipping either `&&` to `||` survived. It matters: a context
+        // function is released *because* it takes nothing, and `CREATE
+        // FUNCTION` is available to ordinary users, so `public.now(text)`
+        // returning its argument is a real shape. With the guard broken,
+        // `now(email)` releases the email.
+        assert_eq!(safety("SELECT now(email) FROM t", 1), vec![Safety::Unknown]);
+        assert_eq!(
+            safety("SELECT current_user(email) FROM t", 1),
+            vec![Safety::Unknown]
+        );
+        assert_eq!(
+            safety("SELECT version(email) FROM t", 1),
+            vec![Safety::Unknown]
+        );
+        // The releasable form still is.
+        assert_eq!(safety("SELECT now()", 1), vec![Safety::Releasable]);
+        assert_eq!(safety("SELECT version()", 1), vec![Safety::Releasable]);
+
+        // `COALESCE` releases only when *every* argument does. Flipping the
+        // `==` to `!=` survived, and it inverts the rule: two unreadable
+        // arguments would have been released together.
+        assert_eq!(
+            safety("SELECT COALESCE(email, phone) FROM t", 1),
+            vec![Safety::Unknown]
+        );
+        assert_eq!(
+            safety("SELECT COALESCE(email, '') FROM t", 1),
+            vec![Safety::Unknown]
+        );
+        assert_eq!(safety("SELECT COALESCE(1, 2)", 1), vec![Safety::Releasable]);
+
+        // `unwrap_star_over_subquery`'s early return was the third survivor and
+        // is *not* pinned here, because it turned out to be an equivalent
+        // mutant: the two conditions it checks are re-enforced by slice
+        // patterns further down the same function, so flipping it changes
+        // nothing observable. Asserting a shape that happens to be refused
+        // anyway would have looked like coverage and provided none — see the
+        // note on the function itself.
+        //
+        // The shape it exists for still unwraps, which is worth holding.
+        assert_eq!(
+            safety("SELECT * FROM (SELECT 1 AS a) q", 1),
+            vec![Safety::Releasable]
         );
     }
 

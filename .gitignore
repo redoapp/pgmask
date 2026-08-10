@@ -1,5 +1,10 @@
 /target
 
+# cargo-mutants scratch: a run's survivors are a finding to act on, not an
+# artefact to keep.
+mutants.out/
+mutants.out.old/
+
 # Coverage artifacts. `cargo llvm-cov show-env` writes these into the repo
 # root, so they need ignoring or they get swept up by `git add -A`.
 *.profraw

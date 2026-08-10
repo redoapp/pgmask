@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.1.27 — mechanical mutation, and two measurements I got wrong first
+
+Two things claimed in 0.1.26's notes and not delivered: real line coverage, and
+mutation testing that is not a hand-picked list. Both are here, and both
+produced a wrong answer before a right one.
+
+COVERAGE
+
+Measured with `PGMASK_ALLOW_SKIP=1`, `catalog.rs` reads 62.6% and looks like the
+weakest module in the proxy. That is not its coverage; it is the coverage of the
+tests that do not need a database. Run against a real Postgres with
+`--test-threads=1`, as `scripts/test-integration.sh` does, it is **88.4%**.
+
+| lineage | mask | metrics | plan_state | catalog | protocol | session |
+|---|---|---|---|---|---|---|
+| 98.2 | 94.5 | 93.8 | 92.3 | 88.4 | 86.4 | 80.7 |
+
+`tls.rs` reads 5.8% and that is also an artefact: the TLS suite exercises the
+proxy as a subprocess, which this instrumentation does not see.
+
+MUTATION
+
+`scripts/test-mutations.py` breaks twenty-six guards someone thought to protect
+— the same blind spot as an inference suite that only knows the spellings it was
+given. `cargo mutants` mutates every function it can reach: **352 mutants, 222
+caught, 111 missed**.
+
+The `catalog.rs` survivors are the coverage mistake again, from the other side:
+run with `-- --lib`, its tests never ran. `scripts/test-mutants.sh` now sets up
+the invocation that means something and says why.
+
+Three survivors in `analysis.rs` were worth acting on:
+
+- The `bare` check for context functions, `&&` to `||`. A real gap: inverted, a
+  context function *with arguments* releases, and `CREATE FUNCTION
+  public.now(text)` returning its argument is a shape an ordinary user can
+  create. Pinned.
+- The `COALESCE` rule, `==` to `!=`. A real gap: inverted, two unreadable
+  arguments release together. Pinned.
+- `unwrap_star_over_subquery`'s early return. **Equivalent**, not a gap — both
+  conditions are re-enforced by slice patterns in the same function. Recorded on
+  the function so it is not re-litigated, rather than pinned with a test that
+  would assert a shape refused for other reasons.
+
+A DEFECT IN CODE FROM EARLIER TODAY
+
+Writing the second test surfaced one. `grouping_may_reference` treated an
+integer literal *nested in an expression* as an ordinal into the target list, so
+`GROUP BY coalesce(col, 0)` resolved `0` to nothing and reported the grouping
+unbounded — refusing an honest aggregate — while `GROUP BY col + 1` resolved `1`
+to the first target and pulled its columns in. Safe in both directions and wrong
+in both. An integer is an ordinal only as a grouping *element*; descending into
+an expression now clears that flag, as it already did for output aliases.
+
+Fourteen more survivors are `grouping_may_reference` arms, all precision-only:
+deleting one makes the grouping unbounded, which refuses. They are pinned by
+asserting that every node type the function claims to read is read — the same
+shape of test as the ordinal-resolution one in 0.1.19, and for the same reason.
+
+Poison control re-run after the walker change: 0 leaks with the
+summary-of-a-grouped-column rule, 1,740 without.
+
 ## 0.1.26 — was this rule ever consulted?
 
 The leak oracle answers "did anything escape". No suite answered "was this rule
