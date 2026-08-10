@@ -88,9 +88,40 @@ if ! cargo build --release -q; then
   echo "FATAL: could not build pgmask"
   exit 1
 fi
+# Wait for a proxy to accept connections, rather than guessing at two seconds.
+#
+# Six startups here used a bare `sleep 2`. pgmask resolves the whole catalog
+# against Postgres before it binds, so on a loaded machine it is not ready in
+# two, and every assertion in that block then fails against a closed port —
+# measured, not theorised: this suite reported 66 of 88 while a mutation pass
+# was running and 88 of 88 on the same commit once the machine was quiet.
+#
+# A timing-dependent suite is not only noisy. It can pass for the wrong reason
+# as easily as fail for one, which is the failure this project keeps finding in
+# its own instruments. `scripts/test-fuzz.sh` already waits for the listener and
+# says why; the fix was never carried across.
+#
+# A bare TCP connect, not a `SELECT 1`. The first version of this probed with
+# psql and broke assertion 13d, which asserts `pgmask_fields_rescued_total 1`
+# exactly: the probe query was itself analysed, rescued and counted. A readiness
+# check that perturbs the measurement is its own kind of wrong answer.
+await_proxy() { # port logfile
+  local port="$1" log="$2"
+  for _ in $(seq 1 120); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      exec 3>&- 3<&-
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "FAIL: proxy on :$port never accepted a connection; last lines of $log:"
+  tail -10 "$log"
+  exit 1
+}
+
 ./target/release/pgmask examples/demo/catalog.toml >/tmp/pgmask-verify.log 2>&1 &
 PROXY_PID=$!
-sleep 2
+await_proxy 6432 /tmp/pgmask-verify.log
 
 echo
 echo "MVP acceptance criteria"
@@ -220,7 +251,7 @@ refute "11c. ...or into the catalog it writes" \
 
 ./target/release/pgmask /tmp/pgmask-generated-full.toml >/tmp/pgmask-generated.log 2>&1 &
 GEN_PID=$!
-sleep 2
+await_proxy 6455 /tmp/pgmask-generated.log
 gen() { psql -h localhost -p 6455 -U postgres -d demo -tAq -c "$1" 2>&1; }
 genrow="$(gen 'SELECT email, name, last_ip FROM demo.customers WHERE id = 1;')"
 check  "11d. pgmask loads the generated catalog and serves"  "***"              "$genrow"
@@ -238,7 +269,7 @@ sed -e 's/^listen = .*/listen = "127.0.0.1:6456"/' \
     examples/demo/catalog.toml > /tmp/pgmask-gui.toml
 ./target/release/pgmask /tmp/pgmask-gui.toml >/tmp/pgmask-gui.log 2>&1 &
 GUI_PID=$!
-sleep 2
+await_proxy 6456 /tmp/pgmask-gui.log
 gui() { psql -h localhost -p 6456 -U postgres -d demo -X -c "$1" 2>&1; }
 
 check "12a. \\dt lists tables (default-deny refuses this)" \
@@ -299,7 +330,7 @@ sed -e 's/^listen = .*/listen = "127.0.0.1:6457"/' \
     examples/demo/catalog.toml > /tmp/pgmask-obs.toml
 PGMASK_LOG=info ./target/release/pgmask /tmp/pgmask-obs.toml >/tmp/pgmask-obs.log 2>&1 &
 OBS_PID=$!
-sleep 2
+await_proxy 6457 /tmp/pgmask-obs.log
 obs() { psql -h localhost -p 6457 -U postgres -d demo -X -tAq -c "$1" 2>&1; }
 obs 'SELECT email, name, city FROM demo.customers LIMIT 5;' >/dev/null
 obs 'SELECT lower(email) FROM demo.customers LIMIT 1;' >/dev/null
@@ -375,7 +406,7 @@ pathlib.Path("/tmp/pgmask-lineage.toml").write_text(base)
 PYEOF
 ./target/release/pgmask /tmp/pgmask-lineage.toml >/tmp/pgmask-lineage.log 2>&1 &
 LIN_PID=$!
-sleep 2
+await_proxy 6460 /tmp/pgmask-lineage.log
 lin() { psql -h localhost -p 6460 -U postgres -d demo -X -tAq -c "$1" 2>&1 | head -1; }
 
 # Released base columns: previously refused, now served.
@@ -422,7 +453,7 @@ echo
 echo "16. channels that carry text outside a result set"
 ./target/release/pgmask examples/demo/catalog.toml >/tmp/pgmask-chan.log 2>&1 &
 CHAN_PID=$!
-sleep 2
+await_proxy 6432 /tmp/pgmask-chan.log
 chan() { psql -h localhost -p 6432 -U postgres -d demo -X "$@" 2>&1; }
 chan_direct() { psql -h localhost -p "$PG_PORT" -U postgres -d demo -X "$@" 2>&1; }
 raise='DO $$ BEGIN RAISE NOTICE %s, (SELECT email FROM demo.customers WHERE id = 1); END $$;'

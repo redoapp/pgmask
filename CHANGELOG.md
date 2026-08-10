@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.1.29 — a suite whose answer depended on the machine
+
+`verify.sh` reported 66 of 88 while a mutation pass was running, and 88 of 88 on
+the same commit once the machine was quiet. Six proxy startups waited with a
+bare `sleep 2`, and pgmask resolves the whole catalog against Postgres before it
+binds — on a loaded machine that is not two seconds, so every assertion in the
+block ran against a closed port.
+
+`scripts/test-fuzz.sh` already waits for the listener and explains why. The fix
+was never carried across, which is the same shape as the `exit 0` this project
+diagnosed in one release path and left standing in the other.
+
+Verified against the condition that caused it rather than by reading: 88 of 88
+with twelve CPU spinners running.
+
+THE FIRST FIX WAS WORSE THAN THE BUG
+
+It probed with `SELECT 1` through the proxy. Assertion 13d asserts
+`pgmask_fields_rescued_total 1` exactly, and the probe query was itself
+analysed, rescued and counted — a readiness check that corrupted the
+measurement it existed to make reliable. It is a bare TCP connect now.
+
+Third distinct way an instrument gave a confident wrong answer today: a value
+dropped before the detector (`int8`, `numeric`, `timestamptz`), an answer that
+depended on machine load, and a probe that changed what it measured.
+
+WHY A FLAKY SUITE IS NOT JUST NOISE
+
+It failed 22 assertions under load. With different timing it could as easily
+have passed ones it had not earned — a proxy that never came up looks identical
+to one that answered correctly if nothing checks. That is the same failure as
+every other instrument problem here: the answer turning on something other than
+the property under test.
+
 ## 0.1.28 — seven predicates that only one suite was watching
 
 `cargo mutants` replaced each of these function bodies with a constant and
