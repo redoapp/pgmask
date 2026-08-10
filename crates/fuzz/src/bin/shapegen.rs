@@ -451,11 +451,10 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
                 4 => format!("coalesce({key}, 0)"),
                 _ => format!("{key}::text"),
             };
-            // `sum` only. `avg` over int4 returns `numeric`, which the
-            // extended harness cannot decode without a decimal dependency, so
-            // an `avg` disclosure would be generated and then discarded before
-            // the oracle saw it — the exact blindness this arm exists to end.
-            let agg = "sum";
+            // Both. `avg` over int4 returns `numeric`, which the harness now
+            // decodes; it was restricted to `sum` for one release because a
+            // value that cannot be decoded is a value the oracle never scans.
+            let agg = *rng.pick(&["sum", "avg"]);
             // Three ways to name the same grouping. The alias and the ordinal
             // are not decoration: both were live disclosures, because a name in
             // the clause is not the column being grouped on.

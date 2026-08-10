@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.21 — a value the harness cannot decode is a value the oracle never sees
+
+0.1.19 restricted the generator to `sum` and said why in a comment: `avg` over
+an integer returns `numeric`, the harness could not decode it, and an `avg`
+disclosure would have been generated and then discarded before any detector
+ran. That is a documented hole, not a closed one, and it is the same shape as
+the defect that hid the singleton-group leak — `sum(int4)` is `int8`, and int8
+was being dropped too.
+
+`rust_decimal` was already a workspace dependency; the fuzz crate now enables
+its `db-tokio-postgres` feature and renders `numeric` through the same type
+ladder. `avg` is back in the generator: 60 `avg` disclosure shapes per 1500
+statements.
+
+Verified the way the rest of this is verified rather than by inspection: with
+the guard removed the campaign reports 180 leaked salaries through `avg` alone,
+and 0 with it restored. `avg` over a singleton group returns
+`900000137.00000000`, so the values are normalised before the integer detector
+sees them.
+
 ## 0.1.20 — the same product, on the other engine
 
 CockroachDB resolves an output alias in a grouping exactly as Postgres does, so

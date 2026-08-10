@@ -29,7 +29,7 @@ indexing_slicing = "warn"
 arithmetic_side_effects = "warn"
 
 [workspace.package]
-version = "0.1.20"
+version = "0.1.21"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -48,5 +48,5 @@ tokio-postgres-rustls = "0.13"
 pg_query = "6"
 proptest = "1"
 jiff = "0.2"
-rust_decimal = "1"
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
 postgres-types = { version = "0.2", features = ["with-jiff-0_2"] }

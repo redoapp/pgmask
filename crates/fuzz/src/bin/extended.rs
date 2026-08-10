@@ -91,6 +91,13 @@ fn render(row: &Row, i: usize) -> Option<String> {
     if let Ok(v) = row.try_get::<_, Option<jiff::civil::Date>>(i) {
         return v.map(|v| v.to_string());
     }
+    // `numeric`, which is what `avg` over an integer returns. Without this the
+    // generator had to avoid `avg` entirely: a disclosure through it would be
+    // produced and then discarded before any detector ran, which is the exact
+    // blindness that hid the singleton-group leak.
+    if let Ok(v) = row.try_get::<_, Option<rust_decimal::Decimal>>(i) {
+        return v.map(|v| v.normalize().to_string());
+    }
     None
 }
 
