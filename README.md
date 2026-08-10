@@ -4,6 +4,14 @@ A fail-closed column masking proxy for Postgres. Point your connection string at
 pgmask instead of the database; it rewrites sensitive column values in result sets
 according to a policy catalog, and refuses anything it cannot classify.
 
+**What it does and does not do.** It guarantees a masked value does not appear
+in a result set. It does *not* stop a determined client reconstructing one by
+inference: the filter side is ungoverned, so `count(*)` with a `LIKE` predicate
+recovers a full address in about 300 queries, and `sum(x) GROUP BY <unique key>`
+returns every value in one. `./scripts/test-inference.sh` demonstrates both
+against the demo fixture. Treat this as a control against incidental exposure —
+an analyst who is not attacking you — not as containment for one who is.
+
 ```
 $ psql -p 55432 -c 'SELECT id, email, name, phone, city, internal_note FROM demo.customers ORDER BY id LIMIT 2'
  id |       email       |    name    |  phone   |  city  | internal_note

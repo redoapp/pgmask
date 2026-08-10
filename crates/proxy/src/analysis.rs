@@ -7,10 +7,26 @@
 //!
 //! # The threat model this encodes
 //!
-//! The bar is **"you cannot read an anonymised value"**, not "no information
-//! flows". `sum(salary)` is released: it is a summary, not a salary. A group of
-//! one row makes it that row's salary, and that is accepted — the same class of
-//! trade already recorded for predicate oracles in `docs/handoff.md` §11.
+//! The bar is **"a masked value does not appear in a projection"**. It is not
+//! "you cannot read an anonymised value", which is what this comment used to
+//! say and what the README implied — and against an adversarial client that
+//! claim is simply false. `scripts/test-inference.sh` measures it:
+//!
+//!   - `SELECT sum(salary) FROM t GROUP BY id` returns every salary exactly, in
+//!     one query, when `id` is unique and released. The "group of one" trade
+//!     was written down as an incidental edge case; grouping by a key makes it
+//!     the bulk interface.
+//!   - the filter side is ungoverned, so `WHERE email LIKE 'a%'` with `count(*)`
+//!     recovers a full address in **313 queries**, measured, through the proxy.
+//!   - an error is a one-bit channel that needs no aggregate: `1/(CASE WHEN …
+//!     THEN 0 ELSE 1 END)`.
+//!
+//! None of that is a defect in the rules below; every one follows from masking
+//! the *projection* and leaving the predicate alone. It is recorded here
+//! because the distinction decides who the tool is for: it reduces incidental
+//! exposure for an analyst who is not attacking you, and it does not contain
+//! one who is. Governing the filter side is the only sound answer and it is a
+//! different product — it would refuse `WHERE email = …` outright.
 //!
 //! That relaxation is what makes this tractable without a lineage engine. If the
 //! outermost node of a target expression is a reducing aggregate, it cannot
