@@ -274,7 +274,7 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
     // travels with it unless the arm changes the type.
     let wrap = |sql: String, cols: Vec<String>, typed: bool| Shape { sql, cols, typed };
 
-    match rng.below(11) {
+    match rng.below(12) {
         // Subquery.
         0 => {
             let inner = compose(rng, next, n, allow_typed);
@@ -393,6 +393,101 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
             Shape {
                 sql,
                 cols: vec!["c0".into()],
+                typed: false,
+            }
+        }
+        // A *reducing* aggregate over a grouping.
+        //
+        // This arm exists for the same reason arm 9 does, and it is the same
+        // omission twice. The only GROUP BY the generator had projected
+        // `count(*)`, which discloses nothing whatever it is grouped by — so no
+        // generated statement could reach a summary over a grouping, and
+        // 176,000 of them reported clean while `sum(annual_salary) GROUP BY id`
+        // returned the whole masked column in one query.
+        //
+        // Grouped by a unique key, every group is one row and the summary *is*
+        // the value, which lands exactly on the fixture's poison sequence and
+        // trips the numeric detector. `fz.*.id` is a primary key, so half the
+        // groupings drawn here are the disclosure and half are honest
+        // aggregation that must keep working.
+        //
+        // Spellings are restricted to what both engines accept. Postgres-only
+        // syntax — `ROLLUP`, `CUBE`, `GROUPING SETS`, which CockroachDB rejects
+        // outright — is covered by `scripts/test-grouping.py` instead, so this
+        // corpus stays at zero engine errors on both.
+        10 => {
+            // Weighted towards the relation that carries the poison. Drawn
+            // uniformly, this arm reaches `sum(fz.people.annual_salary) GROUP
+            // BY fz.people.id` in about one statement in forty — thin enough
+            // that a clean run would mean little. The other half stays uniform
+            // so honest aggregation over the rest of the fixture is still
+            // generated, and the grouping is a key only some of the time, so
+            // the arm produces both the disclosure and the query it must not
+            // break.
+            let s = if rng.chance(50) {
+                Source {
+                    relation: RELATIONS
+                        .iter()
+                        .find(|r| r.name == "fz.people")
+                        .unwrap_or_else(|| {
+                            RELATIONS.first().expect("RELATIONS is a non-empty const")
+                        }),
+                    alias: format!("r{}", n.wrapping_add(90)),
+                }
+            } else {
+                source(rng, n.wrapping_add(90))
+            };
+            let value = if rng.chance(70) && s.relation.nums.contains(&"annual_salary") {
+                format!("{}.annual_salary", s.alias)
+            } else {
+                s.num_col(rng)
+            };
+            let key = format!("{}.{}", s.alias, rng.pick(s.relation.nums));
+            let grouped = match rng.below(6) {
+                0 => key.clone(),
+                1 => format!("({key})"),
+                2 => format!("{key} + 0"),
+                3 => format!("abs({key})"),
+                4 => format!("coalesce({key}, 0)"),
+                _ => format!("{key}::text"),
+            };
+            // `sum` only. `avg` over int4 returns `numeric`, which the
+            // extended harness cannot decode without a decimal dependency, so
+            // an `avg` disclosure would be generated and then discarded before
+            // the oracle saw it — the exact blindness this arm exists to end.
+            let agg = "sum";
+            // Three ways to name the same grouping. The alias and the ordinal
+            // are not decoration: both were live disclosures, because a name in
+            // the clause is not the column being grouped on.
+            let sql = match rng.below(3) {
+                0 => format!(
+                    "SELECT {agg}({value}) AS c0 FROM {} {} GROUP BY {grouped}",
+                    s.relation.name, s.alias
+                ),
+                1 => format!(
+                    "SELECT {grouped} AS g0, {agg}({value}) AS c0 FROM {} {} GROUP BY g0",
+                    s.relation.name, s.alias
+                ),
+                _ => format!(
+                    "SELECT {grouped} AS g0, {agg}({value}) AS c0 FROM {} {} GROUP BY 1",
+                    s.relation.name, s.alias
+                ),
+            };
+            // The summary first, deliberately. Every wrapping arm projects
+            // `cols.first()` by name, so listing the grouping first meant an
+            // enclosing subquery or CTE emitted `SELECT g0 FROM (...)` and
+            // dropped the aggregate — the corpus carried the disclosure and
+            // discarded the value before the oracle could see it. Twenty-six
+            // such statements were generated and none could leak. Order here
+            // does not have to match the projection: the reference is by name.
+            let cols = if sql.contains("AS g0") {
+                vec!["c0".into(), "g0".into()]
+            } else {
+                vec!["c0".into()]
+            };
+            Shape {
+                sql,
+                cols,
                 typed: false,
             }
         }

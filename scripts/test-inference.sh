@@ -168,6 +168,18 @@ served "...by ROLLUP"        "$(p 'SELECT city, sum(annual_salary) FROM demo.cus
 served "...by CUBE"          "$(p 'SELECT city, sum(annual_salary) FROM demo.customers GROUP BY CUBE(city)')"
 served "...by GROUPING SETS" "$(p 'SELECT city, sum(annual_salary) FROM demo.customers GROUP BY GROUPING SETS ((city),())')"
 served "count(*) by the key" "$(p 'SELECT id, count(*) FROM demo.customers GROUP BY id LIMIT 1')"
+# The one query that distinguishes reading an ordinal from falling back to the
+# lexer, and therefore the only behavioural evidence that ordinal resolution
+# does anything. Read: the grouping is `city`, not a key, so it is served.
+# Unread: the grouping is opaque, the backstop scans the whole statement, `id`
+# is named in the filter, and it is refused.
+#
+# Added because the mutation harness reported `ordinal grouping unread` as
+# SURVIVED. Breaking ordinal resolution is *safe* — the backstop catches what it
+# misses — so nothing failed, and a purely precision-preserving guard had no
+# test at all.
+served "an ordinal grouping with a key named in the filter" \
+  "$(p 'SELECT city, sum(annual_salary) FROM demo.customers WHERE id > 5 GROUP BY 1 LIMIT 1')"
 # Time bucketing is the ordinary analytics query, and the reason the unreadable
 # case falls back to the lexer instead of refusing outright. `date_trunc` over a
 # coarse literal unit is deliberately released, so these were served before the

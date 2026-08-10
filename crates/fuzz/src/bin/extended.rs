@@ -49,11 +49,56 @@ async fn connect(url: &str) -> Result<Client> {
 /// and `try_get::<String>` on an `int8` is an error, not a value worth
 /// stringifying. Binary is the point of this harness, so the decode is the
 /// driver's, over the bytes the proxy actually emitted.
+/// Every value in the result set, rendered as text for the oracle to scan.
+///
+/// This used to read `Option<String>` and nothing else, which silently dropped
+/// every column the binary path could not hand back as text — and the detectors
+/// it feeds are mostly *not* about text. `sum(int4)` comes back as `int8`, so
+/// the numeric poison detector could never fire here: the value was discarded
+/// before the oracle saw it. Verified by removing the singleton-group guard and
+/// replaying, which leaked exact salaries through psql while this harness
+/// reported clean.
+///
+/// The v0.1.11 note that both harnesses now share `fuzz::oracle` was true and
+/// not sufficient. Sharing the detectors does not help if the values never
+/// reach them, and that fix was verified with `ip-prefix`, which happens to sit
+/// on a `text` column.
+///
+/// Ordered most specific first; a decode failure means "not this type", while
+/// `Ok(None)` means the column really is NULL and there is nothing to scan.
+fn render(row: &Row, i: usize) -> Option<String> {
+    if let Ok(v) = row.try_get::<_, Option<String>>(i) {
+        return v;
+    }
+    if let Ok(v) = row.try_get::<_, Option<i64>>(i) {
+        return v.map(|v| v.to_string());
+    }
+    if let Ok(v) = row.try_get::<_, Option<i32>>(i) {
+        return v.map(|v| v.to_string());
+    }
+    if let Ok(v) = row.try_get::<_, Option<i16>>(i) {
+        return v.map(|v| v.to_string());
+    }
+    if let Ok(v) = row.try_get::<_, Option<f64>>(i) {
+        return v.map(|v| v.to_string());
+    }
+    if let Ok(v) = row.try_get::<_, Option<bool>>(i) {
+        return v.map(|v| v.to_string());
+    }
+    if let Ok(v) = row.try_get::<_, Option<uuid::Uuid>>(i) {
+        return v.map(|v| v.to_string());
+    }
+    if let Ok(v) = row.try_get::<_, Option<jiff::civil::Date>>(i) {
+        return v.map(|v| v.to_string());
+    }
+    None
+}
+
 fn text_values(rows: &[Row]) -> Vec<String> {
     let mut out = Vec::new();
     for row in rows {
         for i in 0..row.len() {
-            if let Ok(Some(v)) = row.try_get::<_, Option<String>>(i) {
+            if let Some(v) = render(row, i) {
                 out.push(v);
             }
         }

@@ -527,7 +527,9 @@ decision stays visible and nobody later mistakes the proxy for anonymization.
   this design.
 - **Join-key re-identification.** Masking `name` while returning `customer_id` leaves an
   identifier that points back to the identity.
-- **Small-cell aggregates.** `GROUP BY city HAVING count(*) = 1`.
+- **Small-cell aggregates.** `GROUP BY city HAVING count(*) = 1`. Note the degenerate
+  case is *not* on this list: a summary of a column the query groups on is that column
+  exactly, needs no small cell and no unique key, and is refused since 0.1.19.
 - **Differencing.** Two permitted aggregate queries whose difference isolates one row.
 
 One case was reclassified from accepted to closed. `SELECT sum(salary) FROM t GROUP BY
@@ -545,6 +547,14 @@ aggregation. Ungrouped aggregates and groupings on non-key columns are served
 unchanged, so ordinary analytics is unaffected. `WHERE id = 1` reaches the same
 value and is still accepted: one row per query rather than the whole table in one, and
 whether a predicate is singleton is a fact about the data.
+
+The guard reads the catalog, so it inherits the catalog's staleness — and in the
+opposite direction to everything else. An unclassified column is masked; a relation
+whose unique keys have not been loaded yet simply has none, so a grouped aggregate over
+a table created since the last refresh is served until the next one. Bounded by
+`catalog_refresh_seconds` and requiring DDL inside that window, so it is documented
+rather than closed: closing it means refusing aggregates over every relation the
+snapshot does not know, temp tables included.
 
 Closing the rest requires query-set-level accounting — minimum group sizes, filter-side
 policy, per-principal budgets, probably noise — a different and much larger project that

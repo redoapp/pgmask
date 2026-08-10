@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Every way to spell "group by the key", generated rather than remembered.
 
-    ./scripts/test-grouping.py [--keep]
+    ./scripts/test-grouping.py [--engine=postgres|cockroach] [--keep]
 
 The singleton-group guard has now been wrong three times, and each time the
 mistake was the same one: treating *a name appearing in the `GROUP BY`* as *the
@@ -50,6 +50,29 @@ import time
 PG_PORT = 55503
 PROXY_PORT = 6543
 CONTAINER = "pgmask-grouping"
+
+# CockroachDB resolves an output alias in a grouping exactly as Postgres does,
+# so the 0.1.18 disclosure existed there too. The fix is in the parser and is
+# engine-independent, which is the sort of "should be fine" that produced the
+# three bugs this file exists to prevent — so it is run against both. CRDB
+# rejects `ROLLUP` and `GROUPING SETS` outright, and those spellings land in
+# "rejected by the server" rather than needing to be special-cased.
+ENGINES = {
+    "postgres": {
+        "image": "docker.io/library/postgres:17",
+        "args": [],
+        "env": ["-e", "POSTGRES_PASSWORD=demo", "-e", "POSTGRES_DB=demo"],
+        "port": 5432,
+        "dsn": "postgresql://postgres:demo@localhost:{port}/demo",
+    },
+    "cockroach": {
+        "image": "docker.io/cockroachdb/cockroach:v25.4.14",
+        "args": ["start-single-node", "--insecure"],
+        "env": [],
+        "port": 26257,
+        "dsn": "postgresql://root@localhost:{port}/defaultdb?sslmode=disable",
+    },
+}
 ROOT = subprocess.run(
     ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
 ).stdout.strip()
@@ -162,6 +185,53 @@ QUOTED_ALIASES = ["g", "city", "Odd Name"]
 PLAIN_NONPROJECTING = "SELECT sum(annual_salary) FROM demo.customers c GROUP BY {e}"
 PLAIN_PROJECTING = "SELECT {e}, sum(annual_salary) FROM demo.customers c GROUP BY {e}"
 
+# A composite key exercises the other half of the predicate — *every* column of
+# some key must be grouped — which the cross product above cannot reach, because
+# demo.customers has only the single-column `id`. Created here rather than in
+# examples/demo/schema.sql so the other suites, which count their assertions,
+# are unaffected.
+COMPOSITE_DDL = """
+CREATE TABLE IF NOT EXISTS demo.memberships (
+    tenant int, email text, city text, amount int, UNIQUE (tenant, email));
+INSERT INTO demo.memberships
+SELECT i % 4, 'm' || i, 'city' || (i % 3), 100 + i FROM generate_series(1, 40) i;
+"""
+
+# (label, expect_refusal, statement)
+COMPOSITE_CASES = [
+    ("both key columns", True,
+     "SELECT sum(amount) FROM demo.memberships GROUP BY tenant, email"),
+    ("...in the other order", True,
+     "SELECT sum(amount) FROM demo.memberships GROUP BY email, tenant"),
+    ("...plus a third column", True,
+     "SELECT sum(amount) FROM demo.memberships GROUP BY tenant, email, city"),
+    ("...through aliases", True,
+     "SELECT tenant AS a, email AS b, sum(amount) FROM demo.memberships GROUP BY a, b"),
+    ("...through ordinals", True,
+     "SELECT tenant, email, sum(amount) FROM demo.memberships GROUP BY 1, 2"),
+    ("...through ROLLUP", True,
+     "SELECT sum(amount) FROM demo.memberships GROUP BY ROLLUP(tenant, email)"),
+    ("...through a parenthesised list", True,
+     "SELECT sum(amount) FROM demo.memberships GROUP BY (tenant, email)"),
+    # Half a composite key is not a key, and these are the queries a composite
+    # key exists to make possible.
+    ("one key column alone", False,
+     "SELECT tenant, sum(amount) FROM demo.memberships GROUP BY tenant"),
+    ("the other alone", False,
+     "SELECT email, sum(amount) FROM demo.memberships GROUP BY email"),
+    ("a non-key column", False,
+     "SELECT city, sum(amount) FROM demo.memberships GROUP BY city"),
+]
+
+# Known cost of unioning names across grouping sets, asserted so it stays
+# visible. Each set here is a single column and neither is a full key, so no
+# group is singleton — but the union is {tenant, email}, which covers the key,
+# and the guard refuses. Safe direction, real cost.
+UNION_OVER_REFUSAL = (
+    "SELECT sum(amount) FROM demo.memberships "
+    "GROUP BY GROUPING SETS ((tenant),(email))"
+)
+
 
 def psql(dsn: str, sql: str) -> tuple[int, str]:
     out = subprocess.run(
@@ -175,14 +245,23 @@ def psql(dsn: str, sql: str) -> tuple[int, str]:
 
 def main() -> int:
     keep = "--keep" in sys.argv
-    direct = f"postgresql://postgres:demo@localhost:{PG_PORT}/demo"
-    proxied = f"postgresql://postgres:demo@localhost:{PROXY_PORT}/demo"
+    engine = "postgres"
+    for arg in sys.argv[1:]:
+        if arg.startswith("--engine="):
+            engine = arg.split("=", 1)[1]
+    if engine not in ENGINES:
+        print(f"unknown engine {engine!r}; expected one of {', '.join(ENGINES)}")
+        return 2
+    spec = ENGINES[engine]
+    container = f"{CONTAINER}-{engine}"
+    direct = spec["dsn"].format(port=PG_PORT)
+    proxied = spec["dsn"].format(port=PROXY_PORT)
+    print(f"\nengine: {engine}")
 
-    subprocess.run(["podman", "rm", "-f", "-v", CONTAINER], capture_output=True)
+    subprocess.run(["podman", "rm", "-f", "-v", container], capture_output=True)
     subprocess.run(
-        ["podman", "run", "-d", "--name", CONTAINER, "-e", "POSTGRES_PASSWORD=demo",
-         "-e", "POSTGRES_DB=demo", "-p", f"{PG_PORT}:5432",
-         "docker.io/library/postgres:17"],
+        ["podman", "run", "-d", "--name", container, *spec["env"],
+         "-p", f"{PG_PORT}:{spec['port']}", spec["image"], *spec["args"]],
         capture_output=True,
     )
     for _ in range(90):
@@ -192,11 +271,31 @@ def main() -> int:
     if psql(direct, "select 1")[0] != 0:
         print("FAIL: postgres did not start")
         return 1
-    subprocess.run(
-        ["psql", "-w", direct, "-q", "-v", "ON_ERROR_STOP=1", "-f",
-         f"{ROOT}/examples/demo/schema.sql"],
-        capture_output=True, env=dict(os.environ, PGPASSWORD="demo"),
-    )
+    if engine == "postgres":
+        subprocess.run(
+            ["psql", "-w", direct, "-q", "-v", "ON_ERROR_STOP=1", "-f",
+             f"{ROOT}/examples/demo/schema.sql"],
+            capture_output=True, env=dict(os.environ, PGPASSWORD="demo"),
+        )
+    else:
+        # A portable stand-in: the demo fixture uses Postgres-only DDL, and what
+        # this suite needs from it is a single-column key, a non-key text column
+        # and a masked numeric column.
+        psql(direct, "CREATE SCHEMA IF NOT EXISTS demo")
+        psql(direct, """
+            CREATE TABLE IF NOT EXISTS demo.customers (
+                id int PRIMARY KEY, email text, city text, annual_salary int);
+            INSERT INTO demo.customers
+            SELECT i, 'user' || i || '@example.com', 'city' || (i % 4), 40000 + i * 137
+            FROM generate_series(1, 60) i;
+        """)
+
+    # Before the proxy starts, deliberately. Creating it afterwards put the new
+    # key outside the catalog snapshot, and the first cases ran before the
+    # refresh picked it up while later ones ran after — four spurious failures
+    # that split exactly on the refresh boundary. The window that exposes is
+    # real and is recorded in the README; it is not what this section tests.
+    psql(direct, COMPOSITE_DDL)
 
     config = "/tmp/pgmask-grouping.toml"
     base = open(f"{ROOT}/examples/demo/catalog.toml").read().splitlines()
@@ -283,9 +382,36 @@ def main() -> int:
                     else:
                         served += 1
 
+    # The composite-key half of the predicate.
+    print()
+    print("composite unique keys")
+    print("----------------------------------------")
+    composite_fail = 0
+    for label, expect_refusal, sql in COMPOSITE_CASES:
+        code, out = psql(proxied, sql)
+        got_refusal = "pgmask:" in out
+        if code != 0 and not got_refusal:
+            print(f"  {YELLOW}skip{OFF}     {label} {DIM}(server rejected){OFF}")
+            continue
+        if got_refusal == expect_refusal:
+            verdict = f"{GREEN}refused{OFF}" if got_refusal else f"{GREEN}served{OFF} "
+            print(f"  {verdict}  {label}")
+        else:
+            what = "served but must be refused" if not got_refusal else "refused but must be served"
+            print(f"  {RED}WRONG{OFF}    {label} {DIM}({what}){OFF}")
+            composite_fail += 1
+
+    # The union rule's cost, pinned rather than left to be discovered.
+    out = psql(proxied, UNION_OVER_REFUSAL)[1]
+    if "pgmask:" in out:
+        print(f"  {YELLOW}cost{OFF}     disjoint grouping sets over the two key columns")
+    else:
+        print(f"  {YELLOW}note{OFF}     disjoint grouping sets are now served — the union")
+        print(f"           rule changed; confirm that is deliberate")
+
     proxy.kill()
     if not keep:
-        subprocess.run(["podman", "rm", "-f", "-v", CONTAINER], capture_output=True)
+        subprocess.run(["podman", "rm", "-f", "-v", container], capture_output=True)
 
     for name, expr, alias, sql in leaks:
         print(f"  {RED}LEAK{OFF}     {name:<20} {expr}  {DIM}alias={alias}{OFF}")
@@ -310,7 +436,7 @@ def main() -> int:
     if served == 0:
         print(f"  {RED}FAIL{OFF}: nothing was served, so refusal proves nothing")
         return 1
-    return 1 if leaks else 0
+    return 1 if (leaks or composite_fail) else 0
 
 
 if __name__ == "__main__":

@@ -179,6 +179,20 @@ MUTATIONS = [
         "./scripts/test-inference.sh",
     ),
     (
+        "summary of a grouped column",
+        "crates/proxy/src/analysis.rs",
+        "                if aggregate_argument_is_grouped(call, grouped) {\n                    return Safety::Unknown;\n                }",
+        "",
+        "./scripts/test-fuzz.sh 900 1 1",
+    ),
+    (
+        "grouping reference bound",
+        "crates/proxy/src/analysis.rs",
+        "    let Some(grouped) = grouped else {\n        return true;\n    };",
+        "    let Some(grouped) = grouped else {\n        return false;\n    };",
+        "./scripts/test-fuzz.sh 900 1 1",
+    ),
+    (
         "notice text withheld",
         "crates/proxy/src/protocol.rs",
         "        if notice && field == b'M' {",

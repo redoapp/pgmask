@@ -798,6 +798,10 @@ impl Session {
         // lexing that was tried and rejected for a harder reason: `deparse` on a
         // synthetic tree aborts the process from C on a malformed enum, which
         // turns a grouping we cannot read into a crash.
+        //
+        // This is the *key* half of the problem only. The other half — a
+        // summary of a column the query groups on, which is that column — is
+        // decided in `analysis`, where the aggregate's argument is visible.
         let singleton_groups = inspection.as_ref().is_some_and(|inspection| {
             match inspection.group_by_columns() {
                 Some(grouped) => {

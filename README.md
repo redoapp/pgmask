@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.18**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.19**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -404,6 +404,18 @@ If a refresh fails, the previous snapshot is kept rather than cleared — cleari
 would be fail-closed in the narrow sense and would mask every column in the
 database the moment Postgres blinked. Failures are logged and counted.
 
+**The snapshot's unique keys fail open, unlike everything else in it.** An
+unknown column is masked, because unclassified means deny; but a relation whose
+unique keys are not yet in the snapshot simply has none, and the singleton-group
+guard has nothing to fire on. A table created after the last refresh therefore
+serves `sum(x) GROUP BY <its key>` until the next one, up to
+`catalog_refresh_seconds`. Found by a test that created its fixture after
+starting the proxy: the cases that ran before the refresh were served and the
+ones after were refused, splitting exactly on the boundary. The window is
+bounded by the refresh interval and needs DDL inside it, so it is recorded
+rather than closed — closing it means refusing aggregates over every relation
+the snapshot does not know, which includes every temp table.
+
 ### Rejection metrics
 
 Every refusal is bucketed by cause, because the numbers decide whether the
@@ -521,7 +533,10 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   refused. Column references, ordinals and `ROLLUP`/`CUBE`/`GROUPING SETS` are
   read, and so is an output alias, which denotes whatever its target computes;
   an expression is not, and falls back to asking whether the statement names
-  every column of some key at all. Ungrouped groupings, non-key
+  every column of some key at all. Separately, a summary of a column the query
+  groups *on* is that column — `sum(x)/count(*)` is `x` within a constant
+  group — so a reducing aggregate whose input the grouping could reach is
+  refused regardless of any key. Ungrouped groupings, non-key
   groupings and coarse date buckets are served unchanged.
 
 ## Layout

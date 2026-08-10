@@ -451,13 +451,21 @@ fn analyze_inspected(
         return unknown;
     }
 
+    // Over-approximated: every column the grouping could reference, or `None`
+    // when that cannot be bounded. Unlike `group_by_columns`, which answers
+    // "which columns is this grouping *on*" for the unique-key test, this only
+    // has to avoid missing a reference, so an unrecognised node collapses to
+    // `None` and refuses instead of releasing.
+    let grouped = grouping_may_reference(select, &select.target_list);
+    let grouped = grouped.as_deref();
+
     select
         .target_list
         .iter()
         .map(|entry| match entry.node.as_ref() {
             Some(NodeEnum::ResTarget(target)) => {
                 match target.val.as_ref().and_then(|v| v.node.as_ref()) {
-                    Some(expr) => classify(expr, allow_summaries),
+                    Some(expr) => classify(expr, allow_summaries, grouped),
                     None => Safety::Unknown,
                 }
             }
@@ -560,7 +568,7 @@ fn target_is_star(node: &pg_query::protobuf::Node) -> bool {
 }
 
 /// The allowlist proper.
-fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
+fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) -> Safety {
     match expr {
         // A literal. `SELECT 1`, `SELECT 'x'`, `SELECT NULL`.
         NodeEnum::AConst(_) => Safety::Releasable,
@@ -574,7 +582,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
 
         // A cast is safe exactly when what it casts is. `SELECT 1::text`.
         NodeEnum::TypeCast(cast) => match cast.arg.as_ref().and_then(|a| a.node.as_ref()) {
-            Some(inner) => classify(inner, allow_summaries),
+            Some(inner) => classify(inner, allow_summaries, grouped),
             None => Safety::Unknown,
         },
 
@@ -636,6 +644,23 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
             // prove-absence reasoning this module refuses to do, so every
             // windowed aggregate is refused.
             if call.over.is_none() && REDUCING_AGGREGATES.contains(&name) {
+                // A summary of a column the query groups on is that column.
+                // Within a group it is constant, so `sum(x)/count(*)` is `x`
+                // exactly — every group, any data, no unique key needed. The
+                // key test in the session cannot see this, and
+                // `SELECT annual_salary AS g0, sum(annual_salary) … GROUP BY 1`
+                // served exact salaries until the generated poison campaign
+                // caught it.
+                //
+                // Narrow on purpose. Refusing whenever a *masked* column is
+                // grouped was tried first and refused every grouped aggregate
+                // in the fixture — under a default-deny catalog almost every
+                // column is masked, which is `summaries = "refuse"` by another
+                // route. The aggregate's own argument is the thing the grouping
+                // makes constant, so that is what is compared.
+                if aggregate_argument_is_grouped(call, grouped) {
+                    return Safety::Unknown;
+                }
                 return Safety::Releasable;
             }
             // Ranking windows emit a position, not a value — but only when
@@ -666,7 +691,9 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
                 let all = call.args.iter().all(|a| {
                     a.node
                         .as_ref()
-                        .map(|inner| classify(inner, allow_summaries) == Safety::Releasable)
+                        .map(|inner| {
+                            classify(inner, allow_summaries, grouped) == Safety::Releasable
+                        })
                         .unwrap_or(false)
                 });
                 if all {
@@ -683,7 +710,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
             {
-                Some(inner) => classify(inner, allow_summaries),
+                Some(inner) => classify(inner, allow_summaries, grouped),
                 // A missing side is a unary operator, not a hidden column.
                 None => Safety::Releasable,
             };
@@ -704,7 +731,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
             for arg in &case.args {
                 if let Some(NodeEnum::CaseWhen(when)) = arg.node.as_ref() {
                     let branch = match when.result.as_ref().and_then(|r| r.node.as_ref()) {
-                        Some(inner) => classify(inner, allow_summaries),
+                        Some(inner) => classify(inner, allow_summaries, grouped),
                         None => Safety::Unknown,
                     };
                     all &= branch == Safety::Releasable;
@@ -713,7 +740,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
                 }
             }
             if let Some(default) = case.defresult.as_ref().and_then(|d| d.node.as_ref()) {
-                all &= classify(default, allow_summaries) == Safety::Releasable;
+                all &= classify(default, allow_summaries, grouped) == Safety::Releasable;
             }
             if all {
                 Safety::Releasable
@@ -726,7 +753,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
             let all = c.args.iter().all(|a| {
                 a.node
                     .as_ref()
-                    .map(|inner| classify(inner, allow_summaries) == Safety::Releasable)
+                    .map(|inner| classify(inner, allow_summaries, grouped) == Safety::Releasable)
                     .unwrap_or(false)
             });
             if all {
@@ -738,6 +765,215 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
 
         _ => Safety::Unknown,
     }
+}
+
+/// Every column the grouping *could* reference, over-approximated.
+///
+/// `None` means "cannot bound this — assume it references everything", and the
+/// caller refuses on it. That inversion is what makes traversing an arbitrary
+/// expression sound here, where the rest of this module will not do it: the
+/// other walks prove a column is *absent* and are unsound the moment they miss
+/// a node type, while this one only ever has to avoid *under*-collecting, and an
+/// unrecognised node collapses to "everything" rather than to "nothing".
+///
+/// Node types are matched explicitly and their child lists exhausted. A
+/// `FuncCall` with an aggregate filter, ordering or window clause is not
+/// bounded, because those carry columns this does not walk.
+///
+/// Hand-rolled on purpose, and the alternative was measured rather than
+/// assumed. `pg_query`'s own generated traversal, `ParseResult::nodes()`, is
+/// the obvious library answer and is *incomplete in the unsafe direction* —
+/// asked for the columns under a grouping it returns, on this version:
+///
+/// | grouping                                | `nodes()` finds |
+/// |-----------------------------------------|-----------------|
+/// | `coalesce(annual_salary, 0)`            | `annual_salary` |
+/// | `(a + b) * c`                           | `a`, `b`, `c`   |
+/// | `ARRAY[deep1, deep2]`                   | nothing         |
+/// | `GROUPING SETS ((g1),(g2))`             | nothing         |
+/// | `row_number() OVER (PARTITION BY w)`    | nothing         |
+/// | `xmlelement(name foo, xmlcol)`          | nothing         |
+///
+/// Four silent misses, each of which would be a release here. The library is
+/// still used as an oracle: `library_traversal_finds_no_column_this_misses`
+/// asserts this function never returns a *narrower* set than `nodes()` does.
+fn grouping_may_reference(
+    select: &SelectStmt,
+    targets: &[pg_query::protobuf::Node],
+) -> Option<Vec<String>> {
+    fn walk(
+        node: &pg_query::protobuf::Node,
+        targets: &[pg_query::protobuf::Node],
+        into: &mut Vec<String>,
+        depth: u32,
+        // Resolve output aliases here? True at the top of a grouping element,
+        // false once inside a target's value. Without it `SELECT city AS city
+        // … GROUP BY city` chases its own alias to the depth cap and reports
+        // "unbounded", refusing six honest aggregations in the fixture.
+        resolve_alias: bool,
+    ) -> Option<()> {
+        if depth > 24 {
+            return None;
+        }
+        let d = depth.saturating_add(1);
+        match node.node.as_ref()? {
+            NodeEnum::ColumnRef(column) => {
+                for field in &column.fields {
+                    if let Some(NodeEnum::String(s)) = &field.node {
+                        into.push(s.sval.to_ascii_lowercase());
+                    }
+                }
+                // A bare name may be an output alias; the target it names can
+                // reference anything.
+                if resolve_alias && column.fields.len() == 1 {
+                    let name = into.last().cloned().unwrap_or_default();
+                    for entry in targets {
+                        let Some(NodeEnum::ResTarget(target)) = entry.node.as_ref() else {
+                            continue;
+                        };
+                        if !target.name.is_empty() && target.name.to_ascii_lowercase() == name {
+                            walk(target.val.as_ref()?, targets, into, d, false)?;
+                        }
+                    }
+                }
+                Some(())
+            }
+            NodeEnum::AConst(constant) => {
+                // An ordinal names a target; anything else is a literal.
+                if let Some(pg_query::protobuf::a_const::Val::Ival(value)) = constant.val.as_ref() {
+                    let position = usize::try_from(value.ival).ok()?.checked_sub(1)?;
+                    let Some(NodeEnum::ResTarget(target)) = targets.get(position)?.node.as_ref()
+                    else {
+                        return None;
+                    };
+                    return walk(target.val.as_ref()?, targets, into, d, false);
+                }
+                Some(())
+            }
+            NodeEnum::TypeCast(cast) => walk(cast.arg.as_ref()?, targets, into, d, resolve_alias),
+            NodeEnum::CollateClause(c) => walk(c.arg.as_ref()?, targets, into, d, resolve_alias),
+            NodeEnum::AExpr(expr) => {
+                for side in [expr.lexpr.as_ref(), expr.rexpr.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    walk(side, targets, into, d, resolve_alias)?;
+                }
+                Some(())
+            }
+            NodeEnum::BoolExpr(expr) => {
+                for arg in &expr.args {
+                    walk(arg, targets, into, d, resolve_alias)?;
+                }
+                Some(())
+            }
+            NodeEnum::CoalesceExpr(expr) => {
+                for arg in &expr.args {
+                    walk(arg, targets, into, d, resolve_alias)?;
+                }
+                Some(())
+            }
+            NodeEnum::MinMaxExpr(expr) => {
+                for arg in &expr.args {
+                    walk(arg, targets, into, d, resolve_alias)?;
+                }
+                Some(())
+            }
+            NodeEnum::NullTest(test) => walk(test.arg.as_ref()?, targets, into, d, resolve_alias),
+            NodeEnum::BooleanTest(test) => {
+                walk(test.arg.as_ref()?, targets, into, d, resolve_alias)
+            }
+            NodeEnum::FuncCall(call) => {
+                if call.over.is_some()
+                    || call.agg_filter.is_some()
+                    || !call.agg_order.is_empty()
+                    || call.agg_star
+                {
+                    return None;
+                }
+                for arg in &call.args {
+                    walk(arg, targets, into, d, resolve_alias)?;
+                }
+                Some(())
+            }
+            NodeEnum::CaseExpr(expr) => {
+                if let Some(arg) = expr.arg.as_ref() {
+                    walk(arg, targets, into, d, resolve_alias)?;
+                }
+                for when in &expr.args {
+                    let Some(NodeEnum::CaseWhen(when)) = when.node.as_ref() else {
+                        return None;
+                    };
+                    walk(when.expr.as_ref()?, targets, into, d, resolve_alias)?;
+                    walk(when.result.as_ref()?, targets, into, d, resolve_alias)?;
+                }
+                if let Some(default) = expr.defresult.as_ref() {
+                    walk(default, targets, into, d, resolve_alias)?;
+                }
+                Some(())
+            }
+            NodeEnum::GroupingSet(set) => {
+                for member in &set.content {
+                    walk(member, targets, into, d, resolve_alias)?;
+                }
+                Some(())
+            }
+            NodeEnum::RowExpr(row) => {
+                for member in &row.args {
+                    walk(member, targets, into, d, resolve_alias)?;
+                }
+                Some(())
+            }
+            // Anything else — a sublink, an array, an unrecognised node —
+            // could reference a column this does not see.
+            _ => None,
+        }
+    }
+
+    let mut columns = Vec::new();
+    for item in &select.group_clause {
+        walk(item, targets, &mut columns, 0, true)?;
+    }
+    Some(columns)
+}
+
+/// Is this aggregate's input held constant by the grouping?
+///
+/// `grouped` is empty when there is no grouping, and also when the grouping
+/// could not be read — in which case this declines rather than guessing, and
+/// the session's lexical backstop is what stands between the statement and a
+/// release.
+///
+/// Only a plain column reference is compared. An argument this cannot read is
+/// treated as *not* grouped, which is the permissive direction and is
+/// deliberate: refusing every aggregate over an expression would cost far more
+/// than the shape is worth, and the readable case is the one that was actually
+/// disclosing.
+fn aggregate_argument_is_grouped(
+    call: &pg_query::protobuf::FuncCall,
+    grouped: Option<&[String]>,
+) -> bool {
+    // `None` is a grouping whose referenced columns could not be bounded, so
+    // any aggregate under it might be summarising a constant.
+    let Some(grouped) = grouped else {
+        return true;
+    };
+    if grouped.is_empty() {
+        return false;
+    }
+    call.args.iter().any(|arg| {
+        let Some(NodeEnum::ColumnRef(column)) = arg.node.as_ref() else {
+            return false;
+        };
+        column
+            .fields
+            .last()
+            .and_then(|f| match &f.node {
+                Some(NodeEnum::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                _ => None,
+            })
+            .is_some_and(|name| grouped.contains(&name))
+    })
 }
 
 /// The column names one `GROUP BY` item can distinguish rows by.
@@ -2229,6 +2465,102 @@ mod referenced_identifier_probe {
             cols("SELECT z.*, sum(x) FROM z, t GROUP BY id"),
             Some(vec!["id".to_string()])
         );
+    }
+
+    /// The library's traversal as a lower bound on ours.
+    ///
+    /// `pg_query::ParseResult::nodes()` is generated from the protobuf schema,
+    /// so where it *does* descend it is authoritative. It is not complete —
+    /// measured misses are tabulated on `grouping_may_reference` — which is why
+    /// it cannot replace the hand-written walker. It makes a good oracle in one
+    /// direction all the same: any column the library finds under a grouping
+    /// that our walker does not is a hole in ours, and a hole here releases a
+    /// value.
+    ///
+    /// Our walker may legitimately return `None` (unbounded, so refuse) or a
+    /// *superset*; it may never return less.
+    #[test]
+    fn library_traversal_finds_no_column_this_misses() {
+        use pg_query::protobuf::{ParseResult as PbResult, RawStmt, ResTarget};
+        use pg_query::NodeRef;
+
+        let library_columns = |select: &SelectStmt, version: i32| {
+            let targets: Vec<pg_query::protobuf::Node> = select
+                .group_clause
+                .iter()
+                .map(|item| pg_query::protobuf::Node {
+                    node: Some(NodeEnum::ResTarget(Box::new(ResTarget {
+                        name: String::new(),
+                        indirection: vec![],
+                        val: Some(Box::new(item.clone())),
+                        location: -1,
+                    }))),
+                })
+                .collect();
+            let synthetic = SelectStmt {
+                target_list: targets,
+                ..Default::default()
+            };
+            let node = pg_query::protobuf::Node {
+                node: Some(NodeEnum::SelectStmt(Box::new(synthetic))),
+            };
+            // `nodes()` is pure Rust. `deparse()` on a synthetic tree is not —
+            // it aborts the process from C on an invalid enum discriminant.
+            let result = PbResult {
+                version,
+                stmts: vec![RawStmt {
+                    stmt: Some(Box::new(node)),
+                    stmt_location: 0,
+                    stmt_len: 0,
+                }],
+            };
+            let mut found = Vec::new();
+            for (node, _, _, _) in result.nodes() {
+                if let NodeRef::ColumnRef(column) = node {
+                    for field in &column.fields {
+                        if let Some(NodeEnum::String(s)) = &field.node {
+                            found.push(s.sval.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        for sql in [
+            "SELECT sum(v) FROM t GROUP BY coalesce(a, 0)",
+            "SELECT sum(v) FROM t GROUP BY (a + b) * c",
+            "SELECT sum(v) FROM t GROUP BY CASE WHEN p THEN q ELSE r END",
+            "SELECT sum(v) FROM t GROUP BY abs(a), lower(b)",
+            "SELECT sum(v) FROM t GROUP BY a::text",
+            "SELECT sum(v) FROM t GROUP BY GROUPING SETS ((g1),(g2))",
+            "SELECT sum(v) FROM t GROUP BY ARRAY[d1, d2]",
+            "SELECT sum(v) FROM t GROUP BY (SELECT max(hidden) FROM u)",
+            "SELECT a AS g, sum(v) FROM t GROUP BY g",
+            "SELECT a, sum(v) FROM t GROUP BY 1",
+        ] {
+            let parsed = pg_query::parse(sql).expect("fixture parses");
+            let statement = parsed.protobuf.stmts.first().expect("one statement");
+            let Some(NodeEnum::SelectStmt(select)) =
+                statement.stmt.as_ref().and_then(|s| s.node.as_ref())
+            else {
+                panic!("fixture is a SELECT");
+            };
+            let library = library_columns(select, parsed.protobuf.version);
+            match grouping_may_reference(select, &select.target_list) {
+                // Unbounded: refuses, so it cannot miss anything.
+                None => {}
+                Some(ours) => {
+                    for column in library {
+                        assert!(
+                            ours.contains(&column),
+                            "{sql}: the library found {column:?} under the grouping and \
+                             grouping_may_reference did not — that is a release",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The case that made this lexical: the tree walk does not enter a

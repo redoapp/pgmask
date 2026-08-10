@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.1.19 — the campaign could not have found it
+
+A summary of a column the query *groups on* is that column. Within a group it is
+constant, so `sum(x)/count(*)` is `x` exactly — every group, any data, no unique
+key involved, which is why the key test added in 0.1.16 never fired:
+
+```sql
+SELECT annual_salary AS g0, sum(annual_salary) AS c0 FROM fz.people GROUP BY 1
+```
+
+Found by the generated poison campaign rather than by review, and only after
+two independent reasons it could not have been found before.
+
+WHY 176,000 STATEMENTS REPORTED CLEAN
+
+The generator's only `GROUP BY` arm projected `count(*)`, which discloses
+nothing whatever it is grouped by. No generated statement could reach a reducing
+aggregate over a grouping at all — the shape was outside the grammar, so the
+clean runs said nothing about it. That is the second time this generator has
+been missing precisely the arm that mattered; the windowed-aggregate arm was
+added in 0.1.5 for the same reason.
+
+The extended harness then read values with `try_get::<Option<String>>` and
+dropped every column it could not decode as text. `sum(int4)` returns `int8`, so
+the numeric poison detector could never fire on that path — and neither could
+the date or uuid ones. The 0.1.11 note that both harnesses now share
+`fuzz::oracle` was true and insufficient: sharing detectors does not help if the
+values never reach them, and that fix was verified with `ip-prefix`, which
+happens to sit on a `text` column. Values are now rendered through a type ladder
+before the oracle sees them.
+
+With both fixed the poison control worked: 480 leaked values with the rule
+removed, 0 with it.
+
+TWO WRONG FIXES FIRST, BOTH CAUGHT BY MEASUREMENT
+
+Refusing whenever a *masked* column is grouped closed the hole and refused every
+grouped aggregate in the fixture — under a default-deny catalog almost every
+column is masked, so that is `summaries = "refuse"` by another route. The
+grouping suite's non-vacuity guard failed the run outright: nothing was served,
+so refusal proved nothing.
+
+Comparing only the aggregate's plain-column argument halved the leaks, 480 to
+240. `GROUP BY coalesce(annual_salary, 0)` is an expression, so the comparison
+was skipped.
+
+What works is bounding *every column the grouping could reference*, where an
+unrecognised node means "could be anything" and refuses. That inversion is what
+makes walking an arbitrary expression sound here when the rest of this module
+will not do it: the other walks prove a column is absent and are unsound the
+moment they miss a node, while this one only has to avoid under-collecting.
+
+THE LIBRARY IS THE UNSAFE OPTION HERE
+
+`pg_query::ParseResult::nodes()` is a generated traversal and the obvious way to
+avoid hand-rolling this. Measured against the same groupings, it silently finds
+nothing under `ARRAY[...]`, `GROUPING SETS`, `OVER (PARTITION BY ...)` or
+`xmlelement(...)` — four misses, each a release. The table is recorded on
+`grouping_may_reference`.
+
+It is still used, as an oracle rather than an implementation:
+`library_traversal_finds_no_column_this_misses` asserts our walker never returns
+a narrower column set than `nodes()` does, so a hole in ours fails the build.
+
+The mutation run then reported `ordinal grouping unread` as SURVIVED, which was
+correct and worth the entry. Since 0.1.17 the lexical backstop catches whatever
+the reader cannot resolve, so breaking ordinal resolution is *safe* — it only
+costs precision, and nothing asserted precision. The distinguishing query is
+`SELECT city, sum(annual_salary) … WHERE id > 5 GROUP BY 1`: read, the grouping
+is `city` and it is served; unread, the backstop scans the whole statement,
+finds `id` in the filter, and refuses. It is now pinned, and the mutation is
+caught. 24 mutations, 0 survived.
+
 ## 0.1.18 — a name in the clause is not the column being grouped on
 
 0.1.17 read the `GROUP BY` and got the wrong answer for two spellings, both
