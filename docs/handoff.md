@@ -530,7 +530,19 @@ decision stays visible and nobody later mistakes the proxy for anonymization.
 - **Small-cell aggregates.** `GROUP BY city HAVING count(*) = 1`.
 - **Differencing.** Two permitted aggregate queries whose difference isolates one row.
 
-Closing these requires query-set-level accounting — minimum group sizes, filter-side
+One case was reclassified from accepted to closed. `SELECT sum(salary) FROM t GROUP BY
+id` is not a small-cell problem — with `id` unique, *every* group is a single row, so the
+statement returns the whole masked column in one query. That one is decidable without any
+query-set accounting: the grouping is in the statement and the uniqueness is in
+`pg_index`. Since v0.1.16 the session refuses a released reducing aggregate whose
+`GROUP BY` covers a declared unique key, and equally one whose `GROUP BY` it cannot reduce
+to column names (`GROUP BY 1`, `GROUPING SETS`, an expression) — an unreadable grouping is
+one that cannot be cleared. Ungrouped aggregates and groupings on non-key columns are
+served unchanged, so ordinary analytics is unaffected. `WHERE id = 1` reaches the same
+value and is still accepted: one row per query rather than the whole table in one, and
+whether a predicate is singleton is a fact about the data.
+
+Closing the rest requires query-set-level accounting — minimum group sizes, filter-side
 policy, per-principal budgets, probably noise — a different and much larger project that
 also costs exactness. Not planned.
 

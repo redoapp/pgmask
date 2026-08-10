@@ -470,6 +470,11 @@ pub struct Snapshot {
     /// unqualified — Harlequin does — and a user may own a `public.pg_database`,
     /// so a name proves nothing. The OID in the `RowDescription` does.
     system_relations: HashSet<u32>,
+    /// Declared unique keys, as sets of lowercased column names.
+    ///
+    /// Used to spot a `GROUP BY` that makes every group a single row, which
+    /// turns a released summary back into the value it was summarising.
+    unique_keys: Vec<Vec<String>>,
     /// Lowercased `schema.relation` of every view whose definition contains a
     /// set operation, transitively, plus every view we could not read or parse.
     ///
@@ -533,6 +538,34 @@ impl Snapshot {
             .rsplit_once('.')
             .map_or(qualified.as_str(), |(_, n)| n);
         self.is_opaque_view(None, bare)
+    }
+
+    /// Whether grouping by these columns makes every group a single row.
+    ///
+    /// `sum(salary)` is released because a summary is not a salary — but
+    /// `GROUP BY id` on a unique key gives one row per group, so every
+    /// "summary" is exactly the value it summarised. Measured on the demo
+    /// fixture, `SELECT id, sum(annual_salary) … GROUP BY id` returned every
+    /// salary in the table, byte-identical to reading it directly, in one
+    /// query. The group-of-one trade was written down as an incidental edge
+    /// case; grouping by a key makes it the bulk interface.
+    ///
+    /// Deliberately not resolved to a relation. It asks whether *any* declared
+    /// unique key is covered by the grouped names, so `GROUP BY id` is refused
+    /// wherever `id` is a key. Resolving which relation the grouping belongs to
+    /// would need name resolution this does not have, and being wrong in that
+    /// direction releases values; being wrong in this one refuses a query whose
+    /// grouping happens to share a key's column names.
+    pub fn grouping_covers_a_unique_key(&self, grouped: &[String]) -> bool {
+        self.unique_keys
+            .iter()
+            .any(|key| key.iter().all(|column| grouped.contains(column)))
+    }
+
+    #[cfg(test)]
+    pub fn insert_unique_key_for_test(&mut self, columns: &[&str]) {
+        self.unique_keys
+            .push(columns.iter().map(|c| (*c).to_ascii_lowercase()).collect());
     }
 
     /// Whether the statement mentions the name of any column this principal
@@ -1248,11 +1281,43 @@ async fn resolve_snapshot(
     }
     let opaque_views = opaque_views(&view_defs);
 
+    // Declared unique keys, so a grouping that yields one row per group can be
+    // told apart from a real aggregation. Partial indexes are excluded: they
+    // are only unique over the rows matching their predicate.
+    let mut unique_keys: Vec<Vec<String>> = Vec::new();
+    for row in client
+        .query(
+            "SELECT string_agg(a.attname, ',' ORDER BY k.ord) AS columns
+               FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+              WHERE i.indisunique AND i.indpred IS NULL
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+              GROUP BY i.indexrelid",
+            &[],
+        )
+        .await
+        .context("loading unique keys")?
+    {
+        let columns: Option<String> = row.get("columns");
+        if let Some(columns) = columns {
+            unique_keys.push(
+                columns
+                    .split(',')
+                    .map(|c| c.trim().to_ascii_lowercase())
+                    .collect(),
+            );
+        }
+    }
+
     if rules.is_empty() {
         let snapshot = Snapshot {
             system_relations,
             relation_columns,
             opaque_views,
+            unique_keys,
             ..Default::default()
         };
         drop(client);
@@ -1300,6 +1365,7 @@ async fn resolve_snapshot(
         system_relations,
         relation_columns,
         opaque_views,
+        unique_keys,
         ..Default::default()
     };
     for rule in rules {
@@ -1394,6 +1460,30 @@ mod tests {
         assert!(snapshot.is_opaque_view(None, "V_UNION"), "case-folded");
         assert!(!snapshot.is_opaque_view(Some("other"), "v_union"));
         assert!(!snapshot.is_opaque_view(None, "something_else"));
+    }
+
+    /// A summary over a singleton group is the value it summarised.
+    ///
+    /// `SELECT id, sum(annual_salary) FROM demo.customers GROUP BY id` returned
+    /// every salary in the fixture exactly, in one query, byte-identical to
+    /// reading the column directly. The group-of-one trade was recorded as an
+    /// incidental edge case; grouping by a key makes it the bulk interface.
+    #[test]
+    fn grouping_by_a_unique_key_is_recognised() {
+        let mut snapshot = Snapshot::default();
+        snapshot.insert_unique_key_for_test(&["id"]);
+        snapshot.insert_unique_key_for_test(&["tenant", "email"]);
+
+        assert!(snapshot.grouping_covers_a_unique_key(&["id".into()]));
+        // A superset of a key still yields one row per group.
+        assert!(snapshot.grouping_covers_a_unique_key(&["id".into(), "city".into()]));
+        assert!(snapshot.grouping_covers_a_unique_key(&["tenant".into(), "email".into()]));
+
+        // Real aggregation is untouched.
+        assert!(!snapshot.grouping_covers_a_unique_key(&["city".into()]));
+        // Part of a composite key is not the key.
+        assert!(!snapshot.grouping_covers_a_unique_key(&["tenant".into()]));
+        assert!(!snapshot.grouping_covers_a_unique_key(&[]));
     }
 
     /// The `system_catalogs = "allow"` fast path serves a whole result set

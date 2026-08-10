@@ -31,12 +31,26 @@ PG_PORT=55501
 PROXY_PORT=6541
 CONTAINER=pgmask-inference
 
-pass=0; fail=0
+recoverable=0; governed=0; fail=0
 # `possible` reads as a PASS when the attack works, because what is being
 # asserted is the limitation, not the defence.
 possible() {
-  if [[ "$3" == *"$2"* ]]; then printf '  \033[33mRECOVERABLE\033[0m  %s\n' "$1"; ((pass++))
+  if [[ "$3" == *"$2"* ]]; then printf '  \033[33mRECOVERABLE\033[0m  %s\n' "$1"; ((recoverable++))
   else printf '  \033[32mGOVERNED\033[0m     %s\n        (expected to recover %s, got: %s)\n' "$1" "$2" "$3"; ((fail++)); fi
+}
+# The other direction: something that used to be recoverable and now is not.
+#
+# Requires a refusal, not merely a different answer. Asserting only "the true
+# value is absent" would pass on any output at all — including a silently wrong
+# number, which is a worse failure than either serving or refusing.
+governed() {
+  if [[ "$3" == *"$2"* ]]; then
+    printf '  \033[31mREGRESSED\033[0m    %s\n        recovered %s\n' "$1" "$2"; ((fail++))
+  elif [[ "$3" != *"pgmask:"* ]]; then
+    printf '  \033[31mNOT REFUSED\033[0m  %s\n        expected a refusal, got: %s\n' "$1" "$3"; ((fail++))
+  else
+    printf '  \033[32mGOVERNED\033[0m     %s\n' "$1"; ((governed++))
+  fi
 }
 
 cleanup() {
@@ -84,11 +98,39 @@ if [[ "$masked" == *"$TRUE_EMAIL"* ]]; then
 fi
 printf '  \033[32mok\033[0m           the projection is masked: %s\n' "${masked:0:44}"
 
-# 1. An aggregate grouped by a unique key is one row per row.
-possible "sum() GROUP BY a unique key returns every value" \
+# 1. An aggregate grouped by a unique key is one row per row. Governed since
+#    v0.1.16: a released summary over a singleton group is the value itself.
+governed "sum() GROUP BY a unique key" \
   "$TRUE_SALARY" "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY id ORDER BY id LIMIT 1')"
+governed "...including a superset of the key" \
+  "$TRUE_SALARY" "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY id, city LIMIT 1')"
+# The ordinal names `id`, so this is the same attack written differently — and
+# pgmask cannot resolve `1` to a column, so it refuses on the weaker ground that
+# a grouping it cannot read is one it cannot clear.
+#
+# `GROUP BY 1` with `sum(...)` as the *only* target is not this test: Postgres
+# rejects it outright ("aggregate functions are not allowed in GROUP BY"), so
+# the assertion would pass on a server error without the proxy deciding
+# anything. It did, until `governed` began requiring a pgmask refusal.
+governed "...and the same attack through an ordinal" \
+  "$TRUE_SALARY" "$(p 'SELECT id, sum(annual_salary) FROM demo.customers GROUP BY 1 ORDER BY 1 LIMIT 1')"
 
-# 2. The same thing with a filter instead of a grouping.
+# The cost of that conservatism, pinned so it is visible: grouping by a non-key
+# through an ordinal is harmless and is refused anyway.
+governed "(cost) an unreadable grouping is refused even on a non-key" \
+  "$TRUE_SALARY" "$(p 'SELECT city, sum(annual_salary) FROM demo.customers GROUP BY 1 LIMIT 1')"
+
+# Real aggregation is untouched, which is the whole point of doing it this way.
+if [[ "$(p 'SELECT sum(annual_salary) FROM demo.customers')" == *"pgmask:"* ]]; then
+  echo "  FAIL: an ungrouped aggregate must still be released"; fail=$((fail+1))
+else
+  printf '  \033[32mok\033[0m           a real aggregate is still served\n'; governed=$((governed+1))
+fi
+
+# 2. The same thing with a filter instead of a grouping. Not governed and not
+#    governable statically: whether `WHERE id=1` matches one row is a property
+#    of the data, not the statement. It costs a query per row rather than one
+#    query for the table, which is the whole of what guard 1 buys.
 possible "sum() filtered to one row is that row" \
   "$TRUE_SALARY" "$(p 'SELECT sum(annual_salary) FROM demo.customers WHERE id=1')"
 
@@ -136,7 +178,7 @@ possible "$queries count(*) queries recover the address" "$TRUE_EMAIL" "$value"
 
 echo
 echo "------------------------------------------"
-printf '%d recoverable, %d now governed\n' "$pass" "$fail"
+printf '%d still recoverable, %d governed, %d unexpected\n' "$recoverable" "$governed" "$fail"
 # Any change here is worth a human deciding about, in either direction.
 [[ "$fail" -eq 0 ]] || {
   echo

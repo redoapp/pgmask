@@ -764,10 +764,26 @@ impl Session {
                         ))
             };
 
-        let safety = match &inspection {
-            Some(inspection) => {
-                inspection.output_safety(fields.len(), self.policy.summaries == Summaries::Allow)
+        // A grouping that yields one row per group turns a released summary
+        // back into the value it summarised: `SELECT id, sum(salary) … GROUP BY
+        // id` returned every salary in the demo fixture exactly, in one query.
+        // Treating such a statement as if `summaries = "refuse"` is the whole
+        // fix. `count(*)` and the relation-size functions are released above
+        // that gate and stay released, because a row count per group discloses
+        // nothing.
+        let singleton_groups = inspection.as_ref().is_some_and(|inspection| {
+            match inspection.group_by_columns() {
+                // A grouping we cannot read is one we cannot clear.
+                None => true,
+                Some(grouped) => {
+                    !grouped.is_empty() && snapshot.grouping_covers_a_unique_key(&grouped)
+                }
             }
+        });
+        let allow_summaries = self.policy.summaries == Summaries::Allow && !singleton_groups;
+
+        let safety = match &inspection {
+            Some(inspection) => inspection.output_safety(fields.len(), allow_summaries),
             None => vec![Safety::Unknown; fields.len()],
         };
         // Engines disagree about this: Postgres zeroes provenance for set

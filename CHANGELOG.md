@@ -1,5 +1,123 @@
 # Changelog
 
+## 0.1.16 — a summary of one row is that row
+
+`SELECT sum(annual_salary) FROM demo.customers GROUP BY id` returned every
+salary, exactly, in a single query. It is not a small-cell problem: with `id`
+unique, *every* group is one row, so the aggregate relaxation — "a reducing
+aggregate cannot return a stored value whatever is inside it" — is false for the
+whole result set at once. 0.1.15 recorded it as an accepted limitation. It is
+the one route on that list that is decidable without query-set accounting: the
+grouping is in the statement and the uniqueness is in `pg_index`.
+
+`StatementInspection::group_by_columns` reads the top-level `GROUP BY` down to
+column names, the catalog snapshot loads unique keys from `pg_index` (excluding
+partial indexes, whose uniqueness is conditional), and the session withholds the
+summary relaxation when the grouping covers one. A grouping that cannot be
+reduced to names — `GROUP BY 1`, `GROUPING SETS`, `GROUP BY lower(a)` — is also
+withheld, because a grouping we cannot read is one we cannot clear.
+
+Scoped so ordinary analytics is untouched, which is why it is done here rather
+than by turning summaries off: an ungrouped `sum`, a `sum` grouped by a non-key
+column, and `count(*)` grouped by anything are all served exactly as before.
+
+`WHERE id = 1` reaches the same value and is still accepted. Whether a predicate
+matches one row is a property of the data, not of the statement, so there is
+nothing sound to decide at Describe time. What the guard buys is the difference
+between one query for the whole column and one query per row — and the inference
+suite now asserts both halves, so undoing either is a failure rather than a
+quiet regression. It joins the gate for that reason.
+
+## 0.1.15 — measure what a client can reconstruct, and stop overclaiming
+
+The suite asked one question — does a masked value appear in the output? — and
+answered it well. It is not the question a reader assumes it answers. An
+adversarial client does not need the value to appear: a grouped aggregate, an
+ungoverned filter with `count(*)` (313 queries to a full address, measured), an
+error used as a one-bit channel, and `ORDER BY` on a masked column all
+reconstruct without disclosing. `analysis.rs` claimed the bar was "you cannot
+read an anonymised value"; against an adversary that is false, and it is the
+kind of false that decides whether this goes in front of regulated data. Both it
+and the README now say what is true. `scripts/test-inference.sh` pins the routes.
+
+## 0.1.14 — a detector that cannot be read is not a detector
+
+A 3000-statement corpus reported 8,221 leaks, all false. The numeric canary
+flagged any integer in the `annual_salary` range, and `row_number()` walks
+straight through it. Tightening to exact-sequence membership still left 60 — an
+int4 salary is indistinguishable from an ordinal by value alone — so the fixture
+moved to `900000000 + i * 137` instead, which no ordinal reaches under the
+statement timeout. The opposite failure mode to the day's other fixes, and just
+as disabling: a real escape would have been three lines inside the noise.
+
+## 0.1.13 — would we find out if a fix were undone?
+
+`scripts/test-mutations.py` breaks each guard on purpose and requires the
+narrowest suite to fail: 16 caught, 0 survived, 0 stale. Not in `test-all.sh`,
+because it edits source and a gate that can leave the tree modified is a worse
+hazard than the coverage. Python rather than bash because the first version
+split its Rust-source table on `|`, straight through `|t| t.strip_suffix(...)` —
+the harness had the defect it exists to find.
+
+## 0.1.12 — a plan outliving the snapshot it was decided against
+
+Statement and portal plans deliberately outlive their result set; nothing tied
+them to the catalog snapshot they were resolved against. A refresh re-resolves
+names to OIDs, and `DROP TABLE; CREATE TABLE` recycles one — so a plan cached
+across that boundary applies the previous mapping's classification, which is a
+different column's mask. Every other DDL direction already failed closed.
+`PlanState` now drops cached statement and portal plans when the catalog
+generation changes, keeping only the in-flight plan whose rows are already being
+served.
+
+## 0.1.11 — ambiguous principals, a blind oracle, ornamental checks
+
+A startup packet naming `user` twice is refused rather than guessed at: pgmask
+took the first and PostgreSQL takes the last, so masking resolved one identity
+while the backend authenticated another. The extended-protocol oracle carried a
+private one-token canary list and could not see any type-aware mask — the same
+blind spot that let the windowed-aggregate disclosure through, reintroduced on
+the other protocol; both harnesses now share `fuzz::oracle`. Eight CockroachDB
+refutes truncated to `head -1` while the leak is on row two, so they passed
+regardless of what the proxy did. Plus README numbers that did not reconcile.
+
+## 0.1.10 — the channels that carry values around the masking
+
+Three backend messages carry free text a client can steer to a stored value, and
+none produces a RowDescription — so no plan, no refusal, no masking. `RAISE
+NOTICE '%', (SELECT email …)` prints the address while the same column read
+through the proxy is a pseudonym. Notice primary messages and
+NotificationResponse are withheld; ParameterStatus is forwarded only for
+reportable GUCs whose values cannot carry row data, `application_name`
+deliberately excluded. An *error's* message is kept — Postgres composes it from
+its own text, and an opaque proxy is a much worse trade.
+
+## 0.1.9 — the release allowlists
+
+`pg_size_pretty`, `pg_size_bytes` and `pg_column_size` take a *value*, not a
+relation: `pg_size_pretty(salary % 10000)` with `pg_size_pretty(salary / 10000)`
+reconstructs any bigint exactly. Moved to `PURE_SCALARS`, released only when
+every argument is. A star over a zero-column relation expands to none, so target
+count could match field count while every later position was shifted — a star
+now makes positional correspondence unprovable. Set-returning functions in
+`FROM` are refused outside three argument-driven generators, because the SRFs
+behind `pg_stat_activity` match no relation rule. In the catalog: `for_roles`
+iterated a `HashSet` so equal-ranked masks resolved differently per connection;
+duplicate rules for one column are refused (which found a real duplicate in
+`catalog-gui.toml`); `pseudonym_key` must be at least 16 bytes.
+
+## 0.1.8 — five defects from an independent audit
+
+Three protocol-legal disclosures with no error and no `Close`: `Parse` replacing
+a statement left the previous plan cached, a Describe answered with an error left
+its FIFO slot forever, and `described_sql` was a scalar while Describes are a
+queue. Each Describe now carries its frontend Sync epoch — clearing on
+`ReadyForQuery` is wrong under pipelining and ate live slots. Two masks failed
+open (`range` with both bounds past the length, `outer` with `keep = 0`), and
+`unclassified_mask` — the entire content of default-deny — was never validated,
+so it returned undeclared columns verbatim while logging `unclassified=Mask`.
+0.1.6's lexical backstop also missed quoted and keyword-shaped identifiers.
+
 ## 0.1.7 — the same gap, in the other release path
 
 Having built a tool for the walker gap, the obvious next question was where else

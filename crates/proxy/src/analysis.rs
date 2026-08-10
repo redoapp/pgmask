@@ -12,10 +12,10 @@
 //! say and what the README implied — and against an adversarial client that
 //! claim is simply false. `scripts/test-inference.sh` measures it:
 //!
-//!   - `SELECT sum(salary) FROM t GROUP BY id` returns every salary exactly, in
-//!     one query, when `id` is unique and released. The "group of one" trade
-//!     was written down as an incidental edge case; grouping by a key makes it
-//!     the bulk interface.
+//!   - `SELECT sum(salary) FROM t GROUP BY id` returned every salary exactly,
+//!     in one query, when `id` is unique and released. The "group of one" trade
+//!     was written down as an incidental edge case; grouping by a key made it
+//!     the bulk interface. **Refused since v0.1.16** — see below.
 //!   - the filter side is ungoverned, so `WHERE email LIKE 'a%'` with `count(*)`
 //!     recovers a full address in **313 queries**, measured, through the proxy.
 //!   - an error is a one-bit channel that needs no aggregate: `1/(CASE WHEN …
@@ -27,6 +27,17 @@
 //! exposure for an analyst who is not attacking you, and it does not contain
 //! one who is. Governing the filter side is the only sound answer and it is a
 //! different product — it would refuse `WHERE email = …` outright.
+//!
+//! The one route that was closed is the one that is decidable from the
+//! statement and the catalog alone: [`StatementInspection::group_by_columns`]
+//! reads the grouping, and if it covers a declared unique key — or cannot be
+//! read at all — the session withholds the aggregate relaxation, so a reducing
+//! aggregate is refused rather than released. That leaves real aggregation
+//! untouched, which is the point of doing it this way rather than by disabling
+//! summaries. The `WHERE id = 1` form of the same attack survives and cannot be
+//! closed here: whether a predicate matches one row is a property of the data,
+//! not of the statement. What the guard buys is the difference between one
+//! query for the whole table and one query per row.
 //!
 //! That relaxation is what makes this tractable without a lineage engine. If the
 //! outermost node of a target expression is a reducing aggregate, it cannot
@@ -74,6 +85,48 @@ pub struct StatementInspection<'sql> {
 }
 
 impl<'sql> StatementInspection<'sql> {
+    /// The columns a top-level `GROUP BY` groups on.
+    ///
+    /// `Some([])` means there is no grouping. `None` means there is one but it
+    /// cannot be reduced to plain column names — an ordinal, an expression,
+    /// `GROUPING SETS` — and the caller must treat that as possibly-singleton,
+    /// because a grouping it cannot read is a grouping it cannot clear.
+    ///
+    /// Read off the top-level `SelectStmt`'s `group_clause` rather than walked.
+    /// That matters: the walker has documented gaps, and a missed `GROUP BY`
+    /// here would look like "no grouping" and release exactly the aggregate
+    /// this exists to catch. A direct field read has nothing to miss.
+    ///
+    /// Only the top level is inspected, which is sufficient — an aggregate
+    /// inside a subquery is not the released field; the outer field
+    /// referencing it has no provenance and is judged on its own.
+    pub fn group_by_columns(&self) -> Option<Vec<String>> {
+        let parsed = self.parsed()?;
+        let [statement] = parsed.protobuf.stmts.as_slice() else {
+            return Some(Vec::new());
+        };
+        let Some(NodeEnum::SelectStmt(select)) =
+            statement.stmt.as_ref().and_then(|s| s.node.as_ref())
+        else {
+            return Some(Vec::new());
+        };
+        if select.group_clause.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut columns = Vec::with_capacity(select.group_clause.len());
+        for item in &select.group_clause {
+            let Some(NodeEnum::ColumnRef(column)) = &item.node else {
+                return None;
+            };
+            let name = column.fields.last().and_then(|f| match &f.node {
+                Some(NodeEnum::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                _ => None,
+            })?;
+            columns.push(name);
+        }
+        Some(columns)
+    }
+
     pub fn new(sql: &'sql str) -> Self {
         Self {
             sql,
@@ -1877,6 +1930,30 @@ mod referenced_identifier_probe {
         let cols = referenced_identifiers(sql).expect("scans");
         assert!(cols.contains(&"d".to_string()), "got {cols:?}");
         assert!(cols.contains(&"id".to_string()), "got {cols:?}");
+    }
+
+    /// A summary over a singleton group is the value it summarised, so the
+    /// grouping has to be read — or admitted to be unreadable.
+    #[test]
+    fn group_by_columns_reads_the_clause_or_admits_it_cannot() {
+        let cols = |sql: &str| StatementInspection::new(sql).group_by_columns();
+        assert_eq!(cols("SELECT sum(x) FROM t"), Some(vec![]));
+        assert_eq!(
+            cols("SELECT id, sum(x) FROM t GROUP BY id"),
+            Some(vec!["id".to_string()])
+        );
+        assert_eq!(
+            cols("SELECT sum(x) FROM t GROUP BY t.id, city"),
+            Some(vec!["id".to_string(), "city".to_string()])
+        );
+        // A grouping that cannot be reduced to names must read as unknown, so
+        // the caller refuses rather than assuming it is not a singleton.
+        assert_eq!(cols("SELECT id, sum(x) FROM t GROUP BY 1"), None);
+        assert_eq!(
+            cols("SELECT sum(x) FROM t GROUP BY GROUPING SETS ((a),(b))"),
+            None
+        );
+        assert_eq!(cols("SELECT sum(x) FROM t GROUP BY lower(a)"), None);
     }
 
     /// The case that made this lexical: the tree walk does not enter a

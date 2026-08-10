@@ -137,6 +137,13 @@ MUTATIONS = [
         "cargo test -p pgmask -q two_users",
     ),
     (
+        "singleton-group aggregate",
+        "crates/proxy/src/session.rs",
+        "let allow_summaries = self.policy.summaries == Summaries::Allow && !singleton_groups;",
+        "let allow_summaries = self.policy.summaries == Summaries::Allow;",
+        "./scripts/test-inference.sh",
+    ),
+    (
         "notice text withheld",
         "crates/proxy/src/protocol.rs",
         "        if notice && field == b'M' {",

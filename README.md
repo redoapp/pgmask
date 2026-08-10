@@ -7,10 +7,14 @@ according to a policy catalog, and refuses anything it cannot classify.
 **What it does and does not do.** It guarantees a masked value does not appear
 in a result set. It does *not* stop a determined client reconstructing one by
 inference: the filter side is ungoverned, so `count(*)` with a `LIKE` predicate
-recovers a full address in about 300 queries, and `sum(x) GROUP BY <unique key>`
-returns every value in one. `./scripts/test-inference.sh` demonstrates both
-against the demo fixture. Treat this as a control against incidental exposure —
-an analyst who is not attacking you — not as containment for one who is.
+recovers a full address in about 300 queries. The one route that returned every
+value at once — `sum(x) GROUP BY <unique key>`, where each group is a single row
+and the summary is that row — is refused as of v0.1.16; the same shape through a
+`WHERE` clause is not, because whether a predicate matches one row is a property
+of the data rather than of the statement. `./scripts/test-inference.sh`
+enumerates what remains, measured against the demo fixture. Treat this as a
+control against incidental exposure — an analyst who is not attacking you — not
+as containment for one who is.
 
 ```
 $ psql -p 55432 -c 'SELECT id, email, name, phone, city, internal_note FROM demo.customers ORDER BY id LIMIT 2'
@@ -37,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.11**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.16**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -511,7 +515,10 @@ analytical ones, and which you have decides whether Phase 6 is optional.
 - Masking is a disclosure control on the projection. It does not defend against
   predicate oracles, join-key re-identification, small-cell aggregates or
   differencing — recorded as reviewed and accepted in
-  [`docs/handoff.md` §11](docs/handoff.md).
+  [`docs/handoff.md` §11](docs/handoff.md). The single exception is the
+  statically decidable one: a released reducing aggregate whose `GROUP BY`
+  covers a declared unique key, or whose `GROUP BY` cannot be read at all, is
+  refused. Ungrouped and non-key groupings are served unchanged.
 
 ## Layout
 
