@@ -91,6 +91,9 @@ struct Relation {
     text: &'static [&'static str],
     nums: &'static [&'static str],
     typed: &'static [&'static str],
+    /// Date/timestamp columns specifically. `typed` mixes dates with uuids and
+    /// int8, and `date_trunc` over a uuid is an engine error rather than a test.
+    dates: &'static [&'static str],
 }
 
 const RELATIONS: &[Relation] = &[
@@ -99,42 +102,49 @@ const RELATIONS: &[Relation] = &[
         text: &["a", "b"],
         nums: &["id", "n"],
         typed: &["d", "u"],
+        dates: &["d"],
     },
     Relation {
         name: "fz.t2",
         text: &["a", "b"],
         nums: &["id", "n"],
         typed: &["d", "u"],
+        dates: &["d"],
     },
     Relation {
         name: "fz.t3",
         text: &["a", "b"],
         nums: &["id", "n"],
         typed: &["d", "u"],
+        dates: &["d"],
     },
     Relation {
         name: "fz.t4",
         text: &["a", "b"],
         nums: &["id", "n"],
         typed: &["d", "u"],
+        dates: &["d"],
     },
     Relation {
         name: "fz.t5",
         text: &["a", "b"],
         nums: &["id", "n"],
         typed: &["d", "u"],
+        dates: &["d"],
     },
     Relation {
         name: "fz.t6",
         text: &["a", "b"],
         nums: &["id", "n"],
         typed: &["d", "u"],
+        dates: &["d"],
     },
     Relation {
         name: "fz.people",
         text: &["email", "full_name", "phone", "city", "last_ip", "note"],
         nums: &["id", "annual_salary"],
         typed: &["birth_date", "account_uuid", "salary_big"],
+        dates: &["birth_date"],
     },
     // The views matter more than the tables: a set operation inside one is
     // invisible in the statement that selects from it, and that was a leak on
@@ -144,18 +154,21 @@ const RELATIONS: &[Relation] = &[
         text: &["a"],
         nums: &["id"],
         typed: &[],
+        dates: &[],
     },
     Relation {
         name: "fz.v_join",
         text: &["xa", "yb"],
         nums: &["id"],
         typed: &[],
+        dates: &[],
     },
     Relation {
         name: "fz.v_mixed",
         text: &["v"],
         nums: &["id"],
         typed: &[],
+        dates: &[],
     },
 ];
 
@@ -189,6 +202,13 @@ impl Source {
     ///
     /// Projected bare rather than wrapped: these are type-aware masks, and an
     /// expression over one is refused before the mask ever runs.
+    /// A date column, when the relation has one.
+    fn date_col(&self, rng: &mut Rng) -> Option<String> {
+        if self.relation.dates.is_empty() {
+            return None;
+        }
+        Some(format!("{}.{}", self.alias, rng.pick(self.relation.dates)))
+    }
     fn typed_col(&self, rng: &mut Rng) -> String {
         if self.relation.typed.is_empty() {
             return self.text_col(rng);
@@ -274,7 +294,7 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
     // travels with it unless the arm changes the type.
     let wrap = |sql: String, cols: Vec<String>, typed: bool| Shape { sql, cols, typed };
 
-    match rng.below(12) {
+    match rng.below(13) {
         // Subquery.
         0 => {
             let inner = compose(rng, next, n, allow_typed);
@@ -514,6 +534,117 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
                 sql,
                 cols,
                 // As above: `sum`/`avg` are numeric.
+                typed: true,
+            }
+        }
+        // The release paths that convert a refusal into an acceptance, which
+        // nothing here could previously produce.
+        //
+        // Two of them have each cost a disclosure. `PURE_SCALARS` was 0.1.9 —
+        // `pg_size_pretty` and `pg_column_size` take a *value*, so a modulo and
+        // a divide reconstruct any bigint. `date_trunc` was 0.1.23 — released
+        // for any unit "at or above a day" while the mask is a year, so
+        // `date_trunc('day', birth_date)` returned the whole date. Both were
+        // found by reading code, because no generated statement could reach
+        // either path.
+        //
+        // Emits the unsafe spellings alongside the safe ones. An arm that only
+        // produces the releasable form asserts nothing — that is exactly how
+        // the grouped-aggregate arm sat here for a release projecting
+        // `count(*)`, unable to find the thing it was added for.
+        //
+        // What the oracle can see here is uneven, and worth saying plainly. A
+        // date truncated below its mask is caught, because the shape detector
+        // knows a masked birth date is `01-01` and a leaked one is not — that
+        // is 0.1.23's bug, so this arm is testable against a known leak. A byte
+        // length from `pg_column_size(email)` is *not* caught: no detector
+        // covers "a number derived from a value". Those statements exercise the
+        // path and would catch a raw passthrough, nothing finer.
+        11 => {
+            // Same reason as arms 9 and 10: these project a date, a text size
+            // or a numeric, none of which can sit opposite text in a set
+            // operation.
+            if !allow_typed {
+                return leaf(rng, depth, n, allow_typed);
+            }
+            let s = source(rng, n.wrapping_add(120));
+            let sql = match rng.below(10) {
+                // Truncation. The unit list mixes safe with unsafe on purpose.
+                0..=2 => {
+                    let unit = rng.pick(&[
+                        "year", "decade", "century", "day", "week", "month", "quarter",
+                    ]);
+                    match s.date_col(rng) {
+                        Some(col) => format!(
+                            "SELECT date_trunc('{unit}', {col}) AS c0 FROM {} {}",
+                            s.relation.name, s.alias
+                        ),
+                        // A view here has no date column; fall back rather
+                        // than emit `date_trunc` over a uuid.
+                        None => format!(
+                            "SELECT pg_column_size({}) AS c0 FROM {} {}",
+                            s.text_col(rng),
+                            s.relation.name,
+                            s.alias
+                        ),
+                    }
+                }
+                // Size formatters over a *value*, which must not be released.
+                //
+                // The releasable direction — `pg_size_pretty(pg_table_size(t))`
+                // — is deliberately absent, along with `version()`,
+                // `current_database()` and `pg_backend_pid()`. Their values are
+                // properties of the engine and the session, so they differ
+                // between Postgres and CockroachDB by construction, and this
+                // corpus is shared with the cross-engine differential, whose
+                // whole premise is that the same fixture and catalog produce
+                // the same masked output. They were here for one run and
+                // produced twelve spurious mismatches: `20` vs `20.5`, and two
+                // version banners. None of them takes a column, so none can
+                // leak one; unit tests are the right place for that path.
+                3 | 4 => format!(
+                    // Cast: `pg_size_pretty` overloads on bigint and numeric,
+                    // so an int4 argument is ambiguous rather than wrong.
+                    "SELECT pg_size_pretty({}::bigint) AS c0 FROM {} {}",
+                    s.num_col(rng),
+                    s.relation.name,
+                    s.alias
+                ),
+                5 => format!(
+                    "SELECT pg_column_size({}) AS c0 FROM {} {}",
+                    s.text_col(rng),
+                    s.relation.name,
+                    s.alias
+                ),
+                // Pure scalars: over a column (refused) and over summaries
+                // (released), which is the distinction the allowlist encodes.
+                6 => {
+                    let f = rng.pick(&["abs", "round", "floor", "ceil", "sign"]);
+                    format!(
+                        "SELECT {f}({}) AS c0 FROM {} {}",
+                        s.num_col(rng),
+                        s.relation.name,
+                        s.alias
+                    )
+                }
+                // `::numeric` so both engines do decimal division. Without it
+                // Postgres integer-divides and CockroachDB does not — `20` vs
+                // `20.5`, which is an arithmetic difference wearing a leak's
+                // clothes.
+                7 => format!(
+                    "SELECT round(sum({})::numeric / greatest(count(*), 1), 1) AS c0 FROM {} {}",
+                    s.num_col(rng),
+                    s.relation.name,
+                    s.alias
+                ),
+                // Not allowlisted, and must stay that way: `set_config` on
+                // `application_name` was an out-of-band channel in 0.1.10, and
+                // this is the query that would read it back.
+                _ => "SELECT current_setting('application_name') AS c0".to_string(),
+            };
+            Shape {
+                sql,
+                cols: vec!["c0".into()],
                 typed: true,
             }
         }

@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.1.24 — generate the release paths, and make the control fail first
+
+Every rule in `classify` that turns a refusal into an acceptance, and whether a
+generated statement could reach it before this release:
+
+| release path | reachable |
+|---|---|
+| literals, `count(*)`, reducing aggregates, ranking windows | yes |
+| `SqlvalueFunction`, `CONTEXT_FUNCTIONS`, `SIZE_FUNCTIONS` | no |
+| `date_trunc` | **no** — 0.1.23's disclosure |
+| `PURE_SCALARS` | **no** — 0.1.9's disclosure |
+
+Two of the three unreachable paths had each already cost a disclosure, both
+found by reading code. The new arm emits them, and emits the *unsafe* spellings
+alongside the safe ones — `date_trunc('day', …)` next to `'year'`,
+`pg_size_pretty(<value>)` next to nothing at all. An arm that only produces the
+releasable form asserts nothing, which is exactly what the grouped-aggregate arm
+did for a full release while projecting `count(*)`.
+
+THE CONTROL FAILED, WHICH IS WHY IT EXISTS
+
+First run of the poison control — revert 0.1.23, require the campaign to find
+it — reported **zero leaks**. The arm could not see the bug it was built for.
+`date_trunc` returns `timestamptz`, and the harness type ladder decoded
+`String`, integers, floats, bool, uuid, `civil::Date` and `Decimal`. The value
+was discarded one layer below the detector.
+
+That is the third instance of the same failure in this codebase:
+
+  0.1.19  `sum(int4)` -> `int8` dropped        hid the singleton-group leak
+  0.1.21  `avg` -> `numeric` dropped           recorded as a comment, not fixed
+  0.1.24  `date_trunc` -> `timestamptz` dropped  broke this arm's own control
+
+With `civil::DateTime` and `Timestamp` added: 1,550 leaks reverted, 0 with the
+fix. The arm can now rediscover 0.1.23.
+
+WHAT THE ARM DELIBERATELY DOES NOT EMIT
+
+`version()`, `current_database()`, `pg_backend_pid()` and
+`pg_size_pretty(pg_table_size(t))` were in the first cut and produced twelve
+cross-engine mismatches — `20` vs `20.5` from integer versus decimal division,
+and two version banners. None was a masking difference. This corpus is shared
+with the differential, whose premise is that the same fixture and catalog give
+the same masked output, and these are properties of the engine and the session.
+None of them takes a column, so none can leak one; unit tests cover that path.
+`round(sum(x)::numeric / …)` stays, with the cast that makes both engines agree.
+
+`shapegen` runs 398 of 400 statements after all this, up from 378 — the arm
+needed real date columns rather than whatever `typed_col` returned, since
+`date_trunc` over a uuid is an engine error and not a test.
+
 ## 0.1.23 — coarsening below the mask is not coarsening
 
 `date_trunc` was released for any unit "at or above a day". The fixture's

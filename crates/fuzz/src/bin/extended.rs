@@ -91,6 +91,18 @@ fn render(row: &Row, i: usize) -> Option<String> {
     if let Ok(v) = row.try_get::<_, Option<jiff::civil::Date>>(i) {
         return v.map(|v| v.to_string());
     }
+    // `timestamp` and `timestamptz`, which is what `date_trunc` returns even
+    // for a `date` input. Their absence was the third instance of this exact
+    // failure in one day: the release-path arm was built specifically to catch
+    // `date_trunc('day', birth_date)`, its poison control reported zero leaks,
+    // and the reason was that the leaked value was thrown away one layer below
+    // the detector.
+    if let Ok(v) = row.try_get::<_, Option<jiff::civil::DateTime>>(i) {
+        return v.map(|v| v.to_string());
+    }
+    if let Ok(v) = row.try_get::<_, Option<jiff::Timestamp>>(i) {
+        return v.map(|v| v.to_string());
+    }
     // `numeric`, which is what `avg` over an integer returns. Without this the
     // generator had to avoid `avg` entirely: a disclosure through it would be
     // produced and then discarded before any detector ran, which is the exact
