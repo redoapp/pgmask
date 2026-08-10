@@ -66,30 +66,50 @@ async fn connect(url: &str) -> Result<Client> {
 ///
 /// Ordered most specific first; a decode failure means "not this type", while
 /// `Ok(None)` means the column really is NULL and there is nothing to scan.
-fn render(row: &Row, i: usize) -> Option<String> {
+/// What one column yielded.
+///
+/// `Null` and `Undecodable` were the same value — `None` — for most of this
+/// harness's life, and that conflation is the single most expensive bug in this
+/// codebase. Three separate disclosures were invisible because the value
+/// carrying them could not be decoded and was silently dropped one layer below
+/// the detectors: `int8` in 0.1.19, `numeric` in 0.1.21, `timestamptz` in
+/// 0.1.24. Each time the fix was to add a type, and each time the *next* type
+/// was equally silent.
+///
+/// So an undecodable value is now an event with a name, counted and reported,
+/// and a run that produces any fails. `interval`, `bytea`, `json`, arrays and
+/// CockroachDB's own types would all have vanished the same way; now they stop
+/// the run and say which type to add.
+enum Rendered {
+    Value(String),
+    Null,
+    Undecodable,
+}
+
+fn render(row: &Row, i: usize) -> Rendered {
     if let Ok(v) = row.try_get::<_, Option<String>>(i) {
-        return v;
+        return v.map_or(Rendered::Null, Rendered::Value);
     }
     if let Ok(v) = row.try_get::<_, Option<i64>>(i) {
-        return v.map(|v| v.to_string());
+        return v.map_or(Rendered::Null, |v| Rendered::Value(v.to_string()));
     }
     if let Ok(v) = row.try_get::<_, Option<i32>>(i) {
-        return v.map(|v| v.to_string());
+        return v.map_or(Rendered::Null, |v| Rendered::Value(v.to_string()));
     }
     if let Ok(v) = row.try_get::<_, Option<i16>>(i) {
-        return v.map(|v| v.to_string());
+        return v.map_or(Rendered::Null, |v| Rendered::Value(v.to_string()));
     }
     if let Ok(v) = row.try_get::<_, Option<f64>>(i) {
-        return v.map(|v| v.to_string());
+        return v.map_or(Rendered::Null, |v| Rendered::Value(v.to_string()));
     }
     if let Ok(v) = row.try_get::<_, Option<bool>>(i) {
-        return v.map(|v| v.to_string());
+        return v.map_or(Rendered::Null, |v| Rendered::Value(v.to_string()));
     }
     if let Ok(v) = row.try_get::<_, Option<uuid::Uuid>>(i) {
-        return v.map(|v| v.to_string());
+        return v.map_or(Rendered::Null, |v| Rendered::Value(v.to_string()));
     }
     if let Ok(v) = row.try_get::<_, Option<jiff::civil::Date>>(i) {
-        return v.map(|v| v.to_string());
+        return v.map_or(Rendered::Null, |v| Rendered::Value(v.to_string()));
     }
     // `timestamp` and `timestamptz`, which is what `date_trunc` returns even
     // for a `date` input. Their absence was the third instance of this exact
@@ -98,31 +118,42 @@ fn render(row: &Row, i: usize) -> Option<String> {
     // and the reason was that the leaked value was thrown away one layer below
     // the detector.
     if let Ok(v) = row.try_get::<_, Option<jiff::civil::DateTime>>(i) {
-        return v.map(|v| v.to_string());
+        return v.map_or(Rendered::Null, |v| Rendered::Value(v.to_string()));
     }
     if let Ok(v) = row.try_get::<_, Option<jiff::Timestamp>>(i) {
-        return v.map(|v| v.to_string());
+        return v.map_or(Rendered::Null, |v| Rendered::Value(v.to_string()));
     }
     // `numeric`, which is what `avg` over an integer returns. Without this the
     // generator had to avoid `avg` entirely: a disclosure through it would be
     // produced and then discarded before any detector ran, which is the exact
     // blindness that hid the singleton-group leak.
     if let Ok(v) = row.try_get::<_, Option<rust_decimal::Decimal>>(i) {
-        return v.map(|v| v.normalize().to_string());
+        return v.map_or(Rendered::Null, |v| {
+            Rendered::Value(v.normalize().to_string())
+        });
     }
-    None
+    Rendered::Undecodable
 }
 
-fn text_values(rows: &[Row]) -> Vec<String> {
+/// Every value in the result set, plus the names of any types that could not be
+/// decoded — a value the oracle never sees is not a value that did not leak.
+fn text_values(rows: &[Row]) -> (Vec<String>, Vec<String>) {
     let mut out = Vec::new();
+    let mut blind = Vec::new();
     for row in rows {
         for i in 0..row.len() {
-            if let Some(v) = render(row, i) {
-                out.push(v);
+            match render(row, i) {
+                Rendered::Value(v) => out.push(v),
+                Rendered::Null => {}
+                Rendered::Undecodable => {
+                    if let Some(column) = row.columns().get(i) {
+                        blind.push(column.type_().name().to_string());
+                    }
+                }
             }
         }
     }
-    out
+    (out, blind)
 }
 
 #[tokio::main]
@@ -164,11 +195,13 @@ async fn main() -> Result<()> {
     let mut visible_directly = 0usize;
     let mut leaks = 0usize;
     let mut reported: Vec<String> = Vec::new();
+    let mut undecodable: std::collections::BTreeMap<String, usize> = Default::default();
 
     for sql in &statements {
         // The control: is there anything to find here at all?
         if let Ok(rows) = direct.query(*sql, &[]).await {
-            let found = text_values(&rows)
+            let (values, _) = text_values(&rows);
+            let found = values
                 .iter()
                 .filter(|v| CANARIES.iter().any(|(t, _)| v.contains(t)) || shape_leak(v).is_some())
                 .count();
@@ -181,7 +214,12 @@ async fn main() -> Result<()> {
         match proxy.query(*sql, &[]).await {
             Ok(rows) => {
                 served = served.saturating_add(1);
-                for value in text_values(&rows) {
+                let (values, blind) = text_values(&rows);
+                for name in blind {
+                    let seen = undecodable.entry(name).or_insert(0usize);
+                    *seen = seen.saturating_add(1);
+                }
+                for value in values {
                     let hit = CANARIES
                         .iter()
                         .find(|(token, _)| value.contains(token))
@@ -239,6 +277,12 @@ async fn main() -> Result<()> {
     for line in &reported {
         println!("\n  {line}");
     }
+    if !undecodable.is_empty() {
+        println!("\n  UNDECODABLE, so never scanned:");
+        for (name, n) in &undecodable {
+            println!("    {n:>7}  {name}");
+        }
+    }
 
     if expect_leaks {
         if leaks == 0 {
@@ -252,6 +296,15 @@ async fn main() -> Result<()> {
     }
     if leaks > 0 {
         bail!("{leaks} masked value(s) reached the client");
+    }
+    // A clean run over values nobody looked at is not a clean run.
+    if let Some((name, n)) = undecodable.iter().next() {
+        bail!(
+            "{n} value(s) of type {name} could not be decoded, so no detector saw them \
+             (and {} type(s) in total) — add it to `render` or the clean result above is \
+             partly an artefact of not looking",
+            undecodable.len()
+        );
     }
     Ok(())
 }

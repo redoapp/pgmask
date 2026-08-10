@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.25 — a value nobody could decode is not a value that did not leak
+
+Three disclosures hid in one line of the extended harness, which returned
+`None` both for "this column was NULL" and for "I could not decode this type".
+The second is a blind spot; the first is nothing. Conflating them meant the
+oracle reported clean on values it had never seen:
+
+  0.1.19  `sum(int4)` is `int8`          hid the singleton-group disclosure
+  0.1.21  `avg` is `numeric`             recorded as a comment and left
+  0.1.24  `date_trunc` is `timestamptz`  broke that release's own poison control
+
+Each fix added a type, and each time the next type was equally silent.
+`interval`, `bytea`, `json`, arrays and CockroachDB's own types were all queued
+up behind it.
+
+An undecodable value is now an event with a name. `render` returns
+`Value`/`Null`/`Undecodable`, the run tallies them by type from
+`row.columns()[i].type_().name()`, prints them, and **fails**:
+
+```
+  UNDECODABLE, so never scanned:
+     6884  date
+Error: 6884 value(s) of type date could not be decoded, so no detector saw them
+```
+
+Verified the way the rest of this is: by deleting the `date` decoder and
+requiring the failure. Before this change that same deletion reported
+`leaks=0` and passed.
+
+This is the fix that should have been made after the first instance rather than
+the third. Adding a type closes one hole; making the hole audible closes the
+class.
+
 ## 0.1.24 — generate the release paths, and make the control fail first
 
 Every rule in `classify` that turns a refusal into an acceptance, and whether a
