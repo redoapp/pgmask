@@ -708,6 +708,11 @@ impl Snapshot {
     }
 
     #[cfg(test)]
+    #[cfg(test)]
+    pub fn insert_system_relation_for_test(&mut self, table_oid: u32) {
+        self.system_relations.insert(table_oid);
+    }
+
     pub fn insert_opaque_view_for_test(&mut self, relation: &str) {
         self.opaque_views.insert(relation.to_ascii_lowercase());
     }
@@ -1460,6 +1465,59 @@ mod tests {
         assert!(snapshot.is_opaque_view(None, "V_UNION"), "case-folded");
         assert!(!snapshot.is_opaque_view(Some("other"), "v_union"));
         assert!(!snapshot.is_opaque_view(None, "something_else"));
+    }
+
+    /// Predicates the release rules consult, asserted directly.
+    ///
+    /// `cargo mutants` replaced each of these with a constant and nothing
+    /// failed. They are covered end-to-end by the shell campaigns, which
+    /// `cargo test` does not run — so `cargo test` would have stayed green
+    /// while `is_system_relation` returned `true` for every OID, which serves
+    /// user tables through the `system_catalogs = "allow"` fast path.
+    #[test]
+    fn predicates_the_release_rules_consult() {
+        let mut snapshot = Snapshot::default();
+        snapshot.insert_relation_for_test("demo.customers", &[("email", Mask::Redact)]);
+        snapshot.relation_columns_for_test("demo.customers", &["id", "email"]);
+
+        // Replacing this with `false` disables the lineage backstop *and* the
+        // masked-column check that gates fine-grained `date_trunc`; with
+        // `true`, every statement looks like it touches something masked.
+        let roles = HashSet::new();
+        assert!(
+            snapshot.statement_references_masked_column("SELECT email FROM demo.customers", &roles)
+        );
+        assert!(
+            !snapshot.statement_references_masked_column("SELECT 1 FROM demo.customers", &roles)
+        );
+
+        // The system-relation set decides whether a whole result set is served
+        // unmasked. Constant in either direction is a different failure: `true`
+        // serves user tables, `false` silently disables GUI support.
+        assert!(!snapshot.is_system_relation(16385));
+        snapshot.insert_system_relation_for_test(1259);
+        assert!(snapshot.is_system_relation(1259));
+        assert!(!snapshot.is_system_relation(16385));
+    }
+
+    /// The 16-byte floor on `pseudonym_key`, at its edge.
+    ///
+    /// Added in 0.1.9 after an unvalidated key made every pseudonym a
+    /// recomputable HMAC with a zero key. `cargo mutants` flipped its `<` to
+    /// `<=` and nothing noticed, so the boundary itself was never asserted.
+    #[test]
+    fn the_pseudonym_key_floor_is_exactly_sixteen_bytes() {
+        let with_key = |bytes: usize| {
+            let key = "k".repeat(bytes);
+            let src = format!(
+                "backend = \"h:1\"\ncatalog_dsn = \"d\"\npseudonym_key = \"{key}\"\nunclassified = \"allow\"\n"
+            );
+            let config: Config = toml::from_str(&src).expect("parses");
+            config.validate_pseudonym_key()
+        };
+        assert!(with_key(15).is_err(), "15 bytes must be refused");
+        assert!(with_key(16).is_ok(), "16 bytes is the documented floor");
+        assert!(with_key(32).is_ok());
     }
 
     /// A summary over a singleton group is the value it summarised.

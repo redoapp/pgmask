@@ -2714,6 +2714,85 @@ mod referenced_identifier_probe {
         );
     }
 
+    /// The functions a whole rule rests on, asserted directly.
+    ///
+    /// `cargo mutants` can replace a function body with a constant and see
+    /// whether anything notices. These three survived that, which means the
+    /// rules built on them were pinned only end-to-end — by
+    /// `scripts/test-fuzz.sh`, which `cargo test` does not run. A `cargo test`
+    /// that passes while `aggregate_argument_is_grouped` always returns false
+    /// is a suite that would not notice the summary-of-a-grouped-column
+    /// disclosure coming back.
+    #[test]
+    fn the_predicates_whole_rules_rest_on() {
+        // `aggregate_argument_is_grouped` decides whether a summary is really
+        // the value it summarised. Replacing it with `false` reopens the 0.1.19
+        // disclosure; deleting its name-reading arm does the same more quietly.
+        let call_in = |sql: &str| {
+            let parsed = pg_query::parse(sql).expect("fixture parses");
+            let statement = parsed.protobuf.stmts.first().expect("one statement");
+            let Some(NodeEnum::SelectStmt(select)) =
+                statement.stmt.as_ref().and_then(|s| s.node.as_ref())
+            else {
+                panic!("fixture is a SELECT");
+            };
+            for entry in &select.target_list {
+                let Some(NodeEnum::ResTarget(target)) = entry.node.as_ref() else {
+                    continue;
+                };
+                if let Some(NodeEnum::FuncCall(call)) =
+                    target.val.as_ref().and_then(|v| v.node.as_ref())
+                {
+                    return call.clone();
+                }
+            }
+            panic!("fixture has no function call: {sql}");
+        };
+
+        let grouped_on_salary = ["annual_salary".to_string()];
+        let grouped_on_city = ["city".to_string()];
+        assert!(aggregate_argument_is_grouped(
+            &call_in("SELECT sum(annual_salary) FROM t"),
+            Some(&grouped_on_salary)
+        ));
+        assert!(!aggregate_argument_is_grouped(
+            &call_in("SELECT sum(annual_salary) FROM t"),
+            Some(&grouped_on_city)
+        ));
+        // No grouping decides nothing; an unbounded grouping refuses.
+        assert!(!aggregate_argument_is_grouped(
+            &call_in("SELECT sum(annual_salary) FROM t"),
+            Some(&[])
+        ));
+        assert!(aggregate_argument_is_grouped(
+            &call_in("SELECT sum(annual_salary) FROM t"),
+            None
+        ));
+
+        // `is_parseable` is how a caller distinguishes "this says nothing" from
+        // "this is nonsense we cannot read". Constant in either direction is
+        // wrong: `true` trusts gibberish, `false` refuses everything.
+        assert!(is_parseable("SELECT 1"));
+        assert!(!is_parseable("SELEKT ¯\\_(ツ)_/¯ FROM"));
+
+        // The lexer is the backstop under lineage, the catalog fast path and
+        // the singleton-group guard. Its word test survived three mutations, so
+        // pin the edges it actually has to get right.
+        let ids = |sql: &str| referenced_identifiers(sql).expect("scans");
+        // A quoted name keeps its spelling, minus the quotes, and an escaped
+        // quote inside one survives.
+        assert!(ids(r#"SELECT "Odd Name" FROM t"#).contains(&"odd name".to_string()));
+        assert!(ids(r#"SELECT "a""b" FROM t"#).contains(&"a\"b".to_string()));
+        // A leading digit is not a name; a leading underscore is.
+        let numeric = ids("SELECT 1234 FROM t");
+        assert!(!numeric.contains(&"1234".to_string()));
+        assert!(ids("SELECT _x FROM t").contains(&"_x".to_string()));
+        // `$` is legal inside a name but not at its start.
+        assert!(ids("SELECT a$b FROM t").contains(&"a$b".to_string()));
+        // And an operator is not a name, or every statement would name one.
+        assert!(!ids("SELECT a + b FROM t").contains(&"+".to_string()));
+    }
+
     /// Every node type `grouping_may_reference` claims to read, read.
     ///
     /// Deleting any arm makes it fall to `_ => None`, which the caller treats

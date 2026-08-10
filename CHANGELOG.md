@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.1.28 — seven predicates that only one suite was watching
+
+`cargo mutants` replaced each of these function bodies with a constant and
+`cargo test` stayed green:
+
+| predicate | what the constant does |
+|---|---|
+| `aggregate_argument_is_grouped -> false` | reopens 0.1.19's summary-of-a-grouped-column disclosure |
+| `statement_references_masked_column -> false` | disables the lineage backstop *and* the mask gate on fine `date_trunc` |
+| `is_system_relation -> true` | every relation reads as `pg_catalog`, so the fast path serves user tables unmasked |
+| `is_parseable -> true` | trusts input the parser rejected |
+| lexer word test, `&&` to `\|\|` | the backstop under lineage, the catalog fast path and the grouping guard |
+| lexer quoted-name handling | 0.1.8 fixed a porous version of exactly this |
+| `pseudonym_key` floor, `<` to `<=` | 0.1.9's sixteen-byte minimum, its boundary never asserted |
+
+All seven are pinned now, and each was verified by applying the mutation and
+requiring the new test to fail — not by assuming it would.
+
+WHAT THEY HAVE IN COMMON
+
+Every one is covered end-to-end by the shell campaigns, and not at all by
+`cargo test`. `cargo mutants` only runs cargo tests, so it found precisely the
+set where the unit suite leans on a suite it cannot invoke.
+
+That is a different failure from the rest of today. The instrument was not
+blind — `test-fuzz.sh` would have caught most of these. But it is not the
+instrument anyone runs before pushing, and `cargo test` would have stayed green
+while `is_system_relation` returned `true` for every OID.
+
+TWO MORE HARNESS MISTAKES ON THE WAY
+
+`-- --test-threads=1` reaches *every* cargo invocation cargo-mutants makes,
+including `cargo build`, which rejects a test-harness flag; the run died at the
+baseline with a bare `Usage:` line and zero mutants tested. `RUST_TEST_THREADS`
+is the right mechanism.
+
+The container start was piped to `/dev/null`, so a failure surfaced only as
+"postgres did not start" — the third diagnosis today slowed by a log sent to
+nowhere, after the proxy log in the CockroachDB work and the dropped values in
+the extended harness. It prints the error and the last lines of the Postgres log
+now.
+
 ## 0.1.27 — mechanical mutation, and two measurements I got wrong first
 
 Two things claimed in 0.1.26's notes and not delivered: real line coverage, and
