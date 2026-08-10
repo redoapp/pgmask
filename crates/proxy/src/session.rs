@@ -417,6 +417,10 @@ impl Session {
     }
 
     fn handle_frontend(&mut self, msg: Message, out: &mut Batch) {
+        // A cached plan is a decision made against one catalog snapshot; a
+        // refresh can tighten a classification underneath it.
+        self.plans
+            .invalidate_if_stale(self.policy.catalog.generation());
         match msg.tag {
             // Emits rows with no RowDescription. One of exactly two such paths.
             protocol::F_FUNCTION_CALL => {

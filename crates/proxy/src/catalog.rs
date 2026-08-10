@@ -845,6 +845,14 @@ impl Catalog {
     }
 
     /// A stable view for the duration of one `RowDescription`.
+    /// How many times the catalog has been re-resolved.
+    ///
+    /// Doubles as a generation number: a plan built under one generation is not
+    /// valid under the next, because a refresh can *tighten* a classification.
+    pub fn generation(&self) -> u64 {
+        self.refreshes.load(Ordering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot.load_full()
     }

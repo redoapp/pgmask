@@ -59,9 +59,38 @@ pub(crate) struct PlanState {
     pending_binds: VecDeque<PendingMutation>,
     simple_sql: Option<String>,
     sync_epoch: u64,
+    /// Catalog generation the cached plans were built under.
+    generation: u64,
 }
 
 impl PlanState {
+    /// Drop cached plans built before a catalog refresh.
+    ///
+    /// A plan is a decision made against one snapshot, and statement and portal
+    /// plans outlive the result set they were described for — that is the point
+    /// of caching them.
+    ///
+    /// A refresh does not re-read the catalog *file* (that needs a restart), so
+    /// this is not about an operator editing a rule. It re-resolves names to
+    /// OIDs, and DDL moves those: `DROP TABLE; CREATE TABLE` gives a new OID,
+    /// and PostgreSQL reuses OIDs. A plan cached across that boundary applies
+    /// the previous mapping's classification — which, when an OID has been
+    /// recycled onto a different relation, is the wrong column's mask.
+    ///
+    /// The in-flight `active_plan` is deliberately kept: its rows are already
+    /// being described and served, and that is bounded by one result set. What
+    /// is dropped is everything a *later* Bind or Execute would reuse, so the
+    /// next one has no plan and fails closed until a fresh Describe rebuilds
+    /// it against the new snapshot.
+    pub(crate) fn invalidate_if_stale(&mut self, current: u64) {
+        if self.generation == current {
+            return;
+        }
+        self.generation = current;
+        self.statement_plans.clear();
+        self.portal_plans.clear();
+    }
+
     pub(crate) fn active_plan(&self) -> Option<Plan> {
         self.active_plan.clone()
     }
@@ -332,6 +361,49 @@ mod tests {
 
     fn name(value: &'static str) -> Bytes {
         Bytes::from_static(value.as_bytes())
+    }
+
+    /// A catalog refresh drops every cached plan.
+    ///
+    /// A refresh re-resolves names to OIDs, and DDL moves those. A plan cached
+    /// across a refresh applies the previous mapping — which, once an OID has
+    /// been recycled onto another relation, is a different column's mask.
+    /// Every other DDL direction already failed closed; this was the one that
+    /// did not.
+    #[test]
+    fn a_catalog_refresh_invalidates_cached_plans() {
+        let mut state = PlanState::default();
+        state.parse(name("s"), "SELECT secret FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s")));
+        state.finish_description(plan());
+
+        // Same generation: the cached plan is still reusable.
+        state.invalidate_if_stale(0);
+        state.bind(name("p"), name("s"), None);
+        state.execute(&name("p"));
+        assert!(
+            state.active_plan().is_some(),
+            "no refresh, so the plan stands"
+        );
+
+        // The catalog refreshed underneath the session.
+        state.invalidate_if_stale(1);
+        state.bind(name("p"), name("s"), None);
+        state.execute(&name("p"));
+        assert!(
+            state.active_plan().is_none(),
+            "a plan built against the previous snapshot must not be reused"
+        );
+
+        // A fresh Describe rebuilds it against the new snapshot.
+        state.describe(DescribeTarget::Statement(name("s")));
+        state.finish_description(plan());
+        state.bind(name("p"), name("s"), None);
+        state.execute(&name("p"));
+        assert!(
+            state.active_plan().is_some(),
+            "re-describing must restore it"
+        );
     }
 
     #[test]
