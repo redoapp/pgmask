@@ -66,7 +66,22 @@ pub fn shape_leak(value: &str) -> Option<&'static str> {
     // i in 1..=60, so every raw value lies in a known range and none is a
     // multiple of its bucket, while every masked value is.
     if let Ok(v) = value.trim().parse::<i64>() {
-        if (41_111..=49_331).contains(&v) && v % 25_000 != 0 {
+        // Exact membership of the fixture's sequence, not its range.
+        //
+        // `annual_salary` is `900000000 + i * 137`. A range test over the
+        // old 41k values called every integer between them a leak, because
+        // `row_number()` over a join produces exactly those integers in order:
+        // 8,221 "leaks" in one 3000-statement run, every one an ordinal.
+        // Tightening to exact-sequence membership still left 60 — an ordinal
+        // sequence sweeps through all sixty real values on its way past.
+        //
+        // So the fixture moved instead of the test. A detector that cries wolf
+        // is worse than none: a real escape would have been three lines into
+        // eight thousand.
+        if (900_000_001..=900_008_220).contains(&v)
+            && v.wrapping_sub(900_000_000).rem_euclid(137) == 0
+            && v.rem_euclid(25_000) != 0
+        {
             return Some("fz.people.annual_salary (not floored to its bucket)");
         }
         if (9_000_000_000..=9_000_008_220).contains(&v) && v % 1_000_000 != 0 {

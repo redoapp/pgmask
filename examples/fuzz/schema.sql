@@ -101,7 +101,14 @@ SELECT i,
        (ARRAY['Leeds','Derby','Truro','Ely'])[1 + (i % 4)],
        -- never 1 January, so a year-truncated value is distinguishable
        DATE '1975-02-03' + (i * 11),
-       41111 + i * 137,
+       -- 900-million-ish, not 41-thousand-ish, and the reason is the oracle
+       -- rather than realism: `row_number()` over a join produces every
+       -- integer from 1 upward, so a salary in the 41k range is
+       -- indistinguishable from an ordinal by value alone. A range test called
+       -- 8,221 ordinals a leak; exact-sequence membership still called 60. At
+       -- this magnitude an ordinal would need 900 million rows, which the
+       -- 400ms statement timeout makes impossible.
+       900000000 + i * 137,
        9000000000 + i * 137,
        -- never .0, so a /24-masked value is distinguishable
        '198.51.100.' || (1 + (i % 250)),
