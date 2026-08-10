@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.26 — was this rule ever consulted?
+
+The leak oracle answers "did anything escape". No suite answered "was this rule
+reached at all", and a release rule no generated statement can express is a rule
+the campaign is silent about however many statements it runs. `PURE_SCALARS`
+(0.1.9) and `date_trunc` (0.1.23) were each in that position when they leaked,
+and both were found by reading code rather than by the campaign.
+
+`crates/fuzz/src/bin/reach.rs` replays a corpus through `analysis` alone — no
+server, no proxy — and fails when a tracked release shape is unreachable. In the
+gate as "release paths reached". Verified both directions: 3,000 statements
+reach all thirteen and exit 0; a 40-statement corpus reports `date_trunc`,
+`size formatter`, `pure scalar` and `string_agg` unreachable and exits 1.
+
+Two things the probe got wrong first, both worth recording because both would
+have produced a confident, false number.
+
+It passed `field_count = 1`, so `analyze` collapsed nearly everything to
+`Unknown` on a positional mismatch and it claimed 99 of 3,000 statements were
+releasable. It reads the real target-list length now.
+
+After that fix the number was still 99, and the temptation was to report it as a
+finding. It is not one: `Unknown` from the allowlist does not mean refused, it
+means "a plain column projection, which provenance decides". The labels now say
+"released by the allowlist alone" and "left to provenance or lineage", which is
+what the counters measure. A misleading headline in a security suite is worth
+about what a blind detector is.
+
 ## 0.1.25 — a value nobody could decode is not a value that did not leak
 
 Three disclosures hid in one line of the extended harness, which returned

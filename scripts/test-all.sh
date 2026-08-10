@@ -86,6 +86,11 @@ run "inference limits"        ./scripts/test-inference.sh
 # carry one. Three disclosures in a row were spellings nobody had written down.
 run "grouping spellings"      ./scripts/test-grouping.py
 run "grouping spellings (CockroachDB)" ./scripts/test-grouping.py --engine=cockroach
+# Does the corpus reach each release rule at all? A rule no generated statement
+# can express is a rule the campaign says nothing about, and both `PURE_SCALARS`
+# and `date_trunc` were in exactly that position when each produced a
+# disclosure. Fails when a tracked shape is unreachable.
+run "release paths reached"   bash -c './target/release/shapegen 4242 3000 > /tmp/pgmask-reach.sql && ./target/release/reach /tmp/pgmask-reach.sql'
 run "TLS"                     ./scripts/test-tls.sh
 run "Postgres 13-17"          ./scripts/test-versions.sh
 run "CockroachDB"             ./scripts/test-cockroach.sh

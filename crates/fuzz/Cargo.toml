@@ -12,6 +12,11 @@ jiff.workspace = true
 tokio.workspace = true
 tokio-postgres = { workspace = true, features = ["with-uuid-1", "with-jiff-0_2"] }
 uuid = "1.24.0"
+# The real analysis rules, for the corpus-reach probe. It asks which release
+# decisions a corpus can reach at all, and a copy of the allowlist would answer
+# a question about the copy.
+pgmask = { path = "../proxy" }
+pg_query.workspace = true
 # `avg(int4)` is `numeric`, and a value the harness cannot decode is a value the
 # oracle never scans. That is how the singleton-group disclosure stayed hidden:
 # `sum(int4)` is `int8` and was being dropped before the detectors ran.
