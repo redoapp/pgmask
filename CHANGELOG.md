@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.22 — count what executed, not what was generated
+
+Measured on the fuzz fixture, sqlsmith runs **123 of every 400 statements**. The
+other 277 are `anymultirange is not a multirange type`, `cannot determine
+element type of "anyarray"`, `cannot cast type unknown to anyenum`, `operator
+does not exist: point = point` — polymorphic catalog functions called with
+ill-typed arguments. They exercise the type resolver, not the masker.
+`shapegen` runs 397 of 400, and generates the thing that actually decides
+masking: how many source columns can reach one output field.
+
+So the shape corpus is appended to each seed of the main replay, not just to the
+600-statement extended run it fed before. Appended, not substituted — sqlsmith
+reaches operators and functions nobody here would think to write, which is its
+whole value. Effect on one run:
+
+| | before | after |
+|---|---|---|
+| served | 2,083 / 18,000 (12%) | 6,741 / 19,200 (35%) |
+| Postgres errors | 73% | 37% |
+| masked values reached | 26,153 | 21,557,391 |
+
+`shapegen`'s own error rate fell from 5.5% to 0.75% along the way, and the cause
+was one mistake made twice: the windowed-aggregate arm and the grouped-aggregate
+arm both return `bigint`/`numeric` while declaring `typed: false` — the exact
+flag introduced to stop a date being paired with text under a set operation. The
+residue is `min(uuid)`/`max(uuid)`, which Postgres does not have; the shape does
+not record which typed column it carries, and 3 in 400 does not justify the
+refactor that would fix it.
+
+The README claimed "24,000 statements, 96,000 executions" and counted
+*generated*. It now reports the executed and served fractions, because that is
+the number someone deciding whether to trust this would want.
+
 ## 0.1.21 — a value the harness cannot decode is a value the oracle never sees
 
 0.1.19 restricted the generator to `sum` and said why in a comment: `avg` over

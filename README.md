@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.21**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.22**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -87,10 +87,19 @@ What pgmask owes them instead:
   warning rather than silently ceasing to mask.
 
 **What to do next.** `./scripts/test-fuzz.sh` is the standing answer to having
-no second reviewer: 8 sqlsmith seeds produce 24,000 distinct statements, replayed
-across 4 policy combinations for 96,000 executions in 99 seconds, with **no
-masked value reaching the client in any of them**. (The corpus is 24,000
-statements, not 96,000 — the same SQL runs under each policy.) One of the four configurations masks *nothing*, where the proxy must
+no second reviewer: each seed contributes a sqlsmith corpus and a `shapegen`
+corpus, replayed across 4 policy combinations, with **no masked value reaching
+the client in any of them**. (Executions are 4x the corpus — the same SQL runs
+under each policy.)
+
+Count *executed*, not generated. Roughly a third of what sqlsmith emits runs at
+all: measured on this fixture, 123 of 400 statements execute and the other 277
+are `anymultirange is not a multirange type`, `cannot determine element type of
+"anyarray"`, `operator does not exist: point = point` and kin — the type
+resolver, not the masker. `shapegen` executes 397 of 400. Adding it to the main
+replay took the served fraction from 12% to 35% of statements and the masked
+values actually reached from 26 thousand to 21 million. The generated total is
+the less interesting number and this file used to quote only that. One of the four configurations masks *nothing*, where the proxy must
 be a byte-exact mirror of the database — that asks "did it corrupt anything it
 should not have touched", which a leak oracle is structurally blind to. It
 refuses to pass on a technicality: a poison run with masking removed must trip

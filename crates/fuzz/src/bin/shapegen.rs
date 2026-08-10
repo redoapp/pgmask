@@ -354,8 +354,13 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
             let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
             // `string_agg` only takes text, so it is off the table when the
             // projected column might be a date or a uuid.
+            // `count` for a typed input: Postgres has no `min`/`max` for
+            // `uuid`, and the shape does not record which typed column it is
+            // carrying. `count` is not value-returning, so this arm loses a
+            // little of its point on those, which is better than three engine
+            // errors per four hundred statements.
             let agg = if inner.typed {
-                *rng.pick(&["min", "max"])
+                *rng.pick(&["min", "max", "count"])
             } else {
                 *rng.pick(&["min", "max", "string_agg"])
             };
@@ -376,6 +381,15 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
         // so no generated shape could reach it; a sqlsmith statement did, by
         // accident, once the fixture changed.
         9 => {
+            // A numeric first column, so it cannot sit under a set operation
+            // whose other branch is text. `allow_typed` is how the caller says
+            // "text only"; these two arms produced `bigint` and `numeric` while
+            // declaring `typed: false`, which is the same mistake the `typed` flag
+            // was introduced to stop — 22 type-mismatch errors per 400 statements,
+            // all `INTERSECT types bigint and text cannot be matched` and kin.
+            if !allow_typed {
+                return leaf(rng, depth, n, allow_typed);
+            }
             let s = source(rng, n.wrapping_add(70));
             let frame = rng.pick(&[
                 "ROWS BETWEEN CURRENT ROW AND CURRENT ROW",
@@ -393,7 +407,10 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
             Shape {
                 sql,
                 cols: vec!["c0".into()],
-                typed: false,
+                // Numeric, not text: `string_agg` does not take it, and saying
+                // otherwise is what offered `string_agg(bigint, unknown)` to
+                // the arm above.
+                typed: true,
             }
         }
         // A *reducing* aggregate over a grouping.
@@ -416,6 +433,15 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
         // outright — is covered by `scripts/test-grouping.py` instead, so this
         // corpus stays at zero engine errors on both.
         10 => {
+            // A numeric first column, so it cannot sit under a set operation
+            // whose other branch is text. `allow_typed` is how the caller says
+            // "text only"; these two arms produced `bigint` and `numeric` while
+            // declaring `typed: false`, which is the same mistake the `typed` flag
+            // was introduced to stop — 22 type-mismatch errors per 400 statements,
+            // all `INTERSECT types bigint and text cannot be matched` and kin.
+            if !allow_typed {
+                return leaf(rng, depth, n, allow_typed);
+            }
             // Weighted towards the relation that carries the poison. Drawn
             // uniformly, this arm reaches `sum(fz.people.annual_salary) GROUP
             // BY fz.people.id` in about one statement in forty — thin enough
@@ -487,7 +513,8 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
             Shape {
                 sql,
                 cols,
-                typed: false,
+                // As above: `sum`/`avg` are numeric.
+                typed: true,
             }
         }
         // GROUP BY, keeping the grouped value in the output.

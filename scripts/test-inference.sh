@@ -5,7 +5,11 @@
 #
 # Every other suite here asks the same question: does a masked value appear in
 # the output? That is the property the proxy enforces, and it enforces it well —
-# 176,000 generated statements found nothing.
+# tens of thousands of generated statements find nothing. Read that with the
+# caveat the campaign itself now prints: what matters is how many *executed* and
+# were served, not how many were generated, and for a long time the extended
+# path discarded every value it could not decode as text before the detectors
+# ran.
 #
 # It is not the property people assume it has.
 #

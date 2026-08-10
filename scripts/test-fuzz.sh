@@ -311,6 +311,24 @@ for s in $(seq 1 "$SEEDS"); do
 done
 for pid in "${pids[@]}"; do wait "$pid"; done
 
+# Add a shape corpus to each seed. sqlsmith draws functions from the whole
+# catalog, and most of what it builds from the polymorphic ones is ill-typed:
+# measured on this fixture, **123 of 400 statements execute** and the other 277
+# are `anymultirange is not a multirange type`, `cannot determine element type
+# of "anyarray"`, `operator does not exist: point = point` and kin. Those
+# exercise the type resolver, not the masker.
+#
+# `shapegen` executes 397 of 400 on the same fixture and generates the thing
+# that actually decides masking — how many source columns can reach one output
+# field. Both bugs the campaign found before today were shapes, and the
+# singleton-group disclosure was a shape sqlsmith could not express.
+#
+# Appended rather than substituted: sqlsmith reaches operators and functions
+# nothing here would think to write, which is its whole value.
+for s in $(seq 1 "$SEEDS"); do
+  ./target/release/shapegen $((s * 104729)) "$PER_SEED" >> "/tmp/pgmask-fuzz-$s.sql"
+done
+
 # --- 3. Replay each corpus against every policy combination -----------------
 #
 # Volume of SQL has diminishing returns; the same 24k statements find the same
