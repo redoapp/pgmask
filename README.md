@@ -29,7 +29,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.7**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.11**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -49,8 +49,9 @@ done, and [LICENSE](LICENSE).
 | CockroachDB v25.4 | supported, fuzzed on both protocols; closed three disclosures ([why](docs/engines.md)) |
 
 `./scripts/test-all.sh` runs thirteen suites and reports one line each, with a
-skipped suite counted as a failure: 265 cargo tests, 82 demo assertions, 7 TLS,
-115 across Postgres 13–17, 34 against CockroachDB, a 43-shape canary sweep over
+skipped suite counted as a failure: 265 cargo tests, 31 adversarial and resilience
+tests against a real Postgres, 88 demo assertions, 7 TLS,
+115 across Postgres 13–17, 34 against CockroachDB, a 44-shape canary sweep over
 both engines, a generated-SQL campaign on Postgres and a generated-shape campaign
 on CockroachDB, both of which must report zero leaks. The adversarial cargo suite drives a raw wire
 client and asserts no sentinel byte ever crosses the boundary.
@@ -74,9 +75,10 @@ What pgmask owes them instead:
   warning rather than silently ceasing to mask.
 
 **What to do next.** `./scripts/test-fuzz.sh` is the standing answer to having
-no second reviewer: 8 sqlsmith seeds x 4 policy combinations = 96,000 generated
-statements in 99 seconds, **189,468 masked values readable without the proxy and
-none through it**. One of the four configurations masks *nothing*, where the proxy must
+no second reviewer: 8 sqlsmith seeds produce 24,000 distinct statements, replayed
+across 4 policy combinations for 96,000 executions in 99 seconds, with **no
+masked value reaching the client in any of them**. (The corpus is 24,000
+statements, not 96,000 — the same SQL runs under each policy.) One of the four configurations masks *nothing*, where the proxy must
 be a byte-exact mirror of the database — that asks "did it corrupt anything it
 should not have touched", which a leak oracle is structurally blind to. It
 refuses to pass on a technicality: a poison run with masking removed must trip
@@ -92,10 +94,13 @@ that drives the proxy end to end speaks the simple query protocol, which is
 text-only — the first suite to ask for binary found two bugs, one of which broke
 every driver that prefers it.
 
-Coverage across every suite (Rust tests plus the binary under all three shell
-suites) is **79%**, with the parts that decide masking highest: `analysis.rs`
-98%, `mask.rs` 94%, `session.rs` 85%, `lineage.rs` 97%. Measure it by sourcing
-`cargo llvm-cov show-env --export-prefix` before running the suites. Phase 6 lineage is done — measured at converting about a third
+Coverage was last measured at **79%** overall at v0.1.0 and is not re-measured
+per release, so treat it as indicative rather than current — several suites and
+a good deal of code have landed since. Measure it by sourcing
+`cargo llvm-cov show-env --export-prefix` before running the suites. What is
+worth measuring is coverage *of the generated corpus alone*: "the fuzzer found
+nothing" and "the fuzzer never executed that code" look identical from outside,
+and that distinction has cost this project a real disclosure. Phase 6 lineage is done — measured at converting about a third
 of refusals, see [docs/lineage-estimate.md](docs/lineage-estimate.md). The
 limits below are real and unchanged.
 
@@ -141,8 +146,8 @@ operation, on every engine, and handles those fields as computed ones. See
 ```bash
 ./scripts/test-all.sh            # everything; a skipped suite counts as a failure
 ./examples/demo/verify.sh        # acceptance criteria against a real Postgres
-./scripts/test-fuzz.sh           # 72k generated statements, asserts nothing leaks
-./scripts/test-integration.sh    # canary + adversarial + resilience, 23 tests
+./scripts/test-fuzz.sh           # 24k generated statements x 4 policies, asserts nothing leaks
+./scripts/test-integration.sh    # canary + adversarial + resilience, 31 tests
 ./scripts/test-tls.sh            # TLS on both legs via a real psql, 7 assertions
 ./scripts/test-versions.sh       # 23 assertions x Postgres 13,14,15,16,17
 ./scripts/test-cockroach.sh      # 34 assertions against CockroachDB v25.4

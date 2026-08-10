@@ -175,7 +175,11 @@ grep -E '^RESULT' /tmp/crdb-ext.out | sed 's/^/    /'
 kill "$POISON_PID" 2>/dev/null; POISON_PID=""
 
 # And it has to be able to fail, like every other oracle here.
-sed -e 's/^mask = "redact"/mask = "none"/' -e "s|:$EXT_PORT\"|:$((EXT_PORT+1))\"|" \
+# A shaped mask too, not only redact: the extended oracle used to carry a
+# one-token canary list, and a control that unmasks only the thing it could
+# already see cannot reveal what it was missing.
+sed -e 's/^mask = "redact"/mask = "none"/' -e 's/^mask = "ip-prefix"/mask = "none"/' \
+  -e "s|:$EXT_PORT\"|:$((EXT_PORT+1))\"|" \
   /tmp/crdb-ext.toml > /tmp/crdb-ext-poison.toml
 ext_poison_url="postgresql://root@localhost:$((EXT_PORT+1))/fuzzdb?sslmode=disable"
 ./target/release/pgmask /tmp/crdb-ext-poison.toml >/tmp/crdb-ext-poison.log 2>&1 &

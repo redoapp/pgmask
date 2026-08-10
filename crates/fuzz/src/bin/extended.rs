@@ -13,9 +13,13 @@
 //! so this drives Describe-derived plans, `Bind` result-format re-stamping and
 //! the type-aware decode/encode path — none of which `simple_query` touches.
 //!
-//! The oracle is unchanged: every value in the fixture carries the token
-//! CANARY, masking rewrites all of them, so a CANARY reaching the client is a
-//! leak whatever route it took. Two guards keep a quiet run from reading as a
+//! The oracle is the *same* one, shared from `fuzz::oracle` — nine tokens plus
+//! four shape detectors for the type-aware masks. It used to be a private
+//! one-token copy, which meant that on this path nothing could see a
+//! `date-year`, `ip-prefix`, `numeric-bucket` or uuid-pseudonym escape at all,
+//! while the module doc claimed the oracle was unchanged. Its poison control
+//! unmasked only `redact` — the one thing that copy could see — so the control
+//! was structurally incapable of exposing the gap. Two guards keep a quiet run from reading as a
 //! clean one:
 //!
 //!   - every statement also runs directly, and a run where the corpus never
@@ -26,10 +30,8 @@
 //!   DIRECT_URL=… PROXY_URL=… extended corpus.sql
 
 use anyhow::{bail, Context, Result};
+use fuzz::oracle::{shape_leak, CANARIES};
 use tokio_postgres::{Client, NoTls, Row};
-
-/// Tokens that must never reach a client, and what they identify.
-const CANARIES: &[(&str, &str)] = &[("CANARY", "a masked text column in fz")];
 
 async fn connect(url: &str) -> Result<Client> {
     let (client, connection) = tokio_postgres::connect(url, NoTls)
@@ -104,7 +106,7 @@ async fn main() -> Result<()> {
         if let Ok(rows) = direct.query(*sql, &[]).await {
             let found = text_values(&rows)
                 .iter()
-                .filter(|v| CANARIES.iter().any(|(t, _)| v.contains(t)))
+                .filter(|v| CANARIES.iter().any(|(t, _)| v.contains(t)) || shape_leak(v).is_some())
                 .count();
             if found > 0 {
                 reached_masked = reached_masked.saturating_add(1);
@@ -116,15 +118,18 @@ async fn main() -> Result<()> {
             Ok(rows) => {
                 served = served.saturating_add(1);
                 for value in text_values(&rows) {
-                    for (token, column) in CANARIES {
-                        if value.contains(token) {
-                            leaks = leaks.saturating_add(1);
-                            if reported.len() < 5 {
-                                reported.push(format!(
-                                    "{column} leaked {value:?}\n    via: {}",
-                                    sql.chars().take(300).collect::<String>()
-                                ));
-                            }
+                    let hit = CANARIES
+                        .iter()
+                        .find(|(token, _)| value.contains(token))
+                        .map(|(_, column)| *column)
+                        .or_else(|| shape_leak(&value));
+                    if let Some(column) = hit {
+                        leaks = leaks.saturating_add(1);
+                        if reported.len() < 5 {
+                            reported.push(format!(
+                                "{column} leaked {value:?}\n    via: {}",
+                                sql.chars().take(300).collect::<String>()
+                            ));
                         }
                     }
                 }

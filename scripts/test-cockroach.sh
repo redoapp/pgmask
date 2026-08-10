@@ -92,7 +92,13 @@ PY
 PROXY_PID=$!
 sleep 4
 P="postgresql://root@localhost:$PROXY_PORT/demo?sslmode=disable"
-p() { psql -w "$P" -X -tAq -c "$1" 2>&1 | head -"${2:-1}"; }
+# All rows by default, not just the first.
+#
+# This used to be `head -1`, and the eight "$op does not leak the masked column"
+# refutes below read a two-row result whose leak is on row *two* — so every one
+# of them passed no matter what the proxy did. The direct control right beside
+# them already kept all rows, with a comment saying why.
+p() { psql -w "$P" -X -tAq -c "$1" 2>&1 | head -"${2:-40}"; }
 d() { psql -w "$D" -X -tAq -c "$1" 2>&1; }   # all rows: the leak is in the second
 p 'select 1' >/dev/null 2>&1 || { echo "FAIL: proxy did not come up"; tail -5 /tmp/pgmask-crdb.log; exit 1; }
 
@@ -101,9 +107,13 @@ echo "CockroachDB $VERSION"
 echo "-----------------------"
 
 # The catalog resolver runs Postgres catalog queries against CockroachDB.
+# Assert the number, not a word both branches contain: this was
+#   [[ n -gt 0 ]] && res="resolved $n" || res="resolved nothing"
+#   check "..." "resolved " "$res"
+# and "resolved nothing" contains "resolved ", so it could never fail.
 n=$(grep -o 'classified_columns=[0-9]*' /tmp/pgmask-crdb.log | head -1 | grep -oE '[0-9]+')
-[[ "${n:-0}" -gt 0 ]] && res="resolved $n" || res="resolved nothing"
-check "catalog resolved against CockroachDB" "resolved " "$res"
+[[ "${n:-0}" -gt 0 ]] && res="yes" || res="no ($n)"
+check "catalog resolved against CockroachDB" "yes" "$res"
 
 row="$(p 'SELECT email, name, phone, city, internal_note FROM demo.customers WHERE id = 1')"
 refute "email is not emitted verbatim"      "user1@example.com" "$row"

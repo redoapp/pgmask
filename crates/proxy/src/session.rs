@@ -975,17 +975,30 @@ async fn read_startup_packet<S: AsyncReadExt + Unpin>(
     }))
 }
 
-fn startup_principal(startup: &protocol::StartupPacket) -> String {
-    // PostgreSQL keeps the last value for duplicate startup parameters. Use
-    // the same occurrence for role policy, or a client could present a
-    // privileged name first and authenticate as a different user last.
-    startup
+/// The principal, or `None` if the packet is ambiguous about who that is.
+///
+/// PostgreSQL keeps the *last* value for a duplicated startup parameter, and
+/// this used to take the first — so `user=alice\0…\0user=mallory\0`
+/// authenticated as `mallory` while pgmask resolved `alice`'s roles. A role's
+/// mask *replaces* the default and can be looser, so that is a grant the
+/// database never made.
+///
+/// Matching Postgres's last-wins would fix the observed case and leave the
+/// real defect in place: the principal would still come from an independent
+/// parse of a packet the backend re-parses, and the two would only agree for
+/// as long as this matches an implementation detail of the server. A packet
+/// that names the user twice is refused instead, so they cannot disagree.
+fn startup_principal(startup: &protocol::StartupPacket) -> Option<String> {
+    let mut users = startup
         .parameters()
         .into_iter()
-        .rev()
-        .find(|(key, _)| key == "user")
-        .map(|(_, value)| value)
-        .unwrap_or_else(|| "<unknown>".into())
+        .filter(|(key, _)| key == "user")
+        .map(|(_, value)| value);
+    let first = users.next()?;
+    if users.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 /// Startup negotiation on both legs, then the message pump.
@@ -1065,7 +1078,20 @@ pub async fn handle_connection(
     let mut client_frames = FrameReader::new(client_read);
     let mut backend_frames = FrameReader::new(backend_read);
 
-    let user = startup_principal(&startup);
+    // A packet that names the user twice is refused rather than guessed at.
+    let Some(user) = startup_principal(&startup) else {
+        let err = protocol::build_error(
+            protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "pgmask: the startup packet names \"user\" more than once",
+            Some(
+                "pgmask resolves masking policy from the authenticated principal. A packet \
+                 that names two cannot be resolved to one, so the connection is refused.",
+            ),
+        );
+        client_write.write_all(&err.encode()).await.ok();
+        client_write.flush().await.ok();
+        return Ok(());
+    };
 
     // --- Message pump -------------------------------------------------------
     let mut session = Session::new(policy)
@@ -1136,7 +1162,7 @@ pub async fn handle_connection(
     session
         .policy
         .metrics
-        .record_session_end(session.masked_fields as u64);
+        .record_session_end(session.masked_fields);
     if session.masked_fields > 0 || session.rejected_result_sets > 0 {
         tracing::info!(
             %user,
@@ -1434,13 +1460,32 @@ mask = "none"
         assert!(session.roles.is_empty(), "unknown principals get nothing");
     }
 
+    /// A packet naming the user twice is ambiguous, so it is refused.
+    ///
+    /// Postgres keeps the last value and pgmask used to take the first, so
+    /// `user=privileged … user=actual` authenticated as `actual` while masking
+    /// policy resolved `privileged`'s roles — and a role's mask replaces the
+    /// default, so it can be looser. Matching last-wins would fix this case and
+    /// leave the principal depending on two parsers agreeing.
     #[test]
-    fn duplicate_startup_users_follow_the_backends_last_value() {
+    fn a_startup_packet_naming_two_users_has_no_principal() {
         let startup = protocol::StartupPacket {
             code: 196_608,
             body: Bytes::from_static(b"user\0privileged\0database\0db\0user\0actual\0\0"),
         };
-        assert_eq!(startup_principal(&startup), "actual");
+        assert_eq!(startup_principal(&startup), None);
+
+        let single = protocol::StartupPacket {
+            code: 196_608,
+            body: Bytes::from_static(b"user\0actual\0database\0db\0\0"),
+        };
+        assert_eq!(startup_principal(&single), Some("actual".to_string()));
+
+        let none = protocol::StartupPacket {
+            code: 196_608,
+            body: Bytes::from_static(b"database\0db\0\0"),
+        };
+        assert_eq!(startup_principal(&none), None);
     }
 
     #[test]
