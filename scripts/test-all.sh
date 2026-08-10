@@ -40,7 +40,7 @@ run() { # name command...
   # Containers and proxies from a previous suite are the most common cause of a
   # confusing failure, so every suite starts from nothing.
   pkill -f 'target/release/pgmask' 2>/dev/null
-  podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference >/dev/null 2>&1
+  podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference pgmask-grouping >/dev/null 2>&1
   sleep 1
   local out
   out=$("$@" 2>&1)
@@ -81,6 +81,10 @@ run "demo (verify.sh)"        env KEEP=0 ./examples/demo/verify.sh
 # still take. It belongs in the gate because it now also asserts the routes we
 # closed, so undoing one is a suite failure rather than a quiet regression.
 run "inference limits"        ./scripts/test-inference.sh
+# The generated counterpart to the inference suite's literal strings: every way
+# to spell "group by the key", crossed with every syntactic position that can
+# carry one. Three disclosures in a row were spellings nobody had written down.
+run "grouping spellings"      ./scripts/test-grouping.py
 run "TLS"                     ./scripts/test-tls.sh
 run "Postgres 13-17"          ./scripts/test-versions.sh
 run "CockroachDB"             ./scripts/test-cockroach.sh
@@ -90,7 +94,7 @@ run "generated shapes (CockroachDB)" ./scripts/test-fuzz-cockroach.sh 1200 3
 run "cross-engine differential" ./scripts/test-differential.sh 800
 
 pkill -f 'target/release/pgmask' 2>/dev/null
-podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference >/dev/null 2>&1
+podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference pgmask-grouping >/dev/null 2>&1
 
 echo
 echo "-------------------------------------------------------------"

@@ -104,28 +104,86 @@ governed "sum() GROUP BY a unique key" \
   "$TRUE_SALARY" "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY id ORDER BY id LIMIT 1')"
 governed "...including a superset of the key" \
   "$TRUE_SALARY" "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY id, city LIMIT 1')"
-# The ordinal names `id`, so this is the same attack written differently — and
-# pgmask cannot resolve `1` to a column, so it refuses on the weaker ground that
-# a grouping it cannot read is one it cannot clear.
+# The same attack written four other ways. Each is a shape the grouping reader
+# resolves down to `id`, rather than a shape it refuses for being opaque —
+# the distinction matters, because the opaque route refuses the honest queries
+# below too.
 #
 # `GROUP BY 1` with `sum(...)` as the *only* target is not this test: Postgres
 # rejects it outright ("aggregate functions are not allowed in GROUP BY"), so
 # the assertion would pass on a server error without the proxy deciding
 # anything. It did, until `governed` began requiring a pgmask refusal.
-governed "...and the same attack through an ordinal" \
+governed "...through an ordinal" \
   "$TRUE_SALARY" "$(p 'SELECT id, sum(annual_salary) FROM demo.customers GROUP BY 1 ORDER BY 1 LIMIT 1')"
+governed "...through ROLLUP" \
+  "$TRUE_SALARY" "$(p 'SELECT id, sum(annual_salary) FROM demo.customers GROUP BY ROLLUP(id) ORDER BY 1 LIMIT 1')"
+governed "...through GROUPING SETS" \
+  "$TRUE_SALARY" "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY GROUPING SETS ((id),(city)) LIMIT 1')"
+# An expression grouping cannot be read, so the lexical backstop decides it:
+# the statement names `id`, so it may be grouping by the key, so it is refused.
+# `id::text` and `id+0` separate every row exactly as `id` does.
+governed "...through an expression over the key" \
+  "$TRUE_SALARY" "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY id::text LIMIT 1')"
+governed "...through arithmetic on the key" \
+  "$TRUE_SALARY" "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY (id+0) LIMIT 1')"
+governed "...through a function of a cast of the key" \
+  "$TRUE_SALARY" "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY upper(id::text) LIMIT 1')"
 
-# The cost of that conservatism, pinned so it is visible: grouping by a non-key
-# through an ordinal is harmless and is refused anyway.
-governed "(cost) an unreadable grouping is refused even on a non-key" \
-  "$TRUE_SALARY" "$(p 'SELECT city, sum(annual_salary) FROM demo.customers GROUP BY 1 LIMIT 1')"
+# An output alias denotes whatever its target computes, and reading only the
+# alias name released every salary — the original disclosure with two extra
+# characters. Postgres resolves an alias in any grouping *element*, which
+# includes inside ROLLUP and GROUPING SETS but not inside an expression, so all
+# three spellings are here.
+governed "...through an output alias" \
+  "$TRUE_SALARY" "$(p 'SELECT id AS c, sum(annual_salary) FROM demo.customers GROUP BY c ORDER BY 1 LIMIT 1')"
+governed "...through an alias inside ROLLUP" \
+  "$TRUE_SALARY" "$(p 'SELECT id AS c, sum(annual_salary) FROM demo.customers GROUP BY ROLLUP(c) ORDER BY 1 LIMIT 1')"
+governed "...through an alias inside GROUPING SETS" \
+  "$TRUE_SALARY" "$(p 'SELECT id AS c, sum(annual_salary) FROM demo.customers GROUP BY GROUPING SETS ((c)) ORDER BY 1 LIMIT 1')"
+governed "...through a quoted alias" \
+  "$TRUE_SALARY" "$(p 'SELECT id AS "C", sum(annual_salary) FROM demo.customers GROUP BY "C" ORDER BY 1 LIMIT 1')"
 
-# Real aggregation is untouched, which is the whole point of doing it this way.
-if [[ "$(p 'SELECT sum(annual_salary) FROM demo.customers')" == *"pgmask:"* ]]; then
-  echo "  FAIL: an ungrouped aggregate must still be released"; fail=$((fail+1))
-else
-  printf '  \033[32mok\033[0m           a real aggregate is still served\n'; governed=$((governed+1))
-fi
+# The residual cost of the backstop, pinned so it stays visible. The grouping
+# here is a coarse date bucket and cannot be singleton, but the statement names
+# `id` in its filter and the lexer cannot tell where a name is used. Narrow, and
+# the price of not walking an expression tree to find out.
+governed "(cost) an expression grouping, key named in the filter" \
+  "$TRUE_SALARY" "$(p "SELECT date_trunc('month', placed_at), sum(order_total) FROM demo.orders WHERE id > 5 GROUP BY 1 LIMIT 1")"
+
+# Real aggregation is untouched, which is the whole point of doing it this way
+# rather than by turning summaries off. Every shape the guard reads has an
+# honest counterpart on a non-key column, and refusing those would be a far
+# larger regression than the disclosure is worth.
+served() {
+  if [[ "$2" == *"pgmask:"* ]]; then
+    printf '  \033[31mREFUSED\033[0m      %s\n        %s\n' "$1" "${2:0:96}"; fail=$((fail+1))
+  else
+    printf '  \033[32mok\033[0m           %s\n' "$1"
+  fi
+}
+served "ungrouped sum"       "$(p 'SELECT sum(annual_salary) FROM demo.customers')"
+served "GROUP BY a non-key"  "$(p 'SELECT city, sum(annual_salary) FROM demo.customers GROUP BY city')"
+served "...by ordinal"       "$(p 'SELECT city, sum(annual_salary) FROM demo.customers GROUP BY 1')"
+served "...by ROLLUP"        "$(p 'SELECT city, sum(annual_salary) FROM demo.customers GROUP BY ROLLUP(city)')"
+served "...by CUBE"          "$(p 'SELECT city, sum(annual_salary) FROM demo.customers GROUP BY CUBE(city)')"
+served "...by GROUPING SETS" "$(p 'SELECT city, sum(annual_salary) FROM demo.customers GROUP BY GROUPING SETS ((city),())')"
+served "count(*) by the key" "$(p 'SELECT id, count(*) FROM demo.customers GROUP BY id LIMIT 1')"
+# Time bucketing is the ordinary analytics query, and the reason the unreadable
+# case falls back to the lexer instead of refusing outright. `date_trunc` over a
+# coarse literal unit is deliberately released, so these were served before the
+# singleton-group guard existed and must stay served after it.
+served "date_trunc bucket, by ordinal" \
+  "$(p "SELECT date_trunc('month', placed_at), sum(order_total) FROM demo.orders GROUP BY 1 LIMIT 1")"
+served "date_trunc bucket, by expression" \
+  "$(p "SELECT date_trunc('month', placed_at), sum(order_total) FROM demo.orders GROUP BY date_trunc('month', placed_at) LIMIT 1")"
+served "avg over a coarse bucket" \
+  "$(p "SELECT date_trunc('year', placed_at), avg(order_total) FROM demo.orders GROUP BY 1 LIMIT 1")"
+served "an expression grouping on a non-key" \
+  "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY upper(city) LIMIT 1')"
+served "an alias of a non-key column" \
+  "$(p 'SELECT city AS c, sum(annual_salary) FROM demo.customers GROUP BY c LIMIT 1')"
+served "a date bucket reached through its alias" \
+  "$(p "SELECT date_trunc('month', placed_at) AS m, sum(order_total) FROM demo.orders GROUP BY m LIMIT 1")"
 
 # 2. The same thing with a filter instead of a grouping. Not governed and not
 #    governable statically: whether `WHERE id=1` matches one row is a property

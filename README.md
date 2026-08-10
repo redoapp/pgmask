@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.16**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.18**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -518,7 +518,11 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   [`docs/handoff.md` §11](docs/handoff.md). The single exception is the
   statically decidable one: a released reducing aggregate whose `GROUP BY`
   covers a declared unique key, or whose `GROUP BY` cannot be read at all, is
-  refused. Ungrouped and non-key groupings are served unchanged.
+  refused. Column references, ordinals and `ROLLUP`/`CUBE`/`GROUPING SETS` are
+  read, and so is an output alias, which denotes whatever its target computes;
+  an expression is not, and falls back to asking whether the statement names
+  every column of some key at all. Ungrouped groupings, non-key
+  groupings and coarse date buckets are served unchanged.
 
 ## Layout
 

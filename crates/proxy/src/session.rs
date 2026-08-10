@@ -771,13 +771,43 @@ impl Session {
         // fix. `count(*)` and the relation-size functions are released above
         // that gate and stay released, because a row count per group discloses
         // nothing.
+        //
+        // A grouping the reader cannot reduce to names falls back to the
+        // lexical backstop rather than to a flat refusal. Refusing outright was
+        // the first attempt and it cost too much: `date_trunc` over a coarse
+        // literal unit is deliberately released, so
+        //
+        //   SELECT date_trunc('month', ts), sum(amount) FROM orders GROUP BY 1
+        //
+        // — time-bucketed aggregation, the most ordinary analytics query there
+        // is — was served before the guard existed and refused after it. The
+        // grouping is an expression, and an expression is unreadable.
+        //
+        // The backstop asks the weaker question the lexer can answer soundly:
+        // does the *statement* name every column of some unique key? A grouping
+        // can only reference a column the statement mentions, so a key no part
+        // of the text names is a key the grouping cannot cover. `GROUP BY
+        // id::text` mentions `id` and is refused; the `date_trunc` query
+        // mentions no key column and is served. It over-refuses when a key
+        // column appears elsewhere — `WHERE id > 100` with an expression
+        // grouping — which is narrow and explainable.
+        //
+        // Deliberately the lexer and not a walk of the expression. Collecting
+        // columns beneath an arbitrary node means an exhaustive traversal, and
+        // missing one node type here releases a value. Deparsing the clause and
+        // lexing that was tried and rejected for a harder reason: `deparse` on a
+        // synthetic tree aborts the process from C on a malformed enum, which
+        // turns a grouping we cannot read into a crash.
         let singleton_groups = inspection.as_ref().is_some_and(|inspection| {
             match inspection.group_by_columns() {
-                // A grouping we cannot read is one we cannot clear.
-                None => true,
                 Some(grouped) => {
                     !grouped.is_empty() && snapshot.grouping_covers_a_unique_key(&grouped)
                 }
+                None => match inspection.identifiers() {
+                    Some(named) => snapshot.grouping_covers_a_unique_key(named),
+                    // A statement we cannot even lex is one we cannot clear.
+                    None => true,
+                },
             }
         });
         let allow_summaries = self.policy.summaries == Summaries::Allow && !singleton_groups;

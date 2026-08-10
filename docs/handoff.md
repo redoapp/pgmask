@@ -536,9 +536,13 @@ statement returns the whole masked column in one query. That one is decidable wi
 query-set accounting: the grouping is in the statement and the uniqueness is in
 `pg_index`. Since v0.1.16 the session refuses a released reducing aggregate whose
 `GROUP BY` covers a declared unique key, and equally one whose `GROUP BY` it cannot reduce
-to column names (`GROUP BY 1`, `GROUPING SETS`, an expression) — an unreadable grouping is
-one that cannot be cleared. Ungrouped aggregates and groupings on non-key columns are
-served unchanged, so ordinary analytics is unaffected. `WHERE id = 1` reaches the same
+to column names — an unreadable grouping is one that cannot be cleared. The reader
+resolves column references, ordinals (`GROUP BY 1`) and `ROLLUP`/`CUBE`/`GROUPING SETS`,
+so the honest forms of that syntax are served. An expression stays unreadable, and falls
+back to a lexical question the scanner can answer soundly — does the statement name every
+column of some unique key? — rather than to a refusal, which had cost time-bucketed
+aggregation. Ungrouped aggregates and groupings on non-key columns are served
+unchanged, so ordinary analytics is unaffected. `WHERE id = 1` reaches the same
 value and is still accepted: one row per query rather than the whole table in one, and
 whether a predicate is singleton is a fact about the data.
 

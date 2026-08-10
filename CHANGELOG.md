@@ -1,5 +1,138 @@
 # Changelog
 
+## 0.1.18 — a name in the clause is not the column being grouped on
+
+0.1.17 read the `GROUP BY` and got the wrong answer for two spellings, both
+disclosures, both confirmed against a live server rather than argued about:
+
+```sql
+SELECT id AS c, sum(annual_salary) FROM demo.customers GROUP BY c
+SELECT id AS c, sum(annual_salary) FROM demo.customers GROUP BY ROLLUP(c)
+```
+
+Postgres resolves an output alias in a grouping element, so both group by `id`,
+one row per group. The reader saw the literal name `c`, found it in no unique
+key, and released every salary — the original 0.1.16 disclosure with two extra
+characters.
+
+A bare name in a grouping element is now resolved as an output alias as well as
+a column, collecting both names. Which one Postgres picks is not decidable here
+— it prefers an input column of that name and only then the alias, and knowing
+whether the input column exists needs the relation's columns — so collecting
+both over-refuses in the shadowed case and cannot under-refuse in either.
+
+Where the resolution applies was measured, not assumed. `GROUP BY ROLLUP(c)`
+resolves the alias, because a grouping set nests grouping elements;
+`GROUP BY c+0` reports `column "c" does not exist`, because an expression is not
+one. The first cut used "at the top of the item", which is the wrong axis and
+left the `ROLLUP` spelling open.
+
+THE PATTERN, WRITTEN DOWN
+
+Three releases in, the recurring defect is one mistake: treating *a name
+appearing in the `GROUP BY`* as *the column being grouped on*. SQL separates
+those four ways, and each was found separately and late — ordinals and stars in
+0.1.17, aliases here. Anyone extending this should start from the list rather
+than from the parse tree:
+
+| spelling | denotes | handled by |
+|---|---|---|
+| `GROUP BY col` | that column | read directly |
+| `GROUP BY 1` | an output column by position | ordinal resolution, refused if any target is a star |
+| `GROUP BY alias` | whatever the target computes | alias resolution, in grouping elements only |
+| `GROUP BY expr` | not decidable here | the session's lexical backstop |
+
+Four mutations now cover the reader — unreadable-releases, ordinal-unread,
+alias-unresolved, alias-unresolved-inside-a-grouping-set — because every one of
+these was a live disclosure and none of them was caught by an existing suite.
+
+GENERATING THE SPELLINGS INSTEAD OF REMEMBERING THEM
+
+The deeper problem is that `test-inference.sh` only proves the spellings someone
+already thought of are refused, which is the guarantee that kept failing.
+`scripts/test-grouping.py` crosses 22 expressions — 16 that are the primary key
+under a different spelling, 6 on a non-key column — with 14 syntactic positions
+and adversarial aliases, one of which shadows a real column so that Postgres
+prefers the input column over the alias. It asks the server whether each
+grouping is actually one row per group rather than trusting the list.
+
+It would have caught all three releases' worth of defects: `alias`,
+`alias-in-rollup`, `alias-in-cube`, `alias-in-sets`, `quoted-alias` and
+`ordinal` are all positions in the cross product.
+
+Result: **256 key spellings refused, 0 leaked; 66 non-key spellings served, 0
+over-refused by this guard.** The 60 non-key refusals are the pre-existing
+expression-target rule, and separating those out required a differential — is
+the plainest spelling of the same query refused too? — because the first version
+of the script attributed all 60 to the guard and made its cost look several
+times larger than it is.
+
+## 0.1.17 — the guard was blunter than the problem
+
+0.1.16 refused any `GROUP BY` it could not reduce to column names, reasoning
+that a grouping we cannot read is one we cannot clear. Sound, and blunt enough
+to break the most ordinary analytics query there is:
+
+```sql
+SELECT date_trunc('month', placed_at), sum(order_total) FROM orders GROUP BY 1
+```
+
+`date_trunc` over a coarse literal unit is *deliberately* released — that rule
+predates the guard — so this was served before 0.1.16 and refused after it. The
+claim in that release that expression groupings "were already refused anyway"
+was drawn from one probe of `upper(city)` and does not generalise.
+
+Two changes. The reader now resolves a column reference, an ordinal into the
+target list, and `ROLLUP`/`CUBE`/`GROUPING SETS` over either, unioning names
+across every set — safe, because each set is a subset of the union. Reading
+these *strengthens* the guard as much as it relaxes it: the attack is
+expressible in all of them, and 0.1.16 caught them only by finding them
+illegible.
+
+What still cannot be read now falls back to the lexical backstop instead of to a
+refusal. It asks the weaker question the scanner can answer soundly — does the
+statement name every column of some unique key? A grouping can only reference a
+column the text mentions, so a key the text never names is a key the grouping
+cannot cover. `GROUP BY id::text`, `GROUP BY (id+0)` and `GROUP BY
+upper(id::text)` all name `id` and are refused; the `date_trunc` query names no
+key column and is served.
+
+The residual cost is a key column named *elsewhere* in a statement with an
+expression grouping — `WHERE id > 5 … GROUP BY date_trunc(…)` — since the lexer
+cannot tell where a name is used. Narrow, and pinned in the inference suite
+rather than left to be discovered.
+
+THINGS THAT DID NOT WORK, RECORDED SO THEY ARE NOT RETRIED
+
+Walking the expression to collect its columns is the obvious answer and is
+unsound here for the reason this module already documents: missing one node type
+in a traversal releases a value.
+
+Deparsing the group clause and lexing *that* looked like the sound version of
+the same idea. It is not usable: `deparse` on a synthetically constructed tree
+aborts the process from C on an invalid enum discriminant — `TRAP: failed
+Assert("false")`, not an `Err` — so a grouping we cannot read would become a
+crash rather than a refusal.
+
+An ordinal is also refused whenever any target is a star. A star expands to
+however many columns its relation has, so positions after it shift by an unknown
+amount and `GROUP BY 2` can name one column while `target_list[1]` holds
+another; if the real one is a key and the reported one is not, that releases.
+`positions_are_trustworthy` already refuses such statements, so this is
+unreachable today — checked anyway, because depending on a neighbouring guard to
+stay sound is how the misaligned-star disclosure got in.
+
+A nested grouping construct stays unreadable for a different reason.
+`ROLLUP(a, CUBE(b, c))` does not parse as a nested `GroupingSet` — the raw parse
+tree is not the analysed tree, only the outermost construct is resolved, and the
+inner `CUBE` arrives as an ordinary `FuncCall`. Reading it would mean matching on
+a function name, and `cube` is a real function from a real extension.
+
+Three mutations added: releasing on an unreadable grouping, losing ordinal
+resolution, and dropping the lexical fallback. The second is the first mutation
+here that fails when the proxy becomes *more* restrictive, which is the right
+shape for a change whose entire risk is over-refusal.
+
 ## 0.1.16 — a summary of one row is that row
 
 `SELECT sum(annual_salary) FROM demo.customers GROUP BY id` returned every

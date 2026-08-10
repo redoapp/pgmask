@@ -34,10 +34,16 @@
 //! read at all — the session withholds the aggregate relaxation, so a reducing
 //! aggregate is refused rather than released. That leaves real aggregation
 //! untouched, which is the point of doing it this way rather than by disabling
-//! summaries. The `WHERE id = 1` form of the same attack survives and cannot be
-//! closed here: whether a predicate matches one row is a property of the data,
-//! not of the statement. What the guard buys is the difference between one
-//! query for the whole table and one query per row.
+//! summaries — and why the reader resolves ordinals and grouping sets instead
+//! of refusing them, since `GROUP BY 1` and `ROLLUP(city)` are the honest form
+//! of the same syntax. A grouping it still cannot read falls back to the
+//! lexical backstop in the session rather than to a refusal, because refusing
+//! outright took time-bucketed aggregation with it: `date_trunc` over a coarse
+//! literal unit is released on purpose, so `SELECT date_trunc('month', ts),
+//! sum(amount) … GROUP BY 1` worked before the guard and not after. The `WHERE id = 1` form of the attack survives and
+//! cannot be closed here: whether a predicate matches one row is a property of
+//! the data, not of the statement. What the guard buys is the difference
+//! between one query for the whole table and one query per row.
 //!
 //! That relaxation is what makes this tractable without a lineage engine. If the
 //! outermost node of a target expression is a reducing aggregate, it cannot
@@ -88,9 +94,9 @@ impl<'sql> StatementInspection<'sql> {
     /// The columns a top-level `GROUP BY` groups on.
     ///
     /// `Some([])` means there is no grouping. `None` means there is one but it
-    /// cannot be reduced to plain column names — an ordinal, an expression,
-    /// `GROUPING SETS` — and the caller must treat that as possibly-singleton,
-    /// because a grouping it cannot read is a grouping it cannot clear.
+    /// cannot be reduced to plain column names, and the caller must treat that
+    /// as possibly-singleton, because a grouping it cannot read is a grouping
+    /// it cannot clear.
     ///
     /// Read off the top-level `SelectStmt`'s `group_clause` rather than walked.
     /// That matters: the walker has documented gaps, and a missed `GROUP BY`
@@ -100,6 +106,20 @@ impl<'sql> StatementInspection<'sql> {
     /// Only the top level is inspected, which is sufficient — an aggregate
     /// inside a subquery is not the released field; the outer field
     /// referencing it has no provenance and is judged on its own.
+    ///
+    /// Three shapes are readable, because refusing them costs real queries:
+    /// a column reference, an ordinal into the target list (`GROUP BY 1` is
+    /// idiomatic), and `ROLLUP`/`CUBE`/`GROUPING SETS` over either. For a
+    /// grouping set the names are unioned across every set, which is the safe
+    /// direction: each set is a subset of the union, so a key contained in any
+    /// one of them is contained in the union.
+    ///
+    /// An arbitrary expression stays unreadable. Collecting the columns beneath
+    /// it needs a complete traversal, and this file exists because proving
+    /// absence across `pg_query`'s incomplete walker is how three disclosures
+    /// got in. The cost is small in practice: a query grouping by an expression
+    /// almost always selects it too, and an expression target has no provenance,
+    /// so it was already refused a step earlier for its own reasons.
     pub fn group_by_columns(&self) -> Option<Vec<String>> {
         let parsed = self.parsed()?;
         let [statement] = parsed.protobuf.stmts.as_slice() else {
@@ -115,14 +135,7 @@ impl<'sql> StatementInspection<'sql> {
         }
         let mut columns = Vec::with_capacity(select.group_clause.len());
         for item in &select.group_clause {
-            let Some(NodeEnum::ColumnRef(column)) = &item.node else {
-                return None;
-            };
-            let name = column.fields.last().and_then(|f| match &f.node {
-                Some(NodeEnum::String(s)) => Some(s.sval.to_ascii_lowercase()),
-                _ => None,
-            })?;
-            columns.push(name);
+            group_item_columns(item, &select.target_list, &mut columns)?;
         }
         Some(columns)
     }
@@ -725,6 +738,157 @@ fn classify(expr: &NodeEnum, allow_summaries: bool) -> Safety {
 
         _ => Safety::Unknown,
     }
+}
+
+/// The column names one `GROUP BY` item can distinguish rows by.
+///
+/// Appends to `into` and returns `None` the moment the item cannot be read, so
+/// a partial answer is never mistaken for a complete one — the caller refuses
+/// on `None`, and half a grouping is exactly the case where releasing would be
+/// wrong.
+fn group_item_columns(
+    item: &pg_query::protobuf::Node,
+    targets: &[pg_query::protobuf::Node],
+    into: &mut Vec<String>,
+) -> Option<()> {
+    // `GROUP BY ROLLUP(a, CUBE(b, c))` is legal, so this recurses. Bounded
+    // because the parser has already rejected anything deeper than its own
+    // nesting limit, but bounded explicitly rather than by that assumption.
+    fn walk(
+        item: &pg_query::protobuf::Node,
+        targets: &[pg_query::protobuf::Node],
+        into: &mut Vec<String>,
+        depth: u32,
+        // Whether this node is a *grouping element* — the position where
+        // Postgres resolves an output alias. True at the top of an item and
+        // through `ROLLUP`/`CUBE`/`GROUPING SETS`, which nest grouping
+        // elements; false below an ordinal, which lands in an expression.
+        // Measured, not assumed: `GROUP BY ROLLUP(c)` resolves the alias and
+        // `GROUP BY c+0` reports `column "c" does not exist`.
+        as_element: bool,
+    ) -> Option<()> {
+        if depth > 16 {
+            return None;
+        }
+        match item.node.as_ref()? {
+            NodeEnum::ColumnRef(column) => {
+                let name = column.fields.last().and_then(|f| match &f.node {
+                    Some(NodeEnum::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                    // `GROUP BY t.*` is not a name we can reduce.
+                    _ => None,
+                })?;
+                into.push(name.clone());
+
+                // A bare name in `GROUP BY` may be an *output alias* rather
+                // than a column, and then it denotes whatever the target
+                // computes. `SELECT id AS c, sum(salary) … GROUP BY c` groups by
+                // `id`, one row per group, and reading only the alias reported
+                // `c` — not a key — and released every salary. That is the
+                // original disclosure with two extra characters, and it is what
+                // "read the grouping" kept getting wrong: a name in the clause
+                // is not the column being grouped on. SQL separates the two
+                // four ways — ordinal, star, alias, expression.
+                //
+                // Both names are collected, because which one wins is not
+                // decidable here: Postgres prefers an *input* column of that
+                // name and only falls back to the output alias, and knowing
+                // whether the input column exists needs the relation's columns.
+                // Collecting both over-refuses in the shadowed case and cannot
+                // under-refuse in either.
+                //
+                // Only in a grouping element, which is where Postgres applies
+                // output-name resolution. The resolved target is walked as a
+                // non-element, which both matches Postgres — an alias is not
+                // resolved again inside an expression — and bounds the lookup,
+                // so `SELECT c AS c … GROUP BY c` cannot chase its own alias.
+                if as_element && column.fields.len() == 1 {
+                    for entry in targets {
+                        let Some(NodeEnum::ResTarget(target)) = entry.node.as_ref() else {
+                            continue;
+                        };
+                        if !target.name.is_empty() && target.name.to_ascii_lowercase() == name {
+                            walk(
+                                target.val.as_ref()?,
+                                targets,
+                                into,
+                                depth.saturating_add(1),
+                                false,
+                            )?;
+                        }
+                    }
+                }
+                Some(())
+            }
+            // An ordinal names an *output* column, which is a target-list entry
+            // only while the two lists correspond. A star breaks that: it
+            // expands to however many columns its relation has, so every
+            // position after it is shifted by an amount not visible here, and
+            // `GROUP BY 2` can name one column while `target_list[1]` holds
+            // another. Resolving it then reports a name that is not the
+            // grouping — and if the real one is a key while the reported one is
+            // not, that releases the aggregate this exists to refuse. A star
+            // over a zero-column relation shifts by one, and `CREATE TEMP
+            // TABLE e()` is granted to PUBLIC by default.
+            //
+            // `positions_are_trustworthy` already refuses any statement with a
+            // star before this can matter, so today this is unreachable. It is
+            // checked here anyway: this reader is public, its result decides a
+            // release on its own, and depending on a neighbouring check to stay
+            // sound is how the misaligned-star disclosure got in.
+            //
+            // Only a plain column reference at the resolved position is
+            // readable; an ordinal onto an expression is no more legible than
+            // the expression.
+            NodeEnum::AConst(constant) => {
+                if targets.iter().any(target_is_star) {
+                    return None;
+                }
+                let Some(pg_query::protobuf::a_const::Val::Ival(value)) = constant.val.as_ref()
+                else {
+                    return None;
+                };
+                let position = usize::try_from(value.ival).ok()?.checked_sub(1)?;
+                let Some(NodeEnum::ResTarget(target)) = targets.get(position)?.node.as_ref() else {
+                    return None;
+                };
+                walk(
+                    target.val.as_ref()?,
+                    targets,
+                    into,
+                    depth.saturating_add(1),
+                    false,
+                )
+            }
+            // ROLLUP, CUBE and GROUPING SETS. Unioning the names across every
+            // set is the safe direction: each set is a subset of the union, so
+            // a key contained in one of them is contained in the union. An
+            // empty set — `GROUP BY ()` — contributes nothing, which is right,
+            // since it groups the whole relation into one row.
+            NodeEnum::GroupingSet(set) => {
+                for member in &set.content {
+                    walk(member, targets, into, depth.saturating_add(1), as_element)?;
+                }
+                Some(())
+            }
+            // A multi-column set inside `GROUPING SETS ((a, b), (c))`. Read for
+            // consistency with the single-column form, which is otherwise an
+            // arbitrary-looking split.
+            NodeEnum::RowExpr(row) => {
+                for member in &row.args {
+                    walk(member, targets, into, depth.saturating_add(1), as_element)?;
+                }
+                Some(())
+            }
+            // Everything else, which importantly includes a grouping construct
+            // nested inside another: `ROLLUP(a, CUBE(b, c))` parses the inner
+            // `CUBE` as an ordinary `FuncCall`, because the raw parse tree is
+            // not the analysed tree and only the outermost construct becomes a
+            // `GroupingSet`. Reading it would mean matching on the function
+            // name, and `cube` is a real function from a real extension.
+            _ => None,
+        }
+    }
+    walk(item, targets, into, 0, true)
 }
 
 /// Is this argument a string literal naming a coarse date unit?
@@ -1948,12 +2112,123 @@ mod referenced_identifier_probe {
         );
         // A grouping that cannot be reduced to names must read as unknown, so
         // the caller refuses rather than assuming it is not a singleton.
-        assert_eq!(cols("SELECT id, sum(x) FROM t GROUP BY 1"), None);
+        // An ordinal names a target-list entry, and `GROUP BY 1` is idiomatic
+        // enough that refusing it costs real queries. Reading it also keeps the
+        // guard honest: it is the same attack written differently.
+        assert_eq!(
+            cols("SELECT id, sum(x) FROM t GROUP BY 1"),
+            Some(vec!["id".to_string()])
+        );
+        assert_eq!(
+            cols("SELECT city, id, sum(x) FROM t GROUP BY 2, 1"),
+            Some(vec!["id".to_string(), "city".to_string()])
+        );
+
+        // Grouping sets union their names, because each set is a subset of the
+        // union — a key inside any one of them is inside the union.
         assert_eq!(
             cols("SELECT sum(x) FROM t GROUP BY GROUPING SETS ((a),(b))"),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            cols("SELECT city, sum(x) FROM t GROUP BY ROLLUP(city)"),
+            Some(vec!["city".to_string()])
+        );
+        assert_eq!(
+            cols("SELECT sum(x) FROM t GROUP BY CUBE(b, c)"),
+            Some(vec!["b".to_string(), "c".to_string()])
+        );
+        assert_eq!(
+            cols("SELECT sum(x) FROM t GROUP BY GROUPING SETS ((a, b), (c))"),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        // A grouping construct nested in another is *not* readable: the raw
+        // parse tree renders the inner `CUBE` as an ordinary `FuncCall`, and
+        // only the outermost construct becomes a `GroupingSet`.
+        assert_eq!(
+            cols("SELECT sum(x) FROM t GROUP BY ROLLUP(a, CUBE(b, c))"),
             None
         );
+        // `GROUP BY ()` collapses the relation to one row and distinguishes by
+        // nothing, so it contributes no names.
+        assert_eq!(
+            cols("SELECT sum(x) FROM t GROUP BY GROUPING SETS ((a),())"),
+            Some(vec!["a".to_string()])
+        );
+
+        // Still unreadable, and still refused by the caller: an expression, and
+        // an ordinal pointing at one.
         assert_eq!(cols("SELECT sum(x) FROM t GROUP BY lower(a)"), None);
+        assert_eq!(cols("SELECT lower(a), sum(x) FROM t GROUP BY 1"), None);
+        assert_eq!(
+            cols("SELECT id, sum(x) FROM t GROUP BY ROLLUP(lower(a))"),
+            None
+        );
+        // An ordinal off the end of the target list is not a name either.
+        assert_eq!(cols("SELECT id, sum(x) FROM t GROUP BY 9"), None);
+
+        // A star shifts every position after it by an amount not visible in the
+        // target list, so an ordinal stops naming the entry it indexes. Here
+        // `GROUP BY 2` is `id` if `z` expands to nothing, while `target_list[1]`
+        // is `city` — reading it would report a non-key for a grouping that is
+        // one. Refused instead, and independently of the star check in
+        // `positions_are_trustworthy` that happens to refuse the whole
+        // statement first.
+        assert_eq!(
+            cols("SELECT z.*, city, id, sum(x) FROM z, t GROUP BY 2"),
+            None
+        );
+        assert_eq!(cols("SELECT *, sum(x) FROM t GROUP BY 1"), None);
+        // An output alias denotes whatever its target computes, so both names
+        // are collected. Reading only the alias released every salary through
+        // `SELECT id AS c, sum(salary) … GROUP BY c`.
+        assert_eq!(
+            cols("SELECT id AS c, sum(x) FROM t GROUP BY c"),
+            Some(vec!["c".to_string(), "id".to_string()])
+        );
+        // An alias onto an expression is as unreadable as the expression, and
+        // falls to the caller's lexical backstop rather than to a name.
+        assert_eq!(
+            cols("SELECT date_trunc('month', ts) AS m, sum(x) FROM t GROUP BY m"),
+            None
+        );
+        // A qualified name is never an output alias, so no lookup happens.
+        assert_eq!(
+            cols("SELECT id AS c, sum(x) FROM t GROUP BY t.c"),
+            Some(vec!["c".to_string()])
+        );
+        // Self-referential alias: bounded because the lookup only runs at the
+        // top of an item.
+        assert_eq!(
+            cols("SELECT c AS c, sum(x) FROM t GROUP BY c"),
+            Some(vec!["c".to_string(), "c".to_string()])
+        );
+        // A grouping set nests grouping elements, and Postgres resolves an
+        // output alias in each of them — verified against a live server, which
+        // served `GROUP BY ROLLUP(c)` as a grouping by `id`. Reading only `c`
+        // here was a second copy of the same disclosure.
+        assert_eq!(
+            cols("SELECT id AS c, sum(x) FROM t GROUP BY ROLLUP(c)"),
+            Some(vec!["c".to_string(), "id".to_string()])
+        );
+        assert_eq!(
+            cols("SELECT id AS c, sum(x) FROM t GROUP BY GROUPING SETS ((c))"),
+            Some(vec!["c".to_string(), "id".to_string()])
+        );
+        // An ordinal lands in an expression, where Postgres does *not* resolve
+        // an alias, so the target is read for what it computes and no lookup
+        // runs. `GROUP BY 1` here is `id` either way.
+        assert_eq!(
+            cols("SELECT id AS c, sum(x) FROM t GROUP BY 1"),
+            Some(vec!["id".to_string()])
+        );
+
+        // A star does not make a *named* grouping unreadable — only an ordinal
+        // depends on the positions.
+        assert_eq!(
+            cols("SELECT z.*, sum(x) FROM z, t GROUP BY id"),
+            Some(vec!["id".to_string()])
+        );
     }
 
     /// The case that made this lexical: the tree walk does not enter a
