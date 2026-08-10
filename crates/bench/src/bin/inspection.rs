@@ -30,6 +30,11 @@ fn per_iteration(duration: Duration, iterations: usize) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+const ALLOW_ALL: analysis::Relaxations = analysis::Relaxations {
+    summaries: true,
+    fine_date_trunc: true,
+};
+
 fn main() {
     let iterations = std::env::args()
         .nth(1)
@@ -39,11 +44,11 @@ fn main() {
 
     // Warm the parser and allocator before either measurement.
     for _ in 0..100 {
-        black_box(StatementInspection::new(SQL).output_safety(3, true));
+        black_box(StatementInspection::new(SQL).output_safety(3, ALLOW_ALL));
     }
 
     let repeated = measure(iterations, || {
-        black_box(analysis::analyze(SQL, 3, true));
+        black_box(analysis::analyze(SQL, 3, ALLOW_ALL));
         black_box(analysis::reads_only_server_metadata(SQL));
         black_box(analysis::provenance_is_trustworthy(SQL));
         black_box(analysis::every_relation_is_qualified(SQL));
@@ -52,7 +57,7 @@ fn main() {
     });
     let inspected = measure(iterations, || {
         let inspection = StatementInspection::new(black_box(SQL));
-        black_box(inspection.output_safety(3, true));
+        black_box(inspection.output_safety(3, ALLOW_ALL));
         black_box(inspection.reads_only_server_metadata());
         black_box(inspection.provenance_is_trustworthy());
         black_box(inspection.every_relation_is_qualified());

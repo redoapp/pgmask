@@ -816,8 +816,22 @@ impl Session {
         });
         let allow_summaries = self.policy.summaries == Summaries::Allow && !singleton_groups;
 
+        // `date_trunc` to a unit finer than a year can return more than a date
+        // mask allows — `date_trunc('day', birth_date)` returned the whole
+        // value through a year-masked column. Year and coarser are safe
+        // unconditionally; finer only when the statement names nothing masked,
+        // which is what keeps `date_trunc('month', placed_at)` working on a
+        // column the operator released with `mask = "none"`.
+        let fine_date_trunc = inspection.as_ref().is_some_and(|inspection| {
+            !snapshot.inspection_references_masked_column(inspection, &self.roles)
+        });
+        let allow = crate::analysis::Relaxations {
+            summaries: allow_summaries,
+            fine_date_trunc,
+        };
+
         let safety = match &inspection {
-            Some(inspection) => inspection.output_safety(fields.len(), allow_summaries),
+            Some(inspection) => inspection.output_safety(fields.len(), allow),
             None => vec![Safety::Unknown; fields.len()],
         };
         // Engines disagree about this: Postgres zeroes provenance for set

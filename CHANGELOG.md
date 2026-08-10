@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.23 — coarsening below the mask is not coarsening
+
+`date_trunc` was released for any unit "at or above a day". The fixture's
+`birth_date` is masked to its year, and through the proxy:
+
+```
+  plain birth_date                 1975-01-01   the mask
+  date_trunc('day',  birth_date)   1975-02-14   the whole value
+  date_trunc('week', birth_date)   1975-02-10   a seven-day window
+```
+
+The rule was written as "coarse enough to lose the day". Soundness needs "at
+least as coarse as the mask", and this module cannot see the mask — the field is
+computed, so it has no provenance and no classification.
+
+Found by enumerating which release paths a generated statement can reach.
+`date_trunc` was one of three that nothing in the corpus could produce, and two
+of those three have now produced a disclosure — the other was `PURE_SCALARS` in
+0.1.9.
+
+TRIMMING THE LIST WAS TOO EXPENSIVE
+
+Restricting the units to year and coarser also refused
+`date_trunc('month', placed_at)` on a column the operator set to `mask = "none"`
+— the demo catalog runs without lineage, so there was no second chance to
+release it, and ordinary time bucketing broke.
+
+Year and coarser are now released unconditionally, because year is the coarsest
+date mask on offer and nothing finer can escape through it. Finer units are
+released only when the statement names no masked column at all, which is the
+same lexical backstop the lineage and catalog paths use. Both directions
+measured: the three fine units refused over `birth_date`, and
+`date_trunc('month', placed_at)` and the month-bucket-with-sum query still
+served.
+
+The pair of booleans threading through `classify` became a `Relaxations` struct
+on the way through. This was the second flag, and the call sites had stopped
+saying what `true, false` meant.
+
 ## 0.1.22 — count what executed, not what was generated
 
 Measured on the fuzz fixture, sqlsmith runs **123 of every 400 statements**. The

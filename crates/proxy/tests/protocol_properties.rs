@@ -16,6 +16,11 @@ use pgmask::analysis;
 use pgmask::protocol::*;
 use proptest::prelude::*;
 
+const ALLOW_ALL: pgmask::analysis::Relaxations = pgmask::analysis::Relaxations {
+    summaries: true,
+    fine_date_trunc: true,
+};
+
 proptest! {
     /// Arbitrary bytes must not panic the RowDescription parser. Postgres will
     /// not send these, but a compromised or buggy backend might, and a panic
@@ -135,7 +140,7 @@ proptest! {
     /// do that.
     #[test]
     fn analysis_never_panics_and_fails_closed_on_junk(text in ".{0,200}") {
-        let out = analysis::analyze(&text, 3, true);
+        let out = analysis::analyze(&text, 3, ALLOW_ALL);
         prop_assert_eq!(out.len(), 3);
         // Junk cannot parse as a single SELECT with three matching targets, so
         // nothing may be released.
@@ -153,7 +158,7 @@ proptest! {
     /// answer, whatever the SQL says.
     #[test]
     fn analysis_output_length_follows_the_field_count(n in 0usize..12) {
-        prop_assert_eq!(analysis::analyze("SELECT 1, 2, 3", n, true).len(), n);
+        prop_assert_eq!(analysis::analyze("SELECT 1, 2, 3", n, ALLOW_ALL).len(), n);
     }
 }
 

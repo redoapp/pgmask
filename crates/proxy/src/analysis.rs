@@ -162,8 +162,8 @@ impl<'sql> StatementInspection<'sql> {
             .as_deref()
     }
 
-    pub fn output_safety(&self, field_count: usize, allow_summaries: bool) -> Vec<Safety> {
-        analyze_inspected(self, field_count, allow_summaries)
+    pub fn output_safety(&self, field_count: usize, allow: Relaxations) -> Vec<Safety> {
+        analyze_inspected(self, field_count, allow)
     }
 
     pub fn reads_only_server_metadata(&self) -> bool {
@@ -344,12 +344,57 @@ const RANKING_WINDOWS: &[&str] = &[
 /// `system_catalogs = "allow"` exists.
 const GENERATORS_IN_FROM: &[&str] = &["generate_series", "generate_subscripts", "unnest"];
 
+/// Which release paths the session is willing to open for this result set.
+///
+/// Both depend on facts `analysis` cannot see — the policy, and the catalog —
+/// so they are decided by the caller and passed in rather than guessed at here.
+#[derive(Clone, Copy, Debug)]
+pub struct Relaxations {
+    /// `summaries = "allow"`, and the grouping does not make a summary into a
+    /// value. See the singleton-group guard in `session`.
+    pub summaries: bool,
+    /// Whether `date_trunc` may coarsen to a unit finer than a year.
+    ///
+    /// Year and above are safe unconditionally: they are at least as coarse as
+    /// the coarsest date mask, so they cannot return more than the mask allows.
+    /// Finer units can, and this module has no way to know whether the column
+    /// underneath is masked — the field is computed, so it carries no
+    /// provenance and no classification.
+    ///
+    /// The caller sets this when the *statement* names no masked column, which
+    /// is the same lexical backstop the lineage and catalog paths use. It keeps
+    /// `date_trunc('month', placed_at)` working on a column the operator has
+    /// released, and refuses `date_trunc('day', birth_date)`, which returned
+    /// the whole value through a year-masked column.
+    pub fine_date_trunc: bool,
+}
+
 /// Precisions `date_trunc` may coarsen to.
 ///
 /// **The precision is an argument, so it is caller-controlled.**
-/// `date_trunc('microseconds', birth_date)` coarsens nothing. Only units at or
-/// above a day qualify, and the argument has to be a literal we can read — a
-/// computed precision is not checkable.
+/// `date_trunc('microseconds', birth_date)` coarsens nothing, and the argument
+/// has to be a literal we can read — a computed precision is not checkable.
+///
+/// "At or above a day" was the original rule and it was a disclosure. The
+/// release is sound only when the truncation is at least as coarse as the
+/// *mask*, and this module cannot see the mask: the field is computed, so it
+/// has no provenance and no classification. The coarsest date mask pgmask
+/// offers is `date-year`, so year is the finest unit that is safe against every
+/// column it could be applied to. Measured against the fixture, whose
+/// `birth_date` is year-masked to `1975-01-01`:
+///
+///   date_trunc('year',  birth_date) -> 1975-01-01   the masked value
+///   date_trunc('day',   birth_date) -> 1975-02-14   the whole value
+///   date_trunc('week',  birth_date) -> 1975-02-10   a seven-day window
+///
+/// `month` and `quarter` are excluded for the same reason even though a
+/// `date-month` column exists: this cannot tell the two masks apart.
+///
+/// The cost is that `date_trunc('month', ts)` — ordinary time bucketing — is no
+/// longer released *here*. It is not refused outright: with no provenance the
+/// field falls through to lineage, which resolves the underlying column and
+/// releases when it is unmasked. That is the correct division of labour, since
+/// deciding this needs the classification that only lineage has.
 const COARSE_DATE_UNITS: &[&str] = &[
     "day",
     "week",
@@ -360,6 +405,23 @@ const COARSE_DATE_UNITS: &[&str] = &[
     "century",
     "millennium",
 ];
+
+/// Units at least as coarse as the coarsest date mask, so safe against any
+/// column whatever its classification.
+const YEAR_OR_COARSER: &[&str] = &["year", "decade", "century", "millennium"];
+
+/// Is this argument a literal naming a unit of a year or more?
+fn date_unit_at_least_a_year(arg: &pg_query::protobuf::Node) -> bool {
+    let Some(NodeEnum::AConst(constant)) = arg.node.as_ref() else {
+        return false;
+    };
+    match constant.val.as_ref() {
+        Some(pg_query::protobuf::a_const::Val::Sval(s)) => {
+            YEAR_OR_COARSER.contains(&s.sval.trim().to_ascii_lowercase().as_str())
+        }
+        _ => false,
+    }
+}
 
 /// Pure scalar functions that compute from their arguments and nothing else.
 ///
@@ -408,14 +470,14 @@ const PURE_SCALARS: &[&str] = &[
 /// Returns `Unknown` for every field unless a strict correspondence between the
 /// statement's target list and the described fields can be established. Any
 /// doubt anywhere collapses the whole analysis to `Unknown`.
-pub fn analyze(sql: &str, field_count: usize, allow_summaries: bool) -> Vec<Safety> {
-    StatementInspection::new(sql).output_safety(field_count, allow_summaries)
+pub fn analyze(sql: &str, field_count: usize, allow: Relaxations) -> Vec<Safety> {
+    StatementInspection::new(sql).output_safety(field_count, allow)
 }
 
 fn analyze_inspected(
     inspection: &StatementInspection<'_>,
     field_count: usize,
-    allow_summaries: bool,
+    allow: Relaxations,
 ) -> Vec<Safety> {
     let unknown = vec![Safety::Unknown; field_count];
 
@@ -465,7 +527,7 @@ fn analyze_inspected(
         .map(|entry| match entry.node.as_ref() {
             Some(NodeEnum::ResTarget(target)) => {
                 match target.val.as_ref().and_then(|v| v.node.as_ref()) {
-                    Some(expr) => classify(expr, allow_summaries, grouped),
+                    Some(expr) => classify(expr, allow, grouped),
                     None => Safety::Unknown,
                 }
             }
@@ -568,7 +630,7 @@ fn target_is_star(node: &pg_query::protobuf::Node) -> bool {
 }
 
 /// The allowlist proper.
-fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) -> Safety {
+fn classify(expr: &NodeEnum, allow: Relaxations, grouped: Option<&[String]>) -> Safety {
     match expr {
         // A literal. `SELECT 1`, `SELECT 'x'`, `SELECT NULL`.
         NodeEnum::AConst(_) => Safety::Releasable,
@@ -582,7 +644,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) 
 
         // A cast is safe exactly when what it casts is. `SELECT 1::text`.
         NodeEnum::TypeCast(cast) => match cast.arg.as_ref().and_then(|a| a.node.as_ref()) {
-            Some(inner) => classify(inner, allow_summaries, grouped),
+            Some(inner) => classify(inner, allow, grouped),
             None => Safety::Unknown,
         },
 
@@ -613,7 +675,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) 
             if call.agg_star && name == "count" {
                 return Safety::Releasable;
             }
-            if !allow_summaries {
+            if !allow.summaries {
                 return Safety::Unknown;
             }
 
@@ -679,7 +741,12 @@ fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) 
             if call.over.is_none() && name == "date_trunc" && call.args.len() >= 2 {
                 // `first()` cannot be None here, but expressing that as a
                 // fallible read costs nothing and removes the panic entirely.
-                if call.args.first().is_some_and(coarse_unit_literal) {
+                if call.args.first().is_some_and(date_unit_at_least_a_year) {
+                    return Safety::Releasable;
+                }
+                // Finer than a year: only when nothing masked is in the
+                // statement at all.
+                if allow.fine_date_trunc && call.args.first().is_some_and(coarse_unit_literal) {
                     return Safety::Releasable;
                 }
                 return Safety::Unknown;
@@ -691,9 +758,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) 
                 let all = call.args.iter().all(|a| {
                     a.node
                         .as_ref()
-                        .map(|inner| {
-                            classify(inner, allow_summaries, grouped) == Safety::Releasable
-                        })
+                        .map(|inner| classify(inner, allow, grouped) == Safety::Releasable)
                         .unwrap_or(false)
                 });
                 if all {
@@ -710,7 +775,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) 
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
             {
-                Some(inner) => classify(inner, allow_summaries, grouped),
+                Some(inner) => classify(inner, allow, grouped),
                 // A missing side is a unary operator, not a hidden column.
                 None => Safety::Releasable,
             };
@@ -731,7 +796,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) 
             for arg in &case.args {
                 if let Some(NodeEnum::CaseWhen(when)) = arg.node.as_ref() {
                     let branch = match when.result.as_ref().and_then(|r| r.node.as_ref()) {
-                        Some(inner) => classify(inner, allow_summaries, grouped),
+                        Some(inner) => classify(inner, allow, grouped),
                         None => Safety::Unknown,
                     };
                     all &= branch == Safety::Releasable;
@@ -740,7 +805,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) 
                 }
             }
             if let Some(default) = case.defresult.as_ref().and_then(|d| d.node.as_ref()) {
-                all &= classify(default, allow_summaries, grouped) == Safety::Releasable;
+                all &= classify(default, allow, grouped) == Safety::Releasable;
             }
             if all {
                 Safety::Releasable
@@ -753,7 +818,7 @@ fn classify(expr: &NodeEnum, allow_summaries: bool, grouped: Option<&[String]>) 
             let all = c.args.iter().all(|a| {
                 a.node
                     .as_ref()
-                    .map(|inner| classify(inner, allow_summaries, grouped) == Safety::Releasable)
+                    .map(|inner| classify(inner, allow, grouped) == Safety::Releasable)
                     .unwrap_or(false)
             });
             if all {
@@ -1568,7 +1633,10 @@ mod tests {
         assert!(!inspection.reads_only_server_metadata());
         assert!(!inspection.provenance_is_trustworthy());
         assert!(!inspection.every_relation_is_qualified());
-        assert_eq!(inspection.output_safety(2, true), vec![Safety::Unknown; 2]);
+        assert_eq!(
+            inspection.output_safety(2, ALLOW_ALL),
+            vec![Safety::Unknown; 2]
+        );
     }
 
     // --- system catalogs ---------------------------------------------------
@@ -1710,7 +1778,11 @@ mod tests {
             "SELECT pg_total_relation_size('demo.customers')",
             "SELECT pg_relation_size(c.oid) FROM pg_catalog.pg_class c",
         ] {
-            assert_eq!(analyze(sql, 1, false), vec![Safety::Releasable], "{sql}");
+            assert_eq!(
+                analyze(sql, 1, ALLOW_NONE),
+                vec![Safety::Releasable],
+                "{sql}"
+            );
         }
         // A formatted size is still released under the default posture. It is
         // a pure scalar now rather than a size function, so it sits behind the
@@ -1720,7 +1792,7 @@ mod tests {
             analyze(
                 "SELECT pg_size_pretty(pg_table_size('demo.customers'))",
                 1,
-                true
+                ALLOW_ALL
             ),
             vec![Safety::Releasable]
         );
@@ -1734,14 +1806,14 @@ mod tests {
             "SELECT pg_column_size(email) FROM t",
             "SELECT pg_size_bytes(note) FROM t",
         ] {
-            assert_eq!(analyze(sql, 1, true), vec![Safety::Unknown], "{sql}");
+            assert_eq!(analyze(sql, 1, ALLOW_ALL), vec![Safety::Unknown], "{sql}");
         }
         // The neighbouring trap stays shut: these return an actual member.
         for sql in [
             "SELECT max(email) FROM demo.customers",
             "SELECT pg_read_file('/etc/passwd')",
         ] {
-            assert_eq!(analyze(sql, 1, true), vec![Safety::Unknown], "{sql}");
+            assert_eq!(analyze(sql, 1, ALLOW_ALL), vec![Safety::Unknown], "{sql}");
         }
     }
 
@@ -1773,13 +1845,24 @@ mod tests {
     use super::*;
 
     /// Default posture: summaries released.
+    /// Everything the session can open, for tests about the shape rules.
+    const ALLOW_ALL: Relaxations = Relaxations {
+        summaries: true,
+        fine_date_trunc: true,
+    };
+    /// Nothing opened: what a masked column in the statement produces.
+    const ALLOW_NONE: Relaxations = Relaxations {
+        summaries: false,
+        fine_date_trunc: false,
+    };
+
     fn safety(sql: &str, fields: usize) -> Vec<Safety> {
-        analyze(sql, fields, true)
+        analyze(sql, fields, ALLOW_ALL)
     }
 
     /// The stricter posture, for the cases that must hold either way.
     fn strict(sql: &str, fields: usize) -> Vec<Safety> {
-        analyze(sql, fields, false)
+        analyze(sql, fields, ALLOW_NONE)
     }
 
     fn is_safe(sql: &str) -> bool {
@@ -2561,6 +2644,54 @@ mod referenced_identifier_probe {
                 }
             }
         }
+    }
+
+    /// Coarsening below the mask is not coarsening.
+    ///
+    /// `date_trunc` was released for any unit "at or above a day", and the
+    /// fixture's `birth_date` is masked to its year. Measured through the
+    /// proxy: `date_trunc('day', birth_date)` returned `1975-02-14`, the whole
+    /// value, and `'week'` returned a seven-day window — both from a column
+    /// whose plain projection is `1975-01-01`.
+    ///
+    /// Year and coarser are safe against any date column, because year is the
+    /// coarsest date mask on offer. Finer units are safe only when the caller
+    /// says the statement names nothing masked.
+    #[test]
+    fn date_trunc_below_the_mask_is_not_a_summary() {
+        // `summaries` stays on in both: the summaries gate sits above the
+        // `date_trunc` arm and would short-circuit the whole thing, which would
+        // make this test pass for the wrong reason.
+        const COARSE_ONLY: Relaxations = Relaxations {
+            summaries: true,
+            fine_date_trunc: false,
+        };
+        const FINE: Relaxations = Relaxations {
+            summaries: true,
+            fine_date_trunc: true,
+        };
+        let unconditional = |sql: &str| analyze(sql, 1, COARSE_ONLY);
+        let permitted = |sql: &str| analyze(sql, 1, FINE);
+
+        for unit in ["year", "decade", "century", "millennium"] {
+            let sql = format!("SELECT date_trunc('{unit}', birth_date) FROM t");
+            assert_eq!(unconditional(&sql), vec![Safety::Releasable], "{sql}");
+        }
+        for unit in ["day", "week", "month", "quarter"] {
+            let sql = format!("SELECT date_trunc('{unit}', birth_date) FROM t");
+            assert_eq!(unconditional(&sql), vec![Safety::Unknown], "{sql}");
+            assert_eq!(permitted(&sql), vec![Safety::Releasable], "{sql}");
+        }
+        // Finer than a day was already refused and stays refused either way.
+        for unit in ["microseconds", "second", "hour"] {
+            let sql = format!("SELECT date_trunc('{unit}', birth_date) FROM t");
+            assert_eq!(permitted(&sql), vec![Safety::Unknown], "{sql}");
+        }
+        // A computed precision is not a literal and cannot be checked.
+        assert_eq!(
+            permitted("SELECT date_trunc(u, birth_date) FROM t"),
+            vec![Safety::Unknown]
+        );
     }
 
     /// The case that made this lexical: the tree walk does not enter a

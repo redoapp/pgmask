@@ -21,6 +21,11 @@
 
 use pgmask::analysis::{analyze, Safety};
 
+const ALLOW_ALL: pgmask::analysis::Relaxations = pgmask::analysis::Relaxations {
+    summaries: true,
+    fine_date_trunc: true,
+};
+
 /// Every `pg_catalog` aggregate in PostgreSQL 17.
 const ALL_AGGREGATES: &[&str] = &[
     "any_value",
@@ -112,7 +117,7 @@ fn the_released_set_is_exactly_what_we_intend() {
     let mut actual: Vec<&str> = Vec::new();
     for name in ALL_AGGREGATES {
         let sql = format!("SELECT {name}(email) FROM t");
-        if analyze(&sql, 1, true).first() == Some(&Safety::Releasable) {
+        if analyze(&sql, 1, ALLOW_ALL).first() == Some(&Safety::Releasable) {
             actual.push(name);
         }
     }
@@ -144,7 +149,7 @@ fn every_value_returning_aggregate_is_refused() {
     ] {
         let sql = format!("SELECT {name}(email) FROM t");
         assert_eq!(
-            analyze(&sql, 1, true).first(),
+            analyze(&sql, 1, ALLOW_ALL).first(),
             Some(&Safety::Unknown),
             "{name} returns a value it consumed and must never be released"
         );

@@ -193,6 +193,13 @@ MUTATIONS = [
         "./scripts/test-fuzz.sh 900 1 1",
     ),
     (
+        "date_trunc below the mask",
+        "crates/proxy/src/analysis.rs",
+        "                if allow.fine_date_trunc && call.args.first().is_some_and(coarse_unit_literal) {",
+        "                if call.args.first().is_some_and(coarse_unit_literal) {",
+        "cargo test -p pgmask -q date_trunc_below_the_mask",
+    ),
+    (
         "notice text withheld",
         "crates/proxy/src/protocol.rs",
         "        if notice && field == b'M' {",
