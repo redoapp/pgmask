@@ -95,11 +95,31 @@ echo "==> poison run: masking removed, the oracle must fire"
 mkcfg "$POISON_PORT" /tmp/crdb-fuzz-poison.toml
 sed -i.bak -e 's/^mask = "ip-prefix"/mask = "none"/' -e 's/^mask = "date-year"/mask = "none"/' \
   /tmp/crdb-fuzz-poison.toml
+poison_url="postgresql://root@localhost:$POISON_PORT/fuzzdb?sslmode=disable"
+if psql -w "$poison_url" -tAc 'select 1' >/dev/null 2>&1; then
+  echo "FAIL: poison port $POISON_PORT is already serving a database"
+  echo "      refusing to mistake a stale proxy for this campaign's process"
+  exit 1
+fi
 ./target/release/pgmask /tmp/crdb-fuzz-poison.toml >/tmp/crdb-fuzz-poison.log 2>&1 &
 POISON_PID=$!
-sleep 3
-if DIRECT_URL="$CDB" PROXY_URL="postgresql://root@localhost:$POISON_PORT/fuzzdb?sslmode=disable" \
-   EXPECT_LEAKS=1 ./target/release/fuzz "/tmp/crdb-fuzz-1.sql" >/tmp/crdb-poison.out 2>&1; then
+for _ in $(seq 1 30); do
+  kill -0 "$POISON_PID" 2>/dev/null \
+    || { echo "FAIL: poison proxy exited before becoming ready"; tail -8 /tmp/crdb-fuzz-poison.log; exit 1; }
+  psql -w "$poison_url" -tAc 'select 1' >/dev/null 2>&1 && break
+  sleep 1
+done
+psql -w "$poison_url" -tAc 'select 1' >/dev/null 2>&1 \
+  || { echo "FAIL: poison proxy did not start"; tail -8 /tmp/crdb-fuzz-poison.log; exit 1; }
+# Prefix a deterministic value from each disabled mask class. Shapegen remains
+# random and broad, but the oracle self-test must never depend on whether this
+# particular corpus happened to select birth_date or last_ip.
+{
+  printf '%s\n' 'SELECT birth_date, last_ip FROM fz.people WHERE id = 1;'
+  command cat /tmp/crdb-fuzz-1.sql
+} > /tmp/crdb-poison.sql
+if DIRECT_URL="$CDB" PROXY_URL="$poison_url" \
+   EXPECT_LEAKS=1 ./target/release/fuzz /tmp/crdb-poison.sql >/tmp/crdb-poison.out 2>&1; then
   echo "    poison run tripped the oracle, as required"
 else
   echo "FAIL: masking was removed and nothing leaked — the oracle is not working"

@@ -23,6 +23,8 @@ pub const B_COPY_OUT_RESPONSE: u8 = b'H';
 pub const B_COPY_BOTH_RESPONSE: u8 = b'W';
 pub const B_ERROR_RESPONSE: u8 = b'E';
 pub const B_NOTICE_RESPONSE: u8 = b'N';
+pub const B_PARAMETER_STATUS: u8 = b'S';
+pub const B_NOTIFICATION_RESPONSE: u8 = b'A';
 pub const B_READY_FOR_QUERY: u8 = b'Z';
 pub const B_PARSE_COMPLETE: u8 = b'1';
 pub const B_BIND_COMPLETE: u8 = b'2';
@@ -38,11 +40,9 @@ pub const B_COPY_DONE: u8 = b'c';
 pub const BACKEND_CONTROL_TAGS: &[u8] = &[
     b'R', // Authentication*
     b'K', // BackendKeyData
-    b'S', // ParameterStatus
     b'Z', // ReadyForQuery
     b'C', // CommandComplete
     b'I', // EmptyQueryResponse
-    b'A', // NotificationResponse (payload is application text, not table data)
     b'1', // ParseComplete
     b'2', // BindComplete
     b'3', // CloseComplete
@@ -552,9 +552,37 @@ pub fn build_error(sqlstate: &str, message: &str, hint: Option<&str>) -> Message
 /// message mentions anything we are masking.
 const LEAKY_FIELDS: &[u8] = b"DHncdtq";
 
+/// A `NoticeResponse`'s primary message is written by SQL, so it is dropped too.
+///
+/// `LEAKY_FIELDS` covers the fields Postgres fills from row data. The *primary*
+/// message of a notice is different: the client chooses it outright.
+///
+/// ```sql
+/// DO $$ BEGIN RAISE NOTICE '%', (SELECT email FROM demo.customers LIMIT 1); END $$;
+/// ```
+///
+/// returned `NOTICE:  user1@example.com` through the proxy while the same
+/// column read as a pseudonym — a complete bypass of the control, confirmed
+/// against a live server. An error's message is kept, because "relation does
+/// not exist" is the difference between a usable proxy and an opaque one, and
+/// Postgres composes error messages from its own text rather than from a row.
+const NOTICE_WITHHELD: &str = "pgmask: notice text withheld (it is written by SQL)";
+
 /// Rebuild an Error/Notice with leaky fields removed. Returns `None` if nothing
 /// needed changing, so the common path forwards the original bytes untouched.
+///
+/// `notice` additionally replaces the primary message, which only a
+/// `NoticeResponse` lets SQL choose.
 pub fn scrub_error(body: &Bytes) -> Option<Bytes> {
+    scrub_diagnostic(body, false)
+}
+
+/// As [`scrub_error`], for a `NoticeResponse`.
+pub fn scrub_notice(body: &Bytes) -> Option<Bytes> {
+    scrub_diagnostic(body, true)
+}
+
+fn scrub_diagnostic(body: &Bytes, notice: bool) -> Option<Bytes> {
     let mut buf = body.clone();
     let mut kept = BytesMut::with_capacity(body.len());
     let mut changed = false;
@@ -573,6 +601,13 @@ pub fn scrub_error(body: &Bytes) -> Option<Bytes> {
             changed = true;
             continue;
         }
+        if notice && field == b'M' {
+            changed = true;
+            kept.put_u8(b'M');
+            kept.put_slice(NOTICE_WITHHELD.as_bytes());
+            kept.put_u8(0);
+            continue;
+        }
         kept.put_u8(field);
         kept.put_slice(value.as_bytes());
         kept.put_u8(0);
@@ -582,6 +617,45 @@ pub fn scrub_error(body: &Bytes) -> Option<Bytes> {
     }
     kept.put_u8(0);
     Some(kept.freeze())
+}
+
+/// GUCs Postgres reports on change, none of which a client can fill with row
+/// data.
+///
+/// `application_name` is deliberately absent. It is the one reportable GUC
+/// whose value is free text, and
+///
+/// ```sql
+/// DO $$ BEGIN PERFORM set_config('application_name',
+///          (SELECT email FROM demo.customers LIMIT 1), false); END $$;
+/// ```
+///
+/// puts a masked value in a `ParameterStatus` that no `RowDescription` governs.
+/// Withholding the echo costs a client the confirmation of a name it chose
+/// itself; forwarding it costs the whole control.
+///
+/// An allowlist rather than a denylist because an extension can mark its own
+/// GUC as `GUC_REPORT` with arbitrary text, and a denylist cannot know its name.
+const REPORTABLE_GUCS: &[&str] = &[
+    "client_encoding",
+    "DateStyle",
+    "default_transaction_read_only",
+    "in_hot_standby",
+    "integer_datetimes",
+    "IntervalStyle",
+    "is_superuser",
+    "scram_iterations",
+    "server_encoding",
+    "server_version",
+    "session_authorization",
+    "standard_conforming_strings",
+    "TimeZone",
+];
+
+/// Whether this `ParameterStatus` may be forwarded.
+pub fn parameter_status_is_safe(body: &Bytes) -> bool {
+    let mut buf = body.clone();
+    read_cstring(&mut buf).is_some_and(|key| REPORTABLE_GUCS.iter().any(|safe| *safe == key))
 }
 
 // --- Frontend messages the state machine steers on --------------------------

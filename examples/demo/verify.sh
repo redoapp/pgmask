@@ -413,6 +413,33 @@ check  "15n. ...and email stays masked even for support" \
   "pgmask:" "$(lin_as support_sam 'SELECT upper(email) FROM demo.customers WHERE id = 1;')"
 kill "$LIN_PID" 2>/dev/null
 
+# --- 16. Out-of-band channels -------------------------------------------------
+# Three backend messages carry free text that a client can steer to a stored
+# value, and none of them is a row-producing path — so no RowDescription, no
+# plan, and until this was fixed, no masking either. Each is checked against a
+# positive control proving the raw value really is reachable that way.
+echo
+echo "16. channels that carry text outside a result set"
+./target/release/pgmask examples/demo/catalog.toml >/tmp/pgmask-chan.log 2>&1 &
+CHAN_PID=$!
+sleep 2
+chan() { psql -h localhost -p 6432 -U postgres -d demo -X "$@" 2>&1; }
+chan_direct() { psql -h localhost -p "$PG_PORT" -U postgres -d demo -X "$@" 2>&1; }
+raise='DO $$ BEGIN RAISE NOTICE %s, (SELECT email FROM demo.customers WHERE id = 1); END $$;'
+notify='DO $$ BEGIN PERFORM pg_notify(%s,(SELECT email FROM demo.customers WHERE id = 1)); END $$;'
+
+check  "16a. control: RAISE NOTICE really does carry the address"   "user1@example.com" "$(chan_direct -c "$(printf "$raise" "'%'")")"
+refute "16b. ...and the proxy withholds it"   "user1@example.com" "$(chan -c "$(printf "$raise" "'%'")")"
+
+check  "16c. control: a NOTIFY payload really does carry it"   "user1@example.com" "$(chan_direct -c 'LISTEN c;' -c "$(printf "$notify" "'c'")" -c 'SELECT 1;')"
+refute "16d. ...and the proxy withholds it"   "user1@example.com" "$(chan -c 'LISTEN c;' -c "$(printf "$notify" "'c'")" -c 'SELECT 1;')"
+
+# An error's own message is kept: "relation does not exist" is the difference
+# between a usable proxy and an opaque one, and Postgres writes it, not SQL.
+check  "16e. a backend error still says what went wrong"   "does not exist" "$(chan -c 'SELECT * FROM demo.nonexistent')"
+check  "16f. and ordinary masking is unaffected"   "@8dedb655.invalid" "$(chan -tAq -c 'SELECT email FROM demo.customers WHERE id = 1')"
+kill "$CHAN_PID" 2>/dev/null
+
 echo
 echo "-----------------------"
 printf 'passed %d, failed %d\n' "$pass" "$fail"

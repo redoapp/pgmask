@@ -605,6 +605,20 @@ impl Session {
             // under pipelining a `ReadyForQuery` for an earlier exchange
             // arrives after a later `Describe` is already queued, and dropping
             // that live slot left a real result set with no plan.
+            // A `ParameterStatus` for a GUC whose value a client can fill from
+            // a row. `set_config('application_name', (SELECT email …), false)`
+            // put a masked address in one, outside any RowDescription.
+            protocol::B_PARAMETER_STATUS => {
+                if protocol::parameter_status_is_safe(&msg.body) {
+                    out.client(Vetted::control(&msg));
+                }
+            }
+
+            // Channel and payload are both arbitrary SQL expressions with no
+            // provenance to classify, so there is no sound mask to apply.
+            // `pg_notify('c', (SELECT email …))` delivered the address verbatim.
+            protocol::B_NOTIFICATION_RESPONSE => {}
+
             protocol::B_ERROR_RESPONSE => {
                 self.plans.discard_failed_epoch();
                 match protocol::scrub_error(&msg.body) {
@@ -615,7 +629,7 @@ impl Session {
                 }
             }
 
-            protocol::B_NOTICE_RESPONSE => match protocol::scrub_error(&msg.body) {
+            protocol::B_NOTICE_RESPONSE => match protocol::scrub_notice(&msg.body) {
                 Some(scrubbed) => out.client(Vetted::synthetic(&Message::new(msg.tag, scrubbed))),
                 None => out.client(Vetted::control(&msg)),
             },

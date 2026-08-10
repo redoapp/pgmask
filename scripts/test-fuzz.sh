@@ -103,15 +103,31 @@ sed -e 's/^mask = "ip-prefix"/mask = "none"/' -e 's/^mask = "date-year"/mask = "
     -e "s|55432|$PG_PORT|g" \
     -e "s/^listen = .*/listen = \"127.0.0.1:$POISON_PORT\"/" \
     -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-poison.toml
+if psql -h localhost -p "$POISON_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1; then
+  echo "FAIL: poison port $POISON_PORT is already serving a database"
+  echo "      refusing to mistake a stale proxy for this campaign's process"
+  exit 1
+fi
 ./target/release/pgmask /tmp/pgmask-poison.toml >/tmp/pgmask-poison.log 2>&1 &
 POISON_PID=$!
 for _ in $(seq 1 30); do
+  kill -0 "$POISON_PID" 2>/dev/null \
+    || { echo "FAIL: poison proxy exited before becoming ready"; tail -8 /tmp/pgmask-poison.log; exit 1; }
   psql -h localhost -p "$POISON_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 && break
   sleep 1
 done
 psql -h localhost -p "$POISON_PORT" -U postgres -d fuzzdb -tAc 'select 1' >/dev/null 2>&1 \
   || { echo "FAIL: poison proxy did not start"; tail -8 /tmp/pgmask-poison.log; exit 1; }
-gen 11 1200 /tmp/pgmask-poison.sql
+# The generated corpus is deliberately unpredictable. Its direct run can reach
+# thousands of masked values while still missing the particular mask classes
+# disabled above, which makes the oracle self-test flaky rather than useful.
+# Prefix one query whose redact mask was definitely removed; randomness tests
+# the proxy, while this deterministic probe proves that the test can fail.
+gen 11 1200 /tmp/pgmask-poison-generated.sql
+{
+  printf '%s\n' 'SELECT a FROM fz.t1 WHERE id = 1;'
+  command cat /tmp/pgmask-poison-generated.sql
+} > /tmp/pgmask-poison.sql
 if ! EXPECT_LEAKS=1 \
      DIRECT_URL="postgres://postgres:demo@localhost:$PG_PORT/fuzzdb" \
      PROXY_URL="postgres://postgres:demo@localhost:$POISON_PORT/fuzzdb" \
