@@ -248,6 +248,23 @@ refute "11b. ...without echoing a sampled value to the report" \
   "user1@example.com" "$(cat /tmp/pgmask-classify.log)"
 refute "11c. ...or into the catalog it writes" \
   "user1@example.com" "$(cat /tmp/pgmask-generated.toml)"
+# Content discovery. `demo.customers.lookup_key` holds addresses under a name
+# that suggests nothing, so only the sampled values can find it. Before this
+# worked, `--sample` ran solely for columns whose name had already matched a
+# rule: it could confirm a guess and never make one.
+check "11c2. classify finds a masked column its name disguises" \
+  "lookup_key" "$(cat /tmp/pgmask-generated.toml)"
+# Withheld, not narrowed. Content alone is not corroboration: the phone
+# validator accepts any 7-15 punctuated digits, which is also every national ID
+# and every IPv4 address, and taking the matched rule's mask verbatim proposed
+# `partial` for a column of national IDs — publishing their last four digits.
+check "11c3. ...proposing to withhold it rather than guess a mask" \
+  "unidentified" "$(grep -A 3 'column   = \"lookup_key\"' /tmp/pgmask-generated.toml)"
+check "11c4. ...under its own type, so a name-matched column cannot retag it" \
+  'mask = "null"' "$(grep -A 1 'name = \"unidentified\"' /tmp/pgmask-generated.toml)"
+# And it must ask a human rather than assert, naming what the values look like.
+check "11c5. ...telling the operator which shape it saw" \
+  "email" "$(grep 'lookup_key' /tmp/pgmask-classify.log)"
 
 ./target/release/pgmask /tmp/pgmask-generated-full.toml >/tmp/pgmask-generated.log 2>&1 &
 GEN_PID=$!

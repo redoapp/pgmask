@@ -44,6 +44,22 @@ command -v podman >/dev/null || { echo "FAIL: podman is required"; exit 3; }
 
 echo "==> starting CockroachDB $VERSION"
 podman rm -f -v "$CONTAINER" >/dev/null 2>&1
+# Refuse to run against somebody else's database.
+#
+# A container named `crdb`, left over from a session two days earlier, held
+# 26257. This script's `podman run` then failed — silently, into /dev/null — and
+# every query went to that stale server instead. `CREATE TABLE IF NOT EXISTS`
+# was a no-op against its old schema, so the suite reported 34 of 34 while
+# testing a fixture it had not created. It only surfaced when the catalog gained
+# a column the stale table lacked.
+#
+# A suite that quietly tests the wrong database is worse than one that fails.
+if lsof -nP -iTCP:"$CRDB_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "FAIL: something already listens on :$CRDB_PORT — this suite would have"
+  echo "      run against it instead of its own fixture. Offending container:"
+  podman ps --format '  {{.Names}} {{.Ports}}' | grep "$CRDB_PORT" || true
+  exit 1
+fi
 podman run -d --name "$CONTAINER" -p "$CRDB_PORT":26257 \
   "docker.io/cockroachdb/cockroach:$VERSION" start-single-node --insecure --accept-sql-without-tls >/dev/null 2>&1
 D="postgresql://root@localhost:$CRDB_PORT/demo?sslmode=disable"
@@ -59,15 +75,22 @@ echo "==> loading fixture"
 psql -w "$ROOT" -q -c 'CREATE DATABASE IF NOT EXISTS demo' >/dev/null 2>&1
 psql -w "$D" -q -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<'SQL'
 CREATE SCHEMA IF NOT EXISTS demo;
+-- Every column the demo catalog declares, `lookup_key` included. A stand-in
+-- that carries a subset does not start: the proxy resolves the whole catalog
+-- before it binds and refuses on a column that does not exist, because a
+-- half-loaded catalog has unknown coverage. That is the right behaviour and the
+-- reason this list has to track examples/demo/catalog.toml.
 CREATE TABLE IF NOT EXISTS demo.customers (
   id int primary key, email text not null, name text not null, phone text,
   city text not null, birth_date date not null, annual_salary int not null,
-  last_ip text not null, account_uuid uuid not null, internal_note text);
+  last_ip text not null, account_uuid uuid not null, internal_note text,
+  lookup_key text);
 INSERT INTO demo.customers
 SELECT i, 'user'||i||'@example.com', 'Customer '||i, '555-01'||lpad((i%100)::text,2,'0'),
        (ARRAY['Portland','Denver','Austin','Boston'])[1+(i%4)],
        DATE '1970-01-01' + (i%12000), 40000+(i%47)*3700, '203.0.113.'||(i%254+1),
-       ('00000000-0000-4000-8000-'||lpad(i::text,12,'0'))::uuid, 'note '||i
+       ('00000000-0000-4000-8000-'||lpad(i::text,12,'0'))::uuid, 'note '||i,
+       'user'||i||'@example.com'
 FROM generate_series(1,500) AS i
 ON CONFLICT (id) DO NOTHING;
 SQL

@@ -103,9 +103,11 @@ impl<'sql> StatementInspection<'sql> {
     /// here would look like "no grouping" and release exactly the aggregate
     /// this exists to catch. A direct field read has nothing to miss.
     ///
-    /// Only the top level is inspected, which is sufficient — an aggregate
-    /// inside a subquery is not the released field; the outer field
-    /// referencing it has no provenance and is judged on its own.
+    /// Read from the statement `analyze_inspected` actually judges: it unwraps
+    /// `SELECT * FROM (subselect)` before classifying, so the grouping has to be
+    /// taken from the same place or the two halves of the guard disagree. This
+    /// used to say that an aggregate inside a subquery "is not the released
+    /// field", which the unwrapping in this module had already falsified.
     ///
     /// Three shapes are readable, because refusing them costs real queries:
     /// a column reference, an ordinal into the target list (`GROUP BY 1` is
@@ -130,6 +132,30 @@ impl<'sql> StatementInspection<'sql> {
         else {
             return Some(Vec::new());
         };
+
+        // The same statement `analyze_inspected` judges, not the one the client
+        // wrote. It unwraps `SELECT * FROM (subselect)` and classifies the
+        // *subquery's* target list, so the released aggregate can live inside
+        // the subquery — while this used to read the outer `group_clause`,
+        // which is empty for the wrapper, and report "no grouping".
+        //
+        // That put the two halves of the guard on different statements and
+        // restored the 0.1.16 disclosure verbatim:
+        //
+        //   SELECT id, sum(annual_salary) FROM demo.customers GROUP BY id
+        //     -> refused
+        //   SELECT * FROM (SELECT id, sum(annual_salary) FROM demo.customers
+        //                  GROUP BY id) q
+        //     -> served, every salary exactly
+        //
+        // The comment above this function used to argue the case could not
+        // arise — "an aggregate inside a subquery is not the released field" —
+        // and the unwrapping in the same module had already made that false.
+        let mut select: &SelectStmt = select;
+        while let Some(inner) = unwrap_star_over_subquery(select) {
+            select = inner;
+        }
+
         if select.group_clause.is_empty() {
             return Some(Vec::new());
         }
@@ -2449,6 +2475,29 @@ mod referenced_identifier_probe {
             cols("SELECT sum(x) FROM t GROUP BY t.id, city"),
             Some(vec!["id".to_string(), "city".to_string()])
         );
+        // The wrapper the analysis unwraps. `analyze_inspected` classifies the
+        // *subquery's* targets for `SELECT * FROM (…)`, so the grouping has to
+        // come from there too. Reading the outer clause reported "no grouping"
+        // and served every salary in the table:
+        //
+        //   SELECT * FROM (SELECT id, sum(annual_salary) FROM demo.customers
+        //                  GROUP BY id) q
+        //
+        // Confirmed against a live server before the fix and after it.
+        assert_eq!(
+            cols("SELECT * FROM (SELECT id, sum(x) FROM t GROUP BY id) q"),
+            Some(vec!["id".to_string()])
+        );
+        assert_eq!(
+            cols("SELECT * FROM (SELECT * FROM (SELECT id, sum(x) FROM t GROUP BY id) a) b"),
+            Some(vec!["id".to_string()])
+        );
+        // A wrapper over an ungrouped aggregate is still ungrouped.
+        assert_eq!(
+            cols("SELECT * FROM (SELECT sum(x) FROM t) q"),
+            Some(Vec::new())
+        );
+
         // A grouping that cannot be reduced to names must read as unknown, so
         // the caller refuses rather than assuming it is not a singleton.
         // An ordinal names a target-list entry, and `GROUP BY 1` is idiomatic

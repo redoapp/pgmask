@@ -144,6 +144,15 @@ governed "...through an alias inside ROLLUP" \
   "$TRUE_SALARY" "$(p 'SELECT id AS c, sum(annual_salary) FROM demo.customers GROUP BY ROLLUP(c) ORDER BY 1 LIMIT 1')"
 governed "...through an alias inside GROUPING SETS" \
   "$TRUE_SALARY" "$(p 'SELECT id AS c, sum(annual_salary) FROM demo.customers GROUP BY GROUPING SETS ((c)) ORDER BY 1 LIMIT 1')"
+# The wrapper that put the two halves of the guard on different statements.
+# `analyze_inspected` unwraps `SELECT * FROM (…)` and judges the subquery's
+# targets, while the grouping was read from the outer clause — empty for a
+# wrapper — so this served every salary in the table until 0.1.31.
+governed "...through a SELECT * wrapper" \
+  "$TRUE_SALARY" "$(p 'SELECT * FROM (SELECT id, sum(annual_salary) FROM demo.customers GROUP BY id ORDER BY 1 LIMIT 1) q')"
+governed "...through two nested wrappers" \
+  "$TRUE_SALARY" "$(p 'SELECT * FROM (SELECT * FROM (SELECT id, sum(annual_salary) FROM demo.customers GROUP BY id) a) b LIMIT 1')"
+
 governed "...through a quoted alias" \
   "$TRUE_SALARY" "$(p 'SELECT id AS "C", sum(annual_salary) FROM demo.customers GROUP BY "C" ORDER BY 1 LIMIT 1')"
 
@@ -196,6 +205,8 @@ served "avg over a coarse bucket" \
   "$(p "SELECT date_trunc('year', placed_at), avg(order_total) FROM demo.orders GROUP BY 1 LIMIT 1")"
 served "an expression grouping on a non-key" \
   "$(p 'SELECT sum(annual_salary) FROM demo.customers GROUP BY upper(city) LIMIT 1')"
+served "a wrapped aggregate on a non-key column" \
+  "$(p 'SELECT * FROM (SELECT city, sum(annual_salary) FROM demo.customers GROUP BY city LIMIT 1) q')"
 served "an alias of a non-key column" \
   "$(p 'SELECT city AS c, sum(annual_salary) FROM demo.customers GROUP BY c LIMIT 1')"
 served "a date bucket reached through its alias" \

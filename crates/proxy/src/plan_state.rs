@@ -312,11 +312,25 @@ impl PlanState {
         self.pending_describes.pop_front();
     }
 
+    /// The SQL for *this* result set.
+    ///
+    /// A `match`, not `and_then(..).or_else(..)`. Those collapse two different
+    /// situations into one branch: "no Describe is outstanding, so this is the
+    /// simple query" and "a Describe is outstanding but its SQL was never
+    /// recorded". The second must stay unknown — falling back substitutes some
+    /// earlier simple query's text as the identity of a different statement,
+    /// and the analysis then judges the wrong SQL. `SELECT 1, 2` reads as two
+    /// literals and would release fields belonging to `SELECT upper(email), …`.
+    ///
+    /// That is the same failure the pipelined-Describe fix in 0.1.8 closed, on
+    /// a path that fix did not cover. A pending Describe carries no SQL when
+    /// `parse_parse` could not decode the statement — a non-UTF-8 client
+    /// encoding — while the backend accepted the Parse regardless.
     pub(crate) fn described_sql(&self) -> Option<String> {
-        self.pending_describes
-            .front()
-            .and_then(|pending| pending.sql.clone())
-            .or_else(|| self.simple_sql.clone())
+        match self.pending_describes.front() {
+            Some(pending) => pending.sql.clone(),
+            None => self.simple_sql.clone(),
+        }
     }
 
     pub(crate) fn discard_description(&mut self) {
@@ -453,6 +467,11 @@ mod tests {
     #[test]
     fn a_rejected_reparse_cannot_replace_the_backends_sql_identity() {
         let mut state = PlanState::default();
+        // A simple query first, so the fallback has something to reach for.
+        // Without this the assertion below held for the wrong reason —
+        // `simple_sql` was `None`, so `or_else` had nothing to substitute and
+        // the test passed while the fallback it exists to forbid was live.
+        state.begin_simple_query(Some("SELECT 1, 2".into()));
         state.parse(name("s"), "SELECT lower(secret) FROM t".into());
         state.finish_parse();
 

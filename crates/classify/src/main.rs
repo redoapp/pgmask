@@ -325,6 +325,86 @@ async fn main() -> Result<()> {
             }
         }
 
+        // A name that says nothing is exactly where sampling earns its keep,
+        // and it was the one case sampling could not reach: the block above
+        // only samples columns whose *name* already matched a rule, so
+        // `--sample` could confirm or downgrade a guess and never make one.
+        //
+        // That is the opposite of what this tool documents itself as doing —
+        // "a column called `notes` full of email addresses" — and it is the
+        // shape that matters, because a column whose name announces its
+        // contents is the one an operator would have caught unaided.
+        //
+        // WHY THE MASK IS NOT THE MATCHED RULE'S
+        //
+        // The first version of this took the matched rule's mask verbatim, and
+        // that turned a lax validator into a disclosure. `looks_like_phone`
+        // accepts any 7-15 digits punctuated with ` ()+-.`, which is also every
+        // national ID, every IPv4 address and every text-stored date. Measured
+        // on a fixture: a column of national IDs under a meaningless name was
+        // proposed as `phone` with mask `partial`, and `partial` keeps the last
+        // four characters — so the tool's own draft catalog would have
+        // published the last four digits of every ID in it. The `national_id`
+        // rule says `null` precisely because credentials are withheld, not
+        // masked.
+        //
+        // A name match is corroboration; content alone is not. So discovery
+        // proposes withholding, names every shape that matched, and leaves the
+        // narrowing to a human. Over-masking is a utility cost the operator can
+        // undo deliberately; the reverse is a disclosure they never see.
+        //
+        // Text-like columns only. A validator over an integer is a round trip
+        // to learn nothing.
+        let texty = {
+            let d = proposal.column.data_type.to_ascii_lowercase();
+            d.contains("char") || d.contains("text")
+        };
+        if sample > 0 && proposal.semantic_type.is_none() && !proposal.refuted_by_width && texty {
+            let mut matched: Vec<(&str, f64, usize)> = Vec::new();
+            for rule in rules.iter().filter(|rule| rule.validator.is_some()) {
+                let validator = rule.validator.expect("filtered above");
+                let Ok((checked, matching)) =
+                    sample_column(&client, &proposal.column, sample, validator).await
+                else {
+                    continue;
+                };
+                // A single row is not evidence. Without a floor one non-null
+                // value scores 100% and produces a proposal.
+                if checked < 20 {
+                    continue;
+                }
+                let rate = (matching as f64 / checked as f64) * 100.0;
+                if rate >= 80.0 {
+                    matched.push((rule.semantic_type, rate, checked));
+                }
+            }
+            if let Some((_, rate, checked)) = matched.first().copied() {
+                let shapes = matched
+                    .iter()
+                    .map(|(t, _, _)| *t)
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                // A type name of its own, never one of the name-rule types.
+                //
+                // Reusing the matched rule's name defeats the withholding
+                // above: `emit_catalog` keys `[[semantic_type]]` blocks by name
+                // and lets the last writer win, so one column legitimately
+                // matched by name sets `phone` to `partial`, and every column
+                // discovered by content is pointed at that same type and
+                // inherits it. Measured: national IDs found under a meaningless
+                // name came back masked `partial` — the last four digits — via
+                // a `phone` block written by an unrelated column.
+                proposal.semantic_type = Some("unidentified");
+                proposal.mask = "null";
+                proposal.confidence = Confidence::NeedsReview;
+                proposal.note = Some(format!(
+                    "the name suggests nothing, but {rate:.0}% of {checked} sampled values look \
+                     like {shapes}; proposed `null` because content alone cannot tell these \
+                     apart — narrow it deliberately once you know which it is"
+                ));
+            }
+        }
+
         proposals.push(proposal);
     }
 

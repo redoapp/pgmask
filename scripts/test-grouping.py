@@ -290,14 +290,14 @@ def main() -> int:
             CREATE TABLE IF NOT EXISTS demo.customers (
                 id int PRIMARY KEY, email text, name text, phone text, city text,
                 birth_date date, annual_salary int, last_ip text,
-                account_uuid uuid, internal_note text);
+                account_uuid uuid, internal_note text, lookup_key text);
             INSERT INTO demo.customers
             SELECT i, 'user' || i || '@example.com', 'Customer ' || i,
                    '555-' || lpad(i::text, 4, '0'), 'city' || (i % 4),
                    date '1975-02-03' + i, 40000 + i * 137,
                    '198.51.100.' || (i % 250 + 1),
                    ('00000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid,
-                   'note ' || i
+                   'note ' || i, 'user' || i || '@example.com'
             FROM generate_series(1, 60) i;
         """)
 

@@ -49,6 +49,20 @@ FROM generate_series(1, 50000) AS i;
 --   * ~40 orders whose customer_id points at nobody (a bad ETL run)
 --   * a batch stamped in the future (a timezone bug)
 --   * a handful of customers sharing one address (duplicate signups)
+-- A column whose name announces nothing and whose contents are addresses.
+--
+-- `classify` proposes from the column name, and `--sample` used to run *only*
+-- for names that had already matched a rule — so it could confirm a guess and
+-- never make one, which is the opposite of what its own documentation claims it
+-- is for. A `text` column holding fifty thousand real addresses under a name
+-- like this drew no proposal and not even a review flag.
+--
+-- Deliberately not a generated column: the derivation is not the problem. A
+-- plain column populated by an application does the same thing, and is likelier.
+ALTER TABLE demo.customers
+  ADD COLUMN lookup_key text;
+UPDATE demo.customers SET lookup_key = lower(email);
+
 CREATE TABLE demo.orders (
   id            integer PRIMARY KEY,
   customer_id   integer NOT NULL,

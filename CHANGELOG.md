@@ -1,5 +1,109 @@
 # Changelog
 
+## 0.1.30 — `--sample` could confirm a guess but never make one
+
+`classify` proposes a catalog from column names and, with `--sample`, checks the
+values. Its own module doc says why:
+
+> With `--sample` it reads data, because a column called `notes` full of email
+> addresses …
+
+It could not do that. Sampling ran only for columns whose *name* had already
+matched a rule:
+
+```rust
+let matched = rules.iter().find(|rule| rule.pattern.is_match(&lower))
+```
+
+so it could confirm or downgrade a name-based guess and never make one. A `text`
+column named `plain_key` holding fifty thousand real addresses drew no proposal
+and not even a review flag. Neither did `search_key`, nor `sort_hint` full of
+phone prefixes.
+
+WHY THIS IS WORSE THAN AN ORDINARY BUG
+
+The product boundary is that the catalog belongs to whoever deploys the proxy,
+and we ship the mechanism plus the tooling that proposes one. A proposal tool
+that cannot find PII in a column with an unhelpful name leaves a hole the
+operator has no way to see: `classify --check`, the drift gate, cannot flag a
+column `classify` does not know exists. Under `unclassified = "allow"` that is a
+live disclosure; under default-deny it is a column masked by luck rather than by
+decision.
+
+Sampling now runs for columns whose name says nothing, proposing on an 80%
+content match — as `NeedsReview`, never `Clear`, because the name gave no
+corroboration and this file already argues that silently masking on content
+alone trains people to override the tool.
+
+Found while testing a hypothesis that was wrong. Generated columns looked like
+the sharp shape — a stored column with real provenance whose value derives from
+a masked one — and they are not: default-deny nulls an undeclared one, and
+`classify` proposes `type = "email"` for `email_lower` from its name. The
+layered defences held exactly as designed. Testing *why* they held is what
+surfaced this.
+
+REGRESSION COVERAGE
+
+`demo.customers.lookup_key` holds addresses under a name that announces nothing.
+Plain, not generated: the derivation was never the problem, and a column
+populated by application code is both likelier and the same shape — encoding the
+wrong hypothesis in the fixture would have been quietly misleading.
+
+Three assertions, each failing for a different reason: that the column is found
+at all, that the proposed type is the one the values are, and that it is flagged
+for a human rather than decided alone.
+
+Adding it failed `classify --check` immediately, because the shipped catalog did
+not declare the new column. That is the drift gate doing its job on the first
+change that gave it something to catch.
+
+## 0.1.31 — the guard read one statement while the analysis judged another
+
+```sql
+SELECT id, sum(annual_salary) FROM demo.customers GROUP BY id            -- refused
+SELECT * FROM (SELECT id, sum(annual_salary) FROM demo.customers
+               GROUP BY id) q                                            -- served
+```
+
+The second returned `1|43700` — the real salary — against the shipped demo
+catalog. The 0.1.16 disclosure, restored in full by wrapping it, and present
+through every gate run used to validate the five fixes after it.
+
+`analyze_inspected` unwraps `SELECT * FROM (subselect)` and classifies the
+*subquery's* target list, so the released aggregate can sit inside the subquery.
+`group_by_columns` read the *outer* group clause, which is empty for a wrapper,
+and reported "no grouping". Two halves of one guard, looking at two different
+statements. It reads the grouping after unwrapping now.
+
+The comment on that function argued the case could not arise:
+
+> Only the top level is inspected, which is sufficient — an aggregate inside a
+> subquery is not the released field; the outer field referencing it has no
+> provenance and is judged on its own.
+
+Already false when written: the unwrapping is forty lines away in the same
+module. I wrote that justification, believed it, and tested eleven spellings of
+the grouping without once wrapping any of them.
+
+It was found by an audit hunting *confident comments* rather than bugs — the
+generalisation of 0.1.30, where `classify`'s doc claimed a capability the code
+did not have.
+
+ALSO: `described_sql` substituted an unrelated statement's text
+
+`.and_then(..).or_else(..)` collapsed "no Describe outstanding" and "a Describe
+is outstanding whose SQL was never recorded" into one branch, so the second fell
+back to the last simple query. `SELECT 1, 2` reads as two literals and would
+release fields belonging to `SELECT upper(email), …`. Same failure class as the
+pipelined-Describe fix in 0.1.8, on a path it did not cover. A pending Describe
+carries no SQL when the statement could not be decoded — a non-UTF-8 client
+encoding — while the backend accepted the Parse anyway.
+
+Three comments asserted it already failed closed, including the one on the test
+written to pin it. That test passed vacuously: `simple_sql` was `None` in its
+fixture, so the fallback had nothing to substitute. Given a simple query first,
+it fails against the old code.
+
 ## 0.1.29 — a suite whose answer depended on the machine
 
 `verify.sh` reported 66 of 88 while a mutation pass was running, and 88 of 88 on

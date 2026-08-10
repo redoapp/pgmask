@@ -86,6 +86,15 @@ relation = "demo.customers"
 column = "email"
 type = "email"
 
+# The same addresses under a name that announces nothing. Declared because the
+# fixture holds it, and `classify --check` is right to fail a catalog that does
+# not — a column whose name hides its contents is exactly the one an operator
+# would otherwise miss.
+[[column]]
+relation = "demo.customers"
+column = "lookup_key"
+type = "email"
+
 [[column]]
 relation = "demo.customers"
 column = "name"
