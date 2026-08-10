@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.20 — the same product, on the other engine
+
+CockroachDB resolves an output alias in a grouping exactly as Postgres does, so
+the 0.1.18 disclosure existed there too and had never been exercised: the
+generated grouping product ran on Postgres only. It runs on both now — 144 key
+spellings refused, 0 leaked, 28 non-key served, 0 over-refused. `ROLLUP`, `CUBE`
+and `GROUPING SETS` are unsupported on CockroachDB, so those 252 statements are
+rejected by the server and stay Postgres-only.
+
+Getting there took three diagnoses, and only the first was about the proxy.
+
+The proxy resolves the whole catalog at startup and refuses to run when a
+declared column is missing — "a half-loaded catalog has unknown coverage". The
+CockroachDB stand-in carried four of the ten columns the demo catalog declares.
+That is correct fail-closed behaviour, not a bug.
+
+`demo.orders` and `demo.customer_directory` are not in that fixture either, so
+their rules name columns that cannot exist; they are stripped, as
+`test-cockroach.sh` already does.
+
+The last one was a missing trailing newline. The strip regex ends its match on
+`(?=\n\[\[|\Z)` and consumes whole `.*\n` lines, so when the rewritten catalog
+was joined without a final newline the last `[[column]]` block could never reach
+`\Z` and survived — exactly one declared-but-absent column, and the proxy
+refused to start.
+
+The reason that was found rather than guessed at: the suite had been sending the
+proxy's stdout to `/dev/null`, so a precise startup error arrived as "proxy did
+not come up". The log is kept now and printed on failure. Three rounds of
+guessing bought one small change to the harness that would have answered it
+immediately.
+
 ## 0.1.19 — the campaign could not have found it
 
 A summary of a column the query *groups on* is that column. Within a group it is

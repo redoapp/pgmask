@@ -43,6 +43,7 @@ served, none over-refused by the guard, 60 refused by the older rule.
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -278,15 +279,25 @@ def main() -> int:
             capture_output=True, env=dict(os.environ, PGPASSWORD="demo"),
         )
     else:
-        # A portable stand-in: the demo fixture uses Postgres-only DDL, and what
-        # this suite needs from it is a single-column key, a non-key text column
-        # and a masked numeric column.
+        # A portable stand-in: the demo fixture uses Postgres-only DDL. It must
+        # carry *every* column the catalog declares for `demo.customers`, not
+        # just the ones this suite reads — the proxy resolves the whole catalog
+        # at startup and refuses to run when any declared column is missing
+        # ("a half-loaded catalog has unknown coverage"). A subset schema made
+        # it exit before binding, which read as "proxy did not come up".
         psql(direct, "CREATE SCHEMA IF NOT EXISTS demo")
         psql(direct, """
             CREATE TABLE IF NOT EXISTS demo.customers (
-                id int PRIMARY KEY, email text, city text, annual_salary int);
+                id int PRIMARY KEY, email text, name text, phone text, city text,
+                birth_date date, annual_salary int, last_ip text,
+                account_uuid uuid, internal_note text);
             INSERT INTO demo.customers
-            SELECT i, 'user' || i || '@example.com', 'city' || (i % 4), 40000 + i * 137
+            SELECT i, 'user' || i || '@example.com', 'Customer ' || i,
+                   '555-' || lpad(i::text, 4, '0'), 'city' || (i % 4),
+                   date '1975-02-03' + i, 40000 + i * 137,
+                   '198.51.100.' || (i % 250 + 1),
+                   ('00000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid,
+                   'note ' || i
             FROM generate_series(1, 60) i;
         """)
 
@@ -295,7 +306,8 @@ def main() -> int:
     # refresh picked it up while later ones ran after — four spurious failures
     # that split exactly on the refresh boundary. The window that exposes is
     # real and is recorded in the README; it is not what this section tests.
-    psql(direct, COMPOSITE_DDL)
+    if engine == "postgres":
+        psql(direct, COMPOSITE_DDL)
 
     config = "/tmp/pgmask-grouping.toml"
     base = open(f"{ROOT}/examples/demo/catalog.toml").read().splitlines()
@@ -311,15 +323,38 @@ def main() -> int:
             continue
         else:
             rewritten.append(line)
-    open(config, "w").write("\n".join(rewritten))
+    # Trailing newline preserved deliberately: the strip below ends its match
+    # on `(?=\n\[\[|\Z)` and consumes whole `.*\n` lines, so a file whose last
+    # line has no newline can never reach `\Z` and the final `[[column]]` block
+    # survives. That left exactly one declared-but-absent column and the proxy
+    # refused to start.
+    catalog = "\n".join(rewritten) + "\n"
+    if engine != "postgres":
+        # Same reason as the stand-in schema above, from the other side: the
+        # CockroachDB fixture has no `demo.orders` or `demo.customer_directory`,
+        # so their rules would name columns that do not exist and the proxy
+        # would refuse to start. `test-cockroach.sh` strips them the same way.
+        catalog = re.sub(
+            r'\n\[\[column\]\]\nrelation = "demo\.(customer_directory|orders)"\n(?:.*\n)*?(?=\n\[\[|\Z)',
+            "\n",
+            catalog,
+        )
+    open(config, "w").write(catalog)
 
-    proxy = subprocess.Popen(
-        [f"{ROOT}/target/release/pgmask", config],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    # Kept, not discarded. The proxy resolves the whole catalog at startup and
+    # exits when a declared column is missing, and with the log on /dev/null
+    # that failure reads only as "did not come up".
+    log_path = f"/tmp/pgmask-grouping-{engine}.log"
+    with open(log_path, "w") as log:
+        proxy = subprocess.Popen(
+            [f"{ROOT}/target/release/pgmask", config],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
     time.sleep(4)
     if psql(proxied, "select 1")[0] != 0:
-        print("FAIL: proxy did not come up")
+        print(f"FAIL: proxy did not come up — {log_path}")
+        print(open(log_path).read()[-1200:])
         proxy.kill()
         return 1
 
@@ -382,11 +417,18 @@ def main() -> int:
                     else:
                         served += 1
 
-    # The composite-key half of the predicate.
+    # The composite-key half of the predicate. Postgres only: the CockroachDB
+    # stand-in carries just `demo.customers`, and the point of running there is
+    # the *spellings*, since CockroachDB resolves output aliases in a grouping
+    # exactly as Postgres does.
+    composite_fail = 0
+    if engine != "postgres":
+        print()
+        print(f"  {DIM}composite-key section skipped on {engine}{OFF}")
+        COMPOSITE_CASES.clear()
     print()
     print("composite unique keys")
     print("----------------------------------------")
-    composite_fail = 0
     for label, expect_refusal, sql in COMPOSITE_CASES:
         code, out = psql(proxied, sql)
         got_refusal = "pgmask:" in out
@@ -402,7 +444,8 @@ def main() -> int:
             composite_fail += 1
 
     # The union rule's cost, pinned rather than left to be discovered.
-    out = psql(proxied, UNION_OVER_REFUSAL)[1]
+    out = psql(proxied, UNION_OVER_REFUSAL)[1] if engine == "postgres" else "pgmask:"
+
     if "pgmask:" in out:
         print(f"  {YELLOW}cost{OFF}     disjoint grouping sets over the two key columns")
     else:
