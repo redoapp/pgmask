@@ -196,7 +196,9 @@ fi
 grep -E '^RESULT' /tmp/pgmask-ext.out | sed 's/^/    /'
 kill "$BIN_PID" 2>/dev/null
 
-sed -e 's/^mask = "redact"/mask = "none"/' \
+# A shaped mask too: a control that unmasks only what the oracle could already
+# see cannot reveal the detectors it was missing.
+sed -e 's/^mask = "redact"/mask = "none"/' -e 's/^mask = "ip-prefix"/mask = "none"/' \
     -e "s|:$EXT_PORT\"|:$EXT_POISON_PORT\"|" \
     /tmp/pgmask-ext.toml > /tmp/pgmask-ext-poison.toml
 ./target/release/pgmask /tmp/pgmask-ext-poison.toml >/tmp/pgmask-ext-poison.log 2>&1 &
