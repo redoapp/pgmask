@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.1.46 — the campaign's first real finding, and two mutants that are not one
+
+Triage of the 827-mutant campaign, at the halfway mark. Three categories, and
+the interesting thing is that they are genuinely different from what a day of
+reading found.
+
+TWO UNTESTED BOUNDARIES, IN THE DISCLOSURE DIRECTION
+
+`partial`, `inner` and `outer` floor a value that is too short for the window
+they keep: `checked_sub(...).filter(|n| *n > 0)`. Relaxing that to `>= 0` at
+`len == keep` — or `keep * 2` for `inner` — makes the masked run zero characters
+long, so `partial` emits the whole value and `inner` emits head plus tail, which
+is also the whole value.
+
+Both survived. Every existing test sat strictly inside or strictly outside the
+window and none sat *on* it. A four-character value under `keep = 4` would have
+come back verbatim.
+
+`outer` at the same boundary is an **equivalent** mutant: `kept = 0` gives
+`"*" * keep` twice, which is exactly the `len` stars the else branch produces.
+Said so on the function rather than leaving it to be re-derived.
+
+And `truncate_date_text`'s `year > 9999` survived relaxation to `>= 9999`: the
+refusal tests use 10000 and 5874897, the acceptance tests use 2024, nothing sat
+on the edge. Over-refusing 9999 would be safe and still wrong — jiff represents
+it.
+
+This is what mutation testing is for, and it is a different class from the nine
+disclosures: those were missing *cases*, these are untested *boundaries* in
+logic that exists.
+
+FOUR MUTANTS THAT ARE NOT A FINDING
+
+`resolve_snapshot` returns early when `rules.is_empty()`, building a second
+`Snapshot`, and the campaign reports all four of its fields as deletable with
+nothing noticing.
+
+They are equivalent on that path. With no rules nothing is classified, so
+default-deny answers every question before those fields are consulted:
+`opaque_views` refuses a read that is masked anyway, `unique_keys` only
+qualifies a summary and a summary needs a released column, `relation_columns`
+backs "does this mention a masked column" and there are none. The one that could
+differ is `system_relations` under `system_catalogs = "allow"`, and that
+direction is over-refusal.
+
+`an_empty_catalog_masks_everything_and_still_refuses` is added anyway, because
+the property is real and was untested — an operator whose catalog failed to load
+is exactly who default-deny is for. **It does not kill those mutants**, verified
+by poisoning all four; claiming otherwise would be the same mistake as a
+green suite that never ran.
+
+A NOTE ON THE CAMPAIGN'S OWN VALIDITY
+
+cargo-mutants copies the tree when it starts, so these results are against
+v0.1.43 and not the current tree. `delete field unique_keys` was a genuine
+survivor there and is caught now by the v0.1.44 work — confirmed by patching
+both construction sites rather than assumed. Anything triaged from this run has
+to be re-checked against the tree it will be fixed in.
+
 ## 0.1.45 — `SET ROLE` does nothing here, and nothing said so
 
 Before this, no test, script or document in the repository mentioned `SET ROLE`.

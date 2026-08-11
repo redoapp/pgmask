@@ -874,6 +874,44 @@ async fn set_role_cannot_reach_another_roles_mask() -> Result<()> {
     Ok(())
 }
 
+/// A catalog with no column rules at all still masks, and still refuses.
+///
+/// `resolve_snapshot` takes an early return when `rules.is_empty()`, building a
+/// second `Snapshot` from the same parts. No test went down that path — a
+/// catalog with no rules classifies nothing, so it looked like it could not
+/// matter — and the mutation campaign duly reported every field of that struct
+/// as deletable with nothing noticing.
+///
+/// It does matter. An operator whose catalog failed to load, or who has not
+/// written it yet, is exactly the person default-deny is for, and the snapshot
+/// on that path still carries the system-relation set and the opaque-view set
+/// that decide what is refused.
+#[tokio::test]
+async fn an_empty_catalog_masks_everything_and_still_refuses() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, Vec::new()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    for sql in [
+        "SELECT email FROM canary.subjects",
+        "SELECT * FROM canary.subjects",
+        "SELECT email FROM canary.subject_view",
+        // The release paths must stay shut too: with no rules there is no
+        // column anyone declared safe.
+        "SELECT city, count(*) FROM canary.subjects GROUP BY city",
+        "SELECT lower(email) FROM canary.subjects",
+    ] {
+        if client.simple_query(sql).await.is_err() {
+            assert_no_canary(&client, sql);
+            client = RawClient::connect(proxy.addr, DB).await?;
+            continue;
+        }
+        assert_no_canary(&client, sql);
+    }
+    Ok(())
+}
+
 /// An error still says enough to act on.
 ///
 /// Withholding the message is only defensible if the `SQLSTATE` survives — it

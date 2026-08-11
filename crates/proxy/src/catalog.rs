@@ -1389,6 +1389,28 @@ async fn resolve_snapshot(
         }
     }
 
+    // No column rules: every field below is carried for shape, and the mutation
+    // campaign reports all four as deletable with nothing noticing. They are
+    // equivalent mutants on this path, and the reason is worth writing down
+    // once rather than re-deriving it each run.
+    //
+    // With no rules, nothing is classified, so default-deny answers every
+    // question before these are consulted. `opaque_views` refuses a read of a
+    // view containing a set operation — but that read is masked anyway.
+    // `unique_keys` only qualifies a *summary*, and a summary needs a released
+    // column. `relation_columns` backs "does this statement mention a masked
+    // column", and there are none.
+    //
+    // The one that could differ is `system_relations` under
+    // `system_catalogs = "allow"`: an empty set means a `pg_catalog` read is not
+    // recognised as one and falls to default-deny instead of being served. That
+    // is over-refusal, in the direction that does not disclose, on a
+    // configuration that pairs an allow-list for system catalogs with a catalog
+    // that classifies nothing.
+    //
+    // `an_empty_catalog_masks_everything_and_still_refuses` pins the property
+    // this path is actually for. It does not kill these mutants and is not
+    // meant to.
     if rules.is_empty() {
         let snapshot = Snapshot {
             system_relations,

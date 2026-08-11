@@ -664,6 +664,13 @@ fn outer(text: &str, keep: usize) -> String {
     }
     // Mirror of `inner`: `kept` is the middle that survives, and a value with no
     // middle left is masked outright.
+    //
+    // The `> 0` here is the one of the three that is an *equivalent* mutant:
+    // relaxing it to `>= 0` at `len == keep * 2` gives `kept = 0`, so the middle
+    // is empty and the output is `"*" * keep` twice — exactly the `len` stars
+    // the `else` branch produces. `partial` and `inner` are not equivalent at
+    // their boundaries and both have tests; this one cannot, and saying so here
+    // is cheaper than re-deriving it next time cargo-mutants reports it.
     let Some(kept) = keep
         .checked_mul(2)
         .and_then(|ends| chars.len().checked_sub(ends))
@@ -1266,6 +1273,35 @@ mod tests {
         assert_eq!(apply_text(&s, "12345678"), "12****78");
     }
 
+    /// A value exactly as long as the window it keeps.
+    ///
+    /// The floors are `checked_sub(...).filter(|n| *n > 0)`, and at `len ==
+    /// keep` — or `keep * 2` for `inner` — the subtraction is `Some(0)`.
+    /// Relaxing that filter to `>= 0` makes the masked run zero characters
+    /// long, so `partial` emits the whole value and `inner` emits head plus
+    /// tail, which is also the whole value. Both mutants survived the campaign:
+    /// every existing test sat strictly inside or strictly outside the window,
+    /// never on it.
+    #[test]
+    fn a_value_exactly_the_length_of_its_window_is_masked_outright() {
+        let mut p = spec(Mask::Partial);
+        p.keep = 4;
+        assert_eq!(apply_text(&p, "abcd"), "****", "len == keep");
+        assert_eq!(apply_text(&p, "abcde"), "*bcde", "one longer still reveals");
+
+        let mut i = spec(Mask::Inner);
+        i.keep = 4;
+        assert_eq!(apply_text(&i, "abcdefgh"), "********", "len == keep * 2");
+        assert_eq!(apply_text(&i, "abcdefghi"), "abcd*fghi", "one longer");
+
+        // `outer` at its boundary is an equivalent mutant — see the comment on
+        // the function — so this pins the value, not the branch.
+        let mut o = spec(Mask::Outer);
+        o.keep = 4;
+        assert_eq!(apply_text(&o, "abcdefgh"), "********", "len == keep * 2");
+        assert_eq!(apply_text(&o, "abcdefghi"), "****e****", "one longer");
+    }
+
     #[test]
     fn short_values_do_not_leak_through_the_keep_window() {
         let mut s = spec(Mask::Inner);
@@ -1565,6 +1601,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&text[..], b"2024-01-01", "text and binary must agree");
+    }
+
+    /// The year bound is `> 9999`, so 9999 itself must still be masked.
+    ///
+    /// `> 9999` -> `>= 9999` survived the campaign: the refusal tests use 10000
+    /// and 5874897, the acceptance tests use 2024, and nothing sat on the edge.
+    /// Over-refusing here would be safe and still wrong — jiff represents 9999.
+    #[test]
+    fn the_last_representable_year_is_masked_not_refused() {
+        let out = masker()
+            .apply(
+                &spec(Mask::DateMonth),
+                OID_DATE,
+                FORMAT_TEXT,
+                Some(Bytes::from_static(b"9999-06-15")),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[..], b"9999-06-01");
+        assert!(
+            jiff::civil::Date::new(9999, 6, 15).is_ok(),
+            "and binary agrees"
+        );
     }
 
     /// Masking a date in text must reject exactly what masking it in binary

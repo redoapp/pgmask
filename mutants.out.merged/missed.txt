@@ -63,3 +63,15 @@ crates/proxy/src/lineage.rs:113:9: replace <impl CatalogProvider for SnapshotCat
 crates/proxy/src/mask.rs:119:21: replace < with == in is_luhn
 crates/proxy/src/mask.rs:119:21: replace < with <= in is_luhn
 crates/proxy/src/mask.rs:132:28: replace > with >= in is_luhn
+crates/proxy/src/mask.rs:441:13: delete match arm Mask::NumericBucket in MaskSpec::unsupported_hint
+crates/proxy/src/mask.rs:445:13: delete match arm Mask::DateYear | Mask::DateMonth in MaskSpec::unsupported_hint
+crates/proxy/src/mask.rs:449:13: delete match arm Mask::IpPrefix in MaskSpec::unsupported_hint
+crates/proxy/src/mask.rs:453:13: delete match arm Mask::Pseudonym in MaskSpec::unsupported_hint
+crates/proxy/src/mask.rs:577:57: replace && with || in Masker::pseudonym
+crates/proxy/src/mask.rs:586:56: replace / with * in Masker::pseudonym
+crates/proxy/src/mask.rs:604:56: replace / with % in Masker::pseudonym
+crates/proxy/src/mask.rs:604:56: replace / with * in Masker::pseudonym
+crates/proxy/src/mask.rs:629:68: replace > with >= in partial
+crates/proxy/src/mask.rs:645:24: replace > with >= in inner
+crates/proxy/src/mask.rs:670:24: replace > with >= in outer
+crates/proxy/src/mask.rs:817:56: replace > with >= in truncate_date_text

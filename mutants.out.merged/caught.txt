@@ -261,3 +261,60 @@ crates/proxy/src/mask.rs:433:21: replace || with && in MaskSpec::supports
 crates/proxy/src/mask.rs:433:65: replace && with || in MaskSpec::supports
 crates/proxy/src/mask.rs:433:75: replace == with != in MaskSpec::supports
 crates/proxy/src/mask.rs:440:9: replace MaskSpec::unsupported_hint -> &'static str with ""
+crates/proxy/src/mask.rs:440:9: replace MaskSpec::unsupported_hint -> &'static str with "xyzzy"
+crates/proxy/src/mask.rs:489:9: replace Masker::apply -> Result<Option<Bytes>, MaskError> with Ok(None)
+crates/proxy/src/mask.rs:489:9: replace Masker::apply -> Result<Option<Bytes>, MaskError> with Ok(Some(Default::default()))
+crates/proxy/src/mask.rs:489:22: replace == with != in Masker::apply
+crates/proxy/src/mask.rs:492:22: replace == with != in Masker::apply
+crates/proxy/src/mask.rs:495:12: delete ! in Masker::apply
+crates/proxy/src/mask.rs:527:9: replace Masker::digest -> [u8; 32] with [0; 32]
+crates/proxy/src/mask.rs:527:9: replace Masker::digest -> [u8; 32] with [1; 32]
+crates/proxy/src/mask.rs:553:9: replace Masker::pseudonym -> Result<Bytes, MaskError> with Ok(Default::default())
+crates/proxy/src/mask.rs:553:21: replace == with != in Masker::pseudonym
+crates/proxy/src/mask.rs:565:33: replace == with != in Masker::pseudonym
+crates/proxy/src/mask.rs:577:39: delete ! in Masker::pseudonym
+crates/proxy/src/mask.rs:577:60: delete ! in Masker::pseudonym
+crates/proxy/src/mask.rs:584:34: replace match guard !spec.keep_domain with true in Masker::pseudonym
+crates/proxy/src/mask.rs:584:34: replace match guard !spec.keep_domain with false in Masker::pseudonym
+crates/proxy/src/mask.rs:584:34: delete ! in Masker::pseudonym
+crates/proxy/src/mask.rs:586:56: replace / with % in Masker::pseudonym
+crates/proxy/src/mask.rs:611:56: replace / with % in Masker::pseudonym
+crates/proxy/src/mask.rs:611:56: replace / with * in Masker::pseudonym
+crates/proxy/src/mask.rs:621:5: replace text_op -> Bytes with Default::default()
+crates/proxy/src/mask.rs:625:5: replace partial -> String with String::new()
+crates/proxy/src/mask.rs:625:5: replace partial -> String with "xyzzy".into()
+crates/proxy/src/mask.rs:629:68: replace > with == in partial
+crates/proxy/src/mask.rs:629:68: replace > with < in partial
+crates/proxy/src/mask.rs:637:5: replace inner -> String with String::new()
+crates/proxy/src/mask.rs:637:5: replace inner -> String with "xyzzy".into()
+crates/proxy/src/mask.rs:645:24: replace > with == in inner
+crates/proxy/src/mask.rs:645:24: replace > with < in inner
+crates/proxy/src/mask.rs:657:5: replace outer -> String with String::new()
+crates/proxy/src/mask.rs:657:5: replace outer -> String with "xyzzy".into()
+crates/proxy/src/mask.rs:662:13: replace == with != in outer
+crates/proxy/src/mask.rs:670:24: replace > with == in outer
+crates/proxy/src/mask.rs:670:24: replace > with < in outer
+crates/proxy/src/mask.rs:679:5: replace range -> String with String::new()
+crates/proxy/src/mask.rs:679:5: replace range -> String with "xyzzy".into()
+crates/proxy/src/mask.rs:688:14: replace >= with < in range
+crates/proxy/src/mask.rs:695:32: replace && with || in range
+crates/proxy/src/mask.rs:695:23: replace >= with < in range
+crates/proxy/src/mask.rs:695:37: replace < with == in range
+crates/proxy/src/mask.rs:695:37: replace < with > in range
+crates/proxy/src/mask.rs:695:37: replace < with <= in range
+crates/proxy/src/mask.rs:707:5: replace ip_prefix -> String with String::new()
+crates/proxy/src/mask.rs:707:5: replace ip_prefix -> String with "xyzzy".into()
+crates/proxy/src/mask.rs:751:5: replace coarsen -> Result<jiff::civil::Date, MaskError> with Ok(Default::default())
+crates/proxy/src/mask.rs:793:5: replace truncate_date_text -> Result<String, MaskError> with Ok(String::new())
+crates/proxy/src/mask.rs:793:5: replace truncate_date_text -> Result<String, MaskError> with Ok("xyzzy".into())
+crates/proxy/src/mask.rs:812:38: replace && with || in truncate_date_text
+crates/proxy/src/mask.rs:814:54: replace || with && in truncate_date_text
+crates/proxy/src/mask.rs:814:29: replace || with && in truncate_date_text
+crates/proxy/src/mask.rs:814:8: delete ! in truncate_date_text
+crates/proxy/src/mask.rs:814:32: delete ! in truncate_date_text
+crates/proxy/src/mask.rs:814:57: delete ! in truncate_date_text
+crates/proxy/src/mask.rs:817:56: replace > with == in truncate_date_text
+crates/proxy/src/mask.rs:817:56: replace > with < in truncate_date_text
+crates/proxy/src/mask.rs:821:17: replace == with != in truncate_date_text
+crates/proxy/src/mask.rs:841:5: replace truncate_date -> Result<Bytes, MaskError> with Ok(Default::default())
+crates/proxy/src/mask.rs:841:25: replace == with != in truncate_date
