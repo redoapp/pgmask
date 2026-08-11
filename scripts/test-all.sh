@@ -85,8 +85,8 @@ cargo audit >/dev/null 2>&1; record "cargo audit" "$?"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps >/dev/null 2>&1
 record "rustdoc (warnings fatal)" "$?"
 
-./scripts/check-release-metadata.sh >/dev/null 2>&1
-record "release metadata" "$?"
+./scripts/check-repo-invariants.sh >/dev/null 2>&1
+record "repo invariants" "$?"
 
 echo "=== rust tests ==="
 # --no-fail-fast, or one failing target hides every target after it.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Check the three places a version is written agree, and that the changelog
-# reads newest-first.
+# Repository invariants nothing else looks at: version agreement, changelog
+# order, and evidence that must not go untracked.
 #
 # `## 0.1.30` sat above every later entry for seven releases. Nothing looked:
 # the gate runs fmt, clippy, audit, rustdoc and eighteen test suites, and none
@@ -40,5 +40,17 @@ total=$(grep -c '^## ' CHANGELOG.md)
 [ "$count" = "$total" ] ||
   note "$((total - count)) of $total CHANGELOG headings are not a bare version"
 
-[ "$fail" = 0 ] && echo "release metadata ok: v$cargo_version, $total entries, descending"
+# proptest writes the seed of a failing case into a `.proptest-regressions`
+# file, and those replay before any new case is generated — a defect found once
+# stays pinned. An untracked one is a finding sitting on a single machine, which
+# is what happened to the ROLLUP-alias seed for two releases after an ignore
+# rule was added in the same commit as the first such file.
+loose=$(git ls-files --others --exclude-standard '*.proptest-regressions')
+if [ -n "$loose" ]; then
+  note "proptest regression seeds are untracked, so they exist only here:"
+  echo "$loose" | sed 's/^/  /'
+fi
+
+[ "$fail" = 0 ] &&
+  echo "repo invariants ok: v$cargo_version, $total entries, descending, seeds tracked"
 exit "$fail"
