@@ -57,6 +57,53 @@ Adding it failed `classify --check` immediately, because the shipped catalog did
 not declare the new column. That is the drift gate doing its job on the first
 change that gave it something to catch.
 
+## 0.1.34 — the four spelling disclosures were one property all along
+
+Every disclosure in the analysis layer has been the same query written
+differently:
+
+```
+  0.1.16   SELECT id, sum(salary) FROM t GROUP BY id
+  0.1.18   ... GROUP BY <an alias of id>
+  0.1.18   ... GROUP BY ROLLUP(<an alias of id>)
+  0.1.31   SELECT * FROM ( ... GROUP BY id )
+```
+
+Each was fixed by adding a literal string to a list, which only protects against
+spellings someone thought of. Four rounds is enough to conclude the list is the
+wrong shape.
+
+The property needs no list: **a rewrite that does not change what a query
+returns must not lose a grouped column.** `crates/proxy/tests/analysis_properties.rs`
+generates the rewrites — star wrappers, nested wrappers, output aliases,
+ordinals, `ROLLUP`, an alias inside a `ROLLUP` — and requires the reader's answer
+for each to still cover the plain form's.
+
+`proptest` was already a dependency, used for the `RowDescription` parser and the
+masks. It had never been pointed at `analysis.rs`, which is where all six
+disclosures were. No new crate: `shapegen` hand-rolls its RNG rather than take
+`rand`, and that posture is worth keeping.
+
+THE FIRST VERSION WAS DECORATION
+
+It compared `analyze(plain)` against `analyze(rewritten)` and passed against
+*three reverted disclosures*. The singleton-group decision is not made in
+`analyze`: `session` combines the reader with the catalog's unique keys and
+passes the verdict down as a `Relaxations` flag, so both spellings returned
+`Releasable`, the comparison found no difference, and nothing tripped.
+
+Re-aimed at `group_by_columns` — the function whose answer actually differed
+between spellings — reverting the 0.1.31 wrapper fix and the 0.1.18 alias fix
+both fail the property now.
+
+Reverting the 0.1.17 ordinal fix does *not*, and that is correct: breaking
+ordinal resolution makes the reader return unbounded, which refuses. A safety
+property should not fire on over-refusal, and the precision regression is pinned
+separately in the inference suite.
+
+The only reason I know these work is that real fixes were reverted and failure
+required. They passed before that check too.
+
 ## 0.1.33 — tooling that told operators to delete a working defence
 
 `classify --check` reported this, against a live materialised view whose column
