@@ -1,8 +1,10 @@
 # Safety assessment
 
 Written 2026-08-10, after a day that found six disclosures in code which had
-been passing a thirteen-suite release gate. Read the dates: this is a snapshot,
-and the reason to distrust it is at the bottom.
+been passing a thirteen-suite release gate. Updated 2026-08-11; the gate is
+nineteen suites now, which changes nothing about the argument below — the
+thirteen were green through all six. Read the dates: this is a snapshot, and the
+reason to distrust it is at the bottom.
 
 ## What is actually guaranteed
 
@@ -34,9 +36,15 @@ between one query for a whole column and one query per row.
 
 **Anything the operator's catalog does not declare**, unless `unclassified` is
 left at its default of masking. The catalog is the operator's; `classify`
-proposes one and `classify --check` is the drift gate. Three defects were found
-in that tool today — see below — so treat a catalog generated before
-2026-08-10 as unreviewed.
+proposes one and `classify --check` is the drift gate. Four defects were found
+in that tool on 2026-08-10 and a fifth on 2026-08-11 — see below — so treat a
+catalog generated before **2026-08-11** as unreviewed.
+
+The 08-11 one moves the date on its own: until then content discovery could not
+recognise a card number, an IBAN or a national ID under any name, so a catalog
+drafted before it had no chance of proposing anything for a column holding
+them. A name match was the only route, and the operator would see nothing at
+all for a column called `col_7`.
 
 **Byte-length side channels.** `pg_column_size(email)` returns an exact length
 and no detector covers it. The campaigns generate the shape and cannot tell
