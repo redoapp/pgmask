@@ -61,6 +61,21 @@ for named in $(grep -rhoE 'scripts/[A-Za-z0-9_.-]+\.(sh|py)' README.md CONTRIBUT
   [ -e "$named" ] || note "documentation names $named, which does not exist"
 done
 
+# The README's suite count, against the gate's actual one.
+#
+# It said "thirteen suites ... 265 cargo tests" while the gate ran 20 and 505.
+# Nobody noticed for seven releases, and it is the first number a reader meets:
+# a front page that undercounts by a third is the same class of wrong as a test
+# that does not run, just aimed at a person instead of a machine.
+#
+# Counted as: every `record "..."` that is not the `run()` helper's own, plus
+# every `run "..."`. Written as a digit in the README so this can find it.
+suites=$(( $(grep -oE 'record "[^"$][^"]*"' scripts/test-all.sh | wc -l) \
+         + $(grep -oE '^[[:space:]]*run "[^"]*"' scripts/test-all.sh | wc -l) ))
+claimed=$(grep -oE 'runs [0-9]+ suites' README.md | grep -oE '[0-9]+' | head -1)
+[ "${claimed:-none}" = "$suites" ] ||
+  note "README claims the gate runs ${claimed:-no stated number of} suites; it runs $suites."
+
 [ "$fail" = 0 ] &&
   echo "repo invariants ok: v$cargo_version, $total entries, descending, seeds tracked"
 exit "$fail"

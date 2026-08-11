@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.53 — the front page undercounted the gate by a third
+
+> `./scripts/test-all.sh` runs thirteen suites … 265 cargo tests, 31 adversarial
+> and resilience tests, 88 demo assertions, 7 TLS, 115 across Postgres 13-17,
+> 34 against CockroachDB, a 44-shape canary sweep …
+
+Every number there was stale. The gate runs 20 suites and 505 cargo tests, with
+40 adversarial and resilience, 98 demo assertions, an 18-check `classify` round
+trip, 120 across Postgres 13-17, 43 against CockroachDB and an 86-shape sweep.
+It drifted over seven releases and nothing looked, because nothing was looking
+at prose.
+
+This is the same class of wrong as a test that does not run, aimed at a person
+rather than a machine — and the direction matters less than it seems. A front
+page that *undercounts* still misleads: it is the first evidence a reader has
+about how much scrutiny the thing has had.
+
+`check-repo-invariants.sh` counts the gate's suites — every `record "…"` that is
+not the `run()` helper's own, plus every `run "…"` — and requires the README to
+say the same number. The README says `20` as a digit so the check can find it,
+and the check reports both numbers rather than the first draft's
+"README does not say the gate runs 20 suites; it runs 20."
+
+Two poison controls: a wrong number, and no number at all.
+
+Also added there: a line recording that the counts come from a run with nothing
+else on the machine, because several suites are timing-sensitive enough to
+report false failures under load — which happened twice today, to me.
+
 ## 0.1.52 — the gate's containers, and three failures I caused myself
 
 Two gate runs failed the same three container-heavy suites — the Postgres

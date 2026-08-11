@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.52**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.53**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -59,14 +59,21 @@ done, and [LICENSE](LICENSE).
 | `classify --check` — CI gate on catalog drift | done ([who owns what](docs/responsibilities.md)) |
 | Phase 6 — lineage (`lineage = "allow"`) | done, opt-in; TPC-DS refusals 55% → 26% ([measured](docs/lineage-estimate.md)) |
 | CockroachDB v25.4 | supported, fuzzed on both protocols; closed three disclosures ([why](docs/engines.md)) |
+| Diagnostic channels — `RAISE`, `CONTEXT`, `SQLSTATE`, `ParameterStatus` | closed on both engines, 2026-08-11 ([what they were](docs/safety-assessment.md)) |
 
-`./scripts/test-all.sh` runs thirteen suites and reports one line each, with a
-skipped suite counted as a failure: 265 cargo tests, 31 adversarial and resilience
-tests against a real Postgres, 88 demo assertions, 7 TLS,
-115 across Postgres 13–17, 34 against CockroachDB, a 44-shape canary sweep over
-both engines, a generated-SQL campaign on Postgres and a generated-shape campaign
-on CockroachDB, both of which must report zero leaks. The adversarial cargo suite drives a raw wire
-client and asserts no sentinel byte ever crosses the boundary.
+`./scripts/test-all.sh` runs 20 suites and reports one line each, with a
+skipped suite counted as a failure: 505 cargo tests, 40 adversarial and
+resilience tests against a real Postgres, 98 demo assertions, an 18-check
+`classify` round trip, 7 TLS, 120 across Postgres 13–17, 43 against CockroachDB,
+an 86-shape canary sweep over both engines, a generated-SQL campaign on Postgres
+and a 7,200-shape campaign on CockroachDB, both of which must report zero leaks.
+The adversarial cargo suite drives a raw wire client and asserts no sentinel byte
+ever crosses the boundary.
+
+Three of those suites exist because something got through the other seventeen.
+The counts here are from a run with nothing else on the machine: the gate now
+refuses to start when another session's proxy or container is live, because
+several of them are timing-sensitive enough to report false failures under load.
 
 ### Who owns what
 
