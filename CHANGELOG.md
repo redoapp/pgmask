@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.39 — the mutation runs were a fifth of a run
+
+`45 survivors` has been sitting in the safety assessment as a known quantity.
+It was never the survivor list. Two runs died part-way and both printed their
+four outcome counts — caught, missed, timeout, unviable — and nothing else, so
+a run that attempted 293 of 493 mutants read exactly like a complete one. The
+second died on a full disk at 102 of 494.
+
+A partial mutation run is worse than no run. It reads as coverage.
+
+`test-mutants.sh` now counts what it planned against what it attempted and
+refuses to report anything if they differ. Verified against the crashed run
+still on disk rather than a synthetic one: 102 of 494, exit 1.
+
+Two supporting fixes, both causes rather than symptoms:
+
+* A free-space precheck. cargo-mutants copies the whole tree into `$TMPDIR` and
+  rebuilds in it per mutant; the copy reached 5.4 GB. The run needs 20 GB and
+  now says so before starting the container instead of dying at mutant 102.
+* Cleanup of that copy, which a crash leaves behind. The 5.4 GB orphan from the
+  crash was itself part of why the disk was full.
+
+WHAT THE HARNESS STILL DOES NOT LOOK AT
+
+`protocol.rs` and `mask.rs` are not in the mutated file list. `LEAKY_FIELDS` is
+in `protocol.rs` — the error-field scrubbing that stops a unique violation
+echoing `Key (email)=(alice@example.com)` back to the client — and the masks
+themselves are in `mask.rs`. Both decide what reaches the client. Recorded, not
+yet fixed: adding them changes what a complete run costs, and no complete run
+has finished yet.
+
 ## 0.1.38 — four relations that were never a plain table
 
 Partitioned tables, inheritance, domain-typed columns and generated columns had

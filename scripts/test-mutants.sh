@@ -42,8 +42,24 @@ command -v cargo-mutants >/dev/null || {
 }
 command -v podman >/dev/null || { echo "FAIL: podman is required"; exit 3; }
 
+# Free space, checked up front. cargo-mutants copies the whole source tree into
+# $TMPDIR and rebuilds in it for every mutant; the copy reached 5.4 GB here. A
+# run that fills the disk dies mid-way and — before the accounting below
+# existed — still printed a tidy summary. 20 GB is roughly four times the
+# observed peak.
+free_kb=$(df -k "${TMPDIR:-/tmp}" | awk 'NR==2 {print $4}')
+if [ "${free_kb:-0}" -lt 20971520 ]; then
+  echo "FAIL: only $((free_kb / 1048576)) GB free on ${TMPDIR:-/tmp}; this needs 20."
+  echo "      cargo-mutants rebuilds a full copy of the tree per mutant."
+  echo "      \`rm -rf target/debug/incremental\` is usually the cheapest 20 GB."
+  exit 1
+fi
+
 cleanup() {
   [[ "${KEEP:-0}" == "1" ]] || podman rm -f -v "$CONTAINER" >/dev/null 2>&1
+  # A crashed run leaves its multi-gigabyte tree copy behind, which is how the
+  # disk filled in the first place.
+  rm -rf "${TMPDIR:-/tmp}"/cargo-mutants-pgmask-*.tmp 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -90,11 +106,30 @@ status=$?
 
 echo
 echo "-------------------------------------------------------------"
+accounted=0
 for f in caught missed timeout unviable; do
   n=$(wc -l < "mutants.out/$f.txt" 2>/dev/null | tr -d ' ')
-  printf '  %-10s %s\n' "$f" "${n:-0}"
+  n=${n:-0}
+  accounted=$((accounted + n))
+  printf '  %-10s %s\n' "$f" "$n"
 done
+# How many were planned, against how many have an outcome.
+#
+# THIS IS THE POINT OF THE BLOCK. Two runs died part-way — one on a full disk —
+# and both printed the four counts above and nothing else, so `45 survivors`
+# was carried in docs/safety-assessment.md as if it were the whole picture when
+# 200 of 493 mutants had never been attempted. A partial mutation run is worse
+# than none: it reads as coverage.
+planned=$(python3 -c 'import json;print(len(json.load(open("mutants.out/mutants.json"))))' 2>/dev/null)
+printf '  %-10s %s of %s\n' "attempted" "$accounted" "${planned:-?}"
 echo "-------------------------------------------------------------"
+if [ -n "${planned:-}" ] && [ "$accounted" != "$planned" ]; then
+  echo
+  echo "FAIL: this run is INCOMPLETE — $((planned - accounted)) mutants were never"
+  echo "      attempted, so missed.txt is not the survivor list. Do not triage it."
+  echo "      Check the error above; a full disk is the usual cause."
+  exit 1
+fi
 echo "Survivors are in mutants.out/missed.txt. Each is one of:"
 echo "  * a real gap    — the code is right and no test says so; write the test"
 echo "  * equivalent    — the mutation changes nothing observable; say why in a"

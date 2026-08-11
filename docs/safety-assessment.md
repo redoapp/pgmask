@@ -91,6 +91,7 @@ This is the finding that should shape how much weight a green run carries.
 | `classify --check` | told operators to delete a rule protecting a materialised view |
 | coverage measurement | reported `catalog.rs` at 62.6% when it is 88.4% |
 | a mutation-kill check | reported two mutants killed after mutating the wrong line |
+| `test-mutants.sh` | printed a complete-looking summary for a run that attempted 102 of 494 mutants, twice |
 
 Every one produced a confident answer about something it was not measuring.
 Several were built specifically to prevent that.
@@ -128,7 +129,18 @@ comment that asserted the case could not happen.
 ## Still unverified
 
 - Nine findings from an internal audit, mostly documentation overstating code.
-- Remaining mutation survivors, untriaged.
+- **Mutation coverage is unknown, and the number previously quoted here was
+  wrong.** Two runs died part-way — the second on a full disk — and both printed
+  their four outcome counts and nothing else, so "45 survivors" was carried
+  here as a finding when 200 of 493 mutants had never been attempted. The
+  script now compares planned against attempted and refuses to report a partial
+  run. A complete run has not finished yet; until it does, treat mutation
+  coverage of the release rules as unmeasured rather than as 45 known gaps.
+- The mutation harness does not mutate `protocol.rs` or `mask.rs`. It covers
+  `analysis.rs`, `catalog.rs`, `lineage.rs` and `session.rs`. `LEAKY_FIELDS` —
+  the error-field scrubbing that stops a unique violation echoing a masked value
+  back — is in `protocol.rs`, and the masks themselves are in `mask.rs`. Both
+  decide what reaches the client and neither is being mutated.
 - `classify` can find seven shapes by content: card numbers (Luhn), IBANs
   (mod-97), US Social Security numbers (SSA allocation rules), email, IP, phone,
   and free text by absence. Names, street addresses, dates of birth, non-US
