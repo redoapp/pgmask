@@ -38,4 +38,16 @@ secrets/
 
 # TPC-DS corpus is TPC-licensed; fetched, never vendored.
 examples/tpcds/corpus/
-/**/*.proptest-regressions
+
+# NOT ignored: `*.proptest-regressions`.
+#
+# proptest writes the seed of every failing case it finds into one of these, and
+# its own header says to check the file in — the seeds replay before any new
+# case is generated, so a defect found once is pinned forever for four lines.
+#
+# 93c395e committed `mask_properties.proptest-regressions` and added an ignore
+# rule in the same commit. Ignoring does not affect an already-tracked file, so
+# that one survived by accident and the rule quietly applied to whatever came
+# next: `analysis_properties.proptest-regressions`, written two releases later,
+# held the seed for the `ROLLUP`-over-an-alias disclosure and existed only on
+# the machine that found it.
