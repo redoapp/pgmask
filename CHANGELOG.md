@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.59 — a pseudonym whose local part was never looked at
+
+Both email branches of `Masker::pseudonym` slice
+`digest[..PSEUDONYM_HEX_CHARS / 2]`, and every mutation of that arithmetic
+survived. `/` to `%` gives `digest[..0]` — an **empty local part**, so every
+address at a domain masks to the same value and joins collapse silently.
+
+Under `keep_domain` there was one assertion and it was
+`ends_with("@acme.com")`, which passes with an empty local part, a doubled one,
+or anything else. The collision test that would have caught it uses
+`subject-{i}` — no `@` — so it exercises the non-email branch only.
+
+Now the local part is checked: sixteen hex characters, and two addresses at the
+same domain must differ. The default branch too, where the domain is masked as
+well. Two poison controls; the empty-local-part one fails four tests, because
+collapsing every colleague onto one pseudonym breaks rather more than the test
+that names it.
+
+Not a disclosure — a narrower pseudonym leaks nothing, and an empty one leaks
+less. It corrupts the thing the mask exists to preserve, which is that a join
+still works after masking.
+
 ## 0.1.58 — the startup frame, where `<= 8` breaks TLS for everyone
 
 `try_take_startup` is private, so no cargo test reached it and every boundary

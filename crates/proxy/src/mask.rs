@@ -1540,9 +1540,32 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert!(String::from_utf8(kept.to_vec())
-            .unwrap()
-            .ends_with("@acme.com"));
+        let kept = String::from_utf8(kept.to_vec()).unwrap();
+        assert!(kept.ends_with("@acme.com"));
+
+        // The local part, which `ends_with` cannot see.
+        //
+        // Both email branches slice `digest[..PSEUDONYM_HEX_CHARS / 2]`, and
+        // every mutation of that arithmetic survived the campaign. `/` to `%`
+        // gives `digest[..0]` — an empty local part, so *every* address at a
+        // domain masks to the same value and joins silently collapse. `ends_with`
+        // passes either way, and under `keep_domain` there was no other
+        // assertion at all.
+        let local = kept.split('@').next().unwrap();
+        assert_eq!(
+            local.len(),
+            PSEUDONYM_HEX_CHARS,
+            "the local part carries the identity: {kept}"
+        );
+        assert!(local.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let other = apply_text(&keep, "bob@acme.com");
+        assert_ne!(kept, other, "colleagues must not collapse to one pseudonym");
+        assert_eq!(other.split('@').nth(1), Some("acme.com"));
+
+        // And the same for the default branch, where the domain is masked too.
+        let a = apply_text(&spec(Mask::Pseudonym), "alice@acme.com");
+        assert_eq!(a.split('@').next().unwrap().len(), PSEUDONYM_HEX_CHARS);
     }
 
     /// Splitting on `:` produced invalid addresses for compressed forms and let
