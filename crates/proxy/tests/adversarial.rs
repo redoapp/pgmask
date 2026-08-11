@@ -733,6 +733,93 @@ async fn a_reportable_guc_cannot_carry_a_value() -> Result<()> {
     Ok(())
 }
 
+/// Uniqueness the catalog loader could not see, released one row at a time.
+///
+/// The singleton-group guard refuses `sum(x) GROUP BY <unique key>` because
+/// one row per group makes the sum the value. It reads declared unique keys
+/// from `pg_index`, and two shapes were invisible to it — both measured
+/// returning the exact value `987654321` through the proxy:
+///
+/// * `UNIQUE (lower(label))` — `indkey` holds 0 for an expression and the
+///   inner join to `pg_attribute` dropped the whole index. `lower(label)`
+///   unique implies `label` unique, so `GROUP BY label` is provably one row per
+///   group from the catalog alone.
+/// * `UNIQUE (label) WHERE label IS NOT NULL` — partial indexes were excluded
+///   as "only unique over the rows matching their predicate", which is true and
+///   is an argument for the opposite conclusion: leaving a key out is the
+///   releasing direction.
+///
+/// `sum`, not `max`: `max` can return a stored value whatever the grouping, so
+/// it is refused unconditionally and a test built on it measures nothing. The
+/// first version of this used `max` and every case came back refused.
+#[tokio::test]
+async fn a_unique_key_the_loader_cannot_see_still_refuses() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+
+    // The control comes first and is the reason the rest means anything: a
+    // grouping with no unique key behind it must be *served*, or "refused" is
+    // just the proxy refusing everything.
+    //
+    // `bucketname`, not `label`: unique keys are held unscoped, so a key on any
+    // relation refuses a grouping by that name everywhere.
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+    client
+        .simple_query("SELECT bucketname, sum(salary) FROM canary.no_unique GROUP BY bucketname")
+        .await?;
+    let text = client.received_text();
+    assert!(
+        !text.contains("pgmask:"),
+        "a genuine aggregate must still be served, or this test proves nothing:\n{text}"
+    );
+
+    for (what, sql) in [
+        (
+            "an expression unique index, grouped by the expression",
+            "SELECT lower(exprkey), sum(salary) FROM canary.expr_unique GROUP BY lower(exprkey)",
+        ),
+        (
+            "an expression unique index, grouped by the bare column",
+            "SELECT exprkey, sum(salary) FROM canary.expr_unique GROUP BY exprkey",
+        ),
+        (
+            "a partial unique index, query matching the predicate",
+            "SELECT label, sum(salary) FROM canary.partial_unique \
+          WHERE label IS NOT NULL GROUP BY label",
+        ),
+        (
+            "a partial unique index, no predicate",
+            "SELECT label, sum(salary) FROM canary.partial_unique GROUP BY label",
+        ),
+        // The ordinary case, and the one the first attempt at this fix
+        // destroyed: a constraint-backed index records its columns only through
+        // `pg_constraint`, so a loader reading `pg_depend` alone sees nothing
+        // here and the guard stops firing on almost every real table.
+        (
+            "a PRIMARY KEY",
+            "SELECT pkid, sum(salary) FROM canary.pk_unique GROUP BY pkid",
+        ),
+        (
+            "a UNIQUE constraint",
+            "SELECT ucid, sum(salary) FROM canary.uc_unique GROUP BY ucid",
+        ),
+    ] {
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let _ = client.simple_query(sql).await;
+        let text = client.received_text();
+        assert!(
+            !text.contains("987654321"),
+            "{what} disclosed the exact value:\n{text}"
+        );
+        assert!(
+            text.contains("pgmask:"),
+            "{what} should have been refused, not merely masked:\n{text}"
+        );
+    }
+    Ok(())
+}
+
 /// An error still says enough to act on.
 ///
 /// Withholding the message is only defensible if the `SQLSTATE` survives — it

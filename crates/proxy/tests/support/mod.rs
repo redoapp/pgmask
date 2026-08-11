@@ -140,6 +140,50 @@ CREATE DOMAIN canary.email_address AS text;
 CREATE TABLE canary.contacts (id int, email canary.email_address);
 INSERT INTO canary.contacts VALUES (1, 'CANARY_EMAIL_a1b2c3');
 
+-- Uniqueness the loader may not see. The singleton-group guard refuses a
+-- reducing aggregate whose grouping covers a unique key; a unique key it does
+-- not know about is the direction that releases.
+-- Numeric, because the disclosure is `sum(x) GROUP BY <unique key>`: one row
+-- per group makes the sum the value. `max` cannot be used here — it can return
+-- a stored value whatever the grouping, so it is refused unconditionally and a
+-- probe built on it measures nothing.
+-- `exprkey`, a name no other relation here has a unique key on. Unique keys are
+-- unscoped, so calling this `label` made the partial index on a *different*
+-- table supply the key and the expression-index fix went untested: reverting it
+-- broke nothing.
+CREATE TABLE canary.expr_unique (exprkey text, salary int);
+CREATE UNIQUE INDEX expr_unique_lower ON canary.expr_unique ((lower(exprkey)));
+INSERT INTO canary.expr_unique VALUES ('a', 987654321), ('b', 123456789);
+
+CREATE TABLE canary.partial_unique (label text, salary int);
+CREATE UNIQUE INDEX partial_unique_label ON canary.partial_unique (label)
+  WHERE label IS NOT NULL;
+INSERT INTO canary.partial_unique VALUES ('a', 987654321), ('b', 123456789);
+
+-- A PRIMARY KEY, which is the ordinary case and the one that broke. Postgres
+-- records a constraint-backed index's columns only through `pg_constraint`, so
+-- a loader reading `pg_depend` alone sees nothing here at all.
+CREATE TABLE canary.pk_unique (pkid int PRIMARY KEY, salary int);
+INSERT INTO canary.pk_unique VALUES (1, 987654321), (2, 123456789);
+
+-- A UNIQUE constraint, the other constraint-backed shape.
+CREATE TABLE canary.uc_unique (ucid int UNIQUE, salary int);
+INSERT INTO canary.uc_unique VALUES (1, 987654321), (2, 123456789);
+
+-- The comparison: same shape, no unique key at all, two rows per group. A sum
+-- here is a real aggregate and is released, which is what makes the refusals
+-- above mean something.
+--
+-- The grouping column is `bucketname`, not `label`, and that matters. Unique
+-- keys are held as a flat list of column-name sets with no relation attached —
+-- deliberately, because `group_by_columns` yields bare names and resolving each
+-- to a relation is exactly the provenance work the analysis refuses to guess
+-- at. So a key on *any* table makes a grouping by that name refuse everywhere.
+-- Naming this column `label` made the control refuse and would have made the
+-- whole probe read as a fix when it was a blanket.
+CREATE TABLE canary.no_unique (bucketname text, salary int);
+INSERT INTO canary.no_unique VALUES ('a', 987654321), ('a', 123456789);
+
 -- A generated column: a second copy of a classified value under a name the
 -- operator has to have thought of separately.
 CREATE TABLE canary.derived (
@@ -183,12 +227,32 @@ pub fn default_rules() -> Vec<ColumnRule> {
         rule("canary.people", "email", Mask::Pseudonym),
         rule("canary.contacts", "id", Mask::None),
         rule("canary.contacts", "email", Mask::Pseudonym),
+        rule("canary.expr_unique", "exprkey", Mask::None),
+        bucket_rule("canary.expr_unique", "salary", 1000),
+        rule("canary.partial_unique", "label", Mask::None),
+        bucket_rule("canary.partial_unique", "salary", 1000),
+        rule("canary.pk_unique", "pkid", Mask::None),
+        bucket_rule("canary.pk_unique", "salary", 1000),
+        rule("canary.uc_unique", "ucid", Mask::None),
+        bucket_rule("canary.uc_unique", "salary", 1000),
+        rule("canary.no_unique", "bucketname", Mask::None),
+        bucket_rule("canary.no_unique", "salary", 1000),
         rule("canary.derived", "id", Mask::None),
         rule("canary.derived", "email", Mask::Pseudonym),
         // canary.derived.email_copy is deliberately unclassified: a generated
         // column is a copy of a classified value under a name of its own, and
         // default-deny is the only thing standing between the two.
     ]
+}
+
+/// A `numeric-bucket` rule with a real bucket.
+///
+/// The catalog refuses `bucket = 1` — it floors every value to itself and masks
+/// nothing — so the default `params` cannot express this mask at all.
+pub fn bucket_rule(relation: &str, column: &str, bucket: i64) -> ColumnRule {
+    let mut r = rule(relation, column, Mask::NumericBucket);
+    r.params.bucket = Some(bucket);
+    r
 }
 
 pub fn rule(relation: &str, column: &str, mask: Mask) -> ColumnRule {

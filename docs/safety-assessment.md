@@ -105,6 +105,8 @@ that gap a few hours earlier.
 | 7c | `USING ERRCODE = upper(substr(email,1,5))` returns five characters per query | asking what else `RAISE` can choose |
 | 7d | the same through `RAISE NOTICE`/`WARNING`/`INFO`, which a loop repeats freely | re-reading the fix for 7c |
 | 8 | `set_config('scram_iterations', (SELECT annual_salary …))` echoes the number in a `ParameterStatus` | enumerating every field forwarded verbatim |
+| 9a | `UNIQUE (lower(label))` was invisible to the loader, so `sum(x) GROUP BY label` was released one row at a time | asking what the singleton guard reads |
+| 9b | partial unique indexes were excluded outright, same effect | reading the reason given for excluding them |
 
 **This is the notice disclosure again, through the other message type.** The
 notice channel was found, fixed, and checked in both directions in
@@ -130,6 +132,34 @@ Any integer-valued masked column: a salary, an age, a count.
 
 The allowlist was the right design and it was reviewed with the wrong question.
 
+**9 is disclosure 1 again, through the other half of the guard.** Disclosures
+1–4 and 6 were spellings of the *grouping*; these are spellings of the
+*uniqueness*. The guard refuses `sum(x) GROUP BY <unique key>` because one row
+per group makes the sum the value — and it reads the keys from `pg_index` with
+an inner join on `indkey`, which holds `0` for an expression. A pure expression
+index matched no attribute, produced no group, and vanished. `lower(label)`
+unique implies `label` unique, so this was decidable from the catalog and simply
+was not being read.
+
+Partial indexes were excluded deliberately, reasoned as "they are only unique
+over the rows matching their predicate". True, and an argument for the opposite
+conclusion: a key that is present makes the guard *refuse*, so leaving one out
+is the releasing direction. Both measured returning `987654321` — the exact
+value — through the proxy.
+
+Worth recording alongside: unique keys are held **unscoped**, a flat list of
+column-name sets with no relation attached, because `group_by_columns` yields
+bare names and resolving each to a relation is the provenance work the analysis
+refuses to guess at. That is conservative and correct, and it also nearly hid
+this: naming a fixture column `label` let a key from a *different* table satisfy
+the test, so reverting half the fix broke nothing.
+
+A narrow gap remains and is documented in the loader: a *partial* index whose
+key is purely an expression is still missed. `indkey` gives nothing for it, and
+`pg_depend` cannot substitute because a partial index's predicate columns are
+dependencies too — measured, `UNIQUE (label) WHERE salary > 0` yields
+`label,salary`, a wider key than the truth, which is the releasing direction.
+
 What it costs: an error's message is now always withheld, and its `SQLSTATE` is
 withheld too when a `CONTEXT` field proves the error came through user SQL.
 Ordinary errors — missing relation, division by zero, bad cast — carry no
@@ -137,6 +167,61 @@ Ordinary errors — missing relation, division by zero, bad cast — carry no
 An application whose PL/pgSQL raises custom SQLSTATEs for business logic will
 lose them. That is over-withholding, in the direction that does not disclose,
 and it is visible to whoever runs it.
+
+### What the same sweep did *not* find
+
+The 08-11 disclosures came from one method: enumerate everything that reaches
+the client and ask, of each, what shape of value it can carry. Reporting where
+that came up empty matters as much as where it did not, because otherwise the
+method reads as infallible.
+
+* **The backend message dispatch is sound.** It is an explicit allowlist with no
+  catch-all — an unrecognised tag is refused and the connection closed. Each of
+  the twelve forwarded-verbatim tags was checked: `CommandComplete` carries a
+  row count (the inference category), `ParameterDescription` carries the
+  client's own parameter types, `NegotiateProtocolVersion` echoes option names
+  from the client's own startup packet. None carries row data.
+* **The `Vetted` invariant holds by construction.** Its constructors are
+  module-private, and every `Vetted::control` call site is provably not a
+  `DataRow`: the dispatch routes `B_DATA_ROW` to `handle_data_row` before the
+  control arm, `b'D'` is absent from `BACKEND_CONTROL_TAGS`, and the two calls
+  outside the dispatch are guarded by a `ReadyForQuery` tag check and the
+  `RowDescription` handler respectively.
+* Worth knowing anyway: both `Vetted` invariants are `debug_assert`, so they are
+  compiled out of the shipped binary. They are currently redundant —
+  `unmasked_row`'s assert is exactly the `!changed` condition its only caller
+  tests — so nothing rests on them at runtime. If a call site is ever added,
+  that stops being true silently.
+* **The partial-reveal masks have length floors.** `partial`, `inner`, `outer`
+  and `range` each mask outright rather than passing through a value too short
+  for their window, and `range` was the one whose absence of that guard had
+  already been found and fixed.
+
+### Mutation testing would not have found any of the nine
+
+Worth stating because the opposite conclusion is the tempting one. Disclosure 7
+was in `protocol.rs`, which nothing mutated, and I went looking there *because*
+I had written that down — so it reads as "the missing instrument was the cause".
+It was not.
+
+A mutant changes existing logic and asks whether a test notices. Every one of
+the nine disclosures is a **missing case**, not wrong logic:
+
+* `LEAKY_FIELDS` did not contain `W`.
+* The error branch did not replace the message at all.
+* `from_user_sql` had `!notice` in it.
+* `scram_iterations` was on an allowlist.
+* The unique-key query never selected expression indexes.
+
+There is nothing to mutate in code that was never written. Measured rather than
+argued: after adding `protocol.rs` and `mask.rs` to the harness — 333 of the 827
+mutants — the first quarter of the campaign killed **every** mutant in both
+files and every survivor was in `catalog.rs` or `analysis.rs`.
+
+So adding them was right, and it closes a different gap than the one that let
+disclosure 7 through. What found all nine was reading, and what made reading
+productive was choosing where to read: the paths that reach the client, taken
+one at a time, asking of each what shape of value it can carry.
 
 ## The instruments were wrong more often than the code
 

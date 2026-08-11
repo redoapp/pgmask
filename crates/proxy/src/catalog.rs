@@ -1297,20 +1297,82 @@ async fn resolve_snapshot(
     let opaque_views = opaque_views(&view_defs);
 
     // Declared unique keys, so a grouping that yields one row per group can be
-    // told apart from a real aggregation. Partial indexes are excluded: they
-    // are only unique over the rows matching their predicate.
+    // told apart from a real aggregation.
+    //
+    // WHICH DIRECTION IS SAFE
+    //
+    // A key here makes the guard refuse. So a key **narrower** than the truth
+    // over-refuses — a utility cost — and a key **wider** than the truth, or a
+    // key missing entirely, releases an aggregate whose groups are one row
+    // each. Every choice below is made on that basis, and two of them were
+    // measured leaking before it was.
+    //
+    // INDKEY ALWAYS, `pg_depend` ONLY TO ADD EXPRESSION COLUMNS
+    //
+    // `indkey` holds 0 for an expression, and the original query inner-joined
+    // it to `pg_attribute`, so a *pure* expression index — `UNIQUE
+    // (lower(label))` — matched no attribute, produced no group, and vanished.
+    // `GROUP BY label` then released `sum(salary)` one row at a time, and
+    // `lower(label)` unique does imply `label` unique, so this was decidable
+    // from the catalog and simply was not being read.
+    //
+    // The first attempt at fixing it replaced `indkey` with `pg_depend`
+    // outright, and that was much worse than the bug. A **constraint-backed**
+    // index — every `PRIMARY KEY` and every `UNIQUE` constraint — has no direct
+    // index-to-column dependency at all; the dependency runs through
+    // `pg_constraint`. Measured on Postgres 17: `pg_depend` returns nothing for
+    // `t_pkey` and `t_u_key`, and the columns only for a plain
+    // `CREATE UNIQUE INDEX`. Nearly every real unique key disappeared, the
+    // guard stopped firing, and the generated campaigns went from 0 leaks to
+    // 480 and 660. They exist for exactly this.
+    //
+    // So `indkey` is the source, and `pg_depend` only *adds* the base columns
+    // of expressions — and only for non-partial indexes, because a partial
+    // index's *predicate* columns are dependencies too: measured,
+    // `UNIQUE (label) WHERE salary > 0` yields `label,salary`, a wider key than
+    // the truth, which is the releasing direction.
+    //
+    // AND PARTIAL INDEXES ARE INCLUDED NOW
+    //
+    // They used to be excluded, reasoned as "they are only unique over the rows
+    // matching their predicate". True, and backwards: a key makes the guard
+    // refuse, so excluding one is the releasing direction. A partial unique
+    // index guarantees at most one row per key among matching rows, and
+    // `WHERE label IS NOT NULL GROUP BY label` returned the exact value.
+    // Including them over-refuses on queries that do not match the predicate,
+    // which is the cost worth paying.
+    //
+    // KNOWN GAP, NARROW AND DELIBERATE
+    //
+    // A *partial* index whose key is purely an expression is still missed:
+    // `indkey` gives nothing for it and `pg_depend` cannot substitute.
     let mut unique_keys: Vec<Vec<String>> = Vec::new();
     for row in client
         .query(
-            "SELECT string_agg(a.attname, ',' ORDER BY k.ord) AS columns
-               FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indrelid
-               JOIN pg_namespace n ON n.oid = c.relnamespace
-               CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
-               JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
-              WHERE i.indisunique AND i.indpred IS NULL
-                AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-              GROUP BY i.indexrelid",
+            "SELECT string_agg(DISTINCT k.col, ',') AS columns
+               FROM (
+                 SELECT i.indexrelid, a.attname AS col
+                   FROM pg_index i
+                   JOIN pg_class c ON c.oid = i.indrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS u(attnum, ord)
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = u.attnum
+                  WHERE i.indisunique
+                    AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                 UNION
+                 SELECT i.indexrelid, a.attname AS col
+                   FROM pg_index i
+                   JOIN pg_class c ON c.oid = i.indrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   JOIN pg_depend d
+                     ON d.classid = 'pg_class'::regclass AND d.objid = i.indexrelid
+                    AND d.refclassid = 'pg_class'::regclass AND d.refobjid = i.indrelid
+                    AND d.refobjsubid > 0
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = d.refobjsubid
+                  WHERE i.indisunique AND i.indpred IS NULL AND i.indexprs IS NOT NULL
+                    AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+               ) k
+              GROUP BY k.indexrelid",
             &[],
         )
         .await

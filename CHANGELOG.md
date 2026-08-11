@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.1.44 — disclosure 1 again, through the other half of the guard
+
+Disclosures 1-4 and 6 were spellings of the *grouping*. These are spellings of
+the *uniqueness*.
+
+The singleton-group guard refuses `sum(x) GROUP BY <unique key>` because one row
+per group makes the sum the value. It reads declared keys from `pg_index`, and
+two shapes were invisible to it. Both returned `987654321` — the exact value —
+through the proxy.
+
+`UNIQUE (lower(label))`. `indkey` holds `0` for an expression, and the query
+inner-joined it to `pg_attribute`, so a pure expression index matched no
+attribute, produced no group, and vanished. `lower(label)` unique implies
+`label` unique, so `GROUP BY label` is provably one row per group from the
+catalog alone — it was decidable and simply was not being read.
+
+`UNIQUE (label) WHERE label IS NOT NULL`. Partial indexes were excluded, reasoned
+as "they are only unique over the rows matching their predicate". True, and an
+argument for the opposite conclusion: a key makes the guard *refuse*, so leaving
+one out is the releasing direction.
+
+THE FIRST FIX WAS MUCH WORSE THAN THE BUG
+
+`pg_depend` gives the exact base columns of an index, so the obvious move was to
+replace `indkey` with it. That took the generated campaigns from 0 leaks to
+**480 and 660**.
+
+A constraint-backed index — every `PRIMARY KEY` and every `UNIQUE` constraint —
+has no direct index-to-column dependency at all. The dependency runs through
+`pg_constraint`. Measured on Postgres 17: `pg_depend` returns nothing for
+`t_pkey` and `t_u_key`, and the columns only for a plain `CREATE UNIQUE INDEX`.
+So nearly every real unique key vanished and the guard stopped firing on almost
+every table.
+
+Caught by the campaigns, which is what they are for. Nothing else in the gate
+noticed — the adversarial suite went on passing, because its fixture indexes are
+the shapes I had just been thinking about rather than the ordinary ones.
+
+The design that is actually right: `indkey` is the source, always, and
+`pg_depend` only *adds* the base columns of expressions, and only for
+non-partial indexes — a partial index's predicate columns are dependencies too,
+and `UNIQUE (label) WHERE salary > 0` yields `label,salary`, wider than the
+truth, which releases.
+
+A `PRIMARY KEY` and a `UNIQUE` constraint are now fixtures in their own right,
+so removing the `indkey` arm fails a test rather than a campaign.
+
+THREE WAYS THIS TEST NEARLY MEANT NOTHING
+
+`max(salary)` instead of `sum`: `max` can return a stored value whatever the
+grouping, so it is refused unconditionally and every case came back refused,
+including the ones that leak.
+
+No served control: with everything refused, "refused" proves nothing. Adding a
+grouping with no unique key behind it is what showed the fix was not a blanket.
+
+And the control column named `label`: unique keys are held unscoped — a flat
+list of column-name sets, deliberately, because `group_by_columns` yields bare
+names — so a key on *any* relation refuses that name everywhere. That made the
+control refuse, and separately let the partial index on one table satisfy the
+expression-index case on another, so reverting half the fix broke nothing.
+Renaming the fixture columns is what made both halves poison-controllable.
+
 ## 0.1.43 — a postcode mask that kept the identifying half
 
 `classify` proposed `partial` for anything matching `zip|postal|postcode`, and
