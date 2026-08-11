@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.45 — `SET ROLE` does nothing here, and nothing said so
+
+Before this, no test, script or document in the repository mentioned `SET ROLE`.
+
+`[[role]]` maps a startup principal to pgmask role names, resolved once at
+`AuthenticationOk` and never revisited, so `SET ROLE`, `SET SESSION
+AUTHORIZATION` and `RESET ROLE` change what the database will let a session read
+and change nothing about which mask pgmask applies.
+
+That is the safe direction — a client cannot switch into another role's looser
+mask — and it is not what the name suggests. An operator who granted someone a
+Postgres role expecting the mask to follow would be configuring nothing, and
+would find out from a leak rather than from an error. The README says so now, in
+the same section as the promise it qualifies.
+
+Pinned by a test whose fixture is the shape that would matter: a role whose
+`by_role` mask *releases* the column, and a principal who is not a member. Four
+attempts to reach it — `SET ROLE` to the connecting user, `SET ROLE` to the
+privileged role, `SET SESSION AUTHORIZATION`, `SET LOCAL ROLE` — and none does.
+
+The control is half the test: `start_proxy_as_member` connects a principal who
+*is* a member and asserts the value comes through in the clear. Without it,
+"the canary did not appear" is equally consistent with the role's mask never
+releasing anything. Both directions poison-controlled — granting membership
+produces a real leak the test catches, and breaking the control fails with "the
+`analyst` mask must actually release, or this test asserts nothing".
+
 ## 0.1.44 — disclosure 1 again, through the other half of the guard
 
 Disclosures 1-4 and 6 were spellings of the *grouping*. These are spellings of

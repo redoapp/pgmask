@@ -273,6 +273,28 @@ pub struct ProxyHandle {
     pub metrics: Arc<pgmask::metrics::Metrics>,
 }
 
+/// A proxy where the connecting principal *is* a member of `role`.
+///
+/// The other half of a role test: without it, "the value did not come through"
+/// is equally consistent with the role's mask never releasing anything.
+pub async fn start_proxy_as_member(db: &str, role: &str) -> Result<ProxyHandle> {
+    let mut rules = default_rules();
+    for r in &mut rules {
+        if r.relation == "canary.subjects" && r.column == "email" {
+            r.by_role.insert(role.into(), Mask::None);
+        }
+    }
+    start_proxy_with_roles(
+        db,
+        rules,
+        vec![pgmask::catalog::Role {
+            name: role.into(),
+            members: vec!["postgres".into()],
+        }],
+    )
+    .await
+}
+
 pub async fn start_proxy(db: &str, rules: Vec<ColumnRule>) -> Result<ProxyHandle> {
     start_proxy_with(db, rules, Unclassified::Mask, Opaque::Reject).await
 }
@@ -287,6 +309,23 @@ pub async fn start_proxy_with(
     start_proxy_at(&backend, db, rules, unclassified, opaque).await
 }
 
+pub async fn start_proxy_with_roles(
+    db: &str,
+    rules: Vec<ColumnRule>,
+    roles: Vec<pgmask::catalog::Role>,
+) -> Result<ProxyHandle> {
+    let backend = backend_addr().context("PGMASK_TEST_PG")?;
+    start_proxy_at_full(
+        &backend,
+        db,
+        rules,
+        Unclassified::Mask,
+        Opaque::Reject,
+        roles,
+    )
+    .await
+}
+
 /// Same, but forwarding to an arbitrary address — used to point the proxy at a
 /// backend that misbehaves.
 pub async fn start_proxy_at(
@@ -295,6 +334,17 @@ pub async fn start_proxy_at(
     rules: Vec<ColumnRule>,
     unclassified: Unclassified,
     opaque: Opaque,
+) -> Result<ProxyHandle> {
+    start_proxy_at_full(backend, db, rules, unclassified, opaque, Vec::new()).await
+}
+
+pub async fn start_proxy_at_full(
+    backend: &str,
+    db: &str,
+    rules: Vec<ColumnRule>,
+    unclassified: Unclassified,
+    opaque: Opaque,
+    roles: Vec<pgmask::catalog::Role>,
 ) -> Result<ProxyHandle> {
     let backend = backend.to_string();
     let config = Config {
@@ -307,7 +357,7 @@ pub async fn start_proxy_at(
         unclassified_mask: Mask::Null,
         column: rules,
         semantic_type: Vec::new(),
-        role: Vec::new(),
+        role: roles,
         tls_cert: None,
         tls_key: None,
         backend_tls: pgmask::tls::BackendTls::Disable,

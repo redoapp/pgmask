@@ -168,3 +168,96 @@ crates/proxy/src/catalog.rs:727:9: replace Snapshot::insert_opaque_view_for_test
 crates/proxy/src/catalog.rs:732:9: replace Snapshot::is_system_relation -> bool with true
 crates/proxy/src/catalog.rs:732:9: replace Snapshot::is_system_relation -> bool with false
 crates/proxy/src/catalog.rs:743:9: replace Snapshot::lookup -> Option<&Classification> with None
+crates/proxy/src/catalog.rs:751:9: replace Snapshot::knows_relation -> bool with true
+crates/proxy/src/catalog.rs:751:9: replace Snapshot::knows_relation -> bool with false
+crates/proxy/src/catalog.rs:758:9: replace Snapshot::classified_column_names -> HashSet<&str> with HashSet::new()
+crates/proxy/src/catalog.rs:758:9: replace Snapshot::classified_column_names -> HashSet<&str> with HashSet::from_iter([""])
+crates/proxy/src/catalog.rs:758:9: replace Snapshot::classified_column_names -> HashSet<&str> with HashSet::from_iter(["xyzzy"])
+crates/proxy/src/catalog.rs:798:9: replace Snapshot::relation_columns_for_test with ()
+crates/proxy/src/catalog.rs:806:9: replace Snapshot::set_role_mask_for_test with ()
+crates/proxy/src/catalog.rs:815:9: replace Snapshot::insert_for_test with ()
+crates/proxy/src/catalog.rs:865:9: replace Catalog::resolve -> Result<Self> with Ok(Default::default())
+crates/proxy/src/catalog.rs:870:12: delete ! in Catalog::resolve
+crates/proxy/src/catalog.rs:879:13: delete field rules from struct Self expression in Catalog::resolve
+crates/proxy/src/catalog.rs:881:13: delete field dsn from struct Self expression in Catalog::resolve
+crates/proxy/src/catalog.rs:882:13: delete field snapshot from struct Self expression in Catalog::resolve
+crates/proxy/src/catalog.rs:901:9: replace Catalog::generation -> u64 with 1
+crates/proxy/src/catalog.rs:905:9: replace Catalog::snapshot -> Arc<Snapshot> with Arc::new(Default::default())
+crates/proxy/src/catalog.rs:933:9: replace Catalog::refresh -> Result<()> with Ok(())
+crates/proxy/src/catalog.rs:997:9: replace Catalog::run_refresher with ()
+crates/proxy/src/catalog.rs:1105:5: replace opaque_views -> HashSet<String> with HashSet::new()
+crates/proxy/src/catalog.rs:1105:5: replace opaque_views -> HashSet<String> with HashSet::from_iter([String::new()])
+crates/proxy/src/catalog.rs:1105:5: replace opaque_views -> HashSet<String> with HashSet::from_iter(["xyzzy".into()])
+crates/proxy/src/catalog.rs:1108:26: replace match guard !sql.trim().is_empty() with false in opaque_views
+crates/proxy/src/catalog.rs:1108:26: delete ! in opaque_views
+crates/proxy/src/catalog.rs:1108:52: delete ! in opaque_views
+crates/proxy/src/catalog.rs:1137:84: replace == with != in opaque_views
+crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with (String::new(), None)
+crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with (String::new(), Some(""))
+crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with (String::new(), Some("xyzzy"))
+crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with ("xyzzy".into(), None)
+crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with ("xyzzy".into(), Some(""))
+crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with ("xyzzy".into(), Some("xyzzy"))
+crates/proxy/src/catalog.rs:1153:8: delete ! in sanitize_catalog_dsn
+crates/proxy/src/catalog.rs:1179:5: replace validate_spec -> Result<()> with Ok(())
+crates/proxy/src/catalog.rs:1180:32: replace match guard spec.bucket < 2 with true in validate_spec
+crates/proxy/src/catalog.rs:1180:32: replace match guard spec.bucket < 2 with false in validate_spec
+crates/proxy/src/catalog.rs:1185:24: replace match guard spec.end <= spec.start with false in validate_spec
+crates/proxy/src/catalog.rs:1194:24: replace match guard spec.keep == 0 with true in validate_spec
+crates/proxy/src/catalog.rs:1194:24: replace match guard spec.keep == 0 with false in validate_spec
+crates/proxy/src/catalog.rs:1180:44: replace < with == in validate_spec
+crates/proxy/src/catalog.rs:1180:44: replace < with > in validate_spec
+crates/proxy/src/catalog.rs:1185:33: replace <= with > in validate_spec
+crates/proxy/src/catalog.rs:1194:34: replace == with != in validate_spec
+crates/proxy/src/catalog.rs:1211:5: replace resolve_snapshot -> Result<Snapshot> with Ok(Default::default())
+crates/proxy/src/catalog.rs:1445:9: delete field unique_keys from struct Snapshot expression in resolve_snapshot
+crates/proxy/src/lineage.rs:119:9: replace <impl CatalogProvider for SnapshotCatalog>::resolve_column -> Option<TableRef> with None
+crates/proxy/src/lineage.rs:139:5: replace qualify -> String with String::new()
+crates/proxy/src/lineage.rs:139:5: replace qualify -> String with "xyzzy".into()
+crates/proxy/src/lineage.rs:160:5: replace resolve -> Vec<Verdict> with vec![]
+crates/proxy/src/lineage.rs:170:5: replace resolve_inspected -> Vec<Verdict> with vec![]
+crates/proxy/src/lineage.rs:191:23: replace != with == in resolve_inspected
+crates/proxy/src/lineage.rs:243:20: delete ! in resolve_inspected
+crates/proxy/src/lineage.rs:269:20: delete ! in resolve_inspected
+crates/proxy/src/lineage.rs:277:25: replace match guard masked_column_in_statement with true in resolve_inspected
+crates/proxy/src/lineage.rs:277:25: replace match guard masked_column_in_statement with false in resolve_inspected
+crates/proxy/src/mask.rs:118:5: replace is_luhn -> bool with true
+crates/proxy/src/mask.rs:118:5: replace is_luhn -> bool with false
+crates/proxy/src/mask.rs:119:21: replace < with > in is_luhn
+crates/proxy/src/mask.rs:127:22: replace == with != in is_luhn
+crates/proxy/src/mask.rs:127:18: replace % with / in is_luhn
+crates/proxy/src/mask.rs:127:18: replace % with + in is_luhn
+crates/proxy/src/mask.rs:132:28: replace > with == in is_luhn
+crates/proxy/src/mask.rs:132:28: replace > with < in is_luhn
+crates/proxy/src/mask.rs:148:5: replace is_iban -> bool with true
+crates/proxy/src/mask.rs:148:5: replace is_iban -> bool with false
+crates/proxy/src/mask.rs:160:5: replace is_phone_length -> bool with true
+crates/proxy/src/mask.rs:160:5: replace is_phone_length -> bool with false
+crates/proxy/src/mask.rs:174:5: replace is_nhs_number -> bool with true
+crates/proxy/src/mask.rs:174:5: replace is_nhs_number -> bool with false
+crates/proxy/src/mask.rs:190:27: replace % with / in is_nhs_number
+crates/proxy/src/mask.rs:190:27: replace % with + in is_nhs_number
+crates/proxy/src/mask.rs:197:11: replace == with != in is_nhs_number
+crates/proxy/src/mask.rs:216:5: replace scrub_free_text -> String with String::new()
+crates/proxy/src/mask.rs:216:5: replace scrub_free_text -> String with "xyzzy".into()
+crates/proxy/src/mask.rs:218:8: delete ! in scrub_free_text
+crates/proxy/src/mask.rs:231:12: delete ! in scrub_free_text
+crates/proxy/src/mask.rs:261:5: replace canonical_uuid -> Option<[u8; 16]> with None
+crates/proxy/src/mask.rs:261:5: replace canonical_uuid -> Option<[u8; 16]> with Some([0; 16])
+crates/proxy/src/mask.rs:261:5: replace canonical_uuid -> Option<[u8; 16]> with Some([1; 16])
+crates/proxy/src/mask.rs:261:15: replace == with != in canonical_uuid
+crates/proxy/src/mask.rs:266:50: replace != with == in canonical_uuid
+crates/proxy/src/mask.rs:391:9: replace MaskSpec::is_passthrough -> bool with true
+crates/proxy/src/mask.rs:391:9: replace MaskSpec::is_passthrough -> bool with false
+crates/proxy/src/mask.rs:391:19: replace == with != in MaskSpec::is_passthrough
+crates/proxy/src/mask.rs:399:9: replace MaskSpec::supports -> bool with true
+crates/proxy/src/mask.rs:399:9: replace MaskSpec::supports -> bool with false
+crates/proxy/src/mask.rs:413:57: replace || with && in MaskSpec::supports
+crates/proxy/src/mask.rs:413:69: replace == with != in MaskSpec::supports
+crates/proxy/src/mask.rs:422:17: delete match arm OID_INT2 | OID_INT4 | OID_INT8 | OID_FLOAT4 | OID_FLOAT8 in MaskSpec::supports
+crates/proxy/src/mask.rs:423:17: delete match arm OID_NUMERIC in MaskSpec::supports
+crates/proxy/src/mask.rs:423:39: replace == with != in MaskSpec::supports
+crates/proxy/src/mask.rs:433:21: replace || with && in MaskSpec::supports
+crates/proxy/src/mask.rs:433:65: replace && with || in MaskSpec::supports
+crates/proxy/src/mask.rs:433:75: replace == with != in MaskSpec::supports
+crates/proxy/src/mask.rs:440:9: replace MaskSpec::unsupported_hint -> &'static str with ""

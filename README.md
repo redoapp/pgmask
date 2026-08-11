@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.44**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.45**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -408,6 +408,18 @@ client claimed, and a session that has not authenticated holds no roles at all.
 
 When a principal holds several roles with different masks, **the most
 restrictive wins**. Adding a role must never widen access.
+
+**These are not the database's roles.** A `[[role]]` maps the *startup
+principal* — the username in the connection packet, once Postgres has verified
+it — to pgmask role names, and that is resolved once at authentication and never
+revisited. `SET ROLE`, `SET SESSION AUTHORIZATION` and `RESET ROLE` change what
+the database will let a session read; they change nothing about which mask
+pgmask applies.
+
+That is the safe direction — a client cannot reach another role's looser mask by
+switching into it — but it is not what the name suggests, so: if you want a
+person to see less, map their *login* to a role here. Granting them a Postgres
+role has no effect on masking.
 
 The catalog is keyed on `(OID, attnum)`, never on output column name, which any
 query can rename. Views need their own entries: Phase 0 found that Postgres

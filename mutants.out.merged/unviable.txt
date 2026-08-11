@@ -10,3 +10,7 @@ crates/proxy/src/catalog.rs:355:5: replace default_summaries -> Summaries with D
 crates/proxy/src/catalog.rs:360:9: replace Config::load -> Result<Self> with Ok(Default::default())
 crates/proxy/src/catalog.rs:505:9: replace Snapshot::lookup_by_name -> Option<&Classification> with Some(Box::leak(Box::new(Default::default())))
 crates/proxy/src/catalog.rs:743:9: replace Snapshot::lookup -> Option<&Classification> with Some(Box::leak(Box::new(Default::default())))
+crates/proxy/src/catalog.rs:1027:5: replace classify -> Result<Classification> with Ok(Default::default())
+crates/proxy/src/lineage.rs:119:9: replace <impl CatalogProvider for SnapshotCatalog>::resolve_column -> Option<TableRef> with Some(Default::default())
+crates/proxy/src/lineage.rs:160:5: replace resolve -> Vec<Verdict> with vec![Default::default()]
+crates/proxy/src/lineage.rs:170:5: replace resolve_inspected -> Vec<Verdict> with vec![Default::default()]

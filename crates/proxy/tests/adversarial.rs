@@ -820,6 +820,60 @@ async fn a_unique_key_the_loader_cannot_see_still_refuses() -> Result<()> {
     Ok(())
 }
 
+/// `SET ROLE` cannot reach a looser mask, because pgmask's roles are not the
+/// database's.
+///
+/// `[[role]]` maps a *startup principal* to pgmask role names, resolved once at
+/// `AuthenticationOk` and never again. A reader who assumes it follows `SET
+/// ROLE` would configure this wrongly in the dangerous direction, and nothing
+/// said otherwise: before this test, no test, script or document in the
+/// repository mentioned `SET ROLE` at all.
+///
+/// The fixture is the shape that would actually matter: a role whose `by_role`
+/// mask *releases* the column, and a principal who is not a member of it.
+#[tokio::test]
+async fn set_role_cannot_reach_another_roles_mask() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+
+    let mut rules = default_rules();
+    for r in &mut rules {
+        if r.relation == "canary.subjects" && r.column == "email" {
+            // `analyst` sees it in the clear. The connecting principal is
+            // `postgres`, and no `[[role]]` declares postgres a member.
+            r.by_role.insert("analyst".into(), pgmask::mask::Mask::None);
+        }
+    }
+    let proxy = start_proxy(DB, rules).await?;
+
+    // Control: the looser mask exists and is reachable by someone. If this
+    // stops being true the assertions below pass for the wrong reason.
+    let with_role = start_proxy_as_member(DB, "analyst").await?;
+    let mut member = RawClient::connect(with_role.addr, DB).await?;
+    member
+        .simple_query("SELECT email FROM canary.subjects LIMIT 1")
+        .await?;
+    assert!(
+        member.received_text().contains(CANARY_EMAIL),
+        "the `analyst` mask must actually release, or this test asserts nothing"
+    );
+
+    for attempt in [
+        "SET ROLE postgres",
+        "SET ROLE analyst",
+        "SET SESSION AUTHORIZATION postgres",
+        "SET LOCAL ROLE postgres",
+    ] {
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let _ = client.simple_query(attempt).await;
+        let _ = client
+            .simple_query("SELECT email FROM canary.subjects LIMIT 1")
+            .await;
+        assert_no_canary(&client, attempt);
+    }
+    Ok(())
+}
+
 /// An error still says enough to act on.
 ///
 /// Withholding the message is only defensible if the `SQLSTATE` survives — it

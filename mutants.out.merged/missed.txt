@@ -23,3 +23,43 @@ crates/proxy/src/catalog.rs:739:9: delete ! in Snapshot::has_system_relations
 crates/proxy/src/catalog.rs:747:9: replace Snapshot::name_of -> Option<&str> with None
 crates/proxy/src/catalog.rs:747:9: replace Snapshot::name_of -> Option<&str> with Some("")
 crates/proxy/src/catalog.rs:747:9: replace Snapshot::name_of -> Option<&str> with Some("xyzzy")
+crates/proxy/src/catalog.rs:765:9: replace Snapshot::len -> usize with 0
+crates/proxy/src/catalog.rs:765:9: replace Snapshot::len -> usize with 1
+crates/proxy/src/catalog.rs:769:9: replace Snapshot::is_empty -> bool with true
+crates/proxy/src/catalog.rs:769:9: replace Snapshot::is_empty -> bool with false
+crates/proxy/src/catalog.rs:880:13: delete field types from struct Self expression in Catalog::resolve
+crates/proxy/src/catalog.rs:901:9: replace Catalog::generation -> u64 with 0
+crates/proxy/src/catalog.rs:909:9: replace Catalog::name_of -> Option<String> with None
+crates/proxy/src/catalog.rs:909:9: replace Catalog::name_of -> Option<String> with Some(String::new())
+crates/proxy/src/catalog.rs:909:9: replace Catalog::name_of -> Option<String> with Some("xyzzy".into())
+crates/proxy/src/catalog.rs:915:9: replace Catalog::len -> usize with 0
+crates/proxy/src/catalog.rs:915:9: replace Catalog::len -> usize with 1
+crates/proxy/src/catalog.rs:919:9: replace Catalog::is_empty -> bool with true
+crates/proxy/src/catalog.rs:919:9: replace Catalog::is_empty -> bool with false
+crates/proxy/src/catalog.rs:927:9: replace Catalog::note_unknown_relation with ()
+crates/proxy/src/catalog.rs:954:46: replace == with != in Catalog::refresh
+crates/proxy/src/catalog.rs:967:17: delete match arm (Some(b), None) in Catalog::refresh
+crates/proxy/src/catalog.rs:973:17: delete match arm (None, Some(a)) in Catalog::refresh
+crates/proxy/src/catalog.rs:958:39: replace match guard b != a with true in Catalog::refresh
+crates/proxy/src/catalog.rs:958:39: replace match guard b != a with false in Catalog::refresh
+crates/proxy/src/catalog.rs:958:41: replace != with == in Catalog::refresh
+crates/proxy/src/catalog.rs:984:62: replace || with && in Catalog::refresh
+crates/proxy/src/catalog.rs:984:34: replace != with == in Catalog::refresh
+crates/proxy/src/catalog.rs:984:76: replace != with == in Catalog::refresh
+crates/proxy/src/catalog.rs:1108:26: replace match guard !sql.trim().is_empty() with true in opaque_views
+crates/proxy/src/catalog.rs:1185:24: replace match guard spec.end <= spec.start with true in validate_spec
+crates/proxy/src/catalog.rs:1180:44: replace < with <= in validate_spec
+crates/proxy/src/catalog.rs:1394:13: delete field system_relations from struct Snapshot expression in resolve_snapshot
+crates/proxy/src/catalog.rs:1395:13: delete field relation_columns from struct Snapshot expression in resolve_snapshot
+crates/proxy/src/catalog.rs:1396:13: delete field opaque_views from struct Snapshot expression in resolve_snapshot
+crates/proxy/src/catalog.rs:1397:13: delete field unique_keys from struct Snapshot expression in resolve_snapshot
+crates/proxy/src/catalog.rs:1442:9: delete field system_relations from struct Snapshot expression in resolve_snapshot
+crates/proxy/src/catalog.rs:1443:9: delete field relation_columns from struct Snapshot expression in resolve_snapshot
+crates/proxy/src/catalog.rs:1444:9: delete field opaque_views from struct Snapshot expression in resolve_snapshot
+crates/proxy/src/lineage.rs:113:9: replace <impl CatalogProvider for SnapshotCatalog>::list_columns -> Option<Vec<String>> with None
+crates/proxy/src/lineage.rs:113:9: replace <impl CatalogProvider for SnapshotCatalog>::list_columns -> Option<Vec<String>> with Some(vec![])
+crates/proxy/src/lineage.rs:113:9: replace <impl CatalogProvider for SnapshotCatalog>::list_columns -> Option<Vec<String>> with Some(vec![String::new()])
+crates/proxy/src/lineage.rs:113:9: replace <impl CatalogProvider for SnapshotCatalog>::list_columns -> Option<Vec<String>> with Some(vec!["xyzzy".into()])
+crates/proxy/src/mask.rs:119:21: replace < with == in is_luhn
+crates/proxy/src/mask.rs:119:21: replace < with <= in is_luhn
+crates/proxy/src/mask.rs:132:28: replace > with >= in is_luhn
