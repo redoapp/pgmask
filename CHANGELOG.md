@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.58 — the startup frame, where `<= 8` breaks TLS for everyone
+
+`try_take_startup` is private, so no cargo test reached it and every boundary
+mutant survived: `< 8` to `<= 8`, `< len` to `<= len`, and deleting the `!` from
+the plausibility check. The TLS script does exercise this path — but
+`cargo mutants` runs `cargo test`, not scripts, so the only coverage there was
+invisible to it.
+
+`<= 8` is the one that matters. **An `SSLRequest` is exactly eight bytes**, so
+that mutant makes the reader wait forever for a ninth and TLS negotiation stops
+working for every client. Not a disclosure; an outage, and the kind that looks
+like a network problem.
+
+One test, covering: an eight-byte `SSLRequest` taken whole and consumed; seven
+bytes returning `None` without consuming anything and without erroring; a frame
+whose body has not all arrived left untouched rather than truncated; the same
+frame complete; and lengths of 0, 7, 1048577, -1 and `i32::MIN` refused rather
+than trusted.
+
+Three poison controls, all firing.
+
+I got the fixture wrong first — asserted `&body[..9]` against a ten-byte
+`user\0alice`. The test failed on its own arithmetic before it could test
+anything, which is the cheap version of this mistake.
+
 ## 0.1.57 — the result-format codes were only ever checked for not panicking
 
 `parse_bind_result_formats` and `format_for` decide whether each output field is

@@ -1066,6 +1066,70 @@ mod tests {
         b.freeze()
     }
 
+    /// The startup frame's boundaries, one of which is exactly the size of an
+    /// `SSLRequest`.
+    ///
+    /// `try_take_startup` is private, so no cargo test reached it and every
+    /// boundary mutant survived — `< 8` to `<= 8`, `< len` to `<= len`, and
+    /// deleting the `!` from the plausibility check. The TLS script exercises
+    /// this path, but `cargo mutants` runs `cargo test` and not scripts, so the
+    /// only coverage was invisible to it.
+    ///
+    /// `<= 8` is the one that matters: an `SSLRequest` is *exactly* eight bytes,
+    /// so that mutant makes the reader wait forever for a ninth and TLS
+    /// negotiation stops working for every client.
+    #[test]
+    fn a_startup_frame_is_taken_only_when_all_of_it_has_arrived() {
+        const SSL_REQUEST: i32 = 80_877_103;
+        let frame = |len: i32, code: i32, tail: &[u8]| {
+            let mut b = BytesMut::new();
+            b.put_i32(len);
+            b.put_i32(code);
+            b.put_slice(tail);
+            b
+        };
+
+        // Exactly eight bytes, which is the whole of an SSLRequest.
+        let mut buf = frame(8, SSL_REQUEST, b"");
+        let got = try_take_startup(&mut buf)
+            .expect("plausible")
+            .expect("complete");
+        assert_eq!(got.code, SSL_REQUEST);
+        assert!(buf.is_empty(), "the frame is consumed");
+
+        // Seven bytes cannot be a frame yet, and must not be an error.
+        let mut buf = BytesMut::from(&b"\0\0\0\x08\x04\xd2\x16"[..]);
+        assert!(try_take_startup(&mut buf).expect("not an error").is_none());
+        assert_eq!(buf.len(), 7, "and nothing is consumed");
+
+        // A frame whose body has not all arrived: wait, do not truncate.
+        let mut buf = frame(24, 196_608, b"user\0");
+        assert!(try_take_startup(&mut buf).expect("plausible").is_none());
+        assert_eq!(buf.len(), 13, "still untouched");
+
+        // The same frame, complete.
+        let mut buf = frame(24, 196_608, b"user\0alice\0\0\0\0\0\0");
+        let got = try_take_startup(&mut buf)
+            .expect("plausible")
+            .expect("complete");
+        assert_eq!(got.code, 196_608);
+        assert_eq!(&got.body[..10], b"user\0alice");
+
+        // Implausible lengths are refused rather than trusted. A length below
+        // the header cannot describe a frame, and a megabyte cap keeps a
+        // hostile client from making us wait on a length it will never send.
+        for len in [0_i32, 7, 1_048_577, -1, i32::MIN] {
+            let mut buf = frame(len, 196_608, b"padding padding padding");
+            assert!(
+                try_take_startup(&mut buf).is_err(),
+                "length {len} should be refused"
+            );
+        }
+        // And the two ends of the plausible range are accepted.
+        let mut buf = frame(8, SSL_REQUEST, b"");
+        assert!(try_take_startup(&mut buf).is_ok(), "8 is plausible");
+    }
+
     /// A `Bind` carrying parameters, so the skip logic is exercised rather than
     /// stepped over.
     fn bind_body(params: &[&[u8]], result_formats: &[i16]) -> Bytes {
