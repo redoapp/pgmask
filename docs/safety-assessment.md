@@ -12,7 +12,9 @@ reason to distrust it is at the bottom.
 proxy enforces and the one the campaigns test. It holds under sustained
 generated load across both wire protocols and both engines.
 
-Everything below qualifies that sentence.
+Everything below qualifies that sentence, and the first qualification is the
+largest: it is a statement about what the proxy *sends to a client*, not about
+where the data is. The proxy reads unmasked rows to mask them.
 
 ## What is explicitly not guaranteed
 
@@ -45,6 +47,23 @@ recognise a card number, an IBAN or a national ID under any name, so a catalog
 drafted before it had no chance of proposing anything for a column holding
 them. A name match was the only route, and the operator would see nothing at
 all for a column called `col_7`.
+
+**The connection between the proxy and the database.** This qualifies the one
+sentence at the top, so it belongs here rather than only in the README's
+limitations list, where it was.
+
+The proxy reads *unmasked* rows from the backend and masks them on the way out.
+So everything the guarantee is about is in the clear on that hop, and
+`backend_tls` offers two settings: `disable`, plaintext, and `require`,
+encryption without certificate verification — libpq's `sslmode=require`, with
+libpq's caveat. The verifier is named `AcceptAnyServerCert` rather than
+something reassuring.
+
+Neither setting authenticates the database. An attacker who can intercept the
+proxy-to-database connection reads every masked column unmasked, and no rule in
+`analysis.rs` has anything to say about it. Put the proxy where that hop is
+short — a unix socket, a sidecar, a private subnet — and treat "pgmask is in
+front of it" as saying nothing about network position.
 
 **Byte-length side channels.** `pg_column_size(email)` returns an exact length
 and no detector covers it. The campaigns generate the shape and cannot tell
@@ -352,11 +371,14 @@ comment that asserted the case could not happen.
   and a name-based backstop. Read on 2026-08-11 and nothing found; that is a
   reading, not a proof, and it is the module to hand a second reviewer first if
   you intend to turn it on.
-- The 2026-08-11 disclosure fixes are exercised against **Postgres only**. The
-  fixes themselves are wire-protocol level and engine-agnostic — `LEAKY_FIELDS`,
-  the withheld message, the `ParameterStatus` allowlist — but the *triggers* were
-  written as Postgres SQL, and CockroachDB v25 has its own PL/pgSQL and its own
-  reportable GUCs. The cross-engine differential covers the masking paths and
-  not these. Worth an hour from whoever picks this up.
+- The 2026-08-11 diagnostic fixes are now exercised on **both engines**, for the
+  channels each engine actually has. Measured on CockroachDB v25.4.14: `DO $$ …
+  RAISE EXCEPTION $$` carries a value exactly as on Postgres, and so do
+  `USING DETAIL` and `USING HINT`. Two do *not* exist there — a `CONTEXT`
+  traceback is never emitted (a DO-block error reports only `LOCATION`) and
+  `EXECUTE` inside PL/pgSQL is unimplemented, so the dynamic-SQL route into a
+  traceback has nowhere to start; and `scram_iterations` is not a CockroachDB
+  setting. Those are not checked there, because checking a channel the engine
+  cannot open is how a suite comes to report 43 of 43 while testing nothing.
 - Production validation has never run: the intended host is a read-write primary
   and no read-only path has been supplied.

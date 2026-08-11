@@ -17,3 +17,14 @@ crates/proxy/src/catalog.rs:341:5: replace default_refresh_min_seconds -> u64 wi
 crates/proxy/src/catalog.rs:341:5: replace default_refresh_min_seconds -> u64 with 1
 crates/proxy/src/catalog.rs:344:5: replace default_metrics_seconds -> u64 with 0
 crates/proxy/src/catalog.rs:344:5: replace default_metrics_seconds -> u64 with 1
+crates/proxy/src/catalog.rs:739:9: replace Snapshot::has_system_relations -> bool with true
+crates/proxy/src/catalog.rs:739:9: replace Snapshot::has_system_relations -> bool with false
+crates/proxy/src/catalog.rs:739:9: delete ! in Snapshot::has_system_relations
+crates/proxy/src/catalog.rs:747:9: replace Snapshot::name_of -> Option<&str> with None
+crates/proxy/src/catalog.rs:747:9: replace Snapshot::name_of -> Option<&str> with Some("")
+crates/proxy/src/catalog.rs:747:9: replace Snapshot::name_of -> Option<&str> with Some("xyzzy")
+crates/proxy/src/catalog.rs:765:9: replace Snapshot::len -> usize with 0
+crates/proxy/src/catalog.rs:765:9: replace Snapshot::len -> usize with 1
+crates/proxy/src/catalog.rs:769:9: replace Snapshot::is_empty -> bool with true
+crates/proxy/src/catalog.rs:769:9: replace Snapshot::is_empty -> bool with false
+crates/proxy/src/catalog.rs:880:13: delete field types from struct Self expression in Catalog::resolve

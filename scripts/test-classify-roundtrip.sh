@@ -158,6 +158,109 @@ echo "==> and it serves what nobody classified"
 check "an unclassified column arrives intact" "Bay 14" "$(q 'SELECT warehouse_label FROM rt.people')"
 check "and a classified one still does not"  "***"    "$(q 'SELECT city FROM rt.people')"
 
+# --- the drift gate ---------------------------------------------------------
+#
+# `--check` is what operators are told to put in CI, and nothing exercised it:
+# no script ran it and it cannot be unit-tested, because it compares a catalog
+# file against a live schema. Its contract has two halves and they fail for
+# different reasons —
+#
+#   * a column in the database with no rule is masked by default-deny, so it is
+#     safe and invisible; somebody finds out when a dashboard goes blank
+#   * a rule matching nothing means the relation or column was renamed or
+#     dropped: not a leak, but a rule you believe is protecting you and is not
+#
+# — so both are checked, and the no-drift case first, or "it exits non-zero" is
+# equally consistent with it always exiting non-zero.
+echo "==> the drift gate"
+chk() {
+  DSN="postgres://postgres@127.0.0.1:$PG_PORT/postgres" \
+    ./target/debug/classify --check --catalog /tmp/pgmask-roundtrip.toml --schema rt 2>&1
+  return $?
+}
+
+# A freshly generated catalog does NOT pass `--check`, and that is the contract
+# rather than a bug — but it is worth having written down, because the first
+# version of this test asserted the opposite and I believed it.
+#
+# `classify` deliberately emits no rule for a column it judged ordinary: it says
+# in its own report that nothing verified those are harmless, so emitting
+# `mask = "none"` would be the tool claiming exactly what it disclaims.
+# `--check` then reports them as undecided, because default-deny masks them and
+# somebody finds out when a dashboard goes blank.
+#
+# So the operator's loop is: generate, decide the ordinary columns explicitly,
+# and only then is `--check` green. Both ends of that are checked here.
+chk >/tmp/pgmask-roundtrip.check 2>&1
+status=$?
+if [[ $status != 0 ]]; then
+  printf '  \033[32mPASS\033[0m  %s\n' "a fresh catalog reports the columns nobody has decided"
+  pass=$((pass + 1))
+else
+  printf '  \033[31mFAIL\033[0m  %s\n' "a fresh catalog passed --check with ordinary columns unruled"
+  fail=$((fail + 1))
+fi
+check "and it names them"  "no rule"        "$(cat /tmp/pgmask-roundtrip.check)"
+
+# Decide them, the way an operator would, and it goes green.
+{
+  echo
+  for col in id warehouse_label; do
+    echo "[[column]]"
+    echo "relation = \"rt.people\""
+    echo "column   = \"$col\""
+    echo "mask     = \"none\""
+    echo
+  done
+} >>/tmp/pgmask-roundtrip.toml
+chk >/tmp/pgmask-roundtrip.check 2>&1
+if [[ $? == 0 ]]; then
+  printf '  \033[32mPASS\033[0m  %s\n' "and goes green once they are decided explicitly"
+  pass=$((pass + 1))
+else
+  printf '  \033[31mFAIL\033[0m  %s\n' "explicit none rules did not satisfy --check"
+  head -8 /tmp/pgmask-roundtrip.check; fail=$((fail + 1))
+fi
+
+# Nothing to compare is not "no drift". `--check --schema <typo>` exited 0 with
+# "every column has a rule and every rule matches", because zero columns satisfy
+# every assertion vacuously — in the command operators put in CI.
+DSN="postgres://postgres@127.0.0.1:$PG_PORT/postgres" \
+  ./target/debug/classify --check --catalog /tmp/pgmask-roundtrip.toml \
+  --schema definitely_not_a_schema >/tmp/pgmask-roundtrip.check 2>&1
+if [[ $? != 0 ]]; then
+  printf '  \033[32mPASS\033[0m  %s\n' "an empty schema fails rather than passing vacuously"
+  pass=$((pass + 1))
+else
+  printf '  \033[31mFAIL\033[0m  %s\n' "a schema that does not exist reported no drift"
+  fail=$((fail + 1))
+fi
+
+podman exec -i "$CONTAINER" psql -U postgres -q \
+  -c "ALTER TABLE rt.people ADD COLUMN home_email text;" 2>/dev/null
+chk >/tmp/pgmask-roundtrip.check 2>&1
+status=$?
+if [[ $status != 0 ]]; then
+  printf '  \033[32mPASS\033[0m  %s\n' "a new column in the database fails the build"
+  pass=$((pass + 1))
+else
+  printf '  \033[31mFAIL\033[0m  %s\n' "a new column did not fail the build"; fail=$((fail + 1))
+fi
+check "and it names the column" "home_email" "$(cat /tmp/pgmask-roundtrip.check)"
+
+podman exec -i "$CONTAINER" psql -U postgres -q \
+  -c "ALTER TABLE rt.people DROP COLUMN home_email;" \
+  -c "ALTER TABLE rt.people RENAME COLUMN email TO email_address;" 2>/dev/null
+chk >/tmp/pgmask-roundtrip.check 2>&1
+status=$?
+if [[ $status != 0 ]]; then
+  printf '  \033[32mPASS\033[0m  %s\n' "a rule that matches nothing fails the build"
+  pass=$((pass + 1))
+else
+  printf '  \033[31mFAIL\033[0m  %s\n' "a renamed column did not fail the build"; fail=$((fail + 1))
+fi
+check "and it names the rule that went stale" "email" "$(cat /tmp/pgmask-roundtrip.check)"
+
 echo
 echo "-----------------------"
 printf 'passed %d, failed %d\n' "$pass" "$fail"

@@ -1,5 +1,118 @@
 # Changelog
 
+## 0.1.52 — the gate's containers, and three failures I caused myself
+
+Two gate runs failed the same three container-heavy suites — the Postgres
+version matrix, the generated campaign, and the CockroachDB shape run. The
+detail, once I stopped overwriting it:
+
+```text
+==> poison run: masking removed, the oracle must fire
+FAIL: masking was removed and nothing leaked — the oracle is not working
+Error: connecting to the proxy … Connection refused
+```
+
+The negative control could not reach its proxy, because I was running
+`test-cockroach.sh` and `test-classify-roundtrip.sh` in another shell while the
+gate ran. Those tear down proxies and containers *by name*, so each run was
+destroying the other's. Both "failures" were mine.
+
+The gate already refuses to start when a `pgmask` process is running, for this
+exact reason. It did not look at containers, which is the other resource its
+teardown assumes it owns. Now it does, split by how bad the collision is:
+
+* **Hard** — a container the gate removes by name. It will be destroyed mid-use
+  and its ports taken. Refuse.
+* **Soft** — any other `pgmask-*` container, `pgmask-mutants` being the case.
+  Not destroyed, but competing for CPU and disk, and a campaign will take a
+  machine's worth of both. Say so, so the next person does not read timing
+  failures as real.
+
+`pgmask-roundtrip` was also missing from the per-suite teardown list, which is
+how a leftover container from a `KEEP=1` run made the round-trip suite fail with
+"postgres did not start" — its own previous container held the port.
+
+WHAT I DID WRONG, BEYOND THE OBVIOUS
+
+I redirected both gate runs to the same `/tmp/gate.log`, so the second destroyed
+the first's evidence and I spent a round unable to diagnose a three-suite
+failure that the gate had already printed in full.
+
+And I edited `scripts/test-all.sh` while a run was executing from it. Bash reads
+a script incrementally; the hazard is documented in this repository for
+`test-mutants.sh` and I walked into it anyway.
+
+## 0.1.51 — the drift gate passed on a schema that did not exist
+
+`classify --check` is what operators are told to put in CI. Nothing exercised
+it: no script ran it, and it cannot be unit-tested because it compares a catalog
+file against a live schema.
+
+```console
+$ classify --check --catalog catalog.toml --schema definitely_not_a_schema
+catalog catalog.toml vs schema `definitely_not_a_schema`
+  columns in the database   0
+  rules covering them       0
+
+every column has a rule and every rule matches. no drift.
+$ echo $?
+0
+```
+
+Zero columns satisfy every assertion it makes, vacuously. A typo in a schema
+name, a DSN pointing at the wrong database, or a migration that dropped the
+schema all produced a green build that checked nothing — the exact failure this
+tool exists to catch, in the tool itself. It fails now, and says which of the
+two causes to look for.
+
+AND A FRESHLY GENERATED CATALOG DOES NOT PASS IT
+
+Found by writing the test and asserting the opposite, which I believed.
+
+`classify` emits no rule for a column it judged ordinary — deliberately, because
+its own report says nothing verified those are harmless, so `mask = "none"`
+would be the tool claiming exactly what it disclaims. `--check` then reports
+them as undecided, because default-deny masks them and somebody finds out when a
+dashboard goes blank.
+
+So the loop is: generate, decide the ordinary columns explicitly, then put
+`--check` in CI. Both ends are now asserted, and `docs/responsibilities.md` says
+so where the `--check` instructions are, rather than leaving an operator to
+discover it from a red build on day one.
+
+Eight checks on the drift gate, where there were none. The round-trip suite is
+18.
+
+## 0.1.50 — the diagnostic fixes, on the other engine
+
+The 2026-08-11 disclosures were found and fixed against Postgres. The fixes are
+wire-level — `LEAKY_FIELDS`, the withheld primary message, the `ParameterStatus`
+allowlist — so they *should* hold for anything speaking the protocol. "Should"
+is the reason this exists.
+
+Measured on CockroachDB v25.4.14, and the answer is not uniform:
+
+| channel | on CockroachDB |
+|---|---|
+| `RAISE EXCEPTION '%', (SELECT email …)` | carries the value, same as Postgres |
+| `RAISE NOTICE` | same |
+| `USING DETAIL`, `USING HINT` | carry the value |
+| `CONTEXT` traceback | **does not exist** — a DO-block error reports only `LOCATION` |
+| dynamic SQL into a traceback | **unimplemented** — `stmt_dyn_exec is not yet supported` |
+| `scram_iterations` | not a CockroachDB setting |
+
+Five checks added for the four channels that are real, each with a control
+proving the engine carries the value before asserting the proxy does not — the
+suite is 43 checks now, up from 34.
+
+The three that do not exist are deliberately *not* checked. A refute against a
+channel the engine cannot open passes forever and reads as coverage, which is
+the failure this project has hit more often than any other.
+
+Two poison controls: restoring the error-message leak fails two checks, and
+dropping `D` and `H` from `LEAKY_FIELDS` fails two more. Dropping `W` fails
+nothing here, correctly — there is no `CONTEXT` on this engine to drop.
+
 ## 0.1.49 — the TOML classify writes had never been given to pgmask
 
 `classify --check` compares an existing catalog against a live schema.

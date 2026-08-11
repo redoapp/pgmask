@@ -111,7 +111,17 @@ classify --check --catalog catalog.toml --schema public
 ```
 
 Exits non-zero when a column exists in the database but not in your catalog, or
-when a rule in your catalog no longer matches anything. Run it in CI against a
+when a rule in your catalog no longer matches anything — **and when the schema
+has no columns at all**, which used to report "no drift" and exit 0. A typo in
+the schema name or a DSN pointing at the wrong database produced a green build
+that checked nothing.
+
+**A freshly generated catalog does not pass `--check`, and that is deliberate.**
+`classify` emits no rule for a column it judged ordinary, because its own report
+says nothing verified those are harmless and a `mask = "none"` would be the tool
+claiming what it disclaims. `--check` then reports them as undecided. The loop
+is: generate, decide the ordinary columns explicitly with `mask = "none"`, then
+put `--check` in CI. It is green from that point on, and a new column breaks it. Run it in CI against a
 schema-equivalent database and a new column fails the build instead of silently
 turning up blank in someone's dashboard.
 

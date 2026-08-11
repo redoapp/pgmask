@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 
 /// How sure we are, which decides whether a human has to look.
@@ -659,6 +659,24 @@ async fn main() -> Result<()> {
 fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
     let config =
         pgmask::catalog::Config::load(path).with_context(|| format!("loading catalog {path}"))?;
+
+    // Nothing to compare is not "no drift".
+    //
+    // `--check --schema definitely_not_a_schema` exited 0 with "every column has
+    // a rule and every rule matches", because zero columns satisfy every
+    // assertion below vacuously. This is the command operators are told to put
+    // in CI, so a typo in a schema name, a DSN pointing at the wrong database,
+    // or a migration that dropped the schema all produced a green build that
+    // checked nothing — the exact failure this tool exists to catch, in the tool
+    // itself.
+    if proposals.is_empty() {
+        bail!(
+            "schema `{schema}` has no columns, so there is nothing to check.\n\
+             This is a failure and not a pass: every assertion `--check` makes is \
+             vacuously true over an empty schema.\n\
+             Check the schema name and that DSN points at the database you mean."
+        );
+    }
 
     // Every rule's effective mask, and every column's current type, so a
     // migration that changes a type fails the build instead of refusing

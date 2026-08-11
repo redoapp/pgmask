@@ -177,3 +177,33 @@ crates/proxy/src/catalog.rs:608:9: replace Snapshot::statement_references_masked
 crates/proxy/src/catalog.rs:608:9: replace Snapshot::statement_references_masked_column -> bool with false
 crates/proxy/src/catalog.rs:617:9: replace Snapshot::inspection_references_masked_column -> bool with true
 crates/proxy/src/catalog.rs:617:9: replace Snapshot::inspection_references_masked_column -> bool with false
+crates/proxy/src/catalog.rs:622:20: delete ! in Snapshot::inspection_references_masked_column
+crates/proxy/src/catalog.rs:626:45: delete ! in Snapshot::inspection_references_masked_column
+crates/proxy/src/catalog.rs:639:60: replace == with != in Snapshot::inspection_references_masked_column
+crates/proxy/src/catalog.rs:664:9: replace Snapshot::statement_mentions_user_relation -> bool with true
+crates/proxy/src/catalog.rs:664:9: replace Snapshot::statement_mentions_user_relation -> bool with false
+crates/proxy/src/catalog.rs:672:9: replace Snapshot::inspection_mentions_user_relation -> bool with true
+crates/proxy/src/catalog.rs:672:9: replace Snapshot::inspection_mentions_user_relation -> bool with false
+crates/proxy/src/catalog.rs:679:45: replace == with != in Snapshot::inspection_mentions_user_relation
+crates/proxy/src/catalog.rs:686:9: replace Snapshot::statement_touches_opaque_view -> bool with true
+crates/proxy/src/catalog.rs:686:9: replace Snapshot::statement_touches_opaque_view -> bool with false
+crates/proxy/src/catalog.rs:694:9: replace Snapshot::inspection_touches_opaque_view -> bool with true
+crates/proxy/src/catalog.rs:694:9: replace Snapshot::inspection_touches_opaque_view -> bool with false
+crates/proxy/src/catalog.rs:709:12: delete ! in Snapshot::inspection_touches_opaque_view
+crates/proxy/src/catalog.rs:727:9: replace Snapshot::insert_opaque_view_for_test with ()
+crates/proxy/src/catalog.rs:732:9: replace Snapshot::is_system_relation -> bool with true
+crates/proxy/src/catalog.rs:732:9: replace Snapshot::is_system_relation -> bool with false
+crates/proxy/src/catalog.rs:743:9: replace Snapshot::lookup -> Option<&Classification> with None
+crates/proxy/src/catalog.rs:751:9: replace Snapshot::knows_relation -> bool with true
+crates/proxy/src/catalog.rs:751:9: replace Snapshot::knows_relation -> bool with false
+crates/proxy/src/catalog.rs:758:9: replace Snapshot::classified_column_names -> HashSet<&str> with HashSet::new()
+crates/proxy/src/catalog.rs:758:9: replace Snapshot::classified_column_names -> HashSet<&str> with HashSet::from_iter([""])
+crates/proxy/src/catalog.rs:758:9: replace Snapshot::classified_column_names -> HashSet<&str> with HashSet::from_iter(["xyzzy"])
+crates/proxy/src/catalog.rs:798:9: replace Snapshot::relation_columns_for_test with ()
+crates/proxy/src/catalog.rs:806:9: replace Snapshot::set_role_mask_for_test with ()
+crates/proxy/src/catalog.rs:815:9: replace Snapshot::insert_for_test with ()
+crates/proxy/src/catalog.rs:865:9: replace Catalog::resolve -> Result<Self> with Ok(Default::default())
+crates/proxy/src/catalog.rs:870:12: delete ! in Catalog::resolve
+crates/proxy/src/catalog.rs:879:13: delete field rules from struct Self expression in Catalog::resolve
+crates/proxy/src/catalog.rs:881:13: delete field dsn from struct Self expression in Catalog::resolve
+crates/proxy/src/catalog.rs:882:13: delete field snapshot from struct Self expression in Catalog::resolve

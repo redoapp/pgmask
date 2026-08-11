@@ -41,6 +41,42 @@ if pgrep -x pgmask >/dev/null 2>&1; then
   echo "      Wait for it, or stop it deliberately, then re-run."
   exit 1
 fi
+
+# The same hazard through the other resource this script assumes it owns, split
+# by how bad it is.
+#
+# HARD: a container this gate *removes by name* is one it will destroy mid-use.
+# That corrupts the other session and takes its ports, and the two failures
+# compound. Refuse.
+#
+# SOFT: any other `pgmask-*` container is not going to be destroyed, but it is
+# competing for CPU and disk — `pgmask-mutants` is the case, and a campaign will
+# happily take a machine's worth of both. A gate run failed three
+# container-heavy suites under exactly that load, so this says so rather than
+# letting the next person read the failures as real.
+OWNED="pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb \
+pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference \
+pgmask-grouping-postgres pgmask-grouping-cockroach pgmask-roundtrip"
+running=$(podman ps --filter 'name=pgmask-' --format '{{.Names}}' 2>/dev/null)
+clash=""
+other=""
+for c in $running; do
+  case " $OWNED " in
+    *" $c "*) clash="$clash $c" ;;
+    *)        other="$other $c" ;;
+  esac
+done
+if [ -n "$clash" ]; then
+  echo "FAIL: this gate removes these containers by name and one is already running:"
+  echo "       $clash"
+  echo "      Another session is mid-run. Stop it deliberately, then re-run."
+  exit 1
+fi
+if [ -n "$other" ]; then
+  echo "NOTE: other pgmask containers are running and will compete for CPU and disk:"
+  echo "       $other"
+  echo "      Timing-sensitive suites report false failures under that load."
+fi
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
@@ -60,7 +96,10 @@ run() { # name command...
   # Containers and proxies from a previous suite are the most common cause of a
   # confusing failure, so every suite starts from nothing.
   pkill -f 'target/release/pgmask' 2>/dev/null
-  podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference pgmask-grouping-postgres pgmask-grouping-cockroach >/dev/null 2>&1
+  # Every container name any suite uses. `pgmask-roundtrip` was missing, and a
+  # leftover one from a KEEP=1 run made the round-trip suite fail with "postgres
+  # did not start" — the port was taken by its own previous container.
+  podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference pgmask-grouping-postgres pgmask-grouping-cockroach pgmask-roundtrip >/dev/null 2>&1
   sleep 1
   local out
   out=$("$@" 2>&1)

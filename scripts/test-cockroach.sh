@@ -156,6 +156,39 @@ refute "uuid is pseudonymised"              "00000000-0000-4000-8000-00000000010
 # CockroachDB cluster cannot be correlated.
 check "pseudonym matches the Postgres value" "8dedb655.invalid" "$(p 'SELECT email FROM demo.customers WHERE id = 42')"
 
+# The 2026-08-11 diagnostic disclosures, on the other engine.
+#
+# The fixes are wire-level — LEAKY_FIELDS, the withheld primary message, the
+# ParameterStatus allowlist — so they should hold whatever speaks the protocol.
+# "Should" is why this is here. CockroachDB v25 has its own PL/pgSQL, and
+# measured on v25.4.14 it accepts `DO $$ ... RAISE EXCEPTION $$` and returns the
+# text, exactly as Postgres does. `scram_iterations` does not exist here, so
+# that one channel is Postgres-only and is not checked.
+raise_do="DO \$\$ BEGIN RAISE EXCEPTION '%', (SELECT email FROM demo.customers WHERE id = 1); END \$\$;"
+check  "CockroachDB really does carry it in an error" "user1@example.com" "$(d "$raise_do")"
+refute "...and the proxy withholds it"                "user1@example.com" "$(p "$raise_do")"
+check  "...replacing the message"        "error text withheld by pgmask" "$(p "$raise_do")"
+
+notice_do="DO \$\$ BEGIN RAISE NOTICE '%', (SELECT email FROM demo.customers WHERE id = 1); END \$\$;"
+refute "a notice does not carry it either" "user1@example.com" "$(p "$notice_do")"
+
+# The LEAKY_FIELDS channels that exist on this engine. Measured on v25.4.14:
+# `USING DETAIL` and `USING HINT` carry a value, and the `CONTEXT` traceback does
+# not exist — a DO-block error reports only LOCATION, and `EXECUTE` inside
+# PL/pgSQL is unimplemented ("stmt_dyn_exec is not yet supported"), so the
+# dynamic-SQL route into a traceback has nowhere to start. Checking `W` here
+# would be checking a channel the engine cannot open.
+for f in DETAIL HINT; do
+  usingf="DO \$\$ BEGIN RAISE EXCEPTION 'boom' USING $f = \
+    (SELECT email FROM demo.customers WHERE id = 1); END \$\$;"
+  check  "CockroachDB really does carry it in $f" "user1@example.com" "$(d "$usingf")"
+  refute "...and the proxy drops $f"              "user1@example.com" "$(p "$usingf")"
+done
+
+appname="DO \$\$ BEGIN PERFORM set_config('application_name', \
+  (SELECT email FROM demo.customers WHERE id = 1), false); END \$\$;"
+refute "application_name is not reportable here either" "user1@example.com" "$(p "$appname")"
+
 check "expression is refused"  "no column provenance" "$(p 'SELECT lower(email) FROM demo.customers LIMIT 1')"
 check "COPY TO STDOUT refused" "COPY ... TO is not permitted" "$(p 'COPY (SELECT email FROM demo.customers LIMIT 1) TO STDOUT')"
 check "count(*) is served"     "500" "$(p 'SELECT count(*) FROM demo.customers')"
