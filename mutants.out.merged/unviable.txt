@@ -1,6 +1,7 @@
-crates/proxy/src/analysis.rs:1123:21: delete match arm Some(NodeEnum::String(s)) in group_item_columns::walk
-crates/proxy/src/analysis.rs:1466:33: delete match arm NodeEnum::String(s) in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1485:29: delete match arm NodeEnum::String(s) in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:668:5: replace classify -> Safety with Default::default()
+crates/proxy/src/analysis.rs:1154:21: delete match arm Some(NodeEnum::String(s)) in group_item_columns::walk
+crates/proxy/src/analysis.rs:1497:33: delete match arm NodeEnum::String(s) in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1516:29: delete match arm NodeEnum::String(s) in reads_only_server_metadata_inspected
 crates/proxy/src/catalog.rs:329:5: replace default_unclassified -> Unclassified with Default::default()
 crates/proxy/src/catalog.rs:332:5: replace default_opaque -> Opaque with Default::default()
 crates/proxy/src/catalog.rs:335:5: replace default_unclassified_mask -> Mask with Default::default()
@@ -9,14 +10,3 @@ crates/proxy/src/catalog.rs:351:5: replace default_system_catalogs -> SystemCata
 crates/proxy/src/catalog.rs:355:5: replace default_summaries -> Summaries with Default::default()
 crates/proxy/src/catalog.rs:360:9: replace Config::load -> Result<Self> with Ok(Default::default())
 crates/proxy/src/catalog.rs:505:9: replace Snapshot::lookup_by_name -> Option<&Classification> with Some(Box::leak(Box::new(Default::default())))
-crates/proxy/src/catalog.rs:743:9: replace Snapshot::lookup -> Option<&Classification> with Some(Box::leak(Box::new(Default::default())))
-crates/proxy/src/catalog.rs:1027:5: replace classify -> Result<Classification> with Ok(Default::default())
-crates/proxy/src/lineage.rs:119:9: replace <impl CatalogProvider for SnapshotCatalog>::resolve_column -> Option<TableRef> with Some(Default::default())
-crates/proxy/src/lineage.rs:160:5: replace resolve -> Vec<Verdict> with vec![Default::default()]
-crates/proxy/src/lineage.rs:170:5: replace resolve_inspected -> Vec<Verdict> with vec![Default::default()]
-crates/proxy/src/protocol.rs:118:9: replace Message::from_frame -> Self with Default::default()
-crates/proxy/src/protocol.rs:200:9: replace FrameReader<R>::read_message -> Result<Option<Message>> with Ok(Some(Default::default()))
-crates/proxy/src/protocol.rs:223:9: replace FrameReader<R>::try_buffered_message -> Result<Option<Message>> with Ok(Some(Default::default()))
-crates/proxy/src/protocol.rs:228:9: replace FrameReader<R>::read_startup -> Result<Option<StartupPacket>> with Ok(Some(Default::default()))
-crates/proxy/src/protocol.rs:245:5: replace try_take_message -> Result<Option<Message>> with Ok(Some(Default::default()))
-crates/proxy/src/protocol.rs:265:5: replace try_take_startup -> Result<Option<StartupPacket>> with Ok(Some(Default::default()))

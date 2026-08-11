@@ -192,6 +192,17 @@ method reads as infallible.
   `unmasked_row`'s assert is exactly the `!changed` condition its only caller
   tests — so nothing rests on them at runtime. If a call site is ever added,
   that stops being true silently.
+* **The metrics endpoint and the logs carry no row data.** `metrics_listen`
+  opens unauthenticated HTTP, so it is worth being specific: every label is a
+  `&'static str` from a fixed `Cause` enum, so no column name, value or
+  statement text can reach it — which also means no unbounded cardinality.
+  `classify_opaque` takes an output field *name* and returns a `Cause`, so the
+  name does not escape into a label either. Of the sixteen log calls in the
+  proxy, the ones that could carry something carry counts, the connecting
+  principal, and errors from the proxy's own I/O and its own catalog queries
+  against `pg_catalog`. A backend `ErrorResponse` is forwarded as bytes and
+  never becomes a logged Rust error, which matters now that its text can be
+  SQL-chosen.
 * **The partial-reveal masks have length floors.** `partial`, `inner`, `outer`
   and `range` each mask outright rather than passing through a value too short
   for their window, and `range` was the one whose absence of that guard had
@@ -341,5 +352,11 @@ comment that asserted the case could not happen.
   and a name-based backstop. Read on 2026-08-11 and nothing found; that is a
   reading, not a proof, and it is the module to hand a second reviewer first if
   you intend to turn it on.
+- The 2026-08-11 disclosure fixes are exercised against **Postgres only**. The
+  fixes themselves are wire-protocol level and engine-agnostic — `LEAKY_FIELDS`,
+  the withheld message, the `ParameterStatus` allowlist — but the *triggers* were
+  written as Postgres SQL, and CockroachDB v25 has its own PL/pgSQL and its own
+  reportable GUCs. The cross-engine differential covers the masking paths and
+  not these. Worth an hour from whoever picks this up.
 - Production validation has never run: the intended host is a read-write primary
   and no read-only path has been supplied.

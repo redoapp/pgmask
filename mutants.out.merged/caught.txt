@@ -1,3 +1,28 @@
+crates/proxy/src/analysis.rs:645:9: replace && with || in positions_are_trustworthy
+crates/proxy/src/analysis.rs:625:9: replace && with || in positions_are_trustworthy
+crates/proxy/src/analysis.rs:624:9: replace && with || in positions_are_trustworthy
+crates/proxy/src/analysis.rs:623:9: replace && with || in positions_are_trustworthy
+crates/proxy/src/analysis.rs:622:15: replace == with != in positions_are_trustworthy
+crates/proxy/src/analysis.rs:625:37: replace == with != in positions_are_trustworthy
+crates/proxy/src/analysis.rs:645:12: delete ! in positions_are_trustworthy
+crates/proxy/src/analysis.rs:650:5: replace target_is_star -> bool with true
+crates/proxy/src/analysis.rs:650:5: replace target_is_star -> bool with false
+crates/proxy/src/analysis.rs:670:9: delete match arm NodeEnum::AConst(_) in classify
+crates/proxy/src/analysis.rs:677:9: delete match arm NodeEnum::SqlvalueFunction(_) in classify
+crates/proxy/src/analysis.rs:680:9: delete match arm NodeEnum::TypeCast(cast) in classify
+crates/proxy/src/analysis.rs:685:9: delete match arm NodeEnum::FuncCall(call) in classify
+crates/proxy/src/analysis.rs:807:9: delete match arm NodeEnum::AExpr(expr) in classify
+crates/proxy/src/analysis.rs:828:9: delete match arm NodeEnum::CaseExpr(case) in classify
+crates/proxy/src/analysis.rs:851:9: delete match arm NodeEnum::CoalesceExpr(c) in classify
+crates/proxy/src/analysis.rs:692:74: replace && with || in classify
+crates/proxy/src/analysis.rs:692:45: replace && with || in classify
+crates/proxy/src/analysis.rs:693:39: replace && with || in classify
+crates/proxy/src/analysis.rs:693:31: replace && with || in classify
+crates/proxy/src/analysis.rs:693:16: delete ! in classify
+crates/proxy/src/analysis.rs:699:36: replace && with || in classify
+crates/proxy/src/analysis.rs:709:30: replace && with || in classify
+crates/proxy/src/analysis.rs:709:38: replace == with != in classify
+crates/proxy/src/analysis.rs:712:16: delete ! in classify
 crates/proxy/src/analysis.rs:742:36: replace && with || in classify
 crates/proxy/src/analysis.rs:764:36: replace && with || in classify
 crates/proxy/src/analysis.rs:775:60: replace && with || in classify
@@ -21,98 +46,99 @@ crates/proxy/src/analysis.rs:903:5: replace grouping_may_reference -> Option<Vec
 crates/proxy/src/analysis.rs:903:5: replace grouping_may_reference -> Option<Vec<String>> with Some(vec![])
 crates/proxy/src/analysis.rs:903:5: replace grouping_may_reference -> Option<Vec<String>> with Some(vec![String::new()])
 crates/proxy/src/analysis.rs:903:5: replace grouping_may_reference -> Option<Vec<String>> with Some(vec!["xyzzy".into()])
-crates/proxy/src/analysis.rs:917:9: replace grouping_may_reference::walk -> Option<()> with None
-crates/proxy/src/analysis.rs:917:9: replace grouping_may_reference::walk -> Option<()> with Some(())
-crates/proxy/src/analysis.rs:917:18: replace > with < in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:922:13: delete match arm NodeEnum::ColumnRef(column) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:943:13: delete match arm NodeEnum::AConst(constant) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:966:13: delete match arm NodeEnum::TypeCast(cast) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:967:13: delete match arm NodeEnum::CollateClause(c) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:968:13: delete match arm NodeEnum::AExpr(expr) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:977:13: delete match arm NodeEnum::BoolExpr(expr) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:983:13: delete match arm NodeEnum::CoalesceExpr(expr) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:989:13: delete match arm NodeEnum::MinMaxExpr(expr) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:995:13: delete match arm NodeEnum::NullTest(test) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:996:13: delete match arm NodeEnum::BooleanTest(test) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:997:13: delete match arm NodeEnum::FuncCall(call) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:1010:13: delete match arm NodeEnum::CaseExpr(expr) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:1026:13: delete match arm NodeEnum::GroupingSet(set) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:1032:13: delete match arm NodeEnum::RowExpr(row) in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:930:57: replace == with != in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:936:28: delete ! in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:936:88: replace == with != in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:953:20: delete ! in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:1000:24: delete ! in grouping_may_reference::walk
-crates/proxy/src/analysis.rs:1069:5: replace aggregate_argument_is_grouped -> bool with true
-crates/proxy/src/analysis.rs:1069:5: replace aggregate_argument_is_grouped -> bool with false
-crates/proxy/src/analysis.rs:1083:17: delete match arm Some(NodeEnum::String(s)) in aggregate_argument_is_grouped
-crates/proxy/src/analysis.rs:1104:5: replace group_item_columns -> Option<()> with None
-crates/proxy/src/analysis.rs:1104:5: replace group_item_columns -> Option<()> with Some(())
-crates/proxy/src/analysis.rs:1117:9: replace group_item_columns::walk -> Option<()> with None
-crates/proxy/src/analysis.rs:1117:9: replace group_item_columns::walk -> Option<()> with Some(())
-crates/proxy/src/analysis.rs:1117:18: replace > with < in group_item_columns::walk
-crates/proxy/src/analysis.rs:1121:13: delete match arm NodeEnum::ColumnRef(column) in group_item_columns::walk
-crates/proxy/src/analysis.rs:1189:13: delete match arm NodeEnum::AConst(constant) in group_item_columns::walk
-crates/proxy/src/analysis.rs:1214:13: delete match arm NodeEnum::GroupingSet(set) in group_item_columns::walk
-crates/proxy/src/analysis.rs:1223:13: delete match arm NodeEnum::RowExpr(row) in group_item_columns::walk
-crates/proxy/src/analysis.rs:1151:31: replace && with || in group_item_columns::walk
-crates/proxy/src/analysis.rs:1151:54: replace == with != in group_item_columns::walk
-crates/proxy/src/analysis.rs:1156:28: delete ! in group_item_columns::walk
-crates/proxy/src/analysis.rs:1156:88: replace == with != in group_item_columns::walk
-crates/proxy/src/analysis.rs:1245:5: replace coarse_unit_literal -> bool with true
-crates/proxy/src/analysis.rs:1245:5: replace coarse_unit_literal -> bool with false
-crates/proxy/src/analysis.rs:1249:9: delete match arm Some(pg_query::protobuf::a_const::Val::Sval(s)) in coarse_unit_literal
-crates/proxy/src/analysis.rs:1262:5: replace function_name -> Option<String> with None
-crates/proxy/src/analysis.rs:1262:5: replace function_name -> Option<String> with Some(String::new())
-crates/proxy/src/analysis.rs:1262:5: replace function_name -> Option<String> with Some("xyzzy".into())
-crates/proxy/src/analysis.rs:1266:9: delete match arm NodeEnum::String(s) in function_name
-crates/proxy/src/analysis.rs:1375:5: replace reads_only_server_metadata -> bool with true
-crates/proxy/src/analysis.rs:1375:5: replace reads_only_server_metadata -> bool with false
-crates/proxy/src/analysis.rs:1379:5: replace reads_only_server_metadata_inspected -> bool with true
-crates/proxy/src/analysis.rs:1379:5: replace reads_only_server_metadata_inspected -> bool with false
-crates/proxy/src/analysis.rs:1384:36: replace != with == in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1414:13: delete match arm NodeRef::RangeVar(v) in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1452:13: delete match arm NodeRef::RangeFunction(range) in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1477:13: delete match arm NodeRef::FuncCall(call) in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1425:24: delete ! in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1428:50: replace && with || in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1428:34: replace != with == in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1428:60: replace != with == in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1470:28: delete ! in reads_only_server_metadata_inspected
-crates/proxy/src/analysis.rs:1533:5: replace provenance_is_trustworthy -> bool with true
-crates/proxy/src/analysis.rs:1533:5: replace provenance_is_trustworthy -> bool with false
-crates/proxy/src/analysis.rs:1537:5: replace provenance_is_trustworthy_inspected -> bool with true
-crates/proxy/src/analysis.rs:1537:5: replace provenance_is_trustworthy_inspected -> bool with false
-crates/proxy/src/analysis.rs:1545:36: replace != with == in provenance_is_trustworthy_inspected
-crates/proxy/src/analysis.rs:1548:5: delete ! in provenance_is_trustworthy_inspected
-crates/proxy/src/analysis.rs:1553:13: delete match arm NodeRef::SelectStmt(select) in provenance_is_trustworthy_inspected
-crates/proxy/src/analysis.rs:1554:29: replace != with == in provenance_is_trustworthy_inspected
-crates/proxy/src/analysis.rs:1565:5: replace is_parseable -> bool with true
-crates/proxy/src/analysis.rs:1565:5: replace is_parseable -> bool with false
-crates/proxy/src/analysis.rs:1590:5: replace referenced_identifiers -> Option<Vec<String>> with None
-crates/proxy/src/analysis.rs:1590:5: replace referenced_identifiers -> Option<Vec<String>> with Some(vec![])
-crates/proxy/src/analysis.rs:1590:5: replace referenced_identifiers -> Option<Vec<String>> with Some(vec![String::new()])
-crates/proxy/src/analysis.rs:1590:5: replace referenced_identifiers -> Option<Vec<String>> with Some(vec!["xyzzy".into()])
-crates/proxy/src/analysis.rs:1594:5: replace scan_identifiers -> Option<Vec<String>> with None
-crates/proxy/src/analysis.rs:1594:5: replace scan_identifiers -> Option<Vec<String>> with Some(vec![])
-crates/proxy/src/analysis.rs:1594:5: replace scan_identifiers -> Option<Vec<String>> with Some(vec![String::new()])
-crates/proxy/src/analysis.rs:1594:5: replace scan_identifiers -> Option<Vec<String>> with Some(vec!["xyzzy".into()])
-crates/proxy/src/analysis.rs:1625:21: replace && with || in scan_identifiers
-crates/proxy/src/analysis.rs:1624:21: replace && with || in scan_identifiers
-crates/proxy/src/analysis.rs:1623:28: delete ! in scan_identifiers
-crates/proxy/src/analysis.rs:1624:69: replace || with && in scan_identifiers
-crates/proxy/src/analysis.rs:1624:74: replace == with != in scan_identifiers
-crates/proxy/src/analysis.rs:1627:66: replace || with && in scan_identifiers
-crates/proxy/src/analysis.rs:1627:54: replace || with && in scan_identifiers
-crates/proxy/src/analysis.rs:1627:59: replace == with != in scan_identifiers
-crates/proxy/src/analysis.rs:1627:71: replace == with != in scan_identifiers
-crates/proxy/src/analysis.rs:1640:5: replace every_relation_is_qualified -> bool with true
-crates/proxy/src/analysis.rs:1640:5: replace every_relation_is_qualified -> bool with false
-crates/proxy/src/analysis.rs:1644:5: replace every_relation_is_qualified_inspected -> bool with true
-crates/proxy/src/analysis.rs:1644:5: replace every_relation_is_qualified_inspected -> bool with false
-crates/proxy/src/analysis.rs:1659:13: delete match arm NodeRef::RangeVar(v) in every_relation_is_qualified_inspected
-crates/proxy/src/analysis.rs:1660:42: replace || with && in every_relation_is_qualified_inspected
-crates/proxy/src/analysis.rs:1660:17: delete ! in every_relation_is_qualified_inspected
+crates/proxy/src/analysis.rs:924:9: replace grouping_may_reference::walk -> Option<()> with None
+crates/proxy/src/analysis.rs:924:9: replace grouping_may_reference::walk -> Option<()> with Some(())
+crates/proxy/src/analysis.rs:924:18: replace > with < in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:929:13: delete match arm NodeEnum::ColumnRef(column) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:950:13: delete match arm NodeEnum::AConst(constant) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:973:13: delete match arm NodeEnum::TypeCast(cast) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:974:13: delete match arm NodeEnum::CollateClause(c) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:975:13: delete match arm NodeEnum::AExpr(expr) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:984:13: delete match arm NodeEnum::BoolExpr(expr) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:990:13: delete match arm NodeEnum::CoalesceExpr(expr) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:996:13: delete match arm NodeEnum::MinMaxExpr(expr) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1002:13: delete match arm NodeEnum::NullTest(test) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1003:13: delete match arm NodeEnum::BooleanTest(test) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1004:13: delete match arm NodeEnum::FuncCall(call) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1034:13: delete match arm NodeEnum::CaseExpr(expr) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1050:13: delete match arm NodeEnum::GroupingSet(set) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1056:13: delete match arm NodeEnum::RowExpr(row) in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:937:57: replace == with != in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:943:28: delete ! in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:943:88: replace == with != in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:960:20: delete ! in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1024:24: delete ! in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1093:5: replace aggregate_argument_is_grouped -> bool with true
+crates/proxy/src/analysis.rs:1093:5: replace aggregate_argument_is_grouped -> bool with false
+crates/proxy/src/analysis.rs:1107:17: delete match arm Some(NodeEnum::String(s)) in aggregate_argument_is_grouped
+crates/proxy/src/analysis.rs:1128:5: replace group_item_columns -> Option<()> with None
+crates/proxy/src/analysis.rs:1128:5: replace group_item_columns -> Option<()> with Some(())
+crates/proxy/src/analysis.rs:1148:9: replace group_item_columns::walk -> Option<()> with None
+crates/proxy/src/analysis.rs:1148:9: replace group_item_columns::walk -> Option<()> with Some(())
+crates/proxy/src/analysis.rs:1148:18: replace > with < in group_item_columns::walk
+crates/proxy/src/analysis.rs:1152:13: delete match arm NodeEnum::ColumnRef(column) in group_item_columns::walk
+crates/proxy/src/analysis.rs:1220:13: delete match arm NodeEnum::AConst(constant) in group_item_columns::walk
+crates/proxy/src/analysis.rs:1245:13: delete match arm NodeEnum::GroupingSet(set) in group_item_columns::walk
+crates/proxy/src/analysis.rs:1254:13: delete match arm NodeEnum::RowExpr(row) in group_item_columns::walk
+crates/proxy/src/analysis.rs:1182:31: replace && with || in group_item_columns::walk
+crates/proxy/src/analysis.rs:1182:54: replace == with != in group_item_columns::walk
+crates/proxy/src/analysis.rs:1187:28: delete ! in group_item_columns::walk
+crates/proxy/src/analysis.rs:1187:88: replace == with != in group_item_columns::walk
+crates/proxy/src/analysis.rs:1276:5: replace coarse_unit_literal -> bool with true
+crates/proxy/src/analysis.rs:1276:5: replace coarse_unit_literal -> bool with false
+crates/proxy/src/analysis.rs:1280:9: delete match arm Some(pg_query::protobuf::a_const::Val::Sval(s)) in coarse_unit_literal
+crates/proxy/src/analysis.rs:1293:5: replace function_name -> Option<String> with None
+crates/proxy/src/analysis.rs:1293:5: replace function_name -> Option<String> with Some(String::new())
+crates/proxy/src/analysis.rs:1293:5: replace function_name -> Option<String> with Some("xyzzy".into())
+crates/proxy/src/analysis.rs:1297:9: delete match arm NodeEnum::String(s) in function_name
+crates/proxy/src/analysis.rs:1406:5: replace reads_only_server_metadata -> bool with true
+crates/proxy/src/analysis.rs:1406:5: replace reads_only_server_metadata -> bool with false
+crates/proxy/src/analysis.rs:1410:5: replace reads_only_server_metadata_inspected -> bool with true
+crates/proxy/src/analysis.rs:1410:5: replace reads_only_server_metadata_inspected -> bool with false
+crates/proxy/src/analysis.rs:1415:36: replace != with == in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1445:13: delete match arm NodeRef::RangeVar(v) in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1483:13: delete match arm NodeRef::RangeFunction(range) in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1508:13: delete match arm NodeRef::FuncCall(call) in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1456:24: delete ! in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1459:50: replace && with || in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1459:34: replace != with == in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1459:60: replace != with == in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1501:28: delete ! in reads_only_server_metadata_inspected
+crates/proxy/src/analysis.rs:1564:5: replace provenance_is_trustworthy -> bool with true
+crates/proxy/src/analysis.rs:1564:5: replace provenance_is_trustworthy -> bool with false
+crates/proxy/src/analysis.rs:1568:5: replace provenance_is_trustworthy_inspected -> bool with true
+crates/proxy/src/analysis.rs:1568:5: replace provenance_is_trustworthy_inspected -> bool with false
+crates/proxy/src/analysis.rs:1576:36: replace != with == in provenance_is_trustworthy_inspected
+crates/proxy/src/analysis.rs:1579:5: delete ! in provenance_is_trustworthy_inspected
+crates/proxy/src/analysis.rs:1584:13: delete match arm NodeRef::SelectStmt(select) in provenance_is_trustworthy_inspected
+crates/proxy/src/analysis.rs:1585:29: replace != with == in provenance_is_trustworthy_inspected
+crates/proxy/src/analysis.rs:1596:5: replace is_parseable -> bool with true
+crates/proxy/src/analysis.rs:1596:5: replace is_parseable -> bool with false
+crates/proxy/src/analysis.rs:1621:5: replace referenced_identifiers -> Option<Vec<String>> with None
+crates/proxy/src/analysis.rs:1621:5: replace referenced_identifiers -> Option<Vec<String>> with Some(vec![])
+crates/proxy/src/analysis.rs:1621:5: replace referenced_identifiers -> Option<Vec<String>> with Some(vec![String::new()])
+crates/proxy/src/analysis.rs:1621:5: replace referenced_identifiers -> Option<Vec<String>> with Some(vec!["xyzzy".into()])
+crates/proxy/src/analysis.rs:1625:5: replace scan_identifiers -> Option<Vec<String>> with None
+crates/proxy/src/analysis.rs:1625:5: replace scan_identifiers -> Option<Vec<String>> with Some(vec![])
+crates/proxy/src/analysis.rs:1625:5: replace scan_identifiers -> Option<Vec<String>> with Some(vec![String::new()])
+crates/proxy/src/analysis.rs:1625:5: replace scan_identifiers -> Option<Vec<String>> with Some(vec!["xyzzy".into()])
+crates/proxy/src/analysis.rs:1656:21: replace && with || in scan_identifiers
+crates/proxy/src/analysis.rs:1655:21: replace && with || in scan_identifiers
+crates/proxy/src/analysis.rs:1654:28: delete ! in scan_identifiers
+crates/proxy/src/analysis.rs:1655:69: replace || with && in scan_identifiers
+crates/proxy/src/analysis.rs:1655:74: replace == with != in scan_identifiers
+crates/proxy/src/analysis.rs:1658:66: replace || with && in scan_identifiers
+crates/proxy/src/analysis.rs:1658:54: replace || with && in scan_identifiers
+crates/proxy/src/analysis.rs:1658:59: replace == with != in scan_identifiers
+crates/proxy/src/analysis.rs:1658:71: replace == with != in scan_identifiers
+crates/proxy/src/analysis.rs:1671:5: replace every_relation_is_qualified -> bool with true
+crates/proxy/src/analysis.rs:1671:5: replace every_relation_is_qualified -> bool with false
+crates/proxy/src/analysis.rs:1675:5: replace every_relation_is_qualified_inspected -> bool with true
+crates/proxy/src/analysis.rs:1675:5: replace every_relation_is_qualified_inspected -> bool with false
+crates/proxy/src/analysis.rs:1690:13: delete match arm NodeRef::RangeVar(v) in every_relation_is_qualified_inspected
+crates/proxy/src/analysis.rs:1691:42: replace || with && in every_relation_is_qualified_inspected
+crates/proxy/src/analysis.rs:1691:17: delete ! in every_relation_is_qualified_inspected
+crates/proxy/src/catalog.rs:105:9: replace MaskParams::apply_to with ()
 crates/proxy/src/catalog.rs:171:9: replace ColumnRule::key -> (String, String) with (String::new(), String::new())
 crates/proxy/src/catalog.rs:171:9: replace ColumnRule::key -> (String, String) with (String::new(), "xyzzy".into())
 crates/proxy/src/catalog.rs:171:9: replace ColumnRule::key -> (String, String) with ("xyzzy".into(), String::new())
@@ -151,226 +177,3 @@ crates/proxy/src/catalog.rs:608:9: replace Snapshot::statement_references_masked
 crates/proxy/src/catalog.rs:608:9: replace Snapshot::statement_references_masked_column -> bool with false
 crates/proxy/src/catalog.rs:617:9: replace Snapshot::inspection_references_masked_column -> bool with true
 crates/proxy/src/catalog.rs:617:9: replace Snapshot::inspection_references_masked_column -> bool with false
-crates/proxy/src/catalog.rs:622:20: delete ! in Snapshot::inspection_references_masked_column
-crates/proxy/src/catalog.rs:626:45: delete ! in Snapshot::inspection_references_masked_column
-crates/proxy/src/catalog.rs:639:60: replace == with != in Snapshot::inspection_references_masked_column
-crates/proxy/src/catalog.rs:664:9: replace Snapshot::statement_mentions_user_relation -> bool with true
-crates/proxy/src/catalog.rs:664:9: replace Snapshot::statement_mentions_user_relation -> bool with false
-crates/proxy/src/catalog.rs:672:9: replace Snapshot::inspection_mentions_user_relation -> bool with true
-crates/proxy/src/catalog.rs:672:9: replace Snapshot::inspection_mentions_user_relation -> bool with false
-crates/proxy/src/catalog.rs:679:45: replace == with != in Snapshot::inspection_mentions_user_relation
-crates/proxy/src/catalog.rs:686:9: replace Snapshot::statement_touches_opaque_view -> bool with true
-crates/proxy/src/catalog.rs:686:9: replace Snapshot::statement_touches_opaque_view -> bool with false
-crates/proxy/src/catalog.rs:694:9: replace Snapshot::inspection_touches_opaque_view -> bool with true
-crates/proxy/src/catalog.rs:694:9: replace Snapshot::inspection_touches_opaque_view -> bool with false
-crates/proxy/src/catalog.rs:709:12: delete ! in Snapshot::inspection_touches_opaque_view
-crates/proxy/src/catalog.rs:727:9: replace Snapshot::insert_opaque_view_for_test with ()
-crates/proxy/src/catalog.rs:732:9: replace Snapshot::is_system_relation -> bool with true
-crates/proxy/src/catalog.rs:732:9: replace Snapshot::is_system_relation -> bool with false
-crates/proxy/src/catalog.rs:743:9: replace Snapshot::lookup -> Option<&Classification> with None
-crates/proxy/src/catalog.rs:751:9: replace Snapshot::knows_relation -> bool with true
-crates/proxy/src/catalog.rs:751:9: replace Snapshot::knows_relation -> bool with false
-crates/proxy/src/catalog.rs:758:9: replace Snapshot::classified_column_names -> HashSet<&str> with HashSet::new()
-crates/proxy/src/catalog.rs:758:9: replace Snapshot::classified_column_names -> HashSet<&str> with HashSet::from_iter([""])
-crates/proxy/src/catalog.rs:758:9: replace Snapshot::classified_column_names -> HashSet<&str> with HashSet::from_iter(["xyzzy"])
-crates/proxy/src/catalog.rs:798:9: replace Snapshot::relation_columns_for_test with ()
-crates/proxy/src/catalog.rs:806:9: replace Snapshot::set_role_mask_for_test with ()
-crates/proxy/src/catalog.rs:815:9: replace Snapshot::insert_for_test with ()
-crates/proxy/src/catalog.rs:865:9: replace Catalog::resolve -> Result<Self> with Ok(Default::default())
-crates/proxy/src/catalog.rs:870:12: delete ! in Catalog::resolve
-crates/proxy/src/catalog.rs:879:13: delete field rules from struct Self expression in Catalog::resolve
-crates/proxy/src/catalog.rs:881:13: delete field dsn from struct Self expression in Catalog::resolve
-crates/proxy/src/catalog.rs:882:13: delete field snapshot from struct Self expression in Catalog::resolve
-crates/proxy/src/catalog.rs:901:9: replace Catalog::generation -> u64 with 1
-crates/proxy/src/catalog.rs:905:9: replace Catalog::snapshot -> Arc<Snapshot> with Arc::new(Default::default())
-crates/proxy/src/catalog.rs:933:9: replace Catalog::refresh -> Result<()> with Ok(())
-crates/proxy/src/catalog.rs:997:9: replace Catalog::run_refresher with ()
-crates/proxy/src/catalog.rs:1105:5: replace opaque_views -> HashSet<String> with HashSet::new()
-crates/proxy/src/catalog.rs:1105:5: replace opaque_views -> HashSet<String> with HashSet::from_iter([String::new()])
-crates/proxy/src/catalog.rs:1105:5: replace opaque_views -> HashSet<String> with HashSet::from_iter(["xyzzy".into()])
-crates/proxy/src/catalog.rs:1108:26: replace match guard !sql.trim().is_empty() with false in opaque_views
-crates/proxy/src/catalog.rs:1108:26: delete ! in opaque_views
-crates/proxy/src/catalog.rs:1108:52: delete ! in opaque_views
-crates/proxy/src/catalog.rs:1137:84: replace == with != in opaque_views
-crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with (String::new(), None)
-crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with (String::new(), Some(""))
-crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with (String::new(), Some("xyzzy"))
-crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with ("xyzzy".into(), None)
-crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with ("xyzzy".into(), Some(""))
-crates/proxy/src/catalog.rs:1153:5: replace sanitize_catalog_dsn -> (String, Option<&'static str>) with ("xyzzy".into(), Some("xyzzy"))
-crates/proxy/src/catalog.rs:1153:8: delete ! in sanitize_catalog_dsn
-crates/proxy/src/catalog.rs:1179:5: replace validate_spec -> Result<()> with Ok(())
-crates/proxy/src/catalog.rs:1180:32: replace match guard spec.bucket < 2 with true in validate_spec
-crates/proxy/src/catalog.rs:1180:32: replace match guard spec.bucket < 2 with false in validate_spec
-crates/proxy/src/catalog.rs:1185:24: replace match guard spec.end <= spec.start with false in validate_spec
-crates/proxy/src/catalog.rs:1194:24: replace match guard spec.keep == 0 with true in validate_spec
-crates/proxy/src/catalog.rs:1194:24: replace match guard spec.keep == 0 with false in validate_spec
-crates/proxy/src/catalog.rs:1180:44: replace < with == in validate_spec
-crates/proxy/src/catalog.rs:1180:44: replace < with > in validate_spec
-crates/proxy/src/catalog.rs:1185:33: replace <= with > in validate_spec
-crates/proxy/src/catalog.rs:1194:34: replace == with != in validate_spec
-crates/proxy/src/catalog.rs:1211:5: replace resolve_snapshot -> Result<Snapshot> with Ok(Default::default())
-crates/proxy/src/catalog.rs:1445:9: delete field unique_keys from struct Snapshot expression in resolve_snapshot
-crates/proxy/src/lineage.rs:119:9: replace <impl CatalogProvider for SnapshotCatalog>::resolve_column -> Option<TableRef> with None
-crates/proxy/src/lineage.rs:139:5: replace qualify -> String with String::new()
-crates/proxy/src/lineage.rs:139:5: replace qualify -> String with "xyzzy".into()
-crates/proxy/src/lineage.rs:160:5: replace resolve -> Vec<Verdict> with vec![]
-crates/proxy/src/lineage.rs:170:5: replace resolve_inspected -> Vec<Verdict> with vec![]
-crates/proxy/src/lineage.rs:191:23: replace != with == in resolve_inspected
-crates/proxy/src/lineage.rs:243:20: delete ! in resolve_inspected
-crates/proxy/src/lineage.rs:269:20: delete ! in resolve_inspected
-crates/proxy/src/lineage.rs:277:25: replace match guard masked_column_in_statement with true in resolve_inspected
-crates/proxy/src/lineage.rs:277:25: replace match guard masked_column_in_statement with false in resolve_inspected
-crates/proxy/src/mask.rs:118:5: replace is_luhn -> bool with true
-crates/proxy/src/mask.rs:118:5: replace is_luhn -> bool with false
-crates/proxy/src/mask.rs:119:21: replace < with > in is_luhn
-crates/proxy/src/mask.rs:127:22: replace == with != in is_luhn
-crates/proxy/src/mask.rs:127:18: replace % with / in is_luhn
-crates/proxy/src/mask.rs:127:18: replace % with + in is_luhn
-crates/proxy/src/mask.rs:132:28: replace > with == in is_luhn
-crates/proxy/src/mask.rs:132:28: replace > with < in is_luhn
-crates/proxy/src/mask.rs:148:5: replace is_iban -> bool with true
-crates/proxy/src/mask.rs:148:5: replace is_iban -> bool with false
-crates/proxy/src/mask.rs:160:5: replace is_phone_length -> bool with true
-crates/proxy/src/mask.rs:160:5: replace is_phone_length -> bool with false
-crates/proxy/src/mask.rs:174:5: replace is_nhs_number -> bool with true
-crates/proxy/src/mask.rs:174:5: replace is_nhs_number -> bool with false
-crates/proxy/src/mask.rs:190:27: replace % with / in is_nhs_number
-crates/proxy/src/mask.rs:190:27: replace % with + in is_nhs_number
-crates/proxy/src/mask.rs:197:11: replace == with != in is_nhs_number
-crates/proxy/src/mask.rs:216:5: replace scrub_free_text -> String with String::new()
-crates/proxy/src/mask.rs:216:5: replace scrub_free_text -> String with "xyzzy".into()
-crates/proxy/src/mask.rs:218:8: delete ! in scrub_free_text
-crates/proxy/src/mask.rs:231:12: delete ! in scrub_free_text
-crates/proxy/src/mask.rs:261:5: replace canonical_uuid -> Option<[u8; 16]> with None
-crates/proxy/src/mask.rs:261:5: replace canonical_uuid -> Option<[u8; 16]> with Some([0; 16])
-crates/proxy/src/mask.rs:261:5: replace canonical_uuid -> Option<[u8; 16]> with Some([1; 16])
-crates/proxy/src/mask.rs:261:15: replace == with != in canonical_uuid
-crates/proxy/src/mask.rs:266:50: replace != with == in canonical_uuid
-crates/proxy/src/mask.rs:391:9: replace MaskSpec::is_passthrough -> bool with true
-crates/proxy/src/mask.rs:391:9: replace MaskSpec::is_passthrough -> bool with false
-crates/proxy/src/mask.rs:391:19: replace == with != in MaskSpec::is_passthrough
-crates/proxy/src/mask.rs:399:9: replace MaskSpec::supports -> bool with true
-crates/proxy/src/mask.rs:399:9: replace MaskSpec::supports -> bool with false
-crates/proxy/src/mask.rs:413:57: replace || with && in MaskSpec::supports
-crates/proxy/src/mask.rs:413:69: replace == with != in MaskSpec::supports
-crates/proxy/src/mask.rs:422:17: delete match arm OID_INT2 | OID_INT4 | OID_INT8 | OID_FLOAT4 | OID_FLOAT8 in MaskSpec::supports
-crates/proxy/src/mask.rs:423:17: delete match arm OID_NUMERIC in MaskSpec::supports
-crates/proxy/src/mask.rs:423:39: replace == with != in MaskSpec::supports
-crates/proxy/src/mask.rs:433:21: replace || with && in MaskSpec::supports
-crates/proxy/src/mask.rs:433:65: replace && with || in MaskSpec::supports
-crates/proxy/src/mask.rs:433:75: replace == with != in MaskSpec::supports
-crates/proxy/src/mask.rs:440:9: replace MaskSpec::unsupported_hint -> &'static str with ""
-crates/proxy/src/mask.rs:440:9: replace MaskSpec::unsupported_hint -> &'static str with "xyzzy"
-crates/proxy/src/mask.rs:489:9: replace Masker::apply -> Result<Option<Bytes>, MaskError> with Ok(None)
-crates/proxy/src/mask.rs:489:9: replace Masker::apply -> Result<Option<Bytes>, MaskError> with Ok(Some(Default::default()))
-crates/proxy/src/mask.rs:489:22: replace == with != in Masker::apply
-crates/proxy/src/mask.rs:492:22: replace == with != in Masker::apply
-crates/proxy/src/mask.rs:495:12: delete ! in Masker::apply
-crates/proxy/src/mask.rs:527:9: replace Masker::digest -> [u8; 32] with [0; 32]
-crates/proxy/src/mask.rs:527:9: replace Masker::digest -> [u8; 32] with [1; 32]
-crates/proxy/src/mask.rs:553:9: replace Masker::pseudonym -> Result<Bytes, MaskError> with Ok(Default::default())
-crates/proxy/src/mask.rs:553:21: replace == with != in Masker::pseudonym
-crates/proxy/src/mask.rs:565:33: replace == with != in Masker::pseudonym
-crates/proxy/src/mask.rs:577:39: delete ! in Masker::pseudonym
-crates/proxy/src/mask.rs:577:60: delete ! in Masker::pseudonym
-crates/proxy/src/mask.rs:584:34: replace match guard !spec.keep_domain with true in Masker::pseudonym
-crates/proxy/src/mask.rs:584:34: replace match guard !spec.keep_domain with false in Masker::pseudonym
-crates/proxy/src/mask.rs:584:34: delete ! in Masker::pseudonym
-crates/proxy/src/mask.rs:586:56: replace / with % in Masker::pseudonym
-crates/proxy/src/mask.rs:611:56: replace / with % in Masker::pseudonym
-crates/proxy/src/mask.rs:611:56: replace / with * in Masker::pseudonym
-crates/proxy/src/mask.rs:621:5: replace text_op -> Bytes with Default::default()
-crates/proxy/src/mask.rs:625:5: replace partial -> String with String::new()
-crates/proxy/src/mask.rs:625:5: replace partial -> String with "xyzzy".into()
-crates/proxy/src/mask.rs:629:68: replace > with == in partial
-crates/proxy/src/mask.rs:629:68: replace > with < in partial
-crates/proxy/src/mask.rs:637:5: replace inner -> String with String::new()
-crates/proxy/src/mask.rs:637:5: replace inner -> String with "xyzzy".into()
-crates/proxy/src/mask.rs:645:24: replace > with == in inner
-crates/proxy/src/mask.rs:645:24: replace > with < in inner
-crates/proxy/src/mask.rs:657:5: replace outer -> String with String::new()
-crates/proxy/src/mask.rs:657:5: replace outer -> String with "xyzzy".into()
-crates/proxy/src/mask.rs:662:13: replace == with != in outer
-crates/proxy/src/mask.rs:670:24: replace > with == in outer
-crates/proxy/src/mask.rs:670:24: replace > with < in outer
-crates/proxy/src/mask.rs:679:5: replace range -> String with String::new()
-crates/proxy/src/mask.rs:679:5: replace range -> String with "xyzzy".into()
-crates/proxy/src/mask.rs:688:14: replace >= with < in range
-crates/proxy/src/mask.rs:695:32: replace && with || in range
-crates/proxy/src/mask.rs:695:23: replace >= with < in range
-crates/proxy/src/mask.rs:695:37: replace < with == in range
-crates/proxy/src/mask.rs:695:37: replace < with > in range
-crates/proxy/src/mask.rs:695:37: replace < with <= in range
-crates/proxy/src/mask.rs:707:5: replace ip_prefix -> String with String::new()
-crates/proxy/src/mask.rs:707:5: replace ip_prefix -> String with "xyzzy".into()
-crates/proxy/src/mask.rs:751:5: replace coarsen -> Result<jiff::civil::Date, MaskError> with Ok(Default::default())
-crates/proxy/src/mask.rs:793:5: replace truncate_date_text -> Result<String, MaskError> with Ok(String::new())
-crates/proxy/src/mask.rs:793:5: replace truncate_date_text -> Result<String, MaskError> with Ok("xyzzy".into())
-crates/proxy/src/mask.rs:812:38: replace && with || in truncate_date_text
-crates/proxy/src/mask.rs:814:54: replace || with && in truncate_date_text
-crates/proxy/src/mask.rs:814:29: replace || with && in truncate_date_text
-crates/proxy/src/mask.rs:814:8: delete ! in truncate_date_text
-crates/proxy/src/mask.rs:814:32: delete ! in truncate_date_text
-crates/proxy/src/mask.rs:814:57: delete ! in truncate_date_text
-crates/proxy/src/mask.rs:817:56: replace > with == in truncate_date_text
-crates/proxy/src/mask.rs:817:56: replace > with < in truncate_date_text
-crates/proxy/src/mask.rs:821:17: replace == with != in truncate_date_text
-crates/proxy/src/mask.rs:841:5: replace truncate_date -> Result<Bytes, MaskError> with Ok(Default::default())
-crates/proxy/src/mask.rs:841:25: replace == with != in truncate_date
-crates/proxy/src/mask.rs:843:15: replace == with != in truncate_date
-crates/proxy/src/mask.rs:854:9: delete match arm OID_DATE in truncate_date
-crates/proxy/src/mask.rs:896:5: replace bucket_number -> Result<Bytes, MaskError> with Ok(Default::default())
-crates/proxy/src/mask.rs:898:15: replace == with != in bucket_number
-crates/proxy/src/mask.rs:925:16: delete ! in bucket_number
-crates/proxy/src/mask.rs:946:9: delete match arm OID_INT2 in bucket_number
-crates/proxy/src/mask.rs:954:9: delete match arm OID_INT4 in bucket_number
-crates/proxy/src/mask.rs:962:9: delete match arm OID_INT8 in bucket_number
-crates/proxy/src/mask.rs:967:9: delete match arm OID_FLOAT4 in bucket_number
-crates/proxy/src/mask.rs:980:9: delete match arm OID_FLOAT8 in bucket_number
-crates/proxy/src/mask.rs:996:5: replace floor_to -> i64 with 0
-crates/proxy/src/mask.rs:996:5: replace floor_to -> i64 with 1
-crates/proxy/src/mask.rs:996:5: replace floor_to -> i64 with -1
-crates/proxy/src/mask.rs:1020:5: replace floor_within -> Option<i64> with None
-crates/proxy/src/mask.rs:1020:5: replace floor_within -> Option<i64> with Some(0)
-crates/proxy/src/mask.rs:1020:5: replace floor_within -> Option<i64> with Some(1)
-crates/proxy/src/mask.rs:1020:5: replace floor_within -> Option<i64> with Some(-1)
-crates/proxy/src/mask.rs:1030:5: replace hex_into with ()
-crates/proxy/src/mask.rs:1031:29: replace >> with << in hex_into
-crates/proxy/src/mask.rs:1031:40: replace & with | in hex_into
-crates/proxy/src/mask.rs:1031:40: replace & with ^ in hex_into
-crates/proxy/src/mask.rs:1038:43: replace < with == in hex_into
-crates/proxy/src/mask.rs:1038:43: replace < with > in hex_into
-crates/proxy/src/mask.rs:1038:43: replace < with <= in hex_into
-crates/proxy/src/mask.rs:1049:5: replace uuid_bytes -> [u8; 16] with [0; 16]
-crates/proxy/src/mask.rs:1049:5: replace uuid_bytes -> [u8; 16] with [1; 16]
-crates/proxy/src/mask.rs:1051:30: replace | with & in uuid_bytes
-crates/proxy/src/mask.rs:1051:22: replace & with | in uuid_bytes
-crates/proxy/src/mask.rs:1051:22: replace & with ^ in uuid_bytes
-crates/proxy/src/mask.rs:1057:5: replace uuid_text -> String with String::new()
-crates/proxy/src/mask.rs:1057:5: replace uuid_text -> String with "xyzzy".into()
-crates/proxy/src/protocol.rs:77:5: replace is_text_family -> bool with true
-crates/proxy/src/protocol.rs:77:5: replace is_text_family -> bool with false
-crates/proxy/src/protocol.rs:124:9: replace Message::encode -> Bytes with Default::default()
-crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![]
-crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![(String::new(), String::new())]
-crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![(String::new(), "xyzzy".into())]
-crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![("xyzzy".into(), String::new())]
-crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![("xyzzy".into(), "xyzzy".into())]
-crates/proxy/src/protocol.rs:195:9: replace FrameReader<R>::saw_eof -> bool with true
-crates/proxy/src/protocol.rs:200:9: replace FrameReader<R>::read_message -> Result<Option<Message>> with Ok(None)
-crates/proxy/src/protocol.rs:245:5: replace try_take_message -> Result<Option<Message>> with Ok(None)
-crates/proxy/src/protocol.rs:249:12: replace < with == in try_take_message
-crates/proxy/src/protocol.rs:249:12: replace < with > in try_take_message
-crates/proxy/src/protocol.rs:249:12: replace < with <= in try_take_message
-crates/proxy/src/protocol.rs:258:18: replace < with == in try_take_message
-crates/proxy/src/protocol.rs:258:18: replace < with > in try_take_message
-crates/proxy/src/protocol.rs:258:18: replace < with <= in try_take_message
-crates/proxy/src/protocol.rs:291:18: replace < with == in read_i16
-crates/proxy/src/protocol.rs:291:18: replace < with > in read_i16
-crates/proxy/src/protocol.rs:298:18: replace < with == in read_i32
-crates/proxy/src/protocol.rs:298:18: replace < with > in read_i32
-crates/proxy/src/protocol.rs:305:5: replace read_cstring -> Option<String> with None
-crates/proxy/src/protocol.rs:305:5: replace read_cstring -> Option<String> with Some(String::new())
-crates/proxy/src/protocol.rs:305:5: replace read_cstring -> Option<String> with Some("xyzzy".into())
-crates/proxy/src/protocol.rs:315:5: replace read_cstring_bytes -> Option<Bytes> with None

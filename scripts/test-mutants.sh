@@ -79,11 +79,21 @@ for _ in $(seq 1 90); do
   podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && break
   sleep 1
 done
-podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 || {
-  echo "FAIL: postgres did not become ready; last lines of its log:"
-  podman logs "$CONTAINER" 2>&1 | tail -10
+if ! podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then
+  # Both halves of the answer, because they are different problems and the
+  # `>/dev/null 2>&1` above hides which one you have. A run failed here with the
+  # container's own log reading `database system is ready to accept connections`
+  # — so the server was up and it was `podman exec` that could not reach it, and
+  # the message said the opposite.
+  echo "FAIL: could not reach postgres in $CONTAINER."
+  echo "--- what pg_isready said (empty means podman exec itself failed) ---"
+  podman exec "$CONTAINER" pg_isready -U postgres 2>&1 | tail -3
+  echo "--- is the container even running? ---"
+  podman ps -a --filter "name=$CONTAINER" --format '{{.Names}} {{.Status}}' 2>&1 | tail -2
+  echo "--- the server's own log ---"
+  podman logs "$CONTAINER" 2>&1 | tail -6
   exit 1
-}
+fi
 
 # Serially, and with the backend reachable: the integration tests rebuild the
 # canary schema in the same database, and without PGMASK_TEST_PG they skip —
