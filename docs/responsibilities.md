@@ -93,7 +93,16 @@ your business.
 
 With `--sample` it reads data, because a column called `notes` full of email
 addresses is exactly what name matching misses. Sampled values are counted
-against a shape check and thrown away — **it never prints a value it read.**
+against a shape check or a checksum — Luhn for card numbers, mod-97 for IBANs,
+the SSA's allocation rules for US Social Security numbers — and thrown away.
+**It never prints a value it read.**
+
+A checksum is what makes that worth running on a column whose name says
+nothing. A shape test matches roughly one string of digits in one; Luhn rejects
+about nine in ten. What content discovery proposes is always `null`, never the
+matched shape's mask: knowing the values are payment instruments does not say
+whether the column is a card, an IBAN or a bank account, and those are treated
+differently. It names the shapes and leaves the narrowing to you.
 
 ## Keeping it current
 

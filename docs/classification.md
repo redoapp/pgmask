@@ -19,9 +19,14 @@ DSN=postgres://… cargo run -p classify --release -- --schema public --sample 2
 
 `--sample` reads data, because a column called `notes` full of email addresses
 is exactly what name matching misses. Sampled values are counted against a
-shape check and dropped inside `sample_column`; only the verdict and the match
-rate are ever printed. A discovery tool that echoed the data it found would be
-self-defeating.
+shape check or a checksum and dropped inside the function that read them —
+`sample_column` when confirming a name match, `sample_shapes` when discovering
+by content. Only the verdict and the match rate are ever printed. A discovery
+tool that echoed the data it found would be self-defeating.
+
+Every detector runs *inside* `sample_shapes` rather than the caller looping over
+a vector of sampled strings, which is what keeps that guarantee local to one
+function. It is also one query per column instead of one per detector.
 
 ## Four verdicts, and only one of them is silence
 

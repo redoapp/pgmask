@@ -51,6 +51,16 @@ if [ -n "$loose" ]; then
   echo "$loose" | sed 's/^/  /'
 fi
 
+# Every `scripts/…` path the documentation names has to exist.
+#
+# Renaming a script is the realistic way documentation goes wrong here — this
+# file was `check-release-metadata.sh` an hour ago. Deliberately narrow: a
+# general "does every backticked path exist" check flags `pg_query.rs`, which is
+# a crate name, and a check that cries wolf gets overridden wholesale.
+for named in $(grep -rhoE 'scripts/[A-Za-z0-9_.-]+\.(sh|py)' README.md CONTRIBUTING.md docs/*.md crates 2>/dev/null | sort -u); do
+  [ -e "$named" ] || note "documentation names $named, which does not exist"
+done
+
 [ "$fail" = 0 ] &&
   echo "repo invariants ok: v$cargo_version, $total entries, descending, seeds tracked"
 exit "$fail"

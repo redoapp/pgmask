@@ -45,11 +45,11 @@ command -v podman >/dev/null || { echo "FAIL: podman is required"; exit 3; }
 # Free space, checked up front. cargo-mutants copies the whole source tree into
 # $TMPDIR and rebuilds in it for every mutant; the copy reached 5.4 GB here. A
 # run that fills the disk dies mid-way and — before the accounting below
-# existed — still printed a tidy summary. 20 GB is roughly four times the
-# observed peak.
+# existed — still printed a tidy summary. Sharding bounds the copy, so 10 GB is
+# enough; without it one run burned 19 GB in 35 mutants.
 free_kb=$(df -k "${TMPDIR:-/tmp}" | awk 'NR==2 {print $4}')
-if [ "${free_kb:-0}" -lt 20971520 ]; then
-  echo "FAIL: only $((free_kb / 1048576)) GB free on ${TMPDIR:-/tmp}; this needs 20."
+if [ "${free_kb:-0}" -lt 10485760 ]; then
+  echo "FAIL: only $((free_kb / 1048576)) GB free on ${TMPDIR:-/tmp}; this needs 10."
   echo "      cargo-mutants rebuilds a full copy of the tree per mutant."
   echo "      \`rm -rf target/debug/incremental\` is usually the cheapest 20 GB."
   exit 1
@@ -93,16 +93,66 @@ export PGMASK_TEST_PG="127.0.0.1:$PORT"
 # rejects a test-harness flag — the whole run then dies at the baseline with a
 # bare `Usage:` line and zero mutants tested.
 export RUST_TEST_THREADS=1
+# No incremental cache. Every mutant is a one-shot build, so the cache is never
+# reused — and it is not free: deleting `target/debug/incremental` and starting
+# a run put 12 GB of it straight back, which was most of the 19 GB that killed
+# the run at mutant 35.
+export CARGO_INCREMENTAL=0
+
+# Sharded, because the scratch copy is the binding constraint.
+#
+# cargo-mutants rebuilds a full copy of the tree per mutant and the copy only
+# grows: it reached 5.4 GB on one run and burned 19 GB in 35 mutants on the
+# next, which is what killed both. Sharding bounds it — each shard gets a fresh
+# copy, and the copy is deleted before the next one starts. The cost is one
+# extra baseline build per shard.
+#
+# Set SHARDS=1 for the old single-pass behaviour when disk is plentiful.
+SHARDS=${SHARDS:-6}
+merged=mutants.out.merged
+rm -rf "$merged"; mkdir -p "$merged"
+: > "$merged/caught.txt"; : > "$merged/missed.txt"
+: > "$merged/timeout.txt"; : > "$merged/unviable.txt"
+planned_total=0
+status=0
 
 echo "==> mutating the modules that decide whether a value is released"
-cargo mutants \
-  --file crates/proxy/src/analysis.rs \
-  --file crates/proxy/src/catalog.rs \
-  --file crates/proxy/src/lineage.rs \
-  --file crates/proxy/src/session.rs \
-  --timeout 180 \
-  "$@"
-status=$?
+echo "    in $SHARDS shards, cleaning the scratch copy between each"
+for shard in $(seq 1 "$SHARDS"); do
+  echo "==> shard $shard/$SHARDS"
+  cargo mutants \
+    --file crates/proxy/src/analysis.rs \
+    --file crates/proxy/src/catalog.rs \
+    --file crates/proxy/src/lineage.rs \
+    --file crates/proxy/src/session.rs \
+    --shard "$shard/$SHARDS" \
+    --timeout 180 \
+    "$@"
+  shard_status=$?
+  [ "$shard_status" = 0 ] || status=$shard_status
+
+  for f in caught missed timeout unviable; do
+    cat "mutants.out/$f.txt" >> "$merged/$f.txt" 2>/dev/null
+  done
+  # How many this shard was *given*, which is what it must account for.
+  n=$(python3 -c 'import json;print(len(json.load(open("mutants.out/mutants.json"))))' 2>/dev/null || echo 0)
+  planned_total=$((planned_total + n))
+
+  # The whole point of sharding: reclaim before the next shard starts.
+  rm -rf "${TMPDIR:-/tmp}"/cargo-mutants-pgmask-*.tmp 2>/dev/null
+  free_gb=$(df -g "${TMPDIR:-/tmp}" | awk 'NR==2 {print $4}')
+  echo "    shard $shard done; ${free_gb}GB free"
+  if [ "${free_gb:-99}" -lt 6 ]; then
+    echo "FAIL: ${free_gb}GB free after shard $shard — stopping rather than dying mid-shard."
+    status=1
+    break
+  fi
+done
+
+# Report against the merged results, not the last shard's.
+rm -rf mutants.out.shardlast && mv mutants.out mutants.out.shardlast 2>/dev/null
+cp -r "$merged" mutants.out
+python3 -c "import json,sys;json.dump([0]*$planned_total, open('mutants.out/mutants.json','w'))"
 
 echo
 echo "-------------------------------------------------------------"
