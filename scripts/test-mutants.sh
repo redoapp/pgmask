@@ -154,8 +154,11 @@ status=0
 # this list for.
 echo "==> mutating the modules that decide whether a value is released"
 echo "    in $SHARDS shards, cleaning the scratch copy between each"
-for shard in $(seq 1 "$SHARDS"); do
-  echo "==> shard $shard/$SHARDS"
+# 0-indexed. cargo-mutants requires k < n, so `seq 1 $SHARDS` asked for shard
+# 20/20 — rejected with "shard k must be less than n" — and never asked for
+# shard 0 at all. Two shards' worth, about a tenth of the campaign, untested.
+for shard in $(seq 0 $((SHARDS - 1))); do
+  echo "==> shard $((shard + 1)) of $SHARDS (--shard $shard/$SHARDS)"
   cargo mutants \
     --file crates/proxy/src/analysis.rs \
     --file crates/proxy/src/catalog.rs \
@@ -175,6 +178,20 @@ for shard in $(seq 1 "$SHARDS"); do
   # How many this shard was *given*, which is what it must account for.
   n=$(python3 -c 'import json;print(len(json.load(open("mutants.out/mutants.json"))))' 2>/dev/null || echo 0)
   planned_total=$((planned_total + n))
+
+  # A shard that produced no mutants did not run, and the accounting at the end
+  # cannot see it: planned and attempted are both zero for it, so the totals
+  # still agree and a campaign missing a tenth of its mutants reports
+  # "814 of 814". That is the exact vacuity that check exists to prevent,
+  # reached through the one case it did not cover — which is how `--shard 20/20`
+  # went unnoticed.
+  if [ "$n" = 0 ]; then
+    echo "FAIL: shard $shard/$SHARDS produced no mutants, so it did not run."
+    echo "      Its zero is invisible to the planned-vs-attempted check at the"
+    echo "      end, which is why this is caught here instead."
+    status=1
+    break
+  fi
 
   # The whole point of sharding: reclaim before the next shard starts.
   rm -rf "${TMPDIR:-/tmp}"/cargo-mutants-pgmask-*.tmp 2>/dev/null

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.55 — the completeness check had the hole it was built to close
+
+The campaign finished and reported `attempted 814 of 814`. It had run 19 shards
+of 20.
+
+```text
+error: invalid value '20/20' for '--shard <SHARD>': shard k must be less than n
+```
+
+`--shard k/n` is 0-indexed. The loop ran `seq 1 $SHARDS`, so **shard 0 was never
+requested** and shard `20/20` was rejected — about a tenth of the mutants, never
+tested. Verified after fixing: shards 0..19 of `analysis.rs` sum to 197, which
+is exactly its unsharded count. The old range summed to less and nothing said so.
+
+WHY THE ACCOUNTING MISSED IT
+
+This is the check added in 0.1.39 after two runs reported a fifth of a campaign
+as a whole one. It compares mutants planned against mutants attempted, summed
+across shards — and a shard that fails to start contributes **zero to both
+sides**. The totals agree, the run reads as complete, and the one case the check
+cannot see is the case that happened.
+
+So the count is now checked per shard, at the point where a zero is still
+attributable, and the message says why it is caught there rather than at the
+end.
+
+A guard against vacuous success, with a vacuous success in it. Third time in
+this project that the instrument and the defect have been the same shape.
+
+WHAT THE PARTIAL RUN SAYS ANYWAY
+
+550 caught, 215 missed, 12 timed out, 37 unviable, over 90% of the mutant set
+with nothing else on the machine — so the 12 timeouts are real rather than
+contention. The survivors are worth triaging and are not a complete list; the
+assessment says so.
+
 ## 0.1.54 — and the disclosure count, including the one I got wrong fixing it
 
 The README said "what six disclosures were found in a single day" for four

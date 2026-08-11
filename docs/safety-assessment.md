@@ -333,8 +333,15 @@ comment that asserted the case could not happen.
 ## Still unverified
 
 - Nine findings from an internal audit, mostly documentation overstating code.
-- **Mutation coverage is unknown, and the number previously quoted here was
-  wrong.** Two runs died part-way — the second on a full disk — and both printed
+- **Mutation coverage: one complete-looking run, actually 19 shards of 20.**
+  550 caught, 215 missed, 12 timed out, 37 unviable — but `--shard k/n` is
+  0-indexed and the loop ran `1..20`, so shard 0 was never requested and shard
+  `20/20` was rejected outright. About a tenth of the campaign never ran, and
+  the accounting still printed "814 of 814" because a shard that fails to start
+  contributes zero to both sides of the comparison. Fixed, with a per-shard
+  check, but no complete run has finished yet and the 215 survivors are from
+  90% of the mutant set.
+- *(historical)* **The number previously quoted here was wrong.** Two runs died part-way — the second on a full disk — and both printed
   their four outcome counts and nothing else, so "45 survivors" was carried
   here as a finding when 200 of 493 mutants had never been attempted. The
   script now compares planned against attempted and refuses to report a partial
