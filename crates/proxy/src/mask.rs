@@ -129,6 +129,8 @@ fn is_luhn(candidate: &str) -> bool {
                 // most 18 and the fold-back at least 1. The saturating forms
                 // state that bound rather than relying on it going unchecked.
                 let doubled = d.saturating_mul(2);
+                // `> 9` versus `>= 9` is an equivalent mutant and the campaign
+                // reports it: `doubled` is always even, so it is never 9.
                 if doubled > 9 {
                     doubled.saturating_sub(9)
                 } else {
@@ -2176,6 +2178,20 @@ mod scrub_validator_tests {
         assert!(is_luhn("4111111111111111"));
         assert!(is_luhn("5500 0000 0000 0004"));
         assert!(!is_luhn("4111111111111112"));
+
+        // The 13-digit floor, from both sides, with numbers that are
+        // Luhn-valid at each length so only the bound can decide them.
+        //
+        // This matters more here than the same bound does in `classify`.
+        // `Scrub` reveals by default — a gap in a detector is a value left in
+        // the text — so `< 13` relaxed to `<= 13` stops redacting the shorter
+        // Visa and Diners formats and leaves them in a note a human reads.
+        assert!(is_luhn("4111111111119"), "13 digits is a card");
+        assert!(
+            !is_luhn("411111111117"),
+            "12 is below the floor, Luhn or not"
+        );
+        assert!(scrub_free_text("pay 4111111111119 now").contains("<CARD>"));
         assert!(is_nhs_number("9434765919"));
         assert!(!is_nhs_number("9434765910"));
         assert!(!is_nhs_number("123456789"));

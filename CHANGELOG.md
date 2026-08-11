@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.60 — the Luhn floor, where a relaxed bound leaves a card in the text
+
+`is_luhn` is the `Scrub` mask's card detector, and `Scrub` is the one mask that
+**reveals by default** — its own doc says a gap is a disclosure rather than a
+utility cost. Its `digits.len() < 13` floor had no test on either side.
+
+`<= 13` stops redacting the 13-digit Visa and 14-digit Diners formats, which
+then stay in a support note a human reads. Pinned with numbers that are
+Luhn-valid at 12 and 13 digits, so only the bound can decide them, plus the
+`scrub_free_text` level so the redaction itself is checked and not just the
+predicate.
+
+AND ONE THAT IS GENUINELY EQUIVALENT
+
+The campaign also reports `doubled > 9` relaxed to `>= 9`. It cannot matter:
+`doubled` is `d * 2` for a digit, so it is always even and never 9. Predicted
+before running the control, and the control agrees — it is the only one of the
+three that does not fire. Written on the line rather than left for the next run
+to re-raise.
+
+Three predictions, three confirmations: `<= 13` a real gap in the disclosing
+direction, `== 13` a behaviour change in the safe direction, `>= 9` equivalent.
+
 ## 0.1.59 — a pseudonym whose local part was never looked at
 
 Both email branches of `Masker::pseudonym` slice
