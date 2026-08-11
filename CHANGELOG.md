@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.38 — four relations that were never a plain table
+
+Partitioned tables, inheritance, domain-typed columns and generated columns had
+no fixture. Each breaks a different assumption the plan binding makes, and each
+had been probed once by hand and written down as a gap rather than pinned.
+
+They are in the canary schema now, carrying the same canary as everything else,
+under two tests. One sweeps sixteen statements and insists nothing escapes. The
+other records what each statement *does* — served or refused — because a sweep
+where every query errors is also canary-free, and only the second test tells the
+two apart.
+
+TWO OF MY PREDICTIONS WERE WRONG
+
+I expected a **domain** column to be refused: `is_text_family` has never heard
+of an OID allocated at `CREATE DOMAIN` time, so I reasoned the masker would
+reject the result set and the operator would be pushed toward marking the column
+allowed to get their query back. It masks normally. Postgres reports the *base*
+type OID in `RowDescription`, so the masker never sees the domain.
+
+I also expected the partitioned parent to be the hazard, since a
+`RowDescription` for a read through the parent carries the partition's table
+OID. A read through the parent is masked by the parent's rule. Reading the
+partition *by name* falls to default-deny — safe, and a utility cost the
+operator can see.
+
+Inheritance matches partitioning in both directions, including the child's row
+arriving through the parent, masked. A cast off a domain column is refused for
+losing provenance, which is the general rule and nothing to do with domains.
+
+Nothing was found. That is the result, and it is worth having as a fixture
+rather than as a memory of having once checked: four poison controls — allowing
+the column on each parent, and allowing the generated column — fail both tests,
+so the fixture is live rather than accidentally quiet.
+
 ## 0.1.37 — a checksum is what makes content discovery worth running
 
 CONTENT DISCOVERY COULD NOT SEE A CARD NUMBER

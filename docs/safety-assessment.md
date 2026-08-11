@@ -132,7 +132,12 @@ comment that asserted the case could not happen.
   detectors are not affected — those are specific enough to name — but the
   proposal is still `null` for all of them, because a card and a bank account
   are not distinguishable by content and the operator has to say which.
-- No fixture exercises partitioned tables, inheritance, domains or generated
-  columns.
+- Partitioned tables, inheritance, domain-typed columns and generated columns
+  now have a canary fixture and two tests: one that nothing escapes through
+  them, one recording what each actually does so the first cannot pass by
+  refusing everything. Four poison controls, all firing. Two of my predictions
+  were wrong — a domain masks normally, because Postgres reports the base type
+  OID in `RowDescription`, and a partitioned parent is masked by the parent's
+  rule. Reading a partition by name falls to default-deny.
 - Production validation has never run: the intended host is a read-write primary
   and no read-only path has been supplied.

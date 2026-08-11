@@ -411,6 +411,134 @@ async fn no_canary_escapes_across_every_path() -> Result<()> {
     Ok(())
 }
 
+/// Partitions, inherited children, domain-typed columns and generated columns.
+///
+/// Each one breaks a different assumption the plan binding makes, and none of
+/// them had a fixture — the gap was recorded in `docs/safety-assessment.md` and
+/// probed once by hand rather than pinned. Whatever the proxy decides to do
+/// with them, the canary must not come out.
+///
+/// The catalog classifies the parent relations only, which is what an operator
+/// would write, and leaves the generated column unclassified. What each query
+/// actually does — mask, refuse, or serve — is recorded by the assertions in
+/// `relations_that_are_not_plain_tables_behave_as_documented`; this one only
+/// insists nothing escapes.
+#[tokio::test]
+async fn relations_that_are_not_plain_tables_stay_masked() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    for sql in [
+        // Partitioned: through the parent, and through the partition directly.
+        "SELECT * FROM canary.events",
+        "SELECT email FROM canary.events",
+        "SELECT * FROM canary.events_2024",
+        "SELECT email FROM canary.events_2024",
+        // Inheritance: parent (which includes children), child alone, and
+        // ONLY the parent.
+        "SELECT * FROM canary.people",
+        "SELECT email FROM canary.people",
+        "SELECT * FROM canary.staff",
+        "SELECT email FROM canary.staff",
+        "SELECT email FROM ONLY canary.people",
+        // A domain-typed column, and the same column cast back to text.
+        "SELECT * FROM canary.contacts",
+        "SELECT email FROM canary.contacts",
+        "SELECT email::text FROM canary.contacts",
+        // A generated column: the value again, under another name.
+        "SELECT * FROM canary.derived",
+        "SELECT email_copy FROM canary.derived",
+        "SELECT email, email_copy FROM canary.derived",
+    ] {
+        if client.simple_query(sql).await.is_err() {
+            assert_no_canary(&client, sql);
+            client = RawClient::connect(proxy.addr, DB).await?;
+            continue;
+        }
+        assert_no_canary(&client, sql);
+    }
+
+    assert_no_canary(&client, "non-plain-table sweep");
+    Ok(())
+}
+
+/// What each of those four constructs actually does, rather than what I assumed.
+///
+/// Written after watching them, and two guesses were wrong:
+///
+/// * A **domain** column masks normally. Postgres reports the *base* type OID
+///   in `RowDescription`, not the domain's, so the masker never sees the
+///   domain at all. I had expected `is_text_family` to reject an OID allocated
+///   at `CREATE DOMAIN` time and refuse the result set.
+/// * A read through a **partitioned parent** is masked by the parent's rule.
+///   Reading the partition directly falls to default-deny, because the catalog
+///   has nothing under that name — safe, and the utility cost an operator will
+///   notice and can fix.
+///
+/// Inheritance behaves the same way as partitioning in both directions,
+/// including the child's row coming back through the parent, masked. A cast off
+/// a domain column is refused for losing provenance, which is the general rule
+/// and not special to domains.
+///
+/// This exists so the sweep above cannot pass by refusing everything: a
+/// refusal and a masked row are both canary-free, and only this distinguishes
+/// them.
+#[tokio::test]
+async fn relations_that_are_not_plain_tables_behave_as_documented() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Served,
+        Refused,
+    }
+
+    for (sql, want) in [
+        // Classified through the parent: served, masked.
+        ("SELECT * FROM canary.events", Outcome::Served),
+        ("SELECT email FROM canary.events", Outcome::Served),
+        // The partition by name is not in the catalog. Default-deny still
+        // serves the row; the classified column comes back masked.
+        ("SELECT email FROM canary.events_2024", Outcome::Served),
+        // Inheritance, including the child's row through the parent.
+        ("SELECT email FROM canary.people", Outcome::Served),
+        ("SELECT email FROM ONLY canary.people", Outcome::Served),
+        ("SELECT email FROM canary.staff", Outcome::Served),
+        // A domain-typed column: masked like any other text column.
+        ("SELECT email FROM canary.contacts", Outcome::Served),
+        // A cast loses provenance, and that is refused — the general rule.
+        ("SELECT email::text FROM canary.contacts", Outcome::Refused),
+        // A generated column is a second copy of a classified value under an
+        // unclassified name. Default-deny is the only thing covering it.
+        ("SELECT email_copy FROM canary.derived", Outcome::Served),
+        (
+            "SELECT email, email_copy FROM canary.derived",
+            Outcome::Served,
+        ),
+    ] {
+        let before = client.received_text().len();
+        client.simple_query(sql).await?;
+        let text = client.received_text();
+        let reply = text.get(before..).unwrap_or_default();
+        let got = if reply.contains("pgmask:") {
+            Outcome::Refused
+        } else {
+            Outcome::Served
+        };
+        assert_eq!(got, want, "{sql}\n{reply}");
+        assert_no_canary(&client, sql);
+        if got == Outcome::Refused {
+            client = RawClient::connect(proxy.addr, DB).await?;
+        }
+    }
+    Ok(())
+}
+
 // --- The rescue path --------------------------------------------------------
 //
 // analysis.rs turns refusals into passthroughs for expressions positively

@@ -107,6 +107,47 @@ $$ LANGUAGE sql STABLE;
 CREATE FUNCTION canary.emails() RETURNS TABLE (email text) AS $$
   SELECT email FROM canary.subjects;
 $$ LANGUAGE sql STABLE;
+
+-- --- Relations that are not a plain table -----------------------------------
+--
+-- Four constructs that each break an assumption the plan binding makes, and
+-- none of which had a fixture. Every one carries the same canary, so an escape
+-- through any of them fails the sweep.
+
+-- Declarative partitioning. A `RowDescription` for a query against the *parent*
+-- carries the partition's table OID, so a catalog rule written against the
+-- parent's name is looked up under a relation the operator never wrote down.
+CREATE TABLE canary.events (
+  id       int,
+  email    text,
+  occurred date
+) PARTITION BY RANGE (occurred);
+CREATE TABLE canary.events_2024 PARTITION OF canary.events
+  FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+INSERT INTO canary.events VALUES (1, 'CANARY_EMAIL_a1b2c3', '2024-06-01');
+
+-- Inheritance: the same question in the older spelling, and unlike a partition
+-- a child can be queried on its own and carries columns of its own.
+CREATE TABLE canary.people (id int, email text);
+CREATE TABLE canary.staff (badge text) INHERITS (canary.people);
+INSERT INTO canary.people VALUES (1, 'CANARY_EMAIL_a1b2c3');
+INSERT INTO canary.staff VALUES (2, 'CANARY_EMAIL_a1b2c3', 'B-1');
+
+-- A domain. The column's type OID is the domain's own, allocated at creation
+-- time, not `text`'s — so every `is_text_family` test in the masker sees a type
+-- it has never heard of.
+CREATE DOMAIN canary.email_address AS text;
+CREATE TABLE canary.contacts (id int, email canary.email_address);
+INSERT INTO canary.contacts VALUES (1, 'CANARY_EMAIL_a1b2c3');
+
+-- A generated column: a second copy of a classified value under a name the
+-- operator has to have thought of separately.
+CREATE TABLE canary.derived (
+  id         int,
+  email      text,
+  email_copy text GENERATED ALWAYS AS (email || '') STORED
+);
+INSERT INTO canary.derived (id, email) VALUES (1, 'CANARY_EMAIL_a1b2c3');
 "#;
 
 /// Apply the canary schema. Uses tokio-postgres for convenience; the raw client
@@ -133,6 +174,20 @@ pub fn default_rules() -> Vec<ColumnRule> {
         rule("canary.subject_view", "email", Mask::Pseudonym),
         rule("canary.subject_view", "name", Mask::Redact),
         rule("canary.subject_view", "city", Mask::None),
+        // Written against the parent, which is what an operator would write.
+        // Whether the proxy ever consults them for a partitioned read is the
+        // question `relations_that_are_not_plain_tables_stay_masked` asks.
+        rule("canary.events", "id", Mask::None),
+        rule("canary.events", "email", Mask::Pseudonym),
+        rule("canary.people", "id", Mask::None),
+        rule("canary.people", "email", Mask::Pseudonym),
+        rule("canary.contacts", "id", Mask::None),
+        rule("canary.contacts", "email", Mask::Pseudonym),
+        rule("canary.derived", "id", Mask::None),
+        rule("canary.derived", "email", Mask::Pseudonym),
+        // canary.derived.email_copy is deliberately unclassified: a generated
+        // column is a copy of a classified value under a name of its own, and
+        // default-deny is the only thing standing between the two.
     ]
 }
 
