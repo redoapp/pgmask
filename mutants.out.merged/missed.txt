@@ -1,0 +1,9 @@
+crates/proxy/src/analysis.rs:917:18: replace > with == in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:917:18: replace > with >= in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:930:34: replace && with || in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:936:52: replace && with || in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1001:21: replace || with && in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1000:21: replace || with && in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:999:21: replace || with && in grouping_may_reference::walk
+crates/proxy/src/analysis.rs:1117:18: replace > with == in group_item_columns::walk
+crates/proxy/src/analysis.rs:1117:18: replace > with >= in group_item_columns::walk

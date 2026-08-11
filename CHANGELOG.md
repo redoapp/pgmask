@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.1.42 — the allowlist was right and was reviewed with the wrong question
+
+`ParameterStatus` is governed by an allowlist of GUC names, written after
+`application_name` was found carrying a masked address. Twelve names, each one
+checked for whether a client can set it.
+
+None was checked for what *shape of value* it accepts.
+
+```sql
+DO $$ BEGIN PERFORM set_config('scram_iterations',
+         (SELECT annual_salary FROM demo.employees LIMIT 1)::text, false); END $$;
+```
+
+`scram_iterations` takes an arbitrary integer over a 31-bit range, so it carried
+the number verbatim in a `ParameterStatus` that no `RowDescription` governs.
+Measured: `987001`, derived from a masked column, arrived through the proxy.
+
+Every other entry is a boolean, a fixed vocabulary, an existing role name, or
+server-fixed — a few bits each, the covert-channel category the assessment puts
+out of scope. `scram_iterations` was the only one that carries a *value*, and it
+fits any integer-valued masked column: a salary, an age, a count.
+
+Removed. What that costs: libpq reads it to hash a new password client-side and
+falls back to 4096 without it. Setting a password through a masking proxy is not
+the workload this is for.
+
+THE CONTROL WAS THE HARD PART
+
+The first probe used `SELECT set_config(...)` and reported all four GUCs clean.
+They were clean because the proxy refuses that statement outright for having no
+provenance — nothing had run. Including a reportable GUC set to a *constant* as
+a positive control is what exposed it: the control came back empty too, and an
+empty control is the tell.
+
+The test keeps that control and fails on it explicitly — "the control did not
+arrive, so nothing below is being tested" — verified by pointing it at a
+withheld GUC.
+
+NOT IN THE DEMO, AND WHY
+
+`examples/demo/verify.sh` does not check this. psql never surfaces a
+`ParameterStatus`, and the only way to observe one from a psql script is `SHOW`,
+which is a provenance-free result set the proxy refuses — so a check written
+there passes whether the channel is open or closed. It lives in the adversarial
+suite, which reads the wire directly. Writing a check that cannot fail would
+have been worse than writing none.
+
 ## 0.1.41 — my own fix, one hour old, with the same hole in it
 
 `from_user_sql = !notice && has_field(body, b'W')`.

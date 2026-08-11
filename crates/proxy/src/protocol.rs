@@ -792,7 +792,30 @@ const REPORTABLE_GUCS: &[&str] = &[
     "integer_datetimes",
     "IntervalStyle",
     "is_superuser",
-    "scram_iterations",
+    // `scram_iterations` was here and is a disclosure. It is the one reportable
+    // GUC that takes an arbitrary integer over a huge range, so unlike every
+    // other entry it carries a *value* rather than a choice from a vocabulary:
+    //
+    // ```sql
+    // DO $$ BEGIN PERFORM set_config('scram_iterations',
+    //          (SELECT annual_salary FROM demo.employees LIMIT 1)::text, false); END $$;
+    // ```
+    //
+    // came back as a `ParameterStatus` carrying the number. Measured: `987001`,
+    // derived from a masked column, arrived through the proxy while a control
+    // setting `TimeZone` to a constant proved the channel was live.
+    //
+    // What withholding it costs: libpq reads it to hash a new password client
+    // side and falls back to 4096 without it. Setting a password through a
+    // masking proxy is not the workload this is for.
+    //
+    // THE LENS THIS NEEDED
+    //
+    // The allowlist was reviewed for *which GUCs* a client can set, and every
+    // other entry is a boolean, a fixed vocabulary, an existing role name, or
+    // server-fixed — a few bits each, the covert-channel category. It was not
+    // reviewed for *what shape of value* each accepts, and that is the question
+    // that matters: a GUC taking a 31-bit integer is a column read.
     "server_encoding",
     "server_version",
     "session_authorization",

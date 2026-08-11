@@ -103,6 +103,8 @@ that gap a few hours earlier.
 | 7a | `RAISE EXCEPTION '%', (SELECT email …)` returns the value in the error message | reading `scrub_diagnostic` |
 | 7b | a value interpolated into dynamic SQL comes back in the `CONTEXT` traceback | testing the fix for 7a |
 | 7c | `USING ERRCODE = upper(substr(email,1,5))` returns five characters per query | asking what else `RAISE` can choose |
+| 7d | the same through `RAISE NOTICE`/`WARNING`/`INFO`, which a loop repeats freely | re-reading the fix for 7c |
+| 8 | `set_config('scram_iterations', (SELECT annual_salary …))` echoes the number in a `ParameterStatus` | enumerating every field forwarded verbatim |
 
 **This is the notice disclosure again, through the other message type.** The
 notice channel was found, fixed, and checked in both directions in
@@ -114,7 +116,19 @@ The comment was the thing that made it invisible, for the second time.
 
 7c is worth its own line because it is faster than the inference attacks this
 design puts out of scope: five characters per query is roughly five queries for
-an address, against 313 for the documented `count(*)` predicate oracle.
+an address, against 313 for the documented `count(*)` predicate oracle. 7d is
+faster still — a notice does not abort the transaction, so a loop emits as many
+as it likes and the whole value arrives in one statement.
+
+**8 is the one that says the most about method.** `ParameterStatus` is governed
+by an allowlist of GUC names, added after `application_name` was found carrying
+an address. Every entry had been checked for whether a client can set it. None
+had been checked for *what shape of value it accepts*, and `scram_iterations`
+takes an arbitrary 31-bit integer — so unlike every other entry, which is a
+boolean or a fixed vocabulary worth a few bits, it carries the number itself.
+Any integer-valued masked column: a salary, an age, a count.
+
+The allowlist was the right design and it was reviewed with the wrong question.
 
 What it costs: an error's message is now always withheld, and its `SQLSTATE` is
 withheld too when a `CONTEXT` field proves the error came through user SQL.

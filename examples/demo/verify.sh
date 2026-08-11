@@ -511,7 +511,16 @@ refute "16h. ...and the proxy withholds it"   "user1@example.com" "$(chan -c "$c
 # machine-readable half of what the message used to say.
 check  "16i. a backend error still reports its SQLSTATE"   "42P01" "$(chan -v VERBOSITY=verbose -c 'SELECT * FROM demo.nonexistent')"
 refute "16j. ...without the text, which SQL can choose"   "does not exist" "$(chan -c 'SELECT * FROM demo.nonexistent')"
-check  "16k. and ordinary masking is unaffected"   "@8dedb655.invalid" "$(chan -tAq -c 'SELECT email FROM demo.customers WHERE id = 1')"
+# The `ParameterStatus` channel — a reportable GUC carrying a masked value via
+# `scram_iterations` — is NOT checked here. psql never surfaces a
+# `ParameterStatus`, and the only way to observe one from this script is `SHOW`,
+# which is a provenance-free result set the proxy refuses. A check written here
+# passes whether the channel is open or closed.
+#
+# It lives in `a_reportable_guc_cannot_carry_a_value` in the adversarial suite,
+# which reads the wire directly and has a positive control that fails the test
+# when the observation stops working.
+check  "16l. and ordinary masking is unaffected"   "@8dedb655.invalid" "$(chan -tAq -c 'SELECT email FROM demo.customers WHERE id = 1')"
 kill "$CHAN_PID" 2>/dev/null
 
 echo

@@ -678,6 +678,61 @@ async fn a_notice_cannot_smuggle_a_value_through_its_sqlstate() -> Result<()> {
     Ok(())
 }
 
+/// A reportable GUC must not be able to carry a value.
+///
+/// `ParameterStatus` is governed by an allowlist of GUC names, and every entry
+/// was checked for whether a client can set it. None was checked for *what it
+/// accepts*. `scram_iterations` takes an arbitrary integer over a 31-bit range,
+/// so it carried any integer-valued masked column verbatim — measured, `987001`
+/// derived from a masked column arrived through the proxy.
+///
+/// The control matters as much as the attack here. The first version of this
+/// probe used `SELECT set_config(...)`, which the proxy refuses outright for
+/// having no provenance, so every case came back clean and none of them had
+/// run.
+#[tokio::test]
+async fn a_reportable_guc_cannot_carry_a_value() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    // Control: a reportable GUC set to a constant must arrive, or the rest of
+    // this test is asserting nothing.
+    client
+        .simple_query(
+            "DO $$ BEGIN PERFORM set_config('TimeZone', 'Australia/Eucla', false); END $$;",
+        )
+        .await?;
+    assert!(
+        client.received_text().contains("Australia/Eucla"),
+        "the control did not arrive, so nothing below is being tested"
+    );
+
+    for (guc, expr) in [
+        (
+            "scram_iterations",
+            "(SELECT 987000 + id FROM canary.subjects LIMIT 1)::text",
+        ),
+        (
+            "application_name",
+            "(SELECT email FROM canary.subjects LIMIT 1)",
+        ),
+        ("search_path", "(SELECT email FROM canary.subjects LIMIT 1)"),
+    ] {
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let sql = format!("DO $$ BEGIN PERFORM set_config('{guc}', {expr}, false); END $$;");
+        let _ = client.simple_query(&sql).await;
+        let text = client.received_text();
+        assert!(
+            !text.contains("987001"),
+            "{guc} carried a value derived from a masked column:\n{text}"
+        );
+        assert_no_canary(&client, &sql);
+    }
+    Ok(())
+}
+
 /// An error still says enough to act on.
 ///
 /// Withholding the message is only defensible if the `SQLSTATE` survives — it
