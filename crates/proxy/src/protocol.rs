@@ -558,7 +558,20 @@ pub fn build_error(sqlstate: &str, message: &str, hint: Option<&str>) -> Message
 /// field, is the disclosure. Dropping always costs error detail on unmasked
 /// columns, which is a diagnosability cost the operator can see and complain
 /// about; the other failure is silent.
-const LEAKY_FIELDS: &[u8] = b"DHncdtq";
+///
+/// `W` — the `CONTEXT` traceback — was added after it was found carrying a
+/// value. It reproduces the text of a statement PL/pgSQL executed, so
+///
+/// ```sql
+/// DO $$ DECLARE v text; BEGIN
+///   SELECT email INTO v FROM canary.subjects LIMIT 1;
+///   EXECUTE 'SELECT 1/0 -- ' || v;
+/// END $$;
+/// ```
+///
+/// returned `CONTEXT: SQL statement "SELECT 1/0 -- alice@example.com"` through
+/// the proxy. Same shape as `q`, which was already here.
+const LEAKY_FIELDS: &[u8] = b"DHncdtqW";
 
 /// A `NoticeResponse`'s primary message is written by SQL, so it is dropped too.
 ///
@@ -571,16 +584,89 @@ const LEAKY_FIELDS: &[u8] = b"DHncdtq";
 ///
 /// returned `NOTICE:  user1@example.com` through the proxy while the same
 /// column read as a pseudonym — a complete bypass of the control, confirmed
-/// against a live server. An error's message is kept, because "relation does
-/// not exist" is the difference between a usable proxy and an opaque one, and
-/// Postgres composes error messages from its own text rather than from a row.
+/// against a live server.
 const NOTICE_WITHHELD: &str = "pgmask: notice text withheld (it is written by SQL)";
+
+/// An error's primary message is chosen by SQL just as often, and this was
+/// missed for four releases.
+///
+/// The reasoning that kept it said Postgres "composes error messages from its
+/// own text rather than from a row", and that `relation does not exist` is the
+/// difference between a usable proxy and an opaque one. The first half is
+/// false:
+///
+/// ```sql
+/// DO $$ BEGIN RAISE EXCEPTION '%', (SELECT email FROM canary.subjects LIMIT 1); END $$;
+/// ```
+///
+/// returns the address verbatim — the identical channel to the notice above,
+/// through the other message type, and `examples/demo/verify.sh` checked the
+/// notice in both directions while checking only that an ordinary backend error
+/// survived. `RAISE` accepts an expression for the message; there is no locale-
+/// independent way to tell a message Postgres wrote from one a client did.
+///
+/// The `SQLSTATE` is kept, so a client still gets `42P01` for a missing
+/// relation. That is the machine-readable half of what it lost, and every
+/// driver surfaces it.
+/// Deliberately not prefixed `pgmask:`.
+///
+/// That prefix means **the proxy refused this statement** — five harnesses key
+/// off `message().starts_with("pgmask:")` and so, presumably, do operators.
+/// Using it here made every backend error read as a refusal: the generated
+/// campaign's counts diverged from the proxy's own metrics by 20,034
+/// statements, all of them ordinary SQL errors reclassified.
+///
+/// The distinction is real and worth keeping in the wording. "The proxy would
+/// not run this" and "your statement failed and the reason is withheld" are
+/// different things to be told at three in the morning.
+const ERROR_WITHHELD: &str = "error text withheld by pgmask (SQL can choose it); see the SQLSTATE";
+
+/// When the `SQLSTATE` is client-chosen too, it is five characters of anything.
+///
+/// `RAISE ... USING ERRCODE` takes an expression, and a SQLSTATE is five
+/// characters of `[0-9A-Z]`, so
+///
+/// ```sql
+/// DO $$ BEGIN RAISE EXCEPTION 'x'
+///   USING ERRCODE = upper(substr((SELECT email FROM canary.subjects LIMIT 1), 1, 5));
+/// END $$;
+/// ```
+///
+/// returns five characters of the value per query. Measured, not theorised:
+/// `CANAR` came back through the proxy after the message and `CONTEXT` were
+/// closed. That is roughly five queries for an address, against the 313 the
+/// documented `count(*)` predicate oracle needs — a faster channel than the
+/// inference routes the design puts out of scope.
+///
+/// HOW THIS TELLS THE TWO APART
+///
+/// A client-chosen code always arrives with a `CONTEXT` field, because `RAISE`
+/// only exists inside PL/pgSQL and a function frame always produces one.
+/// Ordinary backend errors have none — measured on Postgres 17:
+///
+/// ```text
+///   SELECT * FROM nope      ERROR: 42P01 ...          (no CONTEXT)
+///   SELECT 1/0              ERROR: 22012 ...          (no CONTEXT)
+///   SELECT 'x'::int         ERROR: 22P02 ...          (no CONTEXT)
+///   DO $$ RAISE ... $$      ERROR: P0001 ...  CONTEXT: PL/pgSQL function ...
+/// ```
+///
+/// So the code is kept when there is no `CONTEXT` and replaced when there is.
+/// The cost is that a genuine error raised inside a function loses its
+/// `SQLSTATE` as well — over-withholding, in the direction that does not
+/// disclose. An application whose PL/pgSQL raises custom SQLSTATEs for business
+/// logic will notice; that is the same trade as the message, and it is visible.
+const WITHHELD_SQLSTATE: &str = "XX000";
+const ERROR_WITHHELD_WITH_CODE: &str =
+    "error text and SQLSTATE withheld by pgmask (SQL can choose both)";
 
 /// Rebuild an Error/Notice with leaky fields removed. Returns `None` if nothing
 /// needed changing, so the common path forwards the original bytes untouched.
 ///
-/// `notice` additionally replaces the primary message, which only a
-/// `NoticeResponse` lets SQL choose.
+/// The primary message is replaced for both kinds — `RAISE NOTICE` and
+/// `RAISE EXCEPTION` are the same channel — with different fixed text, because
+/// an error keeps its `SQLSTATE` and a notice has nothing to point the reader
+/// at.
 pub fn scrub_error(body: &Bytes) -> Option<Bytes> {
     scrub_diagnostic(body, false)
 }
@@ -590,7 +676,30 @@ pub fn scrub_notice(body: &Bytes) -> Option<Bytes> {
     scrub_diagnostic(body, true)
 }
 
+/// Is this field present at all? Used to read `W` before the rebuild drops it.
+fn has_field(body: &Bytes, wanted: u8) -> bool {
+    let mut buf = body.clone();
+    loop {
+        if buf.remaining() < 1 {
+            return false;
+        }
+        let field = buf.get_u8();
+        if field == 0 {
+            return false;
+        }
+        if read_cstring(&mut buf).is_none() {
+            return false;
+        }
+        if field == wanted {
+            return true;
+        }
+    }
+}
+
 fn scrub_diagnostic(body: &Bytes, notice: bool) -> Option<Bytes> {
+    // Whether a `CONTEXT` was present, which decides the `SQLSTATE` below. Read
+    // first because `W` is dropped in the rebuild and would be gone by then.
+    let from_user_sql = !notice && has_field(body, b'W');
     let mut buf = body.clone();
     let mut kept = BytesMut::with_capacity(body.len());
     let mut changed = false;
@@ -609,10 +718,25 @@ fn scrub_diagnostic(body: &Bytes, notice: bool) -> Option<Bytes> {
             changed = true;
             continue;
         }
-        if notice && field == b'M' {
+        if field == b'M' {
             changed = true;
             kept.put_u8(b'M');
-            kept.put_slice(NOTICE_WITHHELD.as_bytes());
+            kept.put_slice(
+                match (notice, from_user_sql) {
+                    (true, _) => NOTICE_WITHHELD,
+                    (false, false) => ERROR_WITHHELD,
+                    (false, true) => ERROR_WITHHELD_WITH_CODE,
+                }
+                .as_bytes(),
+            );
+            kept.put_u8(0);
+            continue;
+        }
+        // The protocol requires a code, so it is replaced rather than dropped.
+        if from_user_sql && field == b'C' {
+            changed = true;
+            kept.put_u8(b'C');
+            kept.put_slice(WITHHELD_SQLSTATE.as_bytes());
             kept.put_u8(0);
             continue;
         }
@@ -880,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn scrubs_detail_but_keeps_message() {
+    fn scrubs_detail_and_message_but_keeps_a_backend_sqlstate() {
         let mut body = BytesMut::new();
         for (tag, value) in [
             (b'S', "ERROR"),
@@ -895,12 +1019,28 @@ mod tests {
         body.put_u8(0);
         let scrubbed = scrub_error(&body.freeze()).expect("should have changed");
         let text = String::from_utf8_lossy(&scrubbed);
-        assert!(text.contains("duplicate key"));
-        assert!(!text.contains("alice@example.com"));
+        assert!(!text.contains("alice@example.com"), "the DETAIL value");
+        // The message used to be asserted present here. `RAISE EXCEPTION` lets
+        // SQL write one, so it goes; the SQLSTATE is what has to survive, and
+        // this error has no CONTEXT so the code is Postgres' own.
+        assert!(
+            !text.contains("duplicate key"),
+            "the message is SQL-choosable"
+        );
+        assert!(text.contains("23505"), "but the SQLSTATE stays");
+        assert!(text.contains(ERROR_WITHHELD));
     }
 
+    /// Every error is rebuilt now, so the untouched fast path is unreachable
+    /// for one.
+    ///
+    /// This asserted `scrub_error(...).is_none()` for an error with no leaky
+    /// field. The primary message is always replaced and the protocol requires
+    /// one, so `changed` is always set. The `Option` is kept because the call
+    /// sites read better for it and a malformed frame with no fields at all
+    /// still returns `None`, but nothing real takes that path.
     #[test]
-    fn leaves_clean_errors_untouched() {
+    fn every_error_is_rebuilt_because_its_message_is_always_replaced() {
         let mut body = BytesMut::new();
         for (tag, value) in [(b'S', "ERROR"), (b'C', "42601"), (b'M', "syntax error")] {
             body.put_u8(tag);
@@ -908,7 +1048,42 @@ mod tests {
             body.put_u8(0);
         }
         body.put_u8(0);
-        assert!(scrub_error(&body.freeze()).is_none());
+        let scrubbed = scrub_error(&body.freeze()).expect("no fast path for an error");
+        let text = String::from_utf8_lossy(&scrubbed);
+        assert!(!text.contains("syntax error"));
+        assert!(text.contains("42601"), "a backend SQLSTATE is forwarded");
+
+        // A frame with no fields has nothing to change.
+        assert!(scrub_error(&Bytes::from_static(b"\0")).is_none());
+    }
+
+    /// A CONTEXT means the error came through user SQL, so the code goes too.
+    #[test]
+    fn a_sqlstate_is_replaced_when_a_context_shows_sql_chose_it() {
+        let mut body = BytesMut::new();
+        for (tag, value) in [
+            (b'S', "ERROR"),
+            (b'C', "CANAR"),
+            (b'M', "x"),
+            (b'W', "PL/pgSQL function inline_code_block line 1 at RAISE"),
+        ] {
+            body.put_u8(tag);
+            body.put_slice(value.as_bytes());
+            body.put_u8(0);
+        }
+        body.put_u8(0);
+        let scrubbed = scrub_error(&body.freeze()).expect("should have changed");
+        let text = String::from_utf8_lossy(&scrubbed);
+        assert!(
+            !text.contains("CANAR"),
+            "five characters of a value is a value"
+        );
+        assert!(text.contains(WITHHELD_SQLSTATE));
+        assert!(
+            !text.contains("PL/pgSQL"),
+            "the CONTEXT itself goes as well"
+        );
+        assert!(text.contains(ERROR_WITHHELD_WITH_CODE));
     }
 
     #[test]

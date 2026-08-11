@@ -229,9 +229,22 @@ possible "WHERE on a masked column confirms a guess" \
   "1" "$(p "SELECT count(*) FROM demo.customers WHERE id=1 AND email='$TRUE_EMAIL'")"
 
 # 5. An error is a one-bit channel that needs no aggregate at all.
-possible "an error discloses a predicate" \
-  "division by zero" \
-  "$(p "SELECT 1/(CASE WHEN (SELECT email FROM demo.customers WHERE id=1) LIKE 'user1%' THEN 0 ELSE 1 END)")"
+#
+# Detected by comparing the two branches, not by looking for "division by zero"
+# in the output. That is what this used to do, and when the proxy started
+# withholding error text the check reported GOVERNED — while the channel was
+# untouched. An oracle that reads a message is measuring the message; this one
+# is a *difference*, so the test has to be a difference too.
+oracle_true=$(p "SELECT 1/(CASE WHEN (SELECT email FROM demo.customers WHERE id=1) LIKE 'user1%' THEN 0 ELSE 1 END)")
+oracle_false=$(p "SELECT 1/(CASE WHEN (SELECT email FROM demo.customers WHERE id=1) LIKE 'zzzz%' THEN 0 ELSE 1 END)")
+if [[ "$oracle_true" != "$oracle_false" ]]; then
+  printf '  \033[33mRECOVERABLE\033[0m  %s\n' "an error discloses a predicate"
+  ((recoverable++))
+else
+  printf '  \033[32mGOVERNED\033[0m     %s\n        (both branches returned: %s)\n' \
+    "an error discloses a predicate" "$oracle_true"
+  ((fail++))
+fi
 
 # 6. And the whole value, character by character, through the proxy only.
 echo

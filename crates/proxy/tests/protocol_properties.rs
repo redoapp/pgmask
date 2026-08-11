@@ -107,32 +107,88 @@ proptest! {
         prop_assert_eq!(parsed, values);
     }
 
-    /// Scrubbing must only ever remove. If it can grow the message it is
-    /// rewriting content rather than dropping fields.
+    /// No value a client could have written survives scrubbing.
+    ///
+    /// This asserted `scrubbed.len() <= original.len()` — "if it can grow the
+    /// message it is rewriting content rather than dropping fields". That was a
+    /// proxy for the real property, and it stopped being true the moment the
+    /// primary message started being *replaced* with fixed text rather than
+    /// kept, which is the fix for `RAISE EXCEPTION` writing a masked value into
+    /// it. Length was never the thing that mattered.
+    ///
+    /// The property underneath does not care about length: **a value that came
+    /// in must not come out.** Every generated value is a distinctive token, so
+    /// its presence in the output cannot be a coincidence with the replacement
+    /// text.
+    ///
+    /// `S` is excluded from the generator: severity is drawn from a fixed
+    /// vocabulary and is forwarded by design.
+    ///
+    /// `C` is generated separately, because it is the one field whose treatment
+    /// is *conditional*: forwarded when the error carries no `CONTEXT`,
+    /// replaced when it does. What makes that sound is a measured property of
+    /// Postgres rather than anything the proxy enforces — `RAISE` is the only
+    /// way SQL chooses a SQLSTATE, it exists only inside PL/pgSQL, and a
+    /// function frame always emits a `CONTEXT`, while ordinary errors emit
+    /// none. Writing this property caught me asserting the unconditional
+    /// version and finding it false, which is exactly the assumption worth
+    /// having written down somewhere it runs.
     #[test]
-    fn scrubbing_only_removes(
+    fn no_client_written_value_survives_scrubbing(
         fields in proptest::collection::vec(
-            (proptest::sample::select(vec![b'S', b'C', b'M', b'D', b'H', b'n', b'q']),
-             "[ -~]{0,40}"),
+            (proptest::sample::select(vec![b'M', b'D', b'H', b'n', b'q', b'c', b'd', b't']),
+             0u32..9999),
             0..10,
-        )
+        ),
+        code in 0u32..9999,
+        from_user_sql in any::<bool>(),
     ) {
         let mut body = BytesMut::new();
-        for (tag, value) in &fields {
+        body.put_u8(b'S');
+        body.put_slice(b"ERROR");
+        body.put_u8(0);
+        body.put_u8(b'C');
+        body.put_slice(format!("Zc{code}cZ").as_bytes());
+        body.put_u8(0);
+        if from_user_sql {
+            body.put_u8(b'W');
+            body.put_slice(b"PL/pgSQL function inline_code_block line 1 at RAISE");
+            body.put_u8(0);
+        }
+        for (tag, n) in &fields {
             body.put_u8(*tag);
-            body.put_slice(value.as_bytes());
+            body.put_slice(format!("Zq{n}qZ").as_bytes());
             body.put_u8(0);
         }
         body.put_u8(0);
         let original = body.freeze();
-        if let Some(scrubbed) = scrub_error(&original) {
+        let scrubbed = scrub_error(&original).unwrap_or_else(|| original.clone());
+        let text = String::from_utf8_lossy(&scrubbed).into_owned();
+
+        for (tag, n) in &fields {
+            let token = format!("Zq{n}qZ");
             prop_assert!(
-                scrubbed.len() <= original.len(),
-                "scrubbing grew the message: {} -> {}",
-                original.len(),
-                scrubbed.len()
+                !text.contains(&token),
+                "field {} kept a client-written value {token}:\n{text}",
+                char::from(*tag),
             );
         }
+        let code_token = format!("Zc{code}cZ");
+        if from_user_sql {
+            prop_assert!(
+                !text.contains(&code_token),
+                "a CONTEXT means SQL chose the SQLSTATE, so it must go:\n{text}"
+            );
+        } else {
+            // The whole justification for withholding the message.
+            prop_assert!(
+                text.contains(&code_token),
+                "with no CONTEXT the SQLSTATE is Postgres' own and must survive:\n{text}"
+            );
+        }
+        // Severity is not a channel and must still arrive, or a client cannot
+        // tell an error from a notice.
+        prop_assert!(text.contains("ERROR"), "severity must survive:\n{text}");
     }
 
     /// Arbitrary text must not panic the SQL analysis, and must never be

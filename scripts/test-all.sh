@@ -105,9 +105,24 @@ echo "=== rust tests ==="
 # `cargo test` compiles none of them: the module simply is not there, and the
 # gate reported the same 183 lib tests before and after they were added. A
 # regression test that does not run is a comment.
-out=$(PGMASK_ALLOW_SKIP=1 cargo test --workspace --no-fail-fast -q 2>&1
-      PGMASK_ALLOW_SKIP=1 cargo test -p pgmask --lib --features fuzzing --no-fail-fast -q 2>&1)
-status=$?
+# Two runs, and BOTH statuses. `out=$(a; b)` leaves `$?` as *b's* status, so
+# for as long as this was written that way the workspace run — every integration
+# test in `crates/proxy/tests/` — could not fail the gate. The lib-only second
+# run was the only thing being reported.
+#
+# Found when `no_client_written_value_survives_scrubbing` failed while the gate
+# said `ok cargo test 489 tests`. The count was real; the verdict was not. Same
+# shape as three other status losses in a day: a pipeline or a substitution
+# quietly reporting the wrong command's exit code.
+workspace_out=$(PGMASK_ALLOW_SKIP=1 cargo test --workspace --no-fail-fast -q 2>&1)
+workspace_status=$?
+fuzzing_out=$(PGMASK_ALLOW_SKIP=1 cargo test -p pgmask --lib --features fuzzing --no-fail-fast -q 2>&1)
+fuzzing_status=$?
+out="$workspace_out
+$fuzzing_out"
+status=0
+[ "$workspace_status" = 0 ] || status=$workspace_status
+[ "$fuzzing_status" = 0 ] || status=$fuzzing_status
 total=$(printf '%s\n' "$out" | grep -E '^test result' | awk '{s+=$4} END {print s+0}')
 skipped=$(printf '%s\n' "$out" | grep -c 'skipping by request')
 record "cargo test" "$status" "$total tests ($skipped need Postgres)"

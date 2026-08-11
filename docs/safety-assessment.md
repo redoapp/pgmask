@@ -65,12 +65,46 @@ an acceptance.
 | 6 | `SELECT * FROM (…)` around any of the above | an audit hunting overstated comments |
 
 **Five of six were found by reading, not by the campaign.** The one the campaign
-found needed two harness fixes before it could see it.
+found needed two harness fixes before it could see it. The seventh, a day later,
+was also found by reading — in the one release-relevant module no campaign
+covers.
 
 Number 6 is the one to weigh. It defeated the guard built for number 1, survived
 thirteen gate runs used to validate the fixes for 2–5, and was protected by a
 comment asserting the case could not arise — written by the same person who then
 tested eleven spellings of the grouping without once wrapping one.
+
+## What was found on 2026-08-11
+
+A seventh disclosure, in `protocol.rs` — a module neither the mutation harness
+nor any fuzzer touches, which is where I went looking *because* I had recorded
+that gap a few hours earlier.
+
+| # | disclosure | found by |
+|---|---|---|
+| 7a | `RAISE EXCEPTION '%', (SELECT email …)` returns the value in the error message | reading `scrub_diagnostic` |
+| 7b | a value interpolated into dynamic SQL comes back in the `CONTEXT` traceback | testing the fix for 7a |
+| 7c | `USING ERRCODE = upper(substr(email,1,5))` returns five characters per query | asking what else `RAISE` can choose |
+
+**This is the notice disclosure again, through the other message type.** The
+notice channel was found, fixed, and checked in both directions in
+`examples/demo/verify.sh`. The error channel next to it was checked in *one*
+direction — the old check `16e` asserted that a backend error's text survived —
+and the comment beside the code said Postgres "composes error messages from its
+own text rather than from a row". `RAISE` accepts an expression for the message.
+The comment was the thing that made it invisible, for the second time.
+
+7c is worth its own line because it is faster than the inference attacks this
+design puts out of scope: five characters per query is roughly five queries for
+an address, against 313 for the documented `count(*)` predicate oracle.
+
+What it costs: an error's message is now always withheld, and its `SQLSTATE` is
+withheld too when a `CONTEXT` field proves the error came through user SQL.
+Ordinary errors — missing relation, division by zero, bad cast — carry no
+`CONTEXT` and keep their codes, so `42P01` and `23505` still reach the client.
+An application whose PL/pgSQL raises custom SQLSTATEs for business logic will
+lose them. That is over-withholding, in the direction that does not disclose,
+and it is visible to whoever runs it.
 
 ## The instruments were wrong more often than the code
 
@@ -92,6 +126,8 @@ This is the finding that should shape how much weight a green run carries.
 | coverage measurement | reported `catalog.rs` at 62.6% when it is 88.4% |
 | a mutation-kill check | reported two mutants killed after mutating the wrong line |
 | `test-mutants.sh` | printed a complete-looking summary for a run that attempted 102 of 494 mutants, twice |
+| `verify.sh` | checked the notice channel both ways and the error channel next to it only in the direction that preserved the leak |
+| `assert_no_canary` | looks for the whole token, so five characters of it through a SQLSTATE read as clean |
 
 Every one produced a confident answer about something it was not measuring.
 Several were built specifically to prevent that.

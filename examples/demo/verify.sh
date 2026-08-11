@@ -27,6 +27,11 @@ trap cleanup EXIT
 
 direct() { psql -h localhost -p "$PG_PORT" -U postgres -d demo -tAq -c "$1" 2>&1; }
 proxied() { psql -h localhost -p "$PROXY_PORT" -U postgres -d demo -tAq -c "$1" 2>&1; }
+# psql only prints the SQLSTATE at verbose verbosity, and the SQLSTATE is what
+# an error is reduced to once its text is withheld.
+proxied_verbose() {
+  psql -h localhost -p "$PROXY_PORT" -U postgres -d demo -tAq -v VERBOSITY=verbose -c "$1" 2>&1
+}
 
 check() {
   local name="$1" expected="$2" actual="$3"
@@ -183,7 +188,13 @@ leak="$(direct "$conflict")"
 check  "6a. Postgres really does leak the value in DETAIL" "Key (id)=(1)" "$leak"
 scrubbed="$(proxied "$conflict")"
 refute "6b. pgmask scrubs it"                              "Key (id)=(1)" "$scrubbed"
-check  "6c. ...but keeps the useful message"               "duplicate key" "$scrubbed"
+# The message used to be kept here. It is not any more: `RAISE EXCEPTION` lets
+# SQL choose it, so there is no locale-independent way to tell a message
+# Postgres wrote from one a client did. What is left has to be actionable, and
+# 23505 is unique_violation.
+refute "6c. and withholds the message, which SQL can choose" "duplicate key" "$scrubbed"
+check  "6d. ...leaving the SQLSTATE, which says the same thing" "23505" \
+       "$(proxied_verbose "$conflict")"
 
 # 7 — a rejection must not poison the session.
 after="$(psql -h localhost -p "$PROXY_PORT" -U postgres -d demo -tAq \
@@ -475,6 +486,8 @@ chan() { psql -h localhost -p 6432 -U postgres -d demo -X "$@" 2>&1; }
 chan_direct() { psql -h localhost -p "$PG_PORT" -U postgres -d demo -X "$@" 2>&1; }
 raise='DO $$ BEGIN RAISE NOTICE %s, (SELECT email FROM demo.customers WHERE id = 1); END $$;'
 notify='DO $$ BEGIN PERFORM pg_notify(%s,(SELECT email FROM demo.customers WHERE id = 1)); END $$;'
+except='DO $$ BEGIN RAISE EXCEPTION %s, (SELECT email FROM demo.customers WHERE id = 1); END $$;'
+context="DO \$\$ DECLARE v text; BEGIN SELECT email INTO v FROM demo.customers WHERE id = 1; EXECUTE 'SELECT 1/0 -- ' || v; END \$\$;"
 
 check  "16a. control: RAISE NOTICE really does carry the address"   "user1@example.com" "$(chan_direct -c "$(printf "$raise" "'%'")")"
 refute "16b. ...and the proxy withholds it"   "user1@example.com" "$(chan -c "$(printf "$raise" "'%'")")"
@@ -482,10 +495,23 @@ refute "16b. ...and the proxy withholds it"   "user1@example.com" "$(chan -c "$(
 check  "16c. control: a NOTIFY payload really does carry it"   "user1@example.com" "$(chan_direct -c 'LISTEN c;' -c "$(printf "$notify" "'c'")" -c 'SELECT 1;')"
 refute "16d. ...and the proxy withholds it"   "user1@example.com" "$(chan -c 'LISTEN c;' -c "$(printf "$notify" "'c'")" -c 'SELECT 1;')"
 
-# An error's own message is kept: "relation does not exist" is the difference
-# between a usable proxy and an opaque one, and Postgres writes it, not SQL.
-check  "16e. a backend error still says what went wrong"   "does not exist" "$(chan -c 'SELECT * FROM demo.nonexistent')"
-check  "16f. and ordinary masking is unaffected"   "@8dedb655.invalid" "$(chan -tAq -c 'SELECT email FROM demo.customers WHERE id = 1')"
+# An error's message is chosen by SQL as often as a notice's. This was checked
+# in only one direction for four releases: 16a/16b covered RAISE NOTICE, and the
+# old 16e asserted that a backend error's text survived — which is what made the
+# RAISE EXCEPTION channel invisible.
+check  "16e. control: RAISE EXCEPTION really does carry the address"   "user1@example.com" "$(chan_direct -c "$(printf "$except" "'%'")")"
+refute "16f. ...and the proxy withholds it"   "user1@example.com" "$(chan -c "$(printf "$except" "'%'")")"
+
+# CONTEXT reproduces the text of a statement PL/pgSQL ran, so a value
+# interpolated into dynamic SQL comes back inside it.
+check  "16g. control: a CONTEXT traceback really does carry it"   "user1@example.com" "$(chan_direct -c "$context")"
+refute "16h. ...and the proxy withholds it"   "user1@example.com" "$(chan -c "$context")"
+
+# What is left has to be enough to act on: the SQLSTATE survives, which is the
+# machine-readable half of what the message used to say.
+check  "16i. a backend error still reports its SQLSTATE"   "42P01" "$(chan -v VERBOSITY=verbose -c 'SELECT * FROM demo.nonexistent')"
+refute "16j. ...without the text, which SQL can choose"   "does not exist" "$(chan -c 'SELECT * FROM demo.nonexistent')"
+check  "16k. and ordinary masking is unaffected"   "@8dedb655.invalid" "$(chan -tAq -c 'SELECT email FROM demo.customers WHERE id = 1')"
 kill "$CHAN_PID" 2>/dev/null
 
 echo

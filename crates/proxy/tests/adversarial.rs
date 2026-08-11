@@ -337,9 +337,20 @@ async fn error_detail_cannot_leak() -> Result<()> {
              (1, 'CANARY_EMAIL_a1b2c3', 'CANARY_NAME_d4e5f6', 'CANARY_NOTE_97h8i9', 'x')",
         )
         .await?;
+    let text = client.received_text();
+    // The message used to be asserted here. It is withheld now, because
+    // `RAISE EXCEPTION` lets SQL choose one and there is no locale-independent
+    // way to tell those apart — see `an_error_message_chosen_by_sql_cannot_
+    // carry_a_value`. What has to survive is the SQLSTATE: 23505 is
+    // unique_violation, and this error has no CONTEXT, so the code is Postgres'
+    // own and is forwarded.
     assert!(
-        client.received_text().contains("duplicate key"),
-        "the useful part of the error should survive"
+        !text.contains("duplicate key"),
+        "the message is SQL-choosable and must not survive:\n{text}"
+    );
+    assert!(
+        text.contains("23505"),
+        "but the SQLSTATE must, or the proxy is merely opaque:\n{text}"
     );
     assert_no_canary(&client, "error DETAIL");
     Ok(())
@@ -536,6 +547,136 @@ async fn relations_that_are_not_plain_tables_behave_as_documented() -> Result<()
             client = RawClient::connect(proxy.addr, DB).await?;
         }
     }
+    Ok(())
+}
+
+/// `RAISE EXCEPTION` lets SQL choose an error's primary message, exactly as
+/// `RAISE NOTICE` does for a notice.
+///
+/// The notice case was found and fixed: `scrub_notice` replaces the `M` field
+/// outright, because "the client chooses it outright". `scrub_error` keeps `M`,
+/// justified by a comment saying Postgres "composes error messages from its own
+/// text rather than from a row" — and `examples/demo/verify.sh` checks the
+/// notice path in both directions while checking only that an ordinary backend
+/// error survives.
+///
+/// `RAISE EXCEPTION '%', (SELECT email …)` is the same channel through the
+/// other message type. This asserts it is closed.
+#[tokio::test]
+async fn an_error_message_chosen_by_sql_cannot_carry_a_value() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    for sql in [
+        // The message, straight out of a subquery.
+        "DO $$ BEGIN RAISE EXCEPTION '%', (SELECT email FROM canary.subjects LIMIT 1); END $$;",
+        // The same through the fields RAISE also accepts expressions for.
+        "DO $$ BEGIN RAISE EXCEPTION 'boom' USING DETAIL = \
+         (SELECT email FROM canary.subjects LIMIT 1); END $$;",
+        "DO $$ BEGIN RAISE EXCEPTION 'boom' USING HINT = \
+         (SELECT email FROM canary.subjects LIMIT 1); END $$;",
+        // A value reaching the CONTEXT field by way of a dynamic statement.
+        // `CONTEXT: SQL statement "SELECT 1/0 -- alice@example.com"`.
+        "DO $$ DECLARE v text; BEGIN \
+           SELECT email INTO v FROM canary.subjects LIMIT 1; \
+           EXECUTE 'SELECT 1/0 -- ' || v; END $$;",
+        // The fields RAISE also accepts expressions for, which were already
+        // covered — kept so a change to LEAKY_FIELDS shows up here.
+        "DO $$ BEGIN RAISE EXCEPTION 'boom' USING COLUMN = \
+         (SELECT email FROM canary.subjects LIMIT 1); END $$;",
+        // A unique violation, the channel LEAKY_FIELDS was written for.
+        "INSERT INTO canary.subjects VALUES \
+         (1, (SELECT email FROM canary.subjects LIMIT 1), 'x', 'y', 'z')",
+        // Five characters at a time through a client-chosen SQLSTATE.
+        "DO $$ BEGIN RAISE EXCEPTION 'x' USING ERRCODE = \
+         upper(substr((SELECT email FROM canary.subjects LIMIT 1), 1, 5)); END $$;",
+    ] {
+        let before = client.received_text().len();
+        let failed = client.simple_query(sql).await.is_err();
+        let text = client.received_text();
+        let reply = text.get(before..).unwrap_or_default().to_owned();
+        // Five characters of a value is the value, only slower. `assert_no_canary`
+        // looks for the whole token and would have called the SQLSTATE channel
+        // clean.
+        assert!(
+            !reply.contains("CANAR"),
+            "a prefix of the canary crossed the boundary via {sql}:\n{reply}"
+        );
+        assert_no_canary(&client, sql);
+        if failed {
+            client = RawClient::connect(proxy.addr, DB).await?;
+        }
+    }
+    Ok(())
+}
+
+/// An ordinary error keeps its SQLSTATE; one raised from SQL does not.
+///
+/// The whole justification for withholding the message is that the code
+/// survives. It only survives where the client did not choose it.
+#[tokio::test]
+async fn a_client_chosen_sqlstate_is_replaced_and_an_ordinary_one_is_not() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    // No CONTEXT: Postgres chose this code, so it is forwarded.
+    client
+        .simple_query("SELECT * FROM canary.nonexistent")
+        .await?;
+    assert!(
+        client.received_text().contains("42P01"),
+        "an ordinary error must keep its SQLSTATE"
+    );
+
+    // A CONTEXT proves it came through user SQL, so the code is replaced.
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+    client
+        .simple_query("DO $$ BEGIN RAISE EXCEPTION 'x' USING ERRCODE = 'ZZZZZ'; END $$;")
+        .await?;
+    let text = client.received_text();
+    assert!(
+        !text.contains("ZZZZZ"),
+        "a chosen SQLSTATE must not pass:\n{text}"
+    );
+    assert!(text.contains("XX000"), "and it must be replaced:\n{text}");
+    Ok(())
+}
+
+/// An error still says enough to act on.
+///
+/// Withholding the message is only defensible if the `SQLSTATE` survives — it
+/// is the machine-readable half, and every driver surfaces it. If this stops
+/// holding, the proxy has become opaque rather than careful.
+#[tokio::test]
+async fn an_error_still_carries_its_sqlstate() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    client
+        .simple_query("SELECT * FROM canary.nonexistent")
+        .await?;
+    let text = client.received_text();
+    assert!(
+        text.contains("42P01"),
+        "the SQLSTATE for undefined_table should survive:\n{text}"
+    );
+    assert!(
+        text.contains("error text withheld by pgmask"),
+        "and the message should not:\n{text}"
+    );
+    // Not the `pgmask:` prefix, which means the proxy refused the statement.
+    // This one ran and failed on its own; conflating the two made the generated
+    // campaign misclassify 20,034 statements.
+    assert!(
+        !text.contains("pgmask: "),
+        "a backend error must not read as a proxy refusal:\n{text}"
+    );
     Ok(())
 }
 

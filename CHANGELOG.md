@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.1.40 — the notice disclosure again, through the error message
+
+`RAISE NOTICE '%', (SELECT email …)` returning the address was found, fixed, and
+checked in both directions in the demo. `RAISE EXCEPTION` is the same channel
+through the other message type, and it was open.
+
+```
+DO $$ BEGIN RAISE EXCEPTION '%', (SELECT email FROM canary.subjects LIMIT 1); END $$;
+```
+
+returned the value verbatim while the same column read as a pseudonym.
+
+WHY IT STAYED HIDDEN
+
+The demo checked the notice both ways — control that the value really is
+reachable, then that the proxy withholds it — and checked the error next to it
+in one direction only: `16e. a backend error still says what went wrong`. That
+check asserted the behaviour that carried the leak.
+
+Beside the code, a comment: Postgres "composes error messages from its own text
+rather than from a row". `RAISE` accepts an expression for the message. Second
+time in this project a comment asserting a case could not arise is what kept it
+from being tested — the first was disclosure 6.
+
+Meanwhile `session.rs` already said, twenty lines away, that "every free-text
+diagnostic field can be SQL-controlled (`RAISE` accepts expressions for Message,
+Detail, Hint and object names), so rebuild the message from constrained fields
+plus fixed text." The code did not do that. Two comments, one right and one
+wrong, and the wrong one was the one next to the branch.
+
+TWO MORE, FOUND BY PULLING THE THREAD
+
+`CONTEXT` reproduces the text of a statement PL/pgSQL ran, so a value
+interpolated into dynamic SQL comes straight back inside it. `W` joins
+`LEAKY_FIELDS`, next to `q`, which was already there for the same reason.
+
+And `USING ERRCODE` takes an expression. A SQLSTATE is five characters of
+`[0-9A-Z]`, so `upper(substr(email, 1, 5))` returns five characters of the value
+per query — about five queries for an address, against the 313 the documented
+`count(*)` predicate oracle needs. Faster than the inference routes this design
+declares out of scope, so it is closed rather than documented.
+
+The code is kept when the error has no `CONTEXT` and replaced when it has one:
+`RAISE` only exists inside PL/pgSQL and a function frame always produces one,
+while ordinary errors produce none. Measured on Postgres 17 rather than assumed.
+
+THE GATE'S LARGEST SUITE COULD NOT FAIL
+
+While fixing the above, a property test began failing and the gate reported
+`ok  cargo test  489 tests`. The count was real. The verdict was not:
+
+```bash
+out=$(cargo test --workspace ... 2>&1
+      cargo test -p pgmask --lib --features fuzzing ... 2>&1)
+status=$?          # <- the SECOND command's status, only
+```
+
+`$?` after a command substitution holding two commands is the last one's. For as
+long as that was written that way, the workspace run — every integration test in
+`crates/proxy/tests/`, including the adversarial suite when Postgres is
+available — could not fail the gate. Only the lib-only second run was reported.
+
+Both statuses now. Poison-controlled by planting a failure in the workspace run:
+combined status 101 where it was 0.
+
+That is the fourth exit status lost to a pipeline or a substitution in a day —
+three in throwaway harnesses, one baked into the gate.
+
+A PROPERTY THAT WAS A PROXY FOR THE REAL ONE
+
+The failing test asserted `scrubbed.len() <= original.len()` — "if it can grow
+the message it is rewriting content rather than dropping fields". Replacing the
+message with fixed text makes that false by design, and length was never what
+mattered. Restated as **a value that came in must not come out**, with
+distinctive tokens so a match cannot be coincidence.
+
+Writing it caught a second thing: asserted unconditionally, it fails, because
+`C` is forwarded when there is no `CONTEXT`. That is correct, and it rests on a
+measured property of Postgres rather than anything the proxy enforces. The
+property now says so and tests both branches.
+
+WHAT IT COSTS
+
+An error's message is always withheld now. `42P01` and `23505` still reach the
+client, which is the machine-readable half and what every driver surfaces. An
+application whose PL/pgSQL raises custom SQLSTATEs for business logic loses
+them — over-withholding, in the direction that does not disclose, and visible to
+whoever runs it.
+
+Three demo checks asserted the old behaviour and now assert the new contract in
+both directions. `assert_no_canary` looks for the whole token, so it would have
+called the SQLSTATE channel clean; the test checks for a five-character prefix
+as well.
+
 ## 0.1.39 — the mutation runs were a fifth of a run
 
 `45 survivors` has been sitting in the safety assessment as a known quantity.

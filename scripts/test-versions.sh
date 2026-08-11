@@ -56,7 +56,7 @@ declare -A DESC=(
   [A14]="...but stays a valid uuid"
   [A15]="Postgres really leaks the value in DETAIL (control)"
   [A16]="pgmask scrubs the DETAIL value"
-  [A17]="...but keeps the useful message"
+  [A17]="...and the message, keeping the SQLSTATE"
   [A18]="COPY TO STDOUT is refused"
   [A19]="\\dt lists tables (system_catalogs=allow)"
   [A20]="\\d describes columns"
@@ -163,6 +163,11 @@ for V in $VERSIONS; do
 
   direct()  { psql -h localhost -p "$PG_PORT"    -U postgres -d demo -X -tAq -c "$1" 2>&1; }
   proxied() { psql -h localhost -p "$PROXY_PORT" -U postgres -d demo -X -tAq -c "$1" 2>&1; }
+  # psql prints the SQLSTATE only at verbose verbosity, and once an error's text
+  # is withheld the SQLSTATE is what is left to check.
+  proxied_verbose() {
+    psql -h localhost -p "$PROXY_PORT" -U postgres -d demo -X -tAq -v VERBOSITY=verbose -c "$1" 2>&1
+  }
   gui()     { psql -h localhost -p "$GUI_PORT"   -U postgres -d demo -X       -c "$1" 2>&1; }
   as_role() { psql -h localhost -p "$PROXY_PORT" -U "$1"     -d demo -X -tAq -c "$2" 2>&1; }
 
@@ -304,7 +309,12 @@ for V in $VERSIONS; do
   check  A15 "${DESC[A15]}" "Key (id)=(1)"  "$(direct "$conflict")"
   scrubbed="$(proxied "$conflict")"
   refute A16 "${DESC[A16]}" "Key (id)=(1)"  "$scrubbed"
-  check  A17 "${DESC[A17]}" "duplicate key" "$scrubbed"
+  # The message went with it: `RAISE EXCEPTION` lets SQL choose one, so there is
+  # no locale-independent way to tell those from Postgres' own. 23505 is
+  # unique_violation and this error has no CONTEXT, so the code is forwarded —
+  # which has to hold on every version, not just the one this was written on.
+  refute A17 "${DESC[A17]}" "duplicate key" "$scrubbed"
+  check  A17b "...leaving the SQLSTATE" "23505" "$(proxied_verbose "$conflict")"
 
   # --- COPY -----------------------------------------------------------------
   check A18 "${DESC[A18]}" "COPY ... TO is not permitted" \
