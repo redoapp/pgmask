@@ -1,0 +1,21 @@
+--- crates/proxy/src/protocol.rs
++++ replace read_cstring -> Option<String> with Some(String::new())
+@@ -297,17 +297,17 @@
+ fn read_i32(buf: &mut Bytes) -> Option<i32> {
+     if buf.len() < 4 {
+         return None;
+     }
+     Some(buf.get_i32())
+ }
+ 
+ pub fn read_cstring(buf: &mut Bytes) -> Option<String> {
+-    Some(String::from_utf8_lossy(&read_cstring_bytes(buf)?).into_owned())
++    Some(String::new()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Read a protocol cstring without interpreting its bytes.
+ ///
+ /// Prepared-statement and portal names are protocol identities, not text for
+ /// pgmask to normalize. Lossy UTF-8 decoding collapses distinct byte strings
+ /// onto the same replacement character and therefore cannot be used as a map
+ /// key.

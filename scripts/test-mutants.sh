@@ -112,10 +112,20 @@ export CARGO_INCREMENTAL=0
 #
 # 827 mutants as of 2026-08-11 — 494 before `protocol.rs` and `mask.rs` joined
 # the list. Every one is a build plus a test run, so a complete campaign is an
-# overnight job, not something to slip into a working session. Twelve shards
-# keeps each scratch copy well inside the free space this needs and gives a
-# progress line roughly every seventy mutants.
-SHARDS=${SHARDS:-12}
+# overnight job, not something to slip into a working session.
+#
+# SHARD SIZE IS A DISK BUDGET, NOT A PROGRESS PREFERENCE
+#
+# Measured: a shard of 65 mutants took the free space from 13 GB to 2 GB. The
+# scratch copy is rebuilt per mutant and its target directory accumulates, so
+# the cost is roughly **0.17 GB per mutant** and it is only reclaimed when the
+# shard ends. Twelve shards was 69 mutants each — about 12 GB — and a run died
+# mid-shard with the between-shard check never getting a turn.
+#
+# Twenty shards is ~41 mutants, about 7 GB, which fits inside the floor below
+# with room for a `cargo build` happening alongside. If you raise the mutant
+# count, raise this too.
+SHARDS=${SHARDS:-20}
 merged=mutants.out.merged
 rm -rf "$merged"; mkdir -p "$merged"
 : > "$merged/caught.txt"; : > "$merged/missed.txt"
@@ -160,8 +170,13 @@ for shard in $(seq 1 "$SHARDS"); do
   rm -rf "${TMPDIR:-/tmp}"/cargo-mutants-pgmask-*.tmp 2>/dev/null
   free_gb=$(df -g "${TMPDIR:-/tmp}" | awk 'NR==2 {print $4}')
   echo "    shard $shard done; ${free_gb}GB free"
-  if [ "${free_gb:-99}" -lt 6 ]; then
+  # A shard costs about 7 GB at the default size and reclaims none of it until
+  # it ends, so this floor has to cover a whole shard rather than a comfortable
+  # margin. Set at 6 GB it never got a turn: the shard that emptied the disk
+  # went from 13 GB to 2 GB without an opportunity to check.
+  if [ "${free_gb:-99}" -lt 15 ]; then
     echo "FAIL: ${free_gb}GB free after shard $shard — stopping rather than dying mid-shard."
+    echo "      A shard needs ~7GB and reclaims it only at the end."
     status=1
     break
   fi

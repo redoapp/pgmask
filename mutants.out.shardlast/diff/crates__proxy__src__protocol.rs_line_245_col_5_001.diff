@@ -1,0 +1,37 @@
+--- crates/proxy/src/protocol.rs
++++ replace try_take_message -> Result<Option<Message>> with Ok(Some(Default::default()))
+@@ -237,33 +237,17 @@
+             }
+         }
+     }
+ }
+ 
+ fn try_take_message(buf: &mut BytesMut) -> Result<Option<Message>> {
+     // Nothing can be decided until the whole `[tag][len]` header is buffered;
+     // a short buffer is "not yet", not "malformed".
+-    let Some(&[tag, l0, l1, l2, l3]) = buf.get(..5) else {
+-        return Ok(None);
+-    };
+-    let len = i32::from_be_bytes([l0, l1, l2, l3]);
+-    if len < 4 {
+-        bail!("invalid message length {len}");
+-    }
+-    // `len` is attacker-controlled and counts itself but not the tag byte. A
+-    // total that does not fit a usize is refused rather than wrapped into a
+-    // small one, which would frame the next bytes as a message of our choosing.
+-    let Some(total) = usize::try_from(len).ok().and_then(|n| n.checked_add(1)) else {
+-        bail!("message length {len} does not fit this platform");
+-    };
+-    if buf.len() < total {
+-        return Ok(None);
+-    }
+-    Ok(Some(Message::from_frame(tag, buf.split_to(total).freeze())))
++    Ok(Some(Default::default())) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn try_take_startup(buf: &mut BytesMut) -> Result<Option<StartupPacket>> {
+     if buf.len() < 8 {
+         return Ok(None);
+     }
+     // The `< 8` guard above means the four length bytes are always present.
+     let Some(&[l0, l1, l2, l3]) = buf.get(..4) else {

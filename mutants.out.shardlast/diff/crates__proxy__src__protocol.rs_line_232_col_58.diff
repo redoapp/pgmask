@@ -1,0 +1,21 @@
+--- crates/proxy/src/protocol.rs
++++ replace == with != in FrameReader<R>::read_startup
+@@ -224,17 +224,17 @@
+     }
+ 
+     /// Read one untagged startup packet. `Ok(None)` on clean EOF.
+     pub async fn read_startup(&mut self) -> Result<Option<StartupPacket>> {
+         loop {
+             if let Some(pkt) = try_take_startup(&mut self.buf)? {
+                 return Ok(Some(pkt));
+             }
+-            if self.inner.read_buf(&mut self.buf).await? == 0 {
++            if self.inner.read_buf(&mut self.buf).await? != /* ~ changed by cargo-mutants ~ */ 0 {
+                 if self.buf.is_empty() {
+                     return Ok(None);
+                 }
+                 bail!("peer closed mid-startup-packet");
+             }
+         }
+     }
+ }

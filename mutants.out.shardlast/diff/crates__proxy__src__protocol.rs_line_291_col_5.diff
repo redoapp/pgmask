@@ -1,0 +1,24 @@
+--- crates/proxy/src/protocol.rs
++++ replace read_i16 -> Option<i16> with None
+@@ -283,20 +283,17 @@
+         code,
+         body: frame.freeze(),
+     }))
+ }
+ 
+ /// Length-checked, so a truncated or hostile frame returns `None` rather than
+ /// panicking on a slice out of range.
+ fn read_i16(buf: &mut Bytes) -> Option<i16> {
+-    if buf.len() < 2 {
+-        return None;
+-    }
+-    Some(buf.get_i16())
++    None /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn read_i32(buf: &mut Bytes) -> Option<i32> {
+     if buf.len() < 4 {
+         return None;
+     }
+     Some(buf.get_i32())
+ }

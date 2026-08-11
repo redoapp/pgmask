@@ -1,0 +1,21 @@
+--- crates/proxy/src/protocol.rs
++++ replace < with > in try_take_startup
+@@ -268,17 +268,17 @@
+     // The `< 8` guard above means the four length bytes are always present.
+     let Some(&[l0, l1, l2, l3]) = buf.get(..4) else {
+         return Ok(None);
+     };
+     let len = i32::from_be_bytes([l0, l1, l2, l3]);
+     if !(8..=1_048_576).contains(&len) {
+         bail!("implausible startup packet length {len}");
+     }
+-    if buf.len() < len as usize {
++    if buf.len() > /* ~ changed by cargo-mutants ~ */ len as usize {
+         return Ok(None);
+     }
+     let mut frame = buf.split_to(len as usize);
+     frame.advance(4);
+     let code = frame.get_i32();
+     Ok(Some(StartupPacket {
+         code,
+         body: frame.freeze(),

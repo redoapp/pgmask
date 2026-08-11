@@ -17,3 +17,6 @@ crates/proxy/src/lineage.rs:170:5: replace resolve_inspected -> Vec<Verdict> wit
 crates/proxy/src/protocol.rs:118:9: replace Message::from_frame -> Self with Default::default()
 crates/proxy/src/protocol.rs:200:9: replace FrameReader<R>::read_message -> Result<Option<Message>> with Ok(Some(Default::default()))
 crates/proxy/src/protocol.rs:223:9: replace FrameReader<R>::try_buffered_message -> Result<Option<Message>> with Ok(Some(Default::default()))
+crates/proxy/src/protocol.rs:228:9: replace FrameReader<R>::read_startup -> Result<Option<StartupPacket>> with Ok(Some(Default::default()))
+crates/proxy/src/protocol.rs:245:5: replace try_take_message -> Result<Option<Message>> with Ok(Some(Default::default()))
+crates/proxy/src/protocol.rs:265:5: replace try_take_startup -> Result<Option<StartupPacket>> with Ok(Some(Default::default()))

@@ -1,0 +1,26 @@
+--- crates/proxy/src/protocol.rs
++++ replace read_cstring_bytes -> Option<Bytes> with Some(Default::default())
+@@ -307,22 +307,17 @@
+ 
+ /// Read a protocol cstring without interpreting its bytes.
+ ///
+ /// Prepared-statement and portal names are protocol identities, not text for
+ /// pgmask to normalize. Lossy UTF-8 decoding collapses distinct byte strings
+ /// onto the same replacement character and therefore cannot be used as a map
+ /// key.
+ fn read_cstring_bytes(buf: &mut Bytes) -> Option<Bytes> {
+-    let end = buf.iter().position(|b| *b == 0)?;
+-    // `position` found the NUL inside the buffer, so `end` is a valid split
+-    // point and one byte remains for the terminator.
+-    let value = buf.split_to(end);
+-    buf.advance(1);
+-    Some(value)
++    Some(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// SQL is analyzed as UTF-8. Unsupported client encodings stay unknown so the
+ /// release decision fails closed instead of analyzing replacement characters.
+ fn read_utf8_cstring(buf: &mut Bytes) -> Option<String> {
+     String::from_utf8(read_cstring_bytes(buf)?.to_vec()).ok()
+ }
+ 

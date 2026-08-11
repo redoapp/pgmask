@@ -1,0 +1,41 @@
+--- crates/proxy/src/protocol.rs
++++ replace try_take_startup -> Result<Option<StartupPacket>> with Ok(Some(Default::default()))
+@@ -257,37 +257,17 @@
+     };
+     if buf.len() < total {
+         return Ok(None);
+     }
+     Ok(Some(Message::from_frame(tag, buf.split_to(total).freeze())))
+ }
+ 
+ fn try_take_startup(buf: &mut BytesMut) -> Result<Option<StartupPacket>> {
+-    if buf.len() < 8 {
+-        return Ok(None);
+-    }
+-    // The `< 8` guard above means the four length bytes are always present.
+-    let Some(&[l0, l1, l2, l3]) = buf.get(..4) else {
+-        return Ok(None);
+-    };
+-    let len = i32::from_be_bytes([l0, l1, l2, l3]);
+-    if !(8..=1_048_576).contains(&len) {
+-        bail!("implausible startup packet length {len}");
+-    }
+-    if buf.len() < len as usize {
+-        return Ok(None);
+-    }
+-    let mut frame = buf.split_to(len as usize);
+-    frame.advance(4);
+-    let code = frame.get_i32();
+-    Ok(Some(StartupPacket {
+-        code,
+-        body: frame.freeze(),
+-    }))
++    Ok(Some(Default::default())) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Length-checked, so a truncated or hostile frame returns `None` rather than
+ /// panicking on a slice out of range.
+ fn read_i16(buf: &mut Bytes) -> Option<i16> {
+     if buf.len() < 2 {
+         return None;
+     }

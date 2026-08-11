@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.48 — a shard is a disk budget, measured this time
+
+The campaign filled the disk and died at shard 8 of 12. The accounting caught
+it — `attempted 520 of 552`, exit 1, "missed.txt is not the survivor list, do
+not triage it" — which is the third partial run that guard has refused to let
+pass as complete, and the first where it also stopped me acting on the results.
+
+WHY THE BETWEEN-SHARD CHECK NEVER GOT A TURN
+
+It was set at 6 GB, and a shard of 65 mutants took the free space from 13 GB to
+2 GB in one go. cargo-mutants rebuilds the tree copy per mutant and its target
+directory accumulates, reclaimed only when the shard ends — so a floor that does
+not cover a *whole shard* is a floor the run walks straight past.
+
+Measured at roughly **0.17 GB per mutant**. Twelve shards was 69 each, about
+12 GB. Twenty shards is ~41 each, about 7 GB, and the floor is 15 GB so a shard
+plus a concurrent `cargo build` still fits. The numbers are in the script rather
+than in my head.
+
+WHAT ELSE ATE THE DISK
+
+`cargo clean` on this repository freed **49.5 GB** — `du` had been reporting 34.
+The gate rebuilds with incremental compilation on, and I had been running it
+repeatedly alongside the campaign, which is a large part of why the margin
+vanished. The mutants script sets `CARGO_INCREMENTAL=0` for its own runs; the
+gate does not, deliberately, because iteration speed is worth it there.
+
+Standing recommendation for whoever runs this next: do not run the gate and the
+campaign at the same time. They compete for the same disk and the campaign is
+the one that dies.
+
 ## 0.1.47 — triaging the rest: three tests, two comments, one measurement
 
 Continuing through the survivor list. The useful output of a mutation campaign

@@ -359,3 +359,18 @@ crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(St
 crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![("xyzzy".into(), "xyzzy".into())]
 crates/proxy/src/protocol.rs:195:9: replace FrameReader<R>::saw_eof -> bool with true
 crates/proxy/src/protocol.rs:200:9: replace FrameReader<R>::read_message -> Result<Option<Message>> with Ok(None)
+crates/proxy/src/protocol.rs:245:5: replace try_take_message -> Result<Option<Message>> with Ok(None)
+crates/proxy/src/protocol.rs:249:12: replace < with == in try_take_message
+crates/proxy/src/protocol.rs:249:12: replace < with > in try_take_message
+crates/proxy/src/protocol.rs:249:12: replace < with <= in try_take_message
+crates/proxy/src/protocol.rs:258:18: replace < with == in try_take_message
+crates/proxy/src/protocol.rs:258:18: replace < with > in try_take_message
+crates/proxy/src/protocol.rs:258:18: replace < with <= in try_take_message
+crates/proxy/src/protocol.rs:291:18: replace < with == in read_i16
+crates/proxy/src/protocol.rs:291:18: replace < with > in read_i16
+crates/proxy/src/protocol.rs:298:18: replace < with == in read_i32
+crates/proxy/src/protocol.rs:298:18: replace < with > in read_i32
+crates/proxy/src/protocol.rs:305:5: replace read_cstring -> Option<String> with None
+crates/proxy/src/protocol.rs:305:5: replace read_cstring -> Option<String> with Some(String::new())
+crates/proxy/src/protocol.rs:305:5: replace read_cstring -> Option<String> with Some("xyzzy".into())
+crates/proxy/src/protocol.rs:315:5: replace read_cstring_bytes -> Option<Bytes> with None
