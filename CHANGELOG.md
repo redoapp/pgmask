@@ -57,6 +57,40 @@ Adding it failed `classify --check` immediately, because the shipped catalog did
 not declare the new column. That is the drift gate doing its job on the first
 change that gave it something to catch.
 
+## 0.1.32 — a soak, and a round zero that has to fail
+
+`scripts/soak.sh [hours]` runs a fresh 2,000-statement corpus every round for as
+long as it is given, over both wire protocols, against Postgres 17 and
+CockroachDB v25.4.14, with a running total in `/tmp/pgmask-soak.status`.
+
+**Round zero unmasks the catalog and requires the campaign to leak.** If it does
+not, the run aborts and reports nothing further. A clean round from a detector
+that cannot see is indistinguishable from a proxy that does not leak, and this
+codebase produced that exact false clean three times in one day — `int8`,
+`numeric` and `timestamptz`, each dropped by a type ladder one layer below the
+canaries. Measured on the first run: 817,016 leaks with masking removed.
+
+It also aborts on a blind spot rather than counting it clean: a value in a type
+the harness cannot decode stops the run and names the type.
+
+On a leak it stops and keeps the corpus at `/tmp/soak-leak-<seed>.sql`, so the
+finding is reproducible rather than a number in a log.
+
+Two harness bugs found while smoke-testing it, both this session's recurring
+shape. `mkcfg` rewrote the backend port but not `catalog_dsn`, so the
+CockroachDB proxy died on Postgres credentials. And the CockroachDB fixture load
+was silent, so an empty fixture would have soaked against nothing — it verifies
+`fz.people` is populated before starting.
+
+WHAT A CLEAN SOAK MEANS
+
+That no masked value appeared in a result set, across the statements it ran, on
+both protocols and both engines. Not that the proxy is safe against an
+adversary: inference is out of scope by design and `test-inference.sh` measures
+what remains. Not that untested rules are sound either — `reach` fails when a
+release path has no generated statement behind it, and that is the check which
+bounds this one.
+
 ## 0.1.31 — the guard read one statement while the analysis judged another
 
 ```sql
