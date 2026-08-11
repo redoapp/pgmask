@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.1.41 — my own fix, one hour old, with the same hole in it
+
+`from_user_sql = !notice && has_field(body, b'W')`.
+
+That `!notice` was written while thinking about errors. `RAISE NOTICE 'x' USING
+ERRCODE` takes an expression exactly as `RAISE EXCEPTION` does, so the SQLSTATE
+channel closed in 0.1.40 stayed open through `NOTICE`, `WARNING` and `INFO` —
+measured, five characters of the canary came back through all three.
+
+The notice is the *worse* of the two. It does not abort the transaction, so
+
+```sql
+DO $$ BEGIN FOR i IN 1..10 LOOP
+  RAISE NOTICE 'x' USING ERRCODE = <five characters of the value>;
+END LOOP; END $$;
+```
+
+carries the whole value in a single statement, where the error variant costs one
+query per five characters. Withholding it costs nothing: a notice's text is
+already replaced unconditionally, so its SQLSTATE has nothing left to qualify.
+
+Found by re-reading the fix rather than by any test, which is the fourth time
+that has been the finding method here and the second time in one day that the
+thing being re-read was mine.
+
+WHERE THIS STOPS
+
+Written into the assessment rather than left implied, because otherwise these
+fixes read as claiming more than they deliver.
+
+What they close is the direct echo of value *bytes* — a message written by
+`RAISE`, a `CONTEXT` reproducing a dynamic statement, a `SQLSTATE` set from
+`upper(substr(email, 1, 5))`.
+
+What they do not, and no wire proxy can: a client that can execute a `DO` block
+with a loop can *encode* a value into anything the protocol lets it vary — how
+many notices it emits, which severity each carries, how long the statement
+takes, how many rows come back. Severity alone is about two bits per notice and
+a loop emits as many as it likes. Closing that means refusing `DO` blocks and
+user-defined functions outright, which is a different product.
+
+The line is whether the channel carries the value or carries a message the
+attacker encoded. pgmask stops the first.
+
 ## 0.1.40 — the notice disclosure again, through the error message
 
 `RAISE NOTICE '%', (SELECT email …)` returning the address was found, fixed, and

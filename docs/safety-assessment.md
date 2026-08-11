@@ -50,6 +50,24 @@ all for a column called `col_7`.
 and no detector covers it. The campaigns generate the shape and cannot tell
 whether it leaked.
 
+**Covert channels available to a client that can run arbitrary PL/pgSQL.** This
+boundary matters for reading the 2026-08-11 fixes correctly, and it is not the
+same line as "inference".
+
+What was closed there is the *direct echo of value bytes*: an error or notice
+message written by `RAISE`, a `CONTEXT` reproducing a dynamic statement, and a
+`SQLSTATE` set from `upper(substr(email, 1, 5))`. Those carry the value itself.
+
+What is not closed, and cannot be by a wire proxy: a client that can execute a
+`DO` block with a loop can *encode* a value into anything the protocol lets it
+vary — how many notices it emits, which severity each one carries, how long the
+statement takes, how many rows come back. Severity alone is roughly two bits per
+notice and a loop emits as many as it likes. Closing those would mean refusing
+`DO` blocks and user-defined functions outright, which is a different product.
+
+The distinction is whether the channel carries the value or carries a message
+the attacker encoded. pgmask stops the first.
+
 ## What was found on 2026-08-10
 
 Six disclosures, all in the release rules — the paths that turn a refusal into

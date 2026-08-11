@@ -646,6 +646,38 @@ async fn a_client_chosen_sqlstate_is_replaced_and_an_ordinary_one_is_not() -> Re
     Ok(())
 }
 
+/// A notice's SQLSTATE is the client's too, and it is the cheaper channel.
+///
+/// `RAISE NOTICE … USING ERRCODE` takes an expression just as `RAISE EXCEPTION`
+/// does. The first cut of the error fix wrote `!notice && …` and left this
+/// open. A notice does not abort the transaction, so a loop emits as many as it
+/// likes and five characters each carries the whole value in one statement.
+#[tokio::test]
+async fn a_notice_cannot_smuggle_a_value_through_its_sqlstate() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    for level in ["NOTICE", "WARNING", "INFO"] {
+        let sql = format!(
+            "DO $$ BEGIN RAISE {level} 'x' USING ERRCODE = \
+             upper(substr((SELECT email FROM canary.subjects LIMIT 1), 1, 5)); END $$;"
+        );
+        let before = client.received_text().len();
+        let _ = client.simple_query(&sql).await;
+        let text = client.received_text();
+        let reply = text.get(before..).unwrap_or_default();
+        assert!(
+            !reply.contains("CANAR"),
+            "{level} carried five characters of the value:\n{reply}"
+        );
+        assert_no_canary(&client, &sql);
+        client = RawClient::connect(proxy.addr, DB).await?;
+    }
+    Ok(())
+}
+
 /// An error still says enough to act on.
 ///
 /// Withholding the message is only defensible if the `SQLSTATE` survives — it

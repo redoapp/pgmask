@@ -697,9 +697,25 @@ fn has_field(body: &Bytes, wanted: u8) -> bool {
 }
 
 fn scrub_diagnostic(body: &Bytes, notice: bool) -> Option<Bytes> {
-    // Whether a `CONTEXT` was present, which decides the `SQLSTATE` below. Read
-    // first because `W` is dropped in the rebuild and would be gone by then.
-    let from_user_sql = !notice && has_field(body, b'W');
+    // Whether the SQLSTATE was the client's to choose. Read first because `W` is
+    // dropped in the rebuild and would be gone by then.
+    //
+    // Always true for a notice. `RAISE NOTICE 'x' USING ERRCODE = …` takes an
+    // expression exactly as `RAISE EXCEPTION` does, and the first version of
+    // this fix wrote `!notice && …`, which left it open — measured, five
+    // characters of the canary came back. A notice is the *worse* of the two
+    // channels: it does not abort the transaction, so
+    //
+    // ```sql
+    // DO $$ BEGIN FOR i IN 1..10 LOOP
+    //   RAISE NOTICE 'x' USING ERRCODE = <five characters of the value>;
+    // END LOOP; END $$;
+    // ```
+    //
+    // carries the whole value in one statement. Nothing is lost by withholding
+    // it: a notice's text is already replaced unconditionally, so its SQLSTATE
+    // has nothing left to qualify.
+    let from_user_sql = notice || has_field(body, b'W');
     let mut buf = body.clone();
     let mut kept = BytesMut::with_capacity(body.len());
     let mut changed = false;

@@ -26,8 +26,9 @@
 # this script sets up. The same mistake is available in coverage — measuring
 # with `PGMASK_ALLOW_SKIP=1` put `catalog.rs` at 62% when it is 88%.
 #
-# Slow by nature: every mutant is a build plus a test run. Not in the release
-# gate for that reason; run it when the guards change.
+# Slow by nature: every mutant is a build plus a test run, and there are 827 of
+# them. Not in the release gate for that reason; run it when the guards change,
+# and expect to leave it overnight.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -108,7 +109,13 @@ export CARGO_INCREMENTAL=0
 # extra baseline build per shard.
 #
 # Set SHARDS=1 for the old single-pass behaviour when disk is plentiful.
-SHARDS=${SHARDS:-6}
+#
+# 827 mutants as of 2026-08-11 — 494 before `protocol.rs` and `mask.rs` joined
+# the list. Every one is a build plus a test run, so a complete campaign is an
+# overnight job, not something to slip into a working session. Twelve shards
+# keeps each scratch copy well inside the free space this needs and gives a
+# progress line roughly every seventy mutants.
+SHARDS=${SHARDS:-12}
 merged=mutants.out.merged
 rm -rf "$merged"; mkdir -p "$merged"
 : > "$merged/caught.txt"; : > "$merged/missed.txt"
@@ -116,6 +123,15 @@ rm -rf "$merged"; mkdir -p "$merged"
 planned_total=0
 status=0
 
+# `protocol.rs` and `mask.rs` were absent from this list until 2026-08-11, and
+# the seventh disclosure was in `protocol.rs`. I went looking there *because* I
+# had written down that nothing mutated it a few hours earlier.
+#
+# `protocol.rs` holds `LEAKY_FIELDS` and the error/notice scrubbing — the
+# difference between a unique violation saying `Key (email)=(alice@example.com)`
+# and saying nothing. `mask.rs` is where the value is actually rewritten. Both
+# decide what reaches the client, which is the criterion the other four are on
+# this list for.
 echo "==> mutating the modules that decide whether a value is released"
 echo "    in $SHARDS shards, cleaning the scratch copy between each"
 for shard in $(seq 1 "$SHARDS"); do
@@ -125,6 +141,8 @@ for shard in $(seq 1 "$SHARDS"); do
     --file crates/proxy/src/catalog.rs \
     --file crates/proxy/src/lineage.rs \
     --file crates/proxy/src/session.rs \
+    --file crates/proxy/src/protocol.rs \
+    --file crates/proxy/src/mask.rs \
     --shard "$shard/$SHARDS" \
     --timeout 180 \
     "$@"
