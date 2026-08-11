@@ -29,7 +29,18 @@ const ALLOW: Relaxations = Relaxations {
 /// The releasable shapes worth counting separately, matched on the statement
 /// text. Crude on purpose: the point is which *kinds* of statement the corpus
 /// contains, and a false positive here understates a gap rather than hiding it.
+///
+/// `grouping set` is Postgres-only, so this expects a corpus generated with
+/// `shapegen <seed> <count> postgres` — which is what `test-all.sh` passes. A
+/// `portable` corpus will report it unreached, correctly.
 const SHAPES: &[(&str, &str)] = &[
+    // The wrapper the analysis unwraps before judging anything. It reached
+    // zero statements in 5,000 while the disclosure that needed it was live,
+    // so it is tracked here to keep that from happening twice.
+    ("star over subquery", "SELECT * FROM ("),
+    ("grouping set", "ROLLUP("),
+    ("grouping set", "CUBE("),
+    ("grouping set", "GROUPING SETS"),
     ("reducing aggregate", "sum("),
     ("reducing aggregate", "avg("),
     ("count(*)", "count(*)"),

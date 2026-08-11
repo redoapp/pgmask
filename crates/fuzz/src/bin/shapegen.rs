@@ -1,4 +1,4 @@
-//! A portable generator of *query shapes*, as a corpus for the replay harness.
+//! A generator of *query shapes*, as a corpus for the replay harness.
 //!
 //! # Why this exists rather than sqlsmith
 //!
@@ -16,8 +16,22 @@
 //! top. Both bugs found so far were shapes: a set operation, and a set
 //! operation hidden in a view.
 //!
-//! So this generates compositions of relational operators over the fixture,
-//! using only SQL both engines accept. Every statement is expected to run.
+//! So this generates compositions of relational operators over the fixture.
+//! Every statement is expected to run.
+//!
+//! # Dialect
+//!
+//! Most of the corpus is SQL both engines accept, and it has to stay that way:
+//! the same file is replayed against CockroachDB by `test-fuzz-cockroach.sh`,
+//! `test-differential.sh` and `soak.sh`, and a statement one engine cannot
+//! parse is not a test, it is a hole that reports as a pass.
+//!
+//! `ROLLUP`, `CUBE` and `GROUPING SETS` are the exception. CockroachDB rejects
+//! them outright and they are exactly where one disclosure lived, so they are
+//! generated only when the caller passes `postgres` (the default) and
+//! suppressed under `portable`. An arm that cannot honour what the caller asked
+//! for declines and emits a leaf instead, which is what the `typed` flag
+//! already did for the arms that project a date or a bigint.
 //!
 //! # Determinism
 //!
@@ -25,7 +39,7 @@
 //! corpus exactly and the crate gains nothing to audit.
 //!
 //! Usage:
-//!   shapegen <seed> <count> > corpus.sql
+//!   shapegen <seed> <count> [postgres|portable] > corpus.sql
 
 use std::fmt::Write as _;
 
@@ -185,6 +199,41 @@ struct Shape {
     typed: bool,
 }
 
+/// What the caller of an arm can accept.
+///
+/// Two different questions, both answered the same way: an arm that cannot
+/// honour the constraint declines and emits a leaf instead. Arms 9, 10 and 11
+/// already did that for `typed`, and the reason it is a *flag* and not a
+/// convention is that getting it wrong is silent — the statement is generated,
+/// the engine rejects it, and the corpus quietly shrinks.
+#[derive(Clone, Copy)]
+struct Allow {
+    /// The first output column may be something other than `text`.
+    ///
+    /// A set operation needs its branches to agree on type, so it turns this
+    /// off for both, and `string_agg` only takes text.
+    typed: bool,
+    /// Postgres-only syntax is acceptable, because this corpus will not be
+    /// replayed against CockroachDB.
+    ///
+    /// `ROLLUP`, `CUBE` and `GROUPING SETS` are the whole of it today.
+    /// CockroachDB rejects them outright, and the same generated corpus is
+    /// replayed against both engines by `test-fuzz-cockroach.sh`,
+    /// `test-differential.sh` and `soak.sh`, where an unparseable statement is
+    /// not a test — it is a hole in one that reports as a pass.
+    postgres_only: bool,
+}
+
+impl Allow {
+    /// The same permissions, but the first column has to be text.
+    fn text_only(self) -> Self {
+        Self {
+            typed: false,
+            ..self
+        }
+    }
+}
+
 /// One relation reference: `fz.people p3`.
 struct Source {
     relation: &'static Relation,
@@ -242,7 +291,7 @@ fn scalar(rng: &mut Rng, s: &Source) -> String {
 }
 
 /// A single-relation select, the leaf every larger shape is built from.
-fn leaf(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
+fn leaf(rng: &mut Rng, depth: usize, n: usize, allow: Allow) -> Shape {
     let s = source(rng, n.wrapping_add(depth.wrapping_mul(10)));
     let mut cols = Vec::new();
     let mut typed = false;
@@ -250,7 +299,7 @@ fn leaf(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
     for i in 0..count {
         let expr = if rng.chance(30) {
             scalar(rng, &s)
-        } else if allow_typed && rng.chance(30) {
+        } else if allow.typed && rng.chance(30) {
             typed = true;
             s.typed_col(rng)
         } else {
@@ -285,26 +334,26 @@ fn leaf(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
 /// Each arm is a construct that either preserves provenance, erases it, or —
 /// the interesting case — makes one output field draw from several source
 /// columns. Those last are the ones that have found bugs.
-fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
+fn compose(rng: &mut Rng, depth: usize, n: usize, allow: Allow) -> Shape {
     if depth == 0 {
-        return leaf(rng, depth, n, allow_typed);
+        return leaf(rng, depth, n, allow);
     }
     let next = depth.saturating_sub(1);
     // Every arm below projects `inner`'s first column onward, so the type flag
     // travels with it unless the arm changes the type.
     let wrap = |sql: String, cols: Vec<String>, typed: bool| Shape { sql, cols, typed };
 
-    match rng.below(13) {
+    match rng.below(14) {
         // Subquery.
         0 => {
-            let inner = compose(rng, next, n, allow_typed);
+            let inner = compose(rng, next, n, allow);
             let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
             let sql = format!("SELECT {lc} FROM ({}) q{n}", inner.sql);
             wrap(sql, vec![lc], inner.typed)
         }
         // CTE.
         1 => {
-            let inner = compose(rng, next, n, allow_typed);
+            let inner = compose(rng, next, n, allow);
             let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
             let sql = format!("WITH w{n} AS ({}) SELECT {lc} FROM w{n}", inner.sql);
             wrap(sql, vec![lc], inner.typed)
@@ -316,8 +365,8 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
             // Text on both sides. A set operation needs the branches to agree
             // on type, and pairing a date with text is an engine error, not a
             // test — it put 230 of them into a corpus that ran at zero.
-            let left = compose(rng, next, n, false);
-            let right = compose(rng, next, n.wrapping_add(1), false);
+            let left = compose(rng, next, n, allow.text_only());
+            let right = compose(rng, next, n.wrapping_add(1), allow.text_only());
             let lc = left.cols.first().cloned().unwrap_or_else(|| "c0".into());
             let sql = format!(
                 "SELECT {lc} FROM ({}) a{n} {op} SELECT c0 FROM ({}) b{n}",
@@ -328,7 +377,7 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
         // Join.
         4 => {
             let s = source(rng, n.wrapping_add(50));
-            let inner = compose(rng, next, n, allow_typed);
+            let inner = compose(rng, next, n, allow);
             let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
             let sql = format!(
                 "SELECT q{n}.{lc}, {} AS c1 FROM ({}) q{n} JOIN {} {} ON true",
@@ -341,14 +390,14 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
         }
         // DISTINCT.
         5 => {
-            let inner = compose(rng, next, n, allow_typed);
+            let inner = compose(rng, next, n, allow);
             let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
             let sql = format!("SELECT DISTINCT {lc} FROM ({}) q{n}", inner.sql);
             wrap(sql, vec![lc], inner.typed)
         }
         // ORDER BY / LIMIT.
         6 => {
-            let inner = compose(rng, next, n, allow_typed);
+            let inner = compose(rng, next, n, allow);
             let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
             let sql = format!(
                 "SELECT {lc} FROM ({}) q{n} ORDER BY 1 LIMIT {}",
@@ -359,7 +408,7 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
         }
         // Window function: the value passes through untouched beside a rank.
         7 => {
-            let inner = compose(rng, next, n, allow_typed);
+            let inner = compose(rng, next, n, allow);
             let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
             let sql = format!(
                 "SELECT {lc}, row_number() OVER (ORDER BY {lc}) AS c1 FROM ({}) q{n}",
@@ -370,7 +419,7 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
         // Value-returning aggregates: they return one of their inputs, which is
         // exactly what must stay refused.
         8 => {
-            let inner = compose(rng, next, n, allow_typed);
+            let inner = compose(rng, next, n, allow);
             let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
             // `string_agg` only takes text, so it is off the table when the
             // projected column might be a date or a uuid.
@@ -402,13 +451,13 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
         // accident, once the fixture changed.
         9 => {
             // A numeric first column, so it cannot sit under a set operation
-            // whose other branch is text. `allow_typed` is how the caller says
+            // whose other branch is text. `allow.typed` is how the caller says
             // "text only"; these two arms produced `bigint` and `numeric` while
             // declaring `typed: false`, which is the same mistake the `typed` flag
             // was introduced to stop — 22 type-mismatch errors per 400 statements,
             // all `INTERSECT types bigint and text cannot be matched` and kin.
-            if !allow_typed {
-                return leaf(rng, depth, n, allow_typed);
+            if !allow.typed {
+                return leaf(rng, depth, n, allow);
             }
             let s = source(rng, n.wrapping_add(70));
             let frame = rng.pick(&[
@@ -448,19 +497,29 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
         // groupings drawn here are the disclosure and half are honest
         // aggregation that must keep working.
         //
-        // Spellings are restricted to what both engines accept. Postgres-only
-        // syntax — `ROLLUP`, `CUBE`, `GROUPING SETS`, which CockroachDB rejects
-        // outright — is covered by `scripts/test-grouping.py` instead, so this
-        // corpus stays at zero engine errors on both.
+        // `ROLLUP`, `CUBE` and `GROUPING SETS` are drawn here too, and only
+        // when the caller said Postgres-only. That is not a portability
+        // nicety, it is the reason 0.1.18 could not have been found by this
+        // campaign: a grouping set is read by a *different* branch of
+        // `group_item_columns` than a plain column reference, and until now no
+        // generated statement contained one. This arm used to say the
+        // Postgres-only spellings were "covered by scripts/test-grouping.py
+        // instead", which is true and is not the same thing — that script
+        // checks a fixed list of hand-written statements, so it can only find
+        // the grouping bugs somebody already thought of, and it cannot compose
+        // a grouping set with a subquery wrapper, a view or a join.
+        //
+        // Measured over 5,000 statements before this change: `ROLLUP`, `CUBE`
+        // and `GROUPING SETS` appeared **zero** times.
         10 => {
             // A numeric first column, so it cannot sit under a set operation
-            // whose other branch is text. `allow_typed` is how the caller says
+            // whose other branch is text. `allow.typed` is how the caller says
             // "text only"; these two arms produced `bigint` and `numeric` while
             // declaring `typed: false`, which is the same mistake the `typed` flag
             // was introduced to stop — 22 type-mismatch errors per 400 statements,
             // all `INTERSECT types bigint and text cannot be matched` and kin.
-            if !allow_typed {
-                return leaf(rng, depth, n, allow_typed);
+            if !allow.typed {
+                return leaf(rng, depth, n, allow);
             }
             // Weighted towards the relation that carries the poison. Drawn
             // uniformly, this arm reaches `sum(fz.people.annual_salary) GROUP
@@ -501,23 +560,59 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
             // decodes; it was restricted to `sum` for one release because a
             // value that cannot be decoded is a value the oracle never scans.
             let agg = *rng.pick(&["sum", "avg"]);
-            // Three ways to name the same grouping. The alias and the ordinal
-            // are not decoration: both were live disclosures, because a name in
-            // the clause is not the column being grouped on.
-            let sql = match rng.below(3) {
-                0 => format!(
-                    "SELECT {agg}({value}) AS c0 FROM {} {} GROUP BY {grouped}",
-                    s.relation.name, s.alias
-                ),
-                1 => format!(
-                    "SELECT {grouped} AS g0, {agg}({value}) AS c0 FROM {} {} GROUP BY g0",
-                    s.relation.name, s.alias
-                ),
-                _ => format!(
-                    "SELECT {grouped} AS g0, {agg}({value}) AS c0 FROM {} {} GROUP BY 1",
-                    s.relation.name, s.alias
-                ),
+            // Three ways to *name* the same grouping. The alias and the
+            // ordinal are not decoration: both were live disclosures, because a
+            // name in the clause is not the column being grouped on.
+            //
+            // Named separately from how the grouping is *spelled* below, so
+            // every naming survives inside a grouping set. `GROUP BY
+            // ROLLUP(g0)` resolves the output alias where `GROUP BY g0 + 0`
+            // does not, which is a distinction the reader has to make and had
+            // no generated statement to make it on.
+            let naming = rng.below(3);
+            let (projection, named) = match naming {
+                0 => (String::new(), grouped.clone()),
+                1 => (format!("{grouped} AS g0, "), "g0".to_string()),
+                _ => (format!("{grouped} AS g0, "), "1".to_string()),
             };
+            // A second key, for the multi-element sets. Drawn from the same
+            // relation so the statement stays well-formed.
+            let other = format!("{}.{}", s.alias, rng.pick(s.relation.nums));
+            let clause = if allow.postgres_only {
+                match rng.below(8) {
+                    // The portable spellings still carry half the draw. This
+                    // arm's subject is the singleton grouping; a grouping set
+                    // is one more way to write one, not a different
+                    // disclosure, and the plain forms are what CockroachDB
+                    // also sees.
+                    0..=3 => named,
+                    4 => format!("ROLLUP({named})"),
+                    5 => format!("CUBE({named})"),
+                    6 => format!("GROUPING SETS (({named}))"),
+                    // Several sets over two keys. `group_by_columns` unions
+                    // the names across every set, and this is the shape that
+                    // says whether it has to: a key present in only one set
+                    // still makes that set's groups singletons, so reading one
+                    // set instead of the union would release the value. The
+                    // empty set is the grand total, which discloses nothing
+                    // and must keep coming back.
+                    //
+                    // Only over the expression naming: an ordinal or an alias
+                    // inside a multi-element set would have to be projected
+                    // twice, and a statement that does not compile tests
+                    // nothing.
+                    _ if naming == 0 => {
+                        format!("GROUPING SETS (({named}, {other}), ({named}), ())")
+                    }
+                    _ => named,
+                }
+            } else {
+                named
+            };
+            let sql = format!(
+                "SELECT {projection}{agg}({value}) AS c0 FROM {} {} GROUP BY {clause}",
+                s.relation.name, s.alias
+            );
             // The summary first, deliberately. Every wrapping arm projects
             // `cols.first()` by name, so listing the grouping first meant an
             // enclosing subquery or CTE emitted `SELECT g0 FROM (...)` and
@@ -564,8 +659,8 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
             // Same reason as arms 9 and 10: these project a date, a text size
             // or a numeric, none of which can sit opposite text in a set
             // operation.
-            if !allow_typed {
-                return leaf(rng, depth, n, allow_typed);
+            if !allow.typed {
+                return leaf(rng, depth, n, allow);
             }
             let s = source(rng, n.wrapping_add(120));
             let sql = match rng.below(10) {
@@ -648,9 +743,23 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
                 typed: true,
             }
         }
+        // `SELECT * FROM (<inner>) alias`, in the middle of a nest.
+        //
+        // See [`star_over_subquery`] for why the shape matters. Here it is
+        // buried under whatever arm drew it, which is the weaker half of the
+        // test — the analysis only unwraps from the top, so an inner wrapper is
+        // inert to it. It is still worth generating: `lineage` walks the whole
+        // tree, and a star it cannot resolve has to end in a refusal rather
+        // than in the wrong column. `main` puts the same wrapper where the
+        // analysis will actually read it.
+        12 => {
+            let inner = compose(rng, next, n, allow);
+            let cols = inner.cols.clone();
+            wrap(star_over_subquery(rng, inner.sql, n), cols, inner.typed)
+        }
         // GROUP BY, keeping the grouped value in the output.
         _ => {
-            let inner = compose(rng, next, n, allow_typed);
+            let inner = compose(rng, next, n, allow);
             let lc = inner.cols.first().cloned().unwrap_or_else(|| "c0".into());
             let sql = format!(
                 "SELECT {lc}, count(*) AS c1 FROM ({}) q{n} GROUP BY {lc}",
@@ -661,10 +770,70 @@ fn compose(rng: &mut Rng, depth: usize, n: usize, allow_typed: bool) -> Shape {
     }
 }
 
+/// `SELECT * FROM (<sql>) alias`, once or twice.
+///
+/// # Why this shape and not another wrapper
+///
+/// It is the one the analysis *unwraps*. `analyze_inspected` strips
+/// `SELECT * FROM (subselect)` off the top and classifies the subquery's
+/// target list, because the star means the outer target list has one entry
+/// while the result set has many and positions cannot otherwise map. Every
+/// other question the proxy asks of a statement therefore has to be asked of
+/// the same unwrapped statement, and when one of them was not, the answer came
+/// from the wrapper — an empty `GROUP BY` — while the value came from the
+/// subquery. That was 0.1.31, and it returned every salary in the fixture
+/// exactly:
+///
+///   SELECT id, sum(annual_salary) FROM people GROUP BY id           refused
+///   SELECT * FROM (SELECT id, sum(annual_salary) …GROUP BY id) q    served
+///
+/// Measured over 5,000 generated statements before this change: **zero**
+/// contained the shape, so the campaign could have run forever without
+/// reaching it.
+///
+/// Twice, sometimes, because the unwrapping is a `while` and not an `if`. A
+/// single layer cannot tell the two apart, and an `if` would restore the
+/// disclosure with four more characters.
+fn star_over_subquery(rng: &mut Rng, sql: String, n: usize) -> String {
+    let once = format!("SELECT * FROM ({sql}) s{n}");
+    if rng.chance(30) {
+        return format!("SELECT * FROM ({once}) s{n}x");
+    }
+    once
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let seed: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1);
     let count: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    // The dialect, and it fails loudly on anything else rather than falling
+    // back to a default. A silent fallback here writes a corpus the caller did
+    // not ask for, and a corpus nobody notices is wrong is this repo's most
+    // expensive recurring failure.
+    //
+    // The default is the *superset*, deliberately. A new Postgres-only caller
+    // that forgets the argument loses nothing; a new cross-engine caller that
+    // forgets it gets statements CockroachDB rejects, which shows up as engine
+    // errors in that campaign's own output. Both cross-engine scripts also
+    // assert the corpus is free of Postgres-only syntax, so the mistake is
+    // caught where it is made.
+    let postgres_only = match args.next().as_deref() {
+        None | Some("postgres") => true,
+        Some("portable") => false,
+        Some(other) => {
+            eprintln!(
+                "shapegen: unknown dialect {other:?}\n\
+                 usage: shapegen <seed> <count> [postgres|portable]\n\
+                 \n  postgres  everything, including ROLLUP/CUBE/GROUPING SETS (default)\
+                 \n  portable  only SQL CockroachDB also accepts"
+            );
+            std::process::exit(2);
+        }
+    };
+    let allow = Allow {
+        typed: true,
+        postgres_only,
+    };
     let mut rng = Rng::new(seed);
 
     let mut out = String::new();
@@ -672,8 +841,39 @@ fn main() {
         // Depth 1..=3. Deeper nests mostly repeat shapes while getting slower to
         // plan, and CockroachDB starts timing out on the wide ones.
         let depth = rng.below(3).saturating_add(1);
-        let shape = compose(&mut rng, depth, i, true);
-        let _ = writeln!(out, "{};", shape.sql);
+        let shape = compose(&mut rng, depth, i, allow);
+        // The star wrapper, at the top of the statement.
+        //
+        // Deliberately here and not left to arm 12 alone. Only the *outermost*
+        // wrapper is the one the analysis reads: `analyze_inspected` and
+        // `group_by_columns` both strip it from the top and judge what is
+        // underneath, so that is where the two halves of the guard can be made
+        // to disagree. Reaching the top from inside `compose` needs the arm
+        // drawn at the outermost depth with the interesting arm directly
+        // beneath it, which is about one statement in three hundred — thin
+        // enough that a clean run would mean nothing, which is the same
+        // mistake the grouped-aggregate arm made when it projected `count(*)`.
+        //
+        // Weighted towards statements that group, the same way arm 10 is
+        // weighted towards the relation carrying the poison. The wrapper only
+        // changes a verdict when the outer query has a clause the proxy would
+        // read *instead of* the subquery's, and `GROUP BY` is that clause:
+        // the wrapper's is empty, so a reader that stops at the top sees "no
+        // grouping" over an aggregate that is one row per group. Drawn flat at
+        // 30% this reached the disclosure in 9 corpora out of 10 at 600
+        // statements — and the tenth is the failure this repo keeps having, a
+        // clean run that looked like evidence.
+        let wrap_chance = if shape.sql.contains(" GROUP BY ") {
+            70
+        } else {
+            25
+        };
+        let sql = if rng.chance(wrap_chance) {
+            star_over_subquery(&mut rng, shape.sql, i)
+        } else {
+            shape.sql
+        };
+        let _ = writeln!(out, "{sql};");
     }
     print!("{out}");
 }

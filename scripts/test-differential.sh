@@ -98,7 +98,15 @@ PG_PID=$!
 CRDB_PID=$!
 sleep 4
 
-./target/release/shapegen 777 "$COUNT" > /tmp/pgmask-diff.sql
+# `portable`: one corpus, two engines. `ROLLUP`, `CUBE` and `GROUPING SETS`
+# parse on Postgres and not on CockroachDB, so they would show up here as
+# "one served, one errored" — an engine difference wearing a defect's clothes.
+./target/release/shapegen 777 "$COUNT" portable > /tmp/pgmask-diff.sql
+if grep -qE 'ROLLUP\(|CUBE\(|GROUPING SETS' /tmp/pgmask-diff.sql; then
+  echo "FAIL: the corpus contains Postgres-only syntax; the comparison would be"
+  echo "      measuring which engine can parse it, not what the proxy masked."
+  exit 1
+fi
 
 A="postgresql://postgres:demo@localhost:$PG_PROXY/fuzzdb"
 B="postgresql://root@localhost:$CRDB_PROXY/fuzzdb?sslmode=disable"

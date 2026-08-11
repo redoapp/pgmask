@@ -96,7 +96,9 @@ Count *executed*, not generated. Roughly a third of what sqlsmith emits runs at
 all: measured on this fixture, 123 of 400 statements execute and the other 277
 are `anymultirange is not a multirange type`, `cannot determine element type of
 "anyarray"`, `operator does not exist: point = point` and kin — the type
-resolver, not the masker. `shapegen` executes 397 of 400. Adding it to the main
+resolver, not the masker. `shapegen` executes 400 of 400 on Postgres and 391 of
+400 on CockroachDB, the nine being `pg_size_pretty` and `round(int4)`, which
+that engine does not have. Adding it to the main
 replay took the served fraction from 12% to 35% of statements and the masked
 values actually reached from 26 thousand to 21 million. The generated total is
 the less interesting number and this file used to quote only that. One of the four configurations masks *nothing*, where the proxy must

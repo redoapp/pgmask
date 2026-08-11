@@ -169,7 +169,10 @@ kill "$BIN_PID" 2>/dev/null
 # itself across protocols where CockroachDB does not, so this is the control
 # that says so rather than an assumption.
 echo "==> extended protocol: generated shapes through Parse/Bind/Execute"
-./target/release/shapegen 4242 600 > /tmp/pgmask-ext.sql
+# `postgres` spelled out although it is the default: this campaign never
+# touches CockroachDB, so it takes the whole dialect — `ROLLUP`, `CUBE` and
+# `GROUPING SETS` included, which is where 0.1.18 lived.
+./target/release/shapegen 4242 600 postgres > /tmp/pgmask-ext.sql
 sed -e "s|55432|$PG_PORT|g" -e "s|^listen = .*|listen = \"127.0.0.1:$EXT_PORT\"|" \
     -e 's|^lineage = .*|lineage = "allow"|' \
     -e 's/^metrics_listen.*//' examples/fuzz/catalog.toml > /tmp/pgmask-ext.toml
@@ -326,7 +329,7 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 # Appended rather than substituted: sqlsmith reaches operators and functions
 # nothing here would think to write, which is its whole value.
 for s in $(seq 1 "$SEEDS"); do
-  ./target/release/shapegen $((s * 104729)) "$PER_SEED" >> "/tmp/pgmask-fuzz-$s.sql"
+  ./target/release/shapegen $((s * 104729)) "$PER_SEED" postgres >> "/tmp/pgmask-fuzz-$s.sql"
 done
 
 # --- 3. Replay each corpus against every policy combination -----------------

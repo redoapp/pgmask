@@ -140,9 +140,20 @@ scalar sits on top. Both leaks above were shapes.
 
 `crates/fuzz/src/bin/shapegen.rs` therefore generates compositions of relational
 operators (subquery, CTE, set operation, join, DISTINCT, window, aggregate,
-GROUP BY, ORDER BY/LIMIT) over the fixture, in SQL both engines accept. Seeded
+GROUP BY, ORDER BY/LIMIT, `SELECT * FROM (…)`) over the fixture. Seeded
 xorshift, no dependency, and a seed reproduces a corpus exactly. On CockroachDB
 it produces **zero engine errors** where sqlsmith's corpus produced 98.75%.
+
+Almost all of it is SQL both engines accept, which is what makes one corpus
+replayable against both. The exception is `ROLLUP`, `CUBE` and `GROUPING SETS`:
+CockroachDB rejects them (`unimplemented: this syntax`, issue 46280) and one
+disclosure lived in exactly that reader, so they are generated under the
+default `postgres` dialect and suppressed under `portable`. Every script that
+replays one corpus against both engines — `test-fuzz-cockroach.sh`,
+`test-differential.sh`, `soak.sh` — passes `portable` and then asserts the
+corpus is free of those three spellings, because an engine error is not a
+failure in those campaigns and a corpus that silently stopped parsing would
+still report a pass.
 
 It found a third disclosure on its first run:
 

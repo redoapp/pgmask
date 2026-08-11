@@ -71,11 +71,28 @@ n=$(psql -w "$CDB" -X -tAc 'SELECT count(*) FROM fz.people' 2>/dev/null)
 cargo build --release -q || exit 1
 
 echo "==> generating $((SEEDS * PER_SEED)) query shapes"
+# `portable`, because this engine is the reason the flag exists. CockroachDB
+# rejects `ROLLUP`, `CUBE` and `GROUPING SETS` outright, and shapegen generates
+# them by default now that a disclosure has been found in one.
+corpora=()
 for s in $(seq 1 "$SEEDS"); do
-  ./target/release/shapegen $((s * 7919)) "$PER_SEED" >"/tmp/crdb-fuzz-$s.sql"
+  ./target/release/shapegen $((s * 7919)) "$PER_SEED" portable >"/tmp/crdb-fuzz-$s.sql"
+  corpora+=("/tmp/crdb-fuzz-$s.sql")
 done
-generated=$(cat /tmp/crdb-fuzz-*.sql | grep -c ';' || true)
+# The files this run wrote, not `/tmp/crdb-fuzz-*.sql`. A previous run with more
+# seeds leaves its corpora behind, and the glob counted them: a 600-statement
+# run reported "15000 statements".
+generated=$(cat "${corpora[@]}" | grep -c ';' || true)
 [[ "$generated" -gt 100 ]] || { echo "FAIL: only $generated statements generated"; exit 1; }
+# Asserted rather than trusted. An engine error is not a failure anywhere below
+# — the campaign only asserts on leaks — so a corpus that silently stopped
+# parsing here would shrink the run to nothing and still report a pass. That is
+# the failure mode this whole file was written against.
+if grep -nE 'ROLLUP\(|CUBE\(|GROUPING SETS' "${corpora[@]}" | head -3; then
+  echo "FAIL: the corpus contains Postgres-only syntax CockroachDB cannot parse."
+  echo "      Those statements would error rather than test anything."
+  exit 1
+fi
 echo "    $generated statements"
 
 mkcfg() { # port outfile [extra sed]

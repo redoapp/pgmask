@@ -119,7 +119,10 @@ say "round 0: poison control"
 mkcfg "$PG_PROXY" "$PG_PORT" /tmp/soak-poison.toml "$PG" unmask
 (./target/release/pgmask /tmp/soak-poison.toml >/tmp/soak-poison.log 2>&1 &)
 wait_proxy "$PG_PROXY" || { echo "FAIL: poison proxy"; tail -5 /tmp/soak-poison.log; exit 1; }
-./target/release/shapegen 1 800 > /tmp/soak-poison.sql 2>/dev/null
+# Round zero runs against Postgres alone, so it gets the full dialect —
+# `ROLLUP`, `CUBE` and `GROUPING SETS` included. The soak proper below shares
+# one corpus with CockroachDB and cannot.
+./target/release/shapegen 1 800 postgres > /tmp/soak-poison.sql 2>/dev/null
 poison=$(DIRECT_URL="$PG" PROXY_URL="postgresql://postgres:demo@localhost:$PG_PROXY/fuzzdb" \
   ./target/release/extended /tmp/soak-poison.sql 2>&1 | grep -oE "leaks=[0-9]+" | cut -d= -f2)
 killall pgmask 2>/dev/null; sleep 1
@@ -144,7 +147,9 @@ round=0; stmts=0; leaks=0; served=0; refused=0
 while (( $(date +%s) < deadline )); do
   round=$(( round + 1 ))
   seed=$(( round * 7919 + 13 ))
-  ./target/release/shapegen "$seed" 2000 > /tmp/soak-corpus.sql 2>/dev/null
+  # One corpus, replayed against both engines below, so it has to parse on
+  # both: CockroachDB rejects the Postgres-only grouping syntax outright.
+  ./target/release/shapegen "$seed" 2000 portable > /tmp/soak-corpus.sql 2>/dev/null
 
   for engine in pg crdb; do
     if [[ "$engine" == pg ]]; then D="$PG"; P="postgresql://postgres:demo@localhost:$PG_PROXY/fuzzdb"
