@@ -14,6 +14,12 @@
 # artefact to keep.
 mutants.out/
 mutants.out.old/
+# The sharded run's own scratch. These were tracked for six commits because the
+# ignore rule listed the two directories cargo-mutants makes and not the two the
+# sharding wrapper makes — 49 files of run output in the history, changing on
+# every campaign.
+mutants.out.merged/
+mutants.out.shardlast/
 
 # Coverage artifacts. `cargo llvm-cov show-env` writes these into the repo
 # root, so they need ignoring or they get swept up by `git add -A`.
