@@ -4,6 +4,11 @@
 #
 #   ./scripts/soak.sh [hours]          # default 4
 #
+# DO NOT RUN THE RELEASE GATE AT THE SAME TIME. `scripts/test-all.sh` runs
+# `pkill -f 'target/release/pgmask'` between suites and will kill this soak's
+# proxies. The soak now aborts when that happens rather than counting the
+# remaining rounds as clean, but the run is still lost.
+#
 # The release gate runs a fixed corpus and finishes in minutes. This runs a
 # fresh corpus every round, for hours, across both wire protocols and both
 # engines, and keeps a running total you can read while it works:
@@ -146,9 +151,31 @@ while (( $(date +%s) < deadline )); do
     else D="$CRDB"; P="postgresql://root@localhost:$CRDB_PROXY/defaultdb?sslmode=disable"; fi
     out=$(DIRECT_URL="$D" PROXY_URL="$P" ./target/release/extended /tmp/soak-corpus.sql 2>&1)
     r=$(printf '%s' "$out" | grep -oE "^RESULT.*")
+
+    # A round that did not run is not a round that found nothing.
+    #
+    # This counted 2,000 statements per engine whether or not the harness had
+    # executed anything, so when the release gate's `pkill -f
+    # 'target/release/pgmask'` killed these proxies mid-soak, the loop went on
+    # reporting "0 leaks" — 800,000 statements of fiction in under a minute,
+    # served and refused frozen at the values from the last real round. Exactly
+    # the vacuity this soak's round zero exists to prevent, in the soak itself.
+    if [[ -z "$r" ]]; then
+      say "ABORT: no RESULT from $engine on seed $seed — the harness did not run."
+      say "       Nothing after the last real round can be believed."
+      printf '%s\n' "$out" | tail -6 | tee -a "$STATUS"
+      exit 1
+    fi
     n=$(printf '%s' "$r" | grep -oE "leaks=[0-9]+" | cut -d= -f2)
     s=$(printf '%s' "$r" | grep -oE "served=[0-9]+" | cut -d= -f2)
     f=$(printf '%s' "$r" | grep -oE "refused=[0-9]+" | cut -d= -f2)
+    # A RESULT that served and refused nothing is a connection that produced no
+    # verdicts, which is the same emptiness wearing a well-formed line.
+    if [[ "${s:-0}" -eq 0 && "${f:-0}" -eq 0 ]]; then
+      say "ABORT: $engine seed $seed served and refused nothing — no verdicts were reached."
+      printf '%s\n' "$out" | tail -6 | tee -a "$STATUS"
+      exit 1
+    fi
     stmts=$(( stmts + 2000 )); leaks=$(( leaks + ${n:-0} ))
     served=$(( served + ${s:-0} )); refused=$(( refused + ${f:-0} ))
     if [[ "${n:-0}" -ne 0 ]]; then

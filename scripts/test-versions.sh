@@ -177,7 +177,7 @@ for V in $VERSIONS; do
   # pg_isready inside the container can go green before podman's port forward
   # is live, so wait on the forwarded port too.
   up=0
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 120); do
     if psql -h localhost -p "$PG_PORT" -U postgres -d demo -tAc 'SELECT 1' >/dev/null 2>&1; then
       up=1; break
     fi
@@ -249,8 +249,17 @@ for V in $VERSIONS; do
   PROXY_PID=$!
   ./target/release/pgmask "$GUICAT" > "$GUILOG" 2>&1 &
   GUI_PID=$!
+  # Two minutes, not thirty seconds. This suite starts five Postgres containers
+  # and ten proxies, each of which resolves the whole catalog before it binds,
+  # and the release gate runs it alongside everything else. At a 30s budget a
+  # loaded machine lost one version's readiness and `abort_version` scored all
+  # 23 of its assertions as failures — a real gate failure on a tree that passes
+  # 115 of 115 when run alone.
+  #
+  # Failing is the right response to a proxy that never came up; the budget just
+  # has to be long enough that "never" means never.
   ready=0
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 120); do
     if psql -h localhost -p "$PROXY_PORT" -U postgres -d demo -tAc 'SELECT 1' >/dev/null 2>&1 \
        && psql -h localhost -p "$GUI_PORT" -U postgres -d demo -tAc 'SELECT 1' >/dev/null 2>&1; then
       ready=1; break

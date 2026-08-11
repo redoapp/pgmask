@@ -263,13 +263,32 @@ async fn main() -> Result<()> {
 
     let rows = client
         .query(
-            "SELECT c.table_schema, c.table_name, c.column_name, c.data_type,
-                      c.character_maximum_length
-               FROM information_schema.columns c
-               JOIN information_schema.tables t
-                 ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-              WHERE c.table_schema = $1 AND t.table_type IN ('BASE TABLE', 'VIEW')
-              ORDER BY c.table_name, c.ordinal_position",
+            // `pg_catalog`, not `information_schema`, and the same `relkind`
+            // set the proxy resolves against (`catalog.rs`:
+            // `relkind = ANY('{r,v,m,p,f}')`). The two must agree on what a
+            // relation is or the drift gate lies in both directions.
+            //
+            // `information_schema` omits materialised views entirely — they are
+            // not in the SQL standard — and reports foreign tables as
+            // `'FOREIGN'`, which the old `IN ('BASE TABLE','VIEW')` filter
+            // dropped. Measured: a correct rule protecting `t.mv_contacts.email`
+            // was reported by `--check` as *"The column was renamed or dropped,
+            // and the rule is protecting nothing"*. An operator following that
+            // advice deletes masking from a materialised view, and a
+            // denormalised reporting matview is a classic place for a copy of a
+            // masked column to live. Tooling that recommends removing a working
+            // defence is worse than tooling that stays silent.
+            "SELECT n.nspname, c.relname, a.attname,
+                    format_type(a.atttypid, NULL) AS data_type,
+                    CASE WHEN a.atttypmod > 4 THEN a.atttypmod - 4 END AS max_length
+               FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+              WHERE n.nspname = $1
+                AND c.relkind = ANY('{r,v,m,p,f}')
+                AND a.attnum > 0
+                AND NOT a.attisdropped
+              ORDER BY c.relname, a.attnum",
             &[&schema],
         )
         .await

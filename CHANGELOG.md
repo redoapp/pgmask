@@ -57,6 +57,61 @@ Adding it failed `classify --check` immediately, because the shipped catalog did
 not declare the new column. That is the drift gate doing its job on the first
 change that gave it something to catch.
 
+## 0.1.33 — tooling that told operators to delete a working defence
+
+`classify --check` reported this, against a live materialised view whose column
+the proxy was masking correctly:
+
+```
+1 rule(s) match nothing in the database. The column was renamed or
+dropped, and the rule is protecting nothing:
+  t.mv_contacts.email
+```
+
+An operator following that advice removes masking from a materialised view — a
+denormalised reporting matview being a classic place for a copy of a masked
+column to live. The rule was live: the proxy resolves `relkind = ANY('{r,v,m,p,f}')`.
+`classify` walked `information_schema`, which omits materialised views entirely
+(they are not in the SQL standard) and reports foreign tables as `'FOREIGN'`.
+
+The two components disagreed about what a relation *is*. `classify` walks
+`pg_catalog` with the proxy's own `relkind` set now, so they agree by
+construction. Verified in both directions: the matview is proposed, and the
+correct rule is no longer condemned.
+
+Third defect in `classify` today, all in the component the product boundary
+rests on — *the catalog belongs to whoever deploys the proxy; we ship the
+tooling* — and the one whose coverage was lowest in the repo at 47.6%.
+
+THE SOAK COUNTED ROUNDS IT NEVER RAN
+
+Worth recording in full, because it is the failure this whole file is about and
+I wrote it. `soak.sh` exists to prove the oracle can fail before believing a
+clean run. Underneath that guard, the loop added 2,000 statements per engine
+whether or not the harness executed anything. When the release gate's
+`pkill -f 'target/release/pgmask'` killed the soak's proxies mid-run, it went on
+reporting **800,000 statements, 0 leaks** in under a minute, with `served` and
+`refused` frozen at the last real values. The only thing that caught it was two
+numbers not moving between progress lines.
+
+Two guards now, each verified by causing the failure: a round with no `RESULT`
+aborts, and a `RESULT` that served *and* refused nothing aborts — a well-formed
+line reporting no verdicts is the same emptiness better dressed.
+
+ALSO
+
+`test-versions.sh` lost a version's readiness under gate load and scored its 23
+assertions as failures — correct behaviour, budget too short for five Postgres
+containers and ten proxies starting together. Two minutes now, not thirty
+seconds. It never passed anything it had not run, which is the difference
+between it and `verify.sh`.
+
+The lineage backstop's doc claimed the name comparison "cannot be wrong in the
+unsafe direction". True for an explicitly classified column; for an unclassified
+one the check also requires the relation's name to appear. Not a leak — no
+exploit constructed — but an overstated guarantee is how the `SELECT *` wrapper
+survived a day of grouping work.
+
 ## 0.1.32 — a soak, and a round zero that has to fail
 
 `scripts/soak.sh [hours]` runs a fresh 2,000-statement corpus every round for as

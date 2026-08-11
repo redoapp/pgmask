@@ -587,7 +587,17 @@ impl Snapshot {
     /// which made it depend on `pg_query`'s tree walk finding every `RangeVar` —
     /// exactly the kind of completeness assumption that has failed here twice.
     /// Comparing bare names against every masked column in the catalog needs no
-    /// traversal to be complete and cannot be wrong in the unsafe direction.
+    /// traversal to be complete.
+    ///
+    /// That holds without qualification for a column the operator *classified*.
+    /// For one that is merely unclassified — masked by default-deny — the check
+    /// below is narrower: it also requires the owning relation's bare name to
+    /// appear, so that a common column name existing in some unrelated table
+    /// does not disable lineage everywhere. Deliberate, and a real narrowing of
+    /// this layer; the sentence that used to sit here said the comparison
+    /// "cannot be wrong in the unsafe direction", which described the first arm
+    /// and not the second. A doc that overstates its own guarantee is how the
+    /// `SELECT *` wrapper survived a day of grouping work.
     ///
     /// The cost is over-refusal, and it is real: if `city` is masked in *any*
     /// relation, lineage will not release an expression over a different,
