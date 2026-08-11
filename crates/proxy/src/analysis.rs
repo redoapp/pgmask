@@ -220,7 +220,7 @@ impl<'sql> StatementInspection<'sql> {
 /// is the same order of disclosure as `count(*)`, already accepted.
 ///
 /// `pg_read_file` and friends are emphatically not here; those are on
-/// [`CATALOG_ESCAPE_FUNCTIONS`].
+/// `CATALOG_ESCAPE_FUNCTIONS`.
 const SIZE_FUNCTIONS: &[&str] = &[
     "pg_relation_size",
     "pg_table_size",
@@ -1370,7 +1370,7 @@ const CATALOG_ESCAPE_FUNCTIONS: &[&str] = &[
 ///
 /// Fails closed everywhere: an unparseable statement, a statement that names no
 /// relation at all, a CTE reference that is not declared locally, and any
-/// function on [`CATALOG_ESCAPE_FUNCTIONS`] all return `false`.
+/// function on `CATALOG_ESCAPE_FUNCTIONS` all return `false`.
 pub fn reads_only_server_metadata(sql: &str) -> bool {
     StatementInspection::new(sql).reads_only_server_metadata()
 }
@@ -1526,8 +1526,9 @@ fn reads_only_server_metadata_inspected(inspection: &StatementInspection<'_>) ->
 /// **This is not sufficient on its own.** A set operation can be hidden inside a
 /// view, and then the statement text is an innocent `SELECT v FROM v_union`
 /// while CockroachDB still reports the first branch's provenance. The caller
-/// must also check [`referenced_relations`] against the snapshot's set of views
-/// whose definitions contain one; see `Snapshot::is_opaque_view`.
+/// must also check the statement's [`StatementInspection::identifiers`] against
+/// the snapshot's set of views whose definitions contain one; see
+/// `Snapshot::is_opaque_view`.
 pub fn provenance_is_trustworthy(sql: &str) -> bool {
     StatementInspection::new(sql).provenance_is_trustworthy()
 }

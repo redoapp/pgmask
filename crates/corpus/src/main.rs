@@ -15,7 +15,10 @@
 //! nothing is executed, so nothing is scanned, locked, or returned.
 //!
 //! Usage:
-//!   DSN=postgres://... cargo run -p corpus --release -- <dir-of-sql>
+//!
+//! ```text
+//! DSN=postgres://... cargo run -p corpus --release -- <dir-of-sql>
+//! ```
 
 use std::collections::BTreeMap;
 use std::path::Path;

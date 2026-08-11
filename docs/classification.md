@@ -125,5 +125,17 @@ exposure and a human having to notice.
   explicitly marked ordinary — is the remaining piece of Phase 1, and it is the
   part that keeps the catalog honest after the first pass.
 - **Name matching is a prior, not evidence.** `--sample` is what turns a guess
-  into a verdict, and it only exists for the four types with a cheap shape check
-  (email, phone, IP, and free text by absence). Everything else is a name.
+  into a verdict, and it exists for the shapes with a cheap check: card numbers
+  and IBANs by checksum, US SSNs by the SSA's allocation rules, and email, IP,
+  phone and free-text-by-absence by form. Everything else is a name.
+- **A checksum is what makes content discovery worth running.** A shape test
+  matches roughly one string of digits in one, so it can corroborate a name and
+  little else. Luhn rejects about nine in ten and IBAN's mod-97 about
+  ninety-six in ninety-seven, which is specific enough to make a claim about a
+  column called `col_7`. Before these existed, a column of card numbers under a
+  meaningless name matched *nothing*: `looks_like_phone` stops at 15 digits and
+  a 16-digit PAN went straight past it.
+- **Content discovery still proposes `null`, never the shape's mask.** Knowing
+  the values are payment instruments does not tell you whether the column is a
+  card, an IBAN or a bank account, and those get different treatment. The report
+  names every shape that matched and leaves the narrowing to a human.

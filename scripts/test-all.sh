@@ -77,6 +77,14 @@ n=$(cargo clippy --workspace --all-targets -q 2>&1 | grep -cE '^(warning|error)'
 [[ "$n" == "0" ]]; record "clippy (0 findings)" "$?" "$n findings"
 cargo audit >/dev/null 2>&1; record "cargo audit" "$?"
 
+# Rustdoc, warnings fatal. Not redundant with clippy: a doc link to an item that
+# does not exist compiles, lints clean, and is only ever read by someone trying
+# to follow it. `[`referenced_relations`]` sat in `analysis.rs` pointing at a
+# function that was never written, and four usage lines rendered `<seed>` as an
+# unclosed HTML tag. Nothing in this gate looked.
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps >/dev/null 2>&1
+record "rustdoc (warnings fatal)" "$?"
+
 echo "=== rust tests ==="
 # --no-fail-fast, or one failing target hides every target after it.
 #

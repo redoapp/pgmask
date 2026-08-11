@@ -1,7 +1,10 @@
 //! Microbenchmark the per-RowDescription statement-inspection path.
 //!
 //! Usage:
-//!   cargo run -p bench --bin inspection --release -- [iterations]
+//!
+//! ```text
+//! cargo run -p bench --bin inspection --release -- [iterations]
+//! ```
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};

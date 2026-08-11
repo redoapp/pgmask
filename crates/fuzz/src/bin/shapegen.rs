@@ -39,7 +39,10 @@
 //! corpus exactly and the crate gains nothing to audit.
 //!
 //! Usage:
-//!   shapegen <seed> <count> [postgres|portable] > corpus.sql
+//!
+//! ```text
+//! shapegen <seed> <count> [postgres|portable] > corpus.sql
+//! ```
 
 use std::fmt::Write as _;
 

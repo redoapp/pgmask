@@ -548,8 +548,16 @@ pub fn build_error(sqlstate: &str, message: &str, hint: Option<&str>) -> Message
 ///
 /// A unique-violation carries the conflicting value verbatim:
 ///   `DETAIL: Key (email)=(alice@example.com) already exists.`
-/// That is a live exfiltration channel, so these fields are dropped whenever the
-/// message mentions anything we are masking.
+/// That is a live exfiltration channel, so these fields are dropped from every
+/// error and notice, unconditionally.
+///
+/// Not "when the message mentions a masked column", which is what this said and
+/// what a reader would reasonably implement from it. Deciding per message means
+/// parsing prose written by the server in an unknown locale to work out which
+/// column it is about — and being wrong once, in the direction of keeping the
+/// field, is the disclosure. Dropping always costs error detail on unmasked
+/// columns, which is a diagnosability cost the operator can see and complain
+/// about; the other failure is silent.
 const LEAKY_FIELDS: &[u8] = b"DHncdtq";
 
 /// A `NoticeResponse`'s primary message is written by SQL, so it is dropped too.

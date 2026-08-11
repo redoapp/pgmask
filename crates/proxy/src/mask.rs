@@ -326,8 +326,9 @@ pub enum Mask {
     /// **This mask reveals the value it is applied to, minus what it
     /// recognised.** Every other mask here hides by default and a gap costs
     /// utility; this one shows by default and a gap is a disclosure. It matches
-    /// structured identifiers — address, phone, card, IBAN, national id, IP,
-    /// URL, uuid — and it does not and cannot match a person's name, a postal
+    /// structured identifiers — email, URL, uuid, MAC, IBAN, card, postcode,
+    /// crypto address, IP, phone — and it does not and cannot match a person's
+    /// name, a postal
     /// address written in prose, or `alice [at] acme [dot] com`. Measured
     /// against realistic support notes it catches roughly half of what a human
     /// would call sensitive.
@@ -755,6 +756,82 @@ fn coarsen(date: jiff::civil::Date, to_month: bool) -> Result<jiff::civil::Date,
     })
 }
 
+/// Coarsen Postgres' text rendering of a date or timestamp.
+///
+/// Parsed by locating the delimiters, not by fixed offsets. **A Postgres year
+/// is not four digits.** `date` reaches `5874897-12-31` and renders every digit
+/// of it, and this used to read `&text[0..4]`: `10000-06-15` masked to
+/// `1000-01-01`, a perfectly well-formed date nine thousand years from the real
+/// one, with nothing for the client to notice. Confirmed against Postgres 17,
+/// which also renders `10000-06-15 13:45:00` and `5874897-12-31` verbatim.
+///
+/// The era suffix comes off before anything else reads the string. It used to
+/// be appended *after* a timezone slice that ran to the end of the text, so
+/// `0044-03-15 10:00:00+00 BC` came back as `0044-03-01 00:00:00+00 BC BC`.
+/// That one was reachable and a test covers it.
+///
+/// The timezone is looked for inside the time field rather than by the old
+/// `rfind(['+', '-']).filter(|i| *i > 10)` over the whole string. **This is not
+/// independently load-bearing** — the `i > 10` test is correct for every input
+/// that gets this far, because the year is already bounded to four digits
+/// twenty lines up, and a poison control confirms restoring it breaks nothing.
+/// It is here because a magic offset that is only right by virtue of an
+/// invariant enforced elsewhere is the kind of coupling that breaks the next
+/// time the bound moves.
+///
+/// Refuses any year the binary path cannot produce. jiff's civil date stops at
+/// ±9999, so a wider year fails to decode in binary; text succeeding there
+/// would mean the same stored value masked differently depending on which
+/// protocol the client happened to use, which is exactly what
+/// `binary_date_truncation_agrees_with_the_text_path` exists to forbid.
+fn truncate_date_text(
+    text: &str,
+    type_oid: u32,
+    format: i16,
+    to_month: bool,
+) -> Result<String, MaskError> {
+    let undecodable = || MaskError::Undecodable { type_oid, format };
+    // Postgres renders pre-year-1 dates with a ` BC` suffix. Dropping it moves
+    // the value roughly four thousand years into the future.
+    let (stem, era) = match text.strip_suffix(" BC") {
+        Some(stem) => (stem, " BC"),
+        None => (text, ""),
+    };
+    // A `date` is the date alone; a timestamp adds ` HH:MM:SS[.ffffff][±TZ]`.
+    let (date_part, time_part) = match stem.split_once(' ') {
+        Some((date, time)) => (date, Some(time)),
+        None => (stem, None),
+    };
+    let mut fields = date_part.split('-');
+    let (Some(year), Some(month), Some(day), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err(undecodable());
+    };
+    let digits = |field: &str, width: std::ops::RangeInclusive<usize>| {
+        width.contains(&field.len()) && field.bytes().all(|b| b.is_ascii_digit())
+    };
+    if !digits(year, 1..=7) || !digits(month, 2..=2) || !digits(day, 2..=2) {
+        return Err(undecodable());
+    }
+    if year.parse::<i32>().map_err(|_| undecodable())? > 9999 {
+        return Err(undecodable());
+    }
+    let month = if to_month { month } else { "01" };
+    if type_oid == OID_DATE {
+        return Ok(format!("{year}-{month}-01{era}"));
+    }
+    // Keep any timezone offset so the client parses what it expects.
+    let tz = match time_part {
+        Some(time) => time
+            .rfind(['+', '-'])
+            .and_then(|i| time.get(i..))
+            .unwrap_or(""),
+        None => "",
+    };
+    Ok(format!("{year}-{month}-01 00:00:00{tz}{era}"))
+}
+
 fn truncate_date(
     bytes: &Bytes,
     type_oid: u32,
@@ -764,28 +841,8 @@ fn truncate_date(
     let to_month = kind == Mask::DateMonth;
 
     if format == FORMAT_TEXT {
-        // Text is `YYYY-MM-DD[ HH:MM:SS...]`; rebuilding from the leading date
-        // avoids re-deriving the timezone suffix.
         let text = String::from_utf8_lossy(bytes);
-        if text.len() < 10 || !text.is_char_boundary(10) {
-            return Err(MaskError::Undecodable { type_oid, format });
-        }
-        // Postgres renders pre-year-1 dates with a ` BC` suffix. Dropping it
-        // moves the value roughly four thousand years into the future.
-        let era = if text.ends_with(" BC") { " BC" } else { "" };
-        let year = &text[0..4];
-        let month = if to_month { &text[5..7] } else { "01" };
-        return Ok(Bytes::from(if type_oid == OID_DATE {
-            format!("{year}-{month}-01{era}")
-        } else {
-            // Keep any timezone suffix so the client parses what it expects.
-            let tz = text
-                .rfind(['+', '-'])
-                .filter(|i| *i > 10)
-                .map(|i| &text[i..])
-                .unwrap_or("");
-            format!("{year}-{month}-01 00:00:00{tz}{era}")
-        }));
+        return truncate_date_text(&text, type_oid, format, to_month).map(Bytes::from);
     }
 
     // Binary: decode with the type's own codec, coarsen, re-encode. No epoch
@@ -940,13 +997,12 @@ fn floor_to(v: i64, bucket: i64) -> i64 {
     v.div_euclid(bucket).saturating_mul(bucket)
 }
 
-/// Floor, then bring the result back inside the column's own range.
+/// Floor to a bucket boundary, or `None` when that boundary is out of range.
 ///
 /// A bucket wider than the type is legitimate — it means "one bucket covers
 /// everything" — but the floor then sits below the type's minimum, and the cast
 /// wrapped it to a large positive number. `-1` with a bucket of 32769 came back
-/// as `32767`. Clamping keeps the guarantee that matters: never above the input.
-/// Floor to a bucket boundary, or `None` if the boundary is out of range.
+/// as `32767`.
 ///
 /// This used to `clamp`, and clamping breaks the one property a bucket mask
 /// promises: that the value you see is a bucket boundary. `-2146760705` with a
@@ -1488,6 +1544,124 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&text[..], b"2024-01-01", "text and binary must agree");
+    }
+
+    /// Masking a date in text must reject exactly what masking it in binary
+    /// rejects, or the same stored value masks differently depending on which
+    /// protocol the client used.
+    ///
+    /// jiff's civil date stops at ±9999. Postgres does not: `date` reaches
+    /// `5874897-12-31` and renders every digit. The text path read `&text[0..4]`
+    /// and produced `1000-01-01` for `10000-06-15` — a well-formed date nine
+    /// thousand years from the real one, which no client could detect.
+    #[test]
+    fn a_year_wider_than_four_digits_is_refused_rather_than_truncated() {
+        let m = masker();
+        for (oid, rendering) in [
+            (OID_DATE, "10000-06-15"),
+            (OID_DATE, "5874897-12-31"),
+            (OID_TIMESTAMP, "10000-06-15 13:45:00"),
+            (OID_TIMESTAMPTZ, "10000-06-15 11:45:00+00"),
+        ] {
+            let out = m.apply(
+                &spec(Mask::DateYear),
+                oid,
+                FORMAT_TEXT,
+                Some(Bytes::copy_from_slice(rendering.as_bytes())),
+            );
+            assert!(
+                matches!(out, Err(MaskError::Undecodable { .. })),
+                "{rendering} should be refused, got {out:?}",
+            );
+        }
+        // And the binary path agrees, which is the reason for refusing.
+        assert!(jiff::civil::Date::new(10000, 6, 15).is_err());
+    }
+
+    /// The era suffix was appended after a timezone slice that ran to the end
+    /// of the string, so it came back twice.
+    #[test]
+    fn a_bc_timestamp_with_an_offset_keeps_one_era() {
+        let out = masker()
+            .apply(
+                &spec(Mask::DateMonth),
+                OID_TIMESTAMPTZ,
+                FORMAT_TEXT,
+                Some(Bytes::from_static(b"0044-03-15 10:00:00+00 BC")),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[..], b"0044-03-01 00:00:00+00 BC");
+    }
+
+    /// An offset is still preserved on an ordinary timestamp, and the day and
+    /// time are still discarded.
+    #[test]
+    fn an_offset_survives_truncation() {
+        let m = masker();
+        let cases = [
+            (
+                Mask::DateYear,
+                "2024-03-15 13:45:00+02",
+                "2024-01-01 00:00:00+02",
+            ),
+            (
+                Mask::DateMonth,
+                "2024-03-15 13:45:00+02",
+                "2024-03-01 00:00:00+02",
+            ),
+            (
+                Mask::DateMonth,
+                "2024-03-15 13:45:00-05:30",
+                "2024-03-01 00:00:00-05:30",
+            ),
+            (
+                Mask::DateMonth,
+                "2024-03-15 13:45:00",
+                "2024-03-01 00:00:00",
+            ),
+        ];
+        for (kind, input, want) in cases {
+            let out = m
+                .apply(
+                    &spec(kind),
+                    OID_TIMESTAMPTZ,
+                    FORMAT_TEXT,
+                    Some(Bytes::copy_from_slice(input.as_bytes())),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out), want, "{kind:?} on {input}",);
+        }
+    }
+
+    /// Text that is not a date is refused, not reshaped into one.
+    ///
+    /// The old length-and-char-boundary check let anything ten bytes long
+    /// through and read fixed offsets out of it.
+    #[test]
+    fn text_that_is_not_a_date_is_refused() {
+        let m = masker();
+        for rendering in [
+            "not-a-date",
+            "2024-3-15",     // one-digit month
+            "2024-03",       // two fields
+            "2024-03-15-01", // four fields
+            "20xx-03-15",
+            "",
+            "-2024-03-15", // an empty year field
+        ] {
+            let out = m.apply(
+                &spec(Mask::DateYear),
+                OID_DATE,
+                FORMAT_TEXT,
+                Some(Bytes::copy_from_slice(rendering.as_bytes())),
+            );
+            assert!(
+                matches!(out, Err(MaskError::Undecodable { .. })),
+                "{rendering:?} should be refused, got {out:?}",
+            );
+        }
     }
 
     /// Postgres counts from 2000, so anything earlier is a negative day count —

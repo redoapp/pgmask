@@ -79,6 +79,140 @@ fn looks_like_phone(v: &str) -> bool {
             .all(|c| c.is_ascii_digit() || " ()+-.".contains(c))
 }
 
+/// A payment card number: 13-19 digits that pass the Luhn check.
+///
+/// Luhn is the reason this is worth writing at all. `looks_like_phone` is a
+/// shape test and matches roughly one string of digits in one; Luhn rejects
+/// about nine in ten, so a column that clears it at 80% is a card column and
+/// almost nothing else is. It is a checksum, not a validity check — it says
+/// the digits are a well-formed PAN, not that the card exists.
+fn looks_like_card(v: &str) -> bool {
+    let digits: Vec<u32> = v
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-'))
+        .map(|c| c.to_digit(10).ok_or(()))
+        .collect::<Result<_, _>>()
+        .unwrap_or_default();
+    if !(13..=19).contains(&digits.len()) {
+        return false;
+    }
+    // Doubling a digit and casting out nines, as a table: 7 doubles to 14,
+    // which contributes 1 + 4 = 5. Written out rather than computed so the
+    // whole check is addition.
+    const DOUBLED: [u32; 10] = [0, 2, 4, 6, 8, 1, 3, 5, 7, 9];
+    let mut sum = 0u32;
+    for (i, digit) in digits.iter().rev().enumerate() {
+        let contribution = if i % 2 == 1 {
+            DOUBLED
+                .get(usize::try_from(*digit).unwrap_or(0))
+                .copied()
+                .unwrap_or(0)
+        } else {
+            *digit
+        };
+        sum = sum.saturating_add(contribution);
+    }
+    sum.is_multiple_of(10)
+}
+
+/// An IBAN: two letters, two check digits, then the account, mod-97 == 1.
+///
+/// The same argument as Luhn, harder: the check is over a ~30-digit number, so
+/// a wrong string clears it about once in ninety-seven times.
+fn looks_like_iban(v: &str) -> bool {
+    let upper: Vec<char> = v
+        .chars()
+        .filter(|c| *c != ' ')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if !(15..=34).contains(&upper.len())
+        || !upper.iter().take(2).all(char::is_ascii_alphabetic)
+        || !upper.iter().skip(2).take(2).all(char::is_ascii_digit)
+        || !upper.iter().all(char::is_ascii_alphanumeric)
+    {
+        return false;
+    }
+    // Move the country code and check digits to the end, then read the whole
+    // thing as one long number with each letter standing for its position in
+    // the alphabet plus nine — which is exactly base-36, so no arithmetic on
+    // character codes is needed to get there.
+    let rotated = upper.iter().skip(4).chain(upper.iter().take(4));
+    let mut remainder = 0u32;
+    for c in rotated {
+        let part = c.to_digit(36).unwrap_or(0);
+        // Fold one character at a time so the running value never needs more
+        // than 32 bits, taking two decimal places for the letters.
+        let shift = if part < 10 { 10 } else { 100 };
+        remainder = remainder.saturating_mul(shift).saturating_add(part) % 97;
+    }
+    remainder == 1
+}
+
+/// A US Social Security number, by the SSA's own allocation rules.
+///
+/// Not merely nine digits: area `000`, `666` and `900-999` are never issued,
+/// nor is a `00` group or a `0000` serial. That rules out most nine-digit
+/// sequences that are something else, which is the whole point — every SSN is
+/// also a `looks_like_phone` match, so without this a column of them is
+/// reported as a phone column and nothing else.
+///
+/// Deliberately US-only, and named so. `national_id` also covers passports and
+/// tax IDs, whose formats vary by country; a validator that quietly failed
+/// those would flag correctly classified columns for review, and a tool that
+/// cries wolf gets overridden wholesale.
+fn looks_like_ssn(v: &str) -> bool {
+    let digits: Vec<u32> = v
+        .trim()
+        .chars()
+        .filter(|c| *c != '-' && *c != ' ')
+        .map(|c| c.to_digit(10).ok_or(()))
+        .collect::<Result<_, _>>()
+        .unwrap_or_default();
+    if digits.len() != 9 {
+        return false;
+    }
+    let number = |skip: usize, take: usize| {
+        digits
+            .iter()
+            .skip(skip)
+            .take(take)
+            .fold(0u32, |acc, d| acc.saturating_mul(10).saturating_add(*d))
+    };
+    let (area, group, serial) = (number(0, 3), number(3, 2), number(5, 4));
+    area != 0 && area != 666 && area < 900 && group != 0 && serial != 0
+}
+
+/// A shape label and the check that recognises it.
+type Detector = (&'static str, fn(&str) -> bool);
+
+/// The shapes content discovery can recognise, most specific first.
+///
+/// Separate from `rules()` on purpose. A name rule answers "the column is
+/// called `ssn`, what mask?"; a detector answers "the column is called `col_7`,
+/// what is in it?". They were the same list, which meant discovery could only
+/// find the three shapes that happened to have a confirmation validator
+/// attached — email, phone and IP. A column of card numbers under a
+/// meaningless name matched *nothing*: `looks_like_phone` stops at 15 digits
+/// and a 16-digit PAN sailed past it. That is precisely the case this tool
+/// advertises itself as catching.
+///
+/// The precise checks come first so the note names them ahead of the shape
+/// tests. A US SSN satisfies `phone` as well, and reporting "national_id or
+/// phone" is the honest answer; reporting "phone" alone was not.
+///
+/// Detectors do not set masks. Discovery proposes `null` whatever matched —
+/// see the block that calls this.
+fn detectors() -> &'static [Detector] {
+    &[
+        ("payment", looks_like_card),
+        ("payment", looks_like_iban),
+        ("national_id", looks_like_ssn),
+        ("email", looks_like_email),
+        ("ip_address", looks_like_ip),
+        ("phone", looks_like_phone),
+    ]
+}
+
 /// Name patterns, most specific first — the first match wins.
 ///
 /// Deliberately conservative about `name`: on a company table it is a company
@@ -395,30 +529,25 @@ async fn main() -> Result<()> {
             d.contains("char") || d.contains("text")
         };
         if sample > 0 && proposal.semantic_type.is_none() && !proposal.refuted_by_width && texty {
-            let mut matched: Vec<(&str, f64, usize)> = Vec::new();
-            for rule in rules.iter().filter(|rule| rule.validator.is_some()) {
-                let validator = rule.validator.expect("filtered above");
-                let Ok((checked, matching)) =
-                    sample_column(&client, &proposal.column, sample, validator).await
-                else {
-                    continue;
-                };
-                // A single row is not evidence. Without a floor one non-null
-                // value scores 100% and produces a proposal.
-                if checked < 20 {
-                    continue;
-                }
-                let rate = (matching as f64 / checked as f64) * 100.0;
-                if rate >= 80.0 {
-                    matched.push((rule.semantic_type, rate, checked));
-                }
-            }
+            // One read, every detector. This used to issue a query per
+            // detector, which was three round trips per column and would have
+            // been six after the payment and national_id checks were added.
+            let matched = sample_shapes(&client, &proposal.column, sample)
+                .await
+                .unwrap_or_default();
             if let Some((_, rate, checked)) = matched.first().copied() {
-                let shapes = matched
-                    .iter()
-                    .map(|(t, _, _)| *t)
-                    .collect::<Vec<_>>()
-                    .join(" or ");
+                // Deduplicated: `payment` has two detectors, and a note
+                // reading "payment or payment" is a bug on its face. In
+                // `detectors()` order, not sorted — the specific checks are
+                // listed first there so the note leads with them, and a
+                // `BTreeSet` here quietly threw that away.
+                let mut shapes: Vec<&str> = Vec::new();
+                for (label, _, _) in &matched {
+                    if !shapes.contains(label) {
+                        shapes.push(label);
+                    }
+                }
+                let shapes = shapes.join(" or ");
                 // A type name of its own, never one of the name-rule types.
                 //
                 // Reusing the matched rule's name defeats the withholding
@@ -700,6 +829,50 @@ async fn sample_column(
         }
     }
     Ok((rows.len(), matching))
+}
+
+/// Read up to `limit` values once and report which shapes they fit.
+///
+/// Same contract as `sample_column`: the values are counted here and dropped
+/// here. The caller receives labels and rates, never data — which is why every
+/// detector runs inside this function rather than the caller looping over a
+/// vector of sampled strings.
+///
+/// Returns `(label, rate, checked)` for each shape at least 80% of the sample
+/// fits, in `detectors()` order. Below 20 rows it returns nothing: a single
+/// non-null value scores 100% and would produce a proposal on its own.
+async fn sample_shapes(
+    client: &tokio_postgres::Client,
+    column: &Column,
+    limit: usize,
+) -> Result<Vec<(&'static str, f64, usize)>> {
+    let sql = format!(
+        r#"SELECT "{}"::text FROM "{}"."{}" WHERE "{}" IS NOT NULL LIMIT {limit}"#,
+        column.name, column.schema, column.table, column.name
+    );
+    let rows = client.query(&sql, &[]).await?;
+    let checked = rows.len();
+    if checked < 20 {
+        return Ok(Vec::new());
+    }
+    let mut counts = vec![0usize; detectors().len()];
+    for row in &rows {
+        let value: Option<String> = row.get(0);
+        let Some(value) = value else { continue };
+        for (count, (_, detector)) in counts.iter_mut().zip(detectors()) {
+            if detector(&value) {
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+    Ok(counts
+        .into_iter()
+        .zip(detectors())
+        .filter_map(|(count, (label, _))| {
+            let rate = (count as f64 / checked as f64) * 100.0;
+            (rate >= 80.0).then_some((*label, rate, checked))
+        })
+        .collect())
 }
 
 fn report(proposals: &[Proposal], schema: &str, sample: usize, refuted_by_width: usize) {
@@ -1042,6 +1215,141 @@ mod tests {
         ];
         for rule in rules() {
             assert!(KNOWN.contains(&rule.mask), "unknown mask `{}`", rule.mask);
+        }
+    }
+
+    /// The shapes that only a checksum separates from noise.
+    ///
+    /// Every test value here is a published test number or a synthetic one; a
+    /// real card or a real SSN in a repository is the thing this whole tool
+    /// exists to prevent.
+    #[test]
+    fn checksums_separate_these_shapes_from_digits() {
+        // Luhn accepts across the length range, punctuated or not.
+        assert!(looks_like_card("4111111111111111"));
+        assert!(looks_like_card("4111-1111-1111-1111"));
+        assert!(looks_like_card("4111 1111 1111 1111"));
+        assert!(looks_like_card("378282246310005")); // 15 digits
+        assert!(looks_like_card("30569309025904")); // 14 digits
+                                                    // One transposed digit and it is not a card.
+        assert!(!looks_like_card("4111111111111112"));
+        // Luhn-valid at every length, so only the bound can reject them. The
+        // first version of this used numbers that failed the checksum too,
+        // which meant widening `13..=19` to `1..=99` broke nothing here.
+        assert!(looks_like_card("4111111111119"), "13, the lower bound");
+        assert!(
+            looks_like_card("4111111111111111110"),
+            "19, the upper bound"
+        );
+        assert!(!looks_like_card("411111111117"), "12, one short");
+        assert!(!looks_like_card("41111111111111111115"), "20, one over");
+        assert!(!looks_like_card("4111x111111111111"));
+        assert!(!looks_like_card(""));
+
+        assert!(looks_like_iban("GB82 WEST 1234 5698 7654 32"));
+        assert!(looks_like_iban("DE89370400440532013000"));
+        assert!(looks_like_iban("FR1420041010050500013M02606")); // letter in the body
+        assert!(looks_like_iban("NL91ABNA0417164300"));
+        assert!(!looks_like_iban("GB83WEST12345698765432")); // check digits wrong
+        assert!(!looks_like_iban("GB82WEST1234569876543")); // a digit short
+        assert!(!looks_like_iban(""));
+
+        // Each of these satisfies mod-97 and violates exactly one structural
+        // rule, so each one is rejected by that rule and nothing else. Found by
+        // search, because the first version's counterexamples all failed mod-97
+        // as well — the four structural guards were untested and deleting any
+        // of them broke no test.
+        assert!(!looks_like_iban("GB8212"), "6 characters, folds to 1");
+        assert!(!looks_like_iban("1B82WEST123456987000008"), "country code");
+        assert!(!looks_like_iban("GBX2WEST123456987000072"), "check digits");
+        assert!(
+            !looks_like_iban("GB82WEST_23456987000000"),
+            "body punctuation"
+        );
+
+        // The SSA's allocation rules, not merely nine digits.
+        assert!(looks_like_ssn("123-45-6789"));
+        assert!(looks_like_ssn("123456789"));
+        assert!(!looks_like_ssn("000-45-6789")); // area 000
+        assert!(!looks_like_ssn("666-45-6789")); // area 666
+        assert!(!looks_like_ssn("900-45-6789")); // area 900+
+        assert!(!looks_like_ssn("123-00-6789")); // group 00
+        assert!(!looks_like_ssn("123-45-0000")); // serial 0000
+        assert!(!looks_like_ssn("12345678"));
+        assert!(!looks_like_ssn("1234567890"));
+        assert!(!looks_like_ssn("123-4a-6789"));
+    }
+
+    /// The gap these were added to close, stated as a test.
+    ///
+    /// Discovery could only find the shapes that had a confirmation validator
+    /// attached to a name rule, and a 16-digit PAN matches none of them —
+    /// `looks_like_phone` stops at 15. So a column of card numbers under a
+    /// meaningless name produced no proposal at all: not a wrong one, none.
+    /// Deleting the payment entries from `detectors()` fails here.
+    #[test]
+    fn a_card_column_under_a_meaningless_name_is_recognised_by_something() {
+        let card = "4111111111111111";
+        assert!(
+            !looks_like_phone(card) && !looks_like_email(card) && !looks_like_ip(card),
+            "the pre-existing detectors were supposed to be blind to this",
+        );
+        let hits: Vec<&str> = detectors()
+            .iter()
+            .filter(|(_, d)| d(card))
+            .map(|(label, _)| *label)
+            .collect();
+        assert_eq!(hits, ["payment"]);
+    }
+
+    /// A US SSN is also a valid phone shape, so both fire — and the note has to
+    /// name the specific one first or it reads as a phone column.
+    #[test]
+    fn an_ssn_is_reported_ahead_of_the_phone_shape_it_also_fits() {
+        let ssn = "123-45-6789";
+        assert!(looks_like_phone(ssn), "the ambiguity is the point");
+        let hits: Vec<&str> = detectors()
+            .iter()
+            .filter(|(_, d)| d(ssn))
+            .map(|(label, _)| *label)
+            .collect();
+        assert_eq!(hits, ["national_id", "phone"]);
+    }
+
+    /// The two lists must not drift.
+    ///
+    /// `rules()` carries validators for confirming a name match; `detectors()`
+    /// carries them for discovering content. They were one list, and splitting
+    /// them creates a way for a validator to be added to one and forgotten in
+    /// the other — which is the failure that was already present, in the
+    /// direction of discovery finding less than confirmation could.
+    #[test]
+    fn every_confirmation_validator_is_also_a_detector() {
+        for rule in rules() {
+            let Some(validator) = rule.validator else {
+                continue;
+            };
+            assert!(
+                detectors()
+                    .iter()
+                    .any(|(_, d)| std::ptr::fn_addr_eq(*d, validator)),
+                "`{}` can confirm a name match with a validator that content \
+                 discovery will never run",
+                rule.semantic_type,
+            );
+        }
+    }
+
+    /// Detector labels have to be things the report can talk about.
+    ///
+    /// The label is printed to the operator as "values look like {shapes}".
+    /// A label that matches no rule's `semantic_type` is a word the rest of the
+    /// tool does not use, and the operator has nothing to look it up against.
+    #[test]
+    fn every_detector_label_names_a_type_the_rules_know() {
+        let known: BTreeSet<&str> = rules().iter().map(|r| r.semantic_type).collect();
+        for (label, _) in detectors() {
+            assert!(known.contains(label), "unknown detector label `{label}`");
         }
     }
 }

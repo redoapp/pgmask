@@ -77,6 +77,9 @@ This is the finding that should shape how much weight a green run carries.
 | `test-versions.sh` | lost a version's readiness under load, scoring 23 failures |
 | `soak.sh` (first cut) | counted **800,000 statements it never ran** as clean |
 | `classify --sample` | could confirm a name guess but never make one |
+| `classify` content discovery | could not see a card number at all — 16 digits is past `looks_like_phone`'s ceiling and no other detector existed |
+| `classify`'s own new IBAN tests | four structural guards, zero coverage: every invalid example failed mod-97 too |
+| rustdoc | never run by the gate; a doc link to a function that was never written survived indefinitely |
 | `classify --check` | told operators to delete a rule protecting a materialised view |
 | coverage measurement | reported `catalog.rs` at 62.6% when it is 88.4% |
 | a mutation-kill check | reported two mutants killed after mutating the wrong line |
@@ -118,11 +121,17 @@ comment that asserted the case could not happen.
 
 - Nine findings from an internal audit, mostly documentation overstating code.
 - Remaining mutation survivors, untriaged.
-- `classify` has validators for email, phone and IP only. National IDs, card
-  numbers, IBANs, names, addresses and dates of birth cannot be found by content.
+- `classify` can find seven shapes by content: card numbers (Luhn), IBANs
+  (mod-97), US Social Security numbers (SSA allocation rules), email, IP, phone,
+  and free text by absence. Names, street addresses, dates of birth, non-US
+  national IDs and passport numbers still cannot be found by content — those are
+  a name match or nothing.
 - Its phone validator accepts any 7–15 punctuated digits, which is also every
   national ID and IPv4 address. Content discovery therefore proposes withholding
-  rather than a mask; that is a workaround, not a fix.
+  rather than a mask; that is a workaround, not a fix. The checksum-backed
+  detectors are not affected — those are specific enough to name — but the
+  proposal is still `null` for all of them, because a card and a bank account
+  are not distinguishable by content and the operator has to say which.
 - No fixture exercises partitioned tables, inheritance, domains or generated
   columns.
 - Production validation has never run: the intended host is a read-write primary

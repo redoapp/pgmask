@@ -14,7 +14,10 @@
 //! statistical: every row, every session, every iteration.
 //!
 //! Usage:
-//!   PROXY_URL=postgres://…:6470/fuzzdb roles [sessions] [iterations]
+//!
+//! ```text
+//! PROXY_URL=postgres://…:6470/fuzzdb roles [sessions] [iterations]
+//! ```
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -57,6 +57,105 @@ Adding it failed `classify --check` immediately, because the shipped catalog did
 not declare the new column. That is the drift gate doing its job on the first
 change that gave it something to catch.
 
+## 0.1.37 — a checksum is what makes content discovery worth running
+
+CONTENT DISCOVERY COULD NOT SEE A CARD NUMBER
+
+`classify --sample` advertises itself as catching "a column called `notes` full
+of email addresses". It could find three shapes, because discovery iterated the
+name rules that happened to carry a confirmation validator — email, phone, IP.
+A column of card numbers under a meaningless name matched **nothing**. Not a
+wrong proposal: none. `looks_like_phone` stops at 15 digits and a 16-digit PAN
+sailed past it; an IBAN has letters in it.
+
+Three checksum-backed detectors close that: Luhn for cards, mod-97 for IBANs,
+and the SSA's own allocation rules for US Social Security numbers. The checksum
+is the point. A shape test matches about one string of digits in one, so it can
+corroborate a name and little else; Luhn rejects nine in ten and mod-97 rejects
+ninety-six in ninety-seven, which is specific enough to make a claim about a
+column nobody named.
+
+Verified against a fixture rather than only in unit tests: 60 rows each of
+Luhn-valid PANs, SSNs, IBANs, ordinary prose, and — the load-bearing negative —
+16-digit numbers with a deliberately wrong checksum. The first three are
+proposed `null` and flagged for review; the last two stay silent. That last
+column is the proof the detector is reading the checksum and not the length.
+
+Discovery still proposes `null` whatever matched. Knowing values are payment
+instruments does not say whether the column is a card, an IBAN or a bank
+account, and those get different treatment.
+
+TWO LISTS, WHICH IS THE THING THAT WENT WRONG
+
+Name rules and content detectors are now separate lists, because they answer
+different questions — "the column is called `ssn`, what mask?" versus "the
+column is called `col_7`, what is in it?". Splitting them creates a way to drift,
+so a test asserts every confirmation validator is also a detector, and another
+asserts every detector's label is a type the rules know.
+
+The precise checks are listed first so a US SSN reports as "national_id or
+phone" rather than "phone". The first cut deduplicated those labels through a
+`BTreeSet`, which sorts alphabetically and silently threw that ordering away —
+caught by a poison control that reordered the list and changed nothing.
+
+Discovery also issues one query per column now instead of one per detector,
+which would have been six after this change. The values are still counted and
+dropped inside the sampling function; the caller receives labels and rates.
+
+TWELVE GUARDS, TWELVE POISON CONTROLS, TWO SURVIVORS
+
+Deleting the length bound from the card check broke no test: the too-short and
+too-long examples failed Luhn as well, so only the checksum was rejecting them.
+Replaced with numbers that are Luhn-valid at 12, 13, 19 and 20 digits, which
+pins both edges exactly.
+
+Worse in the IBAN check — all four structural guards were unexercised, every
+invalid example failing mod-97 too. Fixed by searching for strings that satisfy
+mod-97 and violate exactly one rule each: `GB8212` folds to 1 in six characters.
+
+Both are the same failure the vacuous soak was: an assertion that passes for a
+reason other than the one it names.
+
+A POSTGRES YEAR IS NOT FOUR DIGITS
+
+`truncate_date`'s text path read `&text[0..4]`. Against Postgres 17,
+`'10000-06-15'::date` masked with `date-year` came back as `1000-01-01` — a
+well-formed date nine thousand years from the real one, with nothing for the
+client to notice. `date` reaches `5874897-12-31` and Postgres renders every
+digit.
+
+Second defect on the same line of reasoning: the era suffix was appended after a
+timezone slice that ran to the end of the string, so
+`0044-03-15 10:00:00+00 BC` came back as `...+00 BC BC`.
+
+Parsed by delimiter now, and wide years are **refused** rather than coarsened.
+jiff's civil date stops at ±9999, so the binary path already fails on them;
+letting text succeed would mean the same stored value masking differently
+depending on which protocol the client used, which
+`binary_date_truncation_agrees_with_the_text_path` exists to forbid. This is a
+behaviour change: a masked date column holding a year above 9999 now errors in
+text as it already did in binary.
+
+Four of the five guards in the rewrite are load-bearing under poison control.
+The fifth — scoping the timezone search to the time field instead of the old
+`rfind(...).filter(|i| *i > 10)` — is not, because the year bound twenty lines
+above makes the two equivalent, and the doc comment says so rather than
+implying it fixes something reachable.
+
+RUSTDOC WAS NEVER RUN
+
+`[`referenced_relations`]` sat in `analysis.rs` pointing at a function nobody
+ever wrote, and four usage lines rendered `<seed>` as an unclosed HTML tag. The
+gate ran fmt, clippy, audit and seventeen suites, and none of them look at doc
+links. It runs rustdoc with warnings fatal now.
+
+Four other documentation corrections, all found by an earlier audit and none
+made until now: `floor_within` still carried a paragraph describing the clamping
+it stopped doing two releases ago; `LEAKY_FIELDS` claimed to drop fields "when
+the message mentions anything we are masking" while the code drops them
+unconditionally, which is the safer behaviour the doc talked a reader out of;
+the `Scrub` doc listed seven of the ten placeholders it emits.
+
 ## 0.1.36 — a fuzzer for the state machine, and the shapes the grammar could not say
 
 Two parallel efforts, both required to prove themselves by reverting a real fix
