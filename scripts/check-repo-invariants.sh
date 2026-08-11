@@ -92,6 +92,17 @@ esac
 grep -qE "that is $channels, " docs/safety-assessment.md ||
   note "the assessment's channel count does not match its own tables ($channels rows)."
 
+# Cargo.lock's copy of the workspace version.
+#
+# Nothing bumped it, so it trailed the real version by however many releases had
+# happened since the last `cargo build` that someone remembered to commit. Not a
+# correctness problem — cargo rewrites it on the next build — but it means a
+# checkout's lockfile disagrees with its own manifest, and a reviewer cannot
+# tell a stale lockfile from a deliberate pin.
+locked=$(grep -A1 '^name = "pgmask"' Cargo.lock | grep -oE '"[0-9.]+"' | tr -d '"' | head -1)
+[ "${locked:-none}" = "$cargo_version" ] ||
+  note "Cargo.lock says pgmask ${locked:-nothing}; Cargo.toml says $cargo_version. Run cargo build."
+
 [ "$fail" = 0 ] &&
   echo "repo invariants ok: v$cargo_version, $total entries, descending, seeds tracked"
 exit "$fail"
