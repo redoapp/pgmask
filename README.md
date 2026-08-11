@@ -548,6 +548,11 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   refused regardless of any key. Ungrouped groupings, non-key
   groupings and coarse date buckets are served unchanged.
 
+**Before deploying this, read [`docs/safety-assessment.md`](docs/safety-assessment.md).**
+It states what is guaranteed, what is explicitly not, what six disclosures were
+found in a single day, and why the instruments were wrong more often than the
+code was.
+
 ## Layout
 
 ```
