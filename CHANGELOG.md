@@ -57,6 +57,74 @@ Adding it failed `classify --check` immediately, because the shipped catalog did
 not declare the new column. That is the drift gate doing its job on the first
 change that gave it something to catch.
 
+## 0.1.36 — a fuzzer for the state machine, and the shapes the grammar could not say
+
+Two parallel efforts, both required to prove themselves by reverting a real fix
+and finding it again.
+
+THE GRAMMAR COULD NOT EXPRESS TWO OF SIX DISCLOSURES
+
+Measured over 5,000 generated statements before this: `SELECT * FROM (…)`
+appeared **0 times**, `ROLLUP`/`GROUPING SETS` **0 times**. The soak could have
+run for a year without finding 0.1.31 or 0.1.18. Volume was never the binding
+constraint; grammar was.
+
+Now 1,747 star wrappers per 5,000 (622 doubly nested), and the grouping-set
+spellings behind a `postgres` dialect argument so the cross-engine campaigns
+stay portable — CockroachDB rejects all three outright. `reach` tracks both, so
+losing them fails the run instead of going quiet.
+
+Poison control: deleting the unwrap loop from `group_by_columns` takes the
+campaign from 0 leaks to **2,880**, on 10 of 10 seeds. At a flat 30% wrap rate
+one seed in ten found nothing, so the top-level wrap is weighted toward
+statements that group. Executable rate held: 400/400 on Postgres, no new
+CockroachDB errors.
+
+A FUZZER FOR THE PROTOCOL STATE MACHINE
+
+Every campaign here fuzzes SQL shapes; `described_sql` substituting an unrelated
+statement's text was an interleaving bug. `cargo-fuzz` over `PlanState` finds it
+in ~4 seconds from an empty corpus, minimises it to two operations, and reaches
+100% region coverage of `plan_state.rs`. It independently rediscovered the
+non-UTF-8 `ParseUndecodable` precondition nobody pointed it at, and a portal-side
+variant of the same bug.
+
+`libfuzzer-sys` and `arbitrary` live in a workspace-excluded crate; the proxy
+gains an off-by-default `fuzzing = []` feature and nine `#[cfg]`-gated lines.
+Nothing compiles into the binary.
+
+The oracle sits *inside* the crate as a child module because it needs private
+fields for ground truth — an external target would infer "is a Describe
+outstanding" from the function under test and agree with any answer it gave.
+Parse texts and simple-query texts are disjoint pools, so a substitution is
+detectable in both directions.
+
+THE REGRESSIONS WERE NOT RUNNING
+
+The minimised sequences were reported as carried by `test-all.sh`. They were not:
+the module is feature-gated and the gate runs plain `cargo test`, so it compiled
+none of them and reported the same 183 lib tests before and after they were
+added. The gate runs the feature now — 470 tests, and reverting `described_sql`
+fails four of them.
+
+Caught because the test count did not move when a patch that adds tests was
+applied. The same signal that exposed the vacuous soak.
+
+TWO MORE INSTRUMENT FIXES
+
+The shared oracle could not read `900000137.00000000`: `parse::<i64>()` fails on
+it, so the simple-query harness saw 420 leaks where the extended harness saw 540
+on an identical corpus. Fifth instance of a value not reaching a detector.
+Normalised in the oracle so both harnesses see it; a genuine two-row average is
+still correctly ignored.
+
+And this gate destroyed concurrent work. Its teardown is machine-global —
+`pkill -f` matches every pgmask on the host, and the container names are fixed
+strings any checkout uses — so the agent fuzzing in a separate worktree lost its
+proxies and its `pgmask-fuzz` fixture mid-run, while its load made three of this
+gate's suites report false failures. A worktree isolates files, not processes.
+The gate refuses now, naming the offending PID.
+
 ## 0.1.35 — evidence that made the proposal worse
 
 `classify` on a `phone bigint` column, which is an ordinary way to store one:

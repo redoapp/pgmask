@@ -13,6 +13,15 @@ use bytes::Bytes;
 use crate::mask::MaskSpec;
 use crate::protocol::{self, DescribeTarget};
 
+/// Protocol-sequence fuzz harness. See that module for why it is a child of
+/// this one rather than a sibling: the oracle reads `PlanState`'s private
+/// fields for ground truth, and a sibling module cannot. `#[path]` keeps the
+/// production file where it is instead of turning `plan_state.rs` into a
+/// directory for the sake of a test-only module.
+#[cfg(feature = "fuzzing")]
+#[path = "plan_state_fuzz.rs"]
+pub mod fuzz;
+
 /// What to do with one output field.
 #[derive(Debug, Clone)]
 pub(crate) struct FieldPlan {

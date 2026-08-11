@@ -65,7 +65,20 @@ pub fn shape_leak(value: &str) -> Option<&'static str> {
     // The fixture makes this exact: salaries are `41111 + i * 137` for
     // i in 1..=60, so every raw value lies in a known range and none is a
     // multiple of its bucket, while every masked value is.
-    if let Ok(v) = value.trim().parse::<i64>() {
+    // Postgres renders `avg(int4)` as `900000137.00000000`, which is not an
+    // `i64`. The simple-query harness reads values as text and so never got
+    // past this parse: under a poisoned catalog it saw 420 leaks where the
+    // extended harness saw 540, on the identical corpus, because `extended`
+    // normalises through `rust_decimal` on the way in and this did not.
+    //
+    // Fifth time in this project that a real value failed to reach a detector.
+    // Normalising here rather than in one harness means both see it.
+    let trimmed = value.trim();
+    let whole = match trimmed.split_once('.') {
+        Some((int, frac)) if !frac.is_empty() && frac.bytes().all(|b| b == b'0') => int,
+        _ => trimmed,
+    };
+    if let Ok(v) = whole.parse::<i64>() {
         // Exact membership of the fixture's sequence, not its range.
         //
         // `annual_salary` is `900000000 + i * 137`. A range test over the

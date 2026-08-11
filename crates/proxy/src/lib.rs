@@ -16,3 +16,11 @@ pub mod tls;
 
 pub use catalog::{Catalog, Config};
 pub use session::{handle_connection, Policy};
+
+/// Extended-query protocol state machine, exposed for the sequence fuzzer.
+///
+/// Behind a feature so the ordinary build, and the ordinary dependency graph,
+/// are untouched. `fuzz/` is its own workspace for the same reason: nothing
+/// libFuzzer needs is reachable from `cargo build`.
+#[cfg(feature = "fuzzing")]
+pub use plan_state::fuzz as plan_state_fuzz;

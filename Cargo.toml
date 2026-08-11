@@ -2,6 +2,11 @@
 resolver = "2"
 members = ["crates/spike", "crates/proxy", "crates/bench", "crates/corpus",
     "crates/fuzz", "crates/classify"]
+# The libFuzzer target. It has its own `[workspace]`, so this is belt and
+# braces — but it says out loud that `libfuzzer-sys`, its C++ runtime and the
+# `arbitrary` derive are not in this graph. Nothing under `fuzz/` is built,
+# tested or audited by any command run at this root.
+exclude = ["fuzz"]
 
 [profile.release]
 # Arithmetic that overflows wraps silently in release by default. This binary
@@ -29,7 +34,7 @@ indexing_slicing = "warn"
 arithmetic_side_effects = "warn"
 
 [workspace.package]
-version = "0.1.35"
+version = "0.1.36"
 edition = "2021"
 license = "MIT"
 publish = false

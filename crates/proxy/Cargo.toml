@@ -14,6 +14,14 @@ path = "src/lib.rs"
 name = "pgmask"
 path = "src/main.rs"
 
+[features]
+# Exposes the extended-query state machine and its invariant oracle to the
+# protocol fuzz target in `fuzz/`. Adds no dependencies — the oracle is plain
+# Rust and the `Arbitrary` derive lives in the fuzz crate, which is its own
+# workspace. Off by default, so neither the proxy binary nor `cargo build`
+# compiles a line of it.
+fuzzing = []
+
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true

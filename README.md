@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.35**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.36**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -180,6 +180,33 @@ operation, on every engine, and handles those fields as computed ones. See
 cargo llvm-cov --release --summary-only   # coverage, after running the above
 cargo audit && cargo machete              # advisories and unused deps
 ```
+
+Everything above generates SQL. One suite generates **message orderings**
+instead, and it is separate because libFuzzer needs a nightly toolchain:
+
+```bash
+rustup toolchain install nightly && cargo install cargo-fuzz
+./scripts/test-plan-state-fuzz.sh        # coverage-guided protocol interleavings
+```
+
+It drives `PlanState` — Parse, Bind, Describe, Execute, Sync, Close, simple
+Query, and the backend replies that acknowledge or reject them — through
+`arbitrary`-generated sequences, and asserts that the proxy still knows which
+SQL and which plan belong to which result set. It exists because a disclosure
+lived in an interleaving no generated *statement* could reach: `described_sql`
+fell back to an earlier simple query's text when a Describe was outstanding
+whose SQL had never been recorded, so `SELECT 1, 2` — two literals, nothing to
+mask — became the identity under which another statement's fields were
+released. The target rediscovers that in two messages and under ten seconds
+when the fallback is reintroduced, which is the poison control the script runs
+before it will trust a clean sweep.
+
+Nightly is not on the release gate. What is: the minimized sequences are
+checked in as ordinary unit tests in `crates/proxy/src/plan_state_fuzz.rs`, so
+`./scripts/test-all.sh` carries them without a nightly toolchain. `fuzz/` is
+its own workspace and is listed under `exclude` in the root manifest, so
+`libfuzzer-sys` and its C++ runtime never enter the dependency graph that
+`cargo build` or `cargo audit` reads.
 
 Or by hand:
 
@@ -571,6 +598,9 @@ crates/proxy/mask.rs       masking algorithms, semantic-type domains
 crates/proxy/metrics.rs    rejection causes and counters
 crates/proxy/tls.rs        TLS on both legs
 crates/proxy/tests/        canary, adversarial and resilience suites
+crates/proxy/plan_state.rs         extended-query lifecycle: which plan, which rows
+crates/proxy/plan_state_fuzz.rs    its invariants, and the protocol fuzz oracle
+fuzz/                      libFuzzer targets; own workspace, nightly only
 crates/spike/              Phase 0 provenance spike
 crates/bench/              latency and throughput harness
 examples/demo/             schema, catalog, and the acceptance script

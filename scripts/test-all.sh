@@ -21,6 +21,26 @@
 # failed for reasons that had nothing to do with masking.
 
 set -uo pipefail
+
+# Refuse to run alongside another pgmask.
+#
+# The cleanup below is machine-global, not worktree-scoped: `pkill -f` matches
+# every pgmask process on the host, and the container names are fixed strings
+# that any checkout uses. Two sessions running this at once therefore destroy
+# each other — that happened, in both directions, between this gate and an agent
+# fuzzing in a separate worktree. It killed the agent's proxies and deleted its
+# `pgmask-fuzz` fixture mid-run; the agent's load made three of this gate's
+# suites report false failures.
+#
+# A git worktree isolates files. It does not isolate processes or container
+# names, and this script's teardown assumes it owns both.
+if pgrep -x pgmask >/dev/null 2>&1; then
+  echo "FAIL: pgmask is already running, and this gate's teardown would kill it."
+  echo "      Another session or agent is probably mid-run. Processes:"
+  pgrep -lx pgmask | sed 's/^/        /'
+  echo "      Wait for it, or stop it deliberately, then re-run."
+  exit 1
+fi
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
@@ -66,7 +86,16 @@ echo "=== rust tests ==="
 # panics rather than returning Ok — it used to return Ok, which meant those 31
 # reported PASS on every gate run having asserted nothing, the adversarial
 # raw-wire suite among them.
-out=$(PGMASK_ALLOW_SKIP=1 cargo test --workspace --no-fail-fast -q 2>&1)
+# The `fuzzing` feature too, in a second run.
+#
+# `plan_state_fuzz` is feature-gated so `libfuzzer-sys` stays out of the main
+# dependency graph, and the sequences the protocol fuzzer minimised live in it —
+# including the two that reproduce the `described_sql` substitution. A plain
+# `cargo test` compiles none of them: the module simply is not there, and the
+# gate reported the same 183 lib tests before and after they were added. A
+# regression test that does not run is a comment.
+out=$(PGMASK_ALLOW_SKIP=1 cargo test --workspace --no-fail-fast -q 2>&1
+      PGMASK_ALLOW_SKIP=1 cargo test -p pgmask --lib --features fuzzing --no-fail-fast -q 2>&1)
 status=$?
 total=$(printf '%s\n' "$out" | grep -E '^test result' | awk '{s+=$4} END {print s+0}')
 skipped=$(printf '%s\n' "$out" | grep -c 'skipping by request')

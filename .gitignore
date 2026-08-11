@@ -1,5 +1,15 @@
 /target
 
+# libFuzzer build output, saved corpora and crash reproducers. A corpus is a
+# cache — regenerable, machine-specific, and megabytes of it. A crash artifact
+# that matters gets turned into a unit test in `plan_state_fuzz.rs` instead, so
+# it runs on the release gate rather than only when someone has nightly.
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/Cargo.lock
+
 # cargo-mutants scratch: a run's survivors are a finding to act on, not an
 # artefact to keep.
 mutants.out/

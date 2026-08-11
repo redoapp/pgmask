@@ -1,0 +1,41 @@
+[package]
+name = "pgmask-fuzz"
+description = "Coverage-guided fuzzing of the extended-query protocol state machine"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Its own workspace, deliberately. `libfuzzer-sys` links a C++ runtime and
+# pulls `cc`; `arbitrary` pulls a proc macro. None of that belongs in the graph
+# a reviewer of the proxy has to read, and nothing here is reachable from
+# `cargo build`, `cargo test` or `cargo audit` at the repository root. The root
+# manifest also lists this directory under `exclude`, so neither end can pick
+# it up by accident.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.pgmask]
+path = "../crates/proxy"
+features = ["fuzzing"]
+
+# Restated because a separate workspace does not inherit the root's profile,
+# and the reason for it applies here more than anywhere: this target exists to
+# find arithmetic and ordering faults, and a release build that wraps silently
+# would hide the class of bug the epoch counters can produce.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "plan_state"
+path = "fuzz_targets/plan_state.rs"
+test = false
+doc = false
+bench = false
