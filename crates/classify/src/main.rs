@@ -330,15 +330,31 @@ async fn main() -> Result<()> {
                 {
                     if checked > 0 {
                         let rate = (matching as f64 / checked as f64) * 100.0;
-                        proposal.confidence = if rate >= 80.0 {
-                            Confidence::Clear
-                        } else {
-                            Confidence::NeedsReview
-                        };
-                        proposal.note = Some(format!(
+                        // Confirming the *shape* says nothing about whether the
+                        // mask can apply to the column's *type*, and this used
+                        // to overwrite both verdict and note regardless.
+                        //
+                        // `phone bigint` is the ordinary case: `classify_by_name`
+                        // correctly reports "a `partial` mask cannot apply to
+                        // bigint — pick another" and marks it NEEDS REVIEW, then
+                        // sampling casts to text, reads 100% phone-shaped values,
+                        // upgrades to Clear and replaces the note. The emitted
+                        // entry loses its `# NEEDS REVIEW` marker and the proxy
+                        // refuses that result set at runtime — the outage
+                        // `mask_fits` exists to prevent, reintroduced by adding
+                        // evidence. More sampling produced a worse proposal.
+                        let fits = mask_fits(proposal.mask, &proposal.column.data_type);
+                        proposal.confidence = confidence_after_sampling(rate, fits);
+                        let sampled = format!(
                             "{rate:.0}% of {checked} sampled values matched the {} shape",
                             rule.semantic_type
-                        ));
+                        );
+                        // Append, never replace: the incompatibility is the more
+                        // actionable half and it is what the operator has to fix.
+                        proposal.note = Some(match proposal.note.take() {
+                            Some(existing) if !fits => format!("{existing}; {sampled}"),
+                            _ => sampled,
+                        });
                     }
                 }
             }
@@ -640,6 +656,26 @@ fn classify_by_name(rules: &[Rule], column: Column) -> Proposal {
     }
 }
 
+/// What sampled values are allowed to conclude.
+///
+/// A high match rate confirms the *shape* of the data and says nothing about
+/// whether the proposed mask can apply to the column's declared *type*. Those
+/// are independent, and conflating them cost the review flag on `phone bigint`:
+/// `mask_fits` had already reported that `partial` cannot apply to a bigint,
+/// and sampling — which casts to text — overwrote the verdict with `Clear`.
+/// The entry was then emitted without `# NEEDS REVIEW` and the proxy refuses
+/// that result set at runtime.
+///
+/// Extracted so it can be tested without a database; the caller lives in the
+/// middle of a query loop.
+fn confidence_after_sampling(rate: f64, mask_fits_type: bool) -> Confidence {
+    if rate >= 80.0 && mask_fits_type {
+        Confidence::Clear
+    } else {
+        Confidence::NeedsReview
+    }
+}
+
 /// Read up to `limit` non-null values and return how many matched.
 ///
 /// The values themselves are dropped here and never leave this function.
@@ -772,6 +808,7 @@ fn arg(args: &[String], flag: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(
         clippy::unwrap_used,
         clippy::panic,
@@ -779,6 +816,34 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::*;
+
+    /// Sampling confirms a shape, not a type.
+    ///
+    /// `phone bigint` is the case: the name is conclusive, the values are
+    /// phone-shaped, and `partial` still cannot apply to a bigint. Before this
+    /// was separated, a 100% match rate erased that warning and the emitted
+    /// entry lost its review marker — adding evidence produced a worse
+    /// proposal, and the runtime refusal `mask_fits` exists to prevent came
+    /// back.
+    #[test]
+    fn sampling_confirms_a_shape_and_cannot_vouch_for_a_type() {
+        assert_eq!(confidence_after_sampling(100.0, true), Confidence::Clear);
+        assert_eq!(confidence_after_sampling(80.0, true), Confidence::Clear);
+        // Shape confirmed, type still impossible: the operator must look.
+        assert_eq!(
+            confidence_after_sampling(100.0, false),
+            Confidence::NeedsReview
+        );
+        // And a weak rate is never Clear, whatever the type says.
+        assert_eq!(
+            confidence_after_sampling(79.9, true),
+            Confidence::NeedsReview
+        );
+        assert_eq!(
+            confidence_after_sampling(0.0, false),
+            Confidence::NeedsReview
+        );
+    }
 
     /// Classify a bare (name, type) pair the way a schema walk would.
     fn c(name: &str, data_type: &str, max_length: Option<i32>) -> Proposal {

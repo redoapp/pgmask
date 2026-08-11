@@ -111,10 +111,30 @@ if ! cargo build --release -q; then
   echo "FATAL: could not build pgmask"
   exit 1
 fi
+# Wait for the listener, not a fixed two seconds.
+#
+# pgmask resolves the whole catalog before it binds, so on a loaded machine it
+# is not ready in two and the assertions below run against a closed port. This
+# suite reported 3 of 7 while two fuzzers were building, and 7 of 7 alone. It is
+# the third suite here with that defect — `verify.sh` had bare sleeps too, and
+# `test-versions.sh` had a budget too short for the same reason.
+#
+# A TCP connect, not a query: the proxy is mid-TLS-handshake territory here and
+# a psql probe would negotiate a session this suite has not set up yet.
+await_listener() { # port
+  for _ in $(seq 1 120); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3>&- 3<&-; return 0; }
+    sleep 0.25
+  done
+  echo "FAIL: nothing listening on :$1 after 30s"
+  return 1
+}
+
 PGMASK_LOG=info ./target/release/pgmask "$CERTS/tls.toml" > /tmp/pgmask-tls.log 2>&1 &
 PROXY_PID=$!
-sleep 2
-
+if ! await_listener "$PROXY_PORT"; then
+  echo "pgmask never bound:"; cat /tmp/pgmask-tls.log; exit 1
+fi
 if ! kill -0 "$PROXY_PID" 2>/dev/null; then
   echo "pgmask failed to start:"; cat /tmp/pgmask-tls.log; exit 1
 fi
@@ -160,7 +180,7 @@ if [[ "$BACKEND_TLS" == "disable" ]]; then
   sed -i.bak 's|^backend_tls = .*|backend_tls = "require"|' "$CERTS/tls.toml"
   PGMASK_LOG=info ./target/release/pgmask "$CERTS/tls.toml" > /tmp/pgmask-tls-cb.log 2>&1 &
   PROXY_PID=$!
-  sleep 2
+  await_listener "$PROXY_PORT" || { cat /tmp/pgmask-tls-cb.log; exit 1; }
   cb="$(psql "host=localhost port=$PROXY_PORT user=postgres dbname=demo sslmode=require" \
     -tAq -c 'SELECT 1;' 2>&1)"
   check "channel-binding conflict is explained, not opaque" \

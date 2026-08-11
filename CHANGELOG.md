@@ -57,6 +57,44 @@ Adding it failed `classify --check` immediately, because the shipped catalog did
 not declare the new column. That is the drift gate doing its job on the first
 change that gave it something to catch.
 
+## 0.1.35 — evidence that made the proposal worse
+
+`classify` on a `phone bigint` column, which is an ordinary way to store one:
+
+```
+  without --sample   name suggests phone, but a `partial` mask cannot apply to
+                     bigint — pick another          [[column]]   # NEEDS REVIEW
+  with --sample 200  confirmed by sampled values    [[column]]
+```
+
+Sampling casts to text, reads 100% phone-shaped values, and overwrote both the
+verdict and the note — so the emitted entry lost its review marker and the proxy
+refuses that result set at runtime. Adding evidence produced a worse proposal,
+and it removed the warning that `mask_fits` exists to raise.
+
+Sampling confirms a *shape*; it cannot vouch for a *type*. Those were conflated.
+`confidence_after_sampling` is a pure function now, testable without a database,
+and the note is appended rather than replaced — the incompatibility is the more
+actionable half.
+
+Fourth `classify` defect today. Two of the four made the tooling actively
+harmful rather than merely incomplete: one proposed `partial` for national IDs,
+publishing their last four digits, and one told operators a rule protecting a
+materialised view was dead.
+
+A THIRD SUITE THAT FAILED UNDER LOAD
+
+`test-tls.sh` reported 3 of 7 while two fuzzers were building, and 7 of 7 alone.
+Two bare `sleep 2`s after starting a proxy, and a `kill -0` check that proves
+the process exists rather than that it is bound — pgmask resolves the whole
+catalog before binding, so those are seconds apart under load. It waits on the
+listener now, verified at 7 of 7 under twelve CPU spinners.
+
+That is three suites with the same defect: `verify.sh`, `test-versions.sh`, and
+this one. All three produced false *failures*, never false passes, which is the
+safe direction — but three separate diagnoses today went into confirming that a
+red gate was actually green.
+
 ## 0.1.34 — the four spelling disclosures were one property all along
 
 Every disclosure in the analysis layer has been the same query written
