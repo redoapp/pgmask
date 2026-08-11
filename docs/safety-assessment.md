@@ -232,6 +232,15 @@ method reads as infallible.
   against `pg_catalog`. A backend `ErrorResponse` is forwarded as bytes and
   never becomes a logged Rust error, which matters now that its text can be
   SQL-chosen.
+* **Channel binding had no test of any kind, and now has three.**
+  `strip_channel_binding` and `sasl_mechanisms` decide whether authentication
+  downgrades, and nothing in the repository mentioned `-PLUS`,
+  `Cause::ChannelBinding` or either function outside its own definition. The
+  mutation campaign flagged both `session.rs` guards that call them, which is
+  what an untested function looks like from the outside. Not a disclosure — the
+  proxy terminates TLS, so stripping is the only way a plaintext client
+  connects, and that trade is documented — but an authentication-integrity
+  behaviour with a security rationale and no coverage.
 * **The partial-reveal masks have length floors.** `partial`, `inner`, `outer`
   and `range` each mask outright rather than passing through a value too short
   for their window, and `range` was the one whose absence of that guard had

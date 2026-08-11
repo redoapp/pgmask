@@ -1042,6 +1042,101 @@ mod tests {
         assert!(!fields[0].has_provenance());
     }
 
+    /// The two functions that decide whether authentication downgrades.
+    ///
+    /// Neither had a test anywhere in the repository — not a unit test, not a
+    /// suite, not the demo. The mutation campaign flagged both guards in
+    /// `session.rs` that call them, which is what a function with no coverage
+    /// looks like from the outside.
+    ///
+    /// They matter because the proxy terminates TLS: Postgres advertises
+    /// `-PLUS` on its own TLS leg, the client cannot satisfy channel binding
+    /// against a certificate the proxy holds, and stripping is the only way a
+    /// plaintext client connects at all. Getting it wrong in one direction
+    /// breaks every login; in the other it strips for a TLS client, which the
+    /// server correctly reads as a downgrade attack.
+    fn sasl_body(mechanisms: &[&str]) -> Bytes {
+        let mut b = BytesMut::new();
+        b.put_i32(AUTH_SASL);
+        for m in mechanisms {
+            b.put_slice(m.as_bytes());
+            b.put_u8(0);
+        }
+        b.put_u8(0);
+        b.freeze()
+    }
+
+    #[test]
+    fn sasl_mechanisms_reads_what_the_server_offered() {
+        assert_eq!(
+            sasl_mechanisms(&sasl_body(&["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"])),
+            vec!["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"]
+        );
+        assert_eq!(
+            sasl_mechanisms(&sasl_body(&["SCRAM-SHA-256"])),
+            vec!["SCRAM-SHA-256"]
+        );
+        assert!(sasl_mechanisms(&sasl_body(&[])).is_empty());
+
+        // Not a SASL message: a different authentication sub-code must not be
+        // read as an empty mechanism list, because "empty" is the condition the
+        // caller treats as "the server offers only channel binding".
+        let mut ok = BytesMut::new();
+        ok.put_i32(0); // AuthenticationOk
+        assert!(sasl_mechanisms(&ok.freeze()).is_empty());
+
+        // The case that makes the sub-code check load-bearing, and the reason
+        // an `AuthenticationOk` fixture is not enough: a non-SASL auth message
+        // *with a payload*. `AuthenticationMD5Password` carries a 4-byte salt,
+        // and a salt containing a NUL reads as a perfectly good mechanism name
+        // if nothing checks that the sub-code is 10.
+        let mut md5 = BytesMut::new();
+        md5.put_i32(5);
+        md5.put_slice(b"AB\0C");
+        assert!(
+            sasl_mechanisms(&md5.freeze()).is_empty(),
+            "an MD5 salt is not a mechanism list"
+        );
+        assert!(
+            sasl_mechanisms(&Bytes::from_static(b"\x00\x00")).is_empty(),
+            "truncated"
+        );
+        assert!(sasl_mechanisms(&Bytes::new()).is_empty(), "empty");
+    }
+
+    #[test]
+    fn channel_binding_is_stripped_only_when_there_is_something_to_strip() {
+        // The ordinary case: both offered, the -PLUS one goes.
+        let stripped = strip_channel_binding(&sasl_body(&["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"]))
+            .expect("something to strip");
+        assert_eq!(sasl_mechanisms(&stripped), vec!["SCRAM-SHA-256"]);
+
+        // `None` means "forward the original untouched", so returning `Some` of
+        // an identical body here would be a needless rewrite of an auth message.
+        assert!(
+            strip_channel_binding(&sasl_body(&["SCRAM-SHA-256"])).is_none(),
+            "nothing to strip"
+        );
+        assert!(
+            strip_channel_binding(&sasl_body(&[])).is_none(),
+            "no mechanisms"
+        );
+        assert!(
+            strip_channel_binding(&Bytes::new()).is_none(),
+            "not a SASL message"
+        );
+
+        // Only channel binding on offer. Stripping leaves an empty list, and
+        // the caller turns that into a refusal rather than a login that cannot
+        // succeed — so the empty list has to actually come back.
+        let only_plus = strip_channel_binding(&sasl_body(&["SCRAM-SHA-256-PLUS"]))
+            .expect("a -PLUS mechanism is something to strip");
+        assert!(
+            sasl_mechanisms(&only_plus).is_empty(),
+            "the caller keys its refusal off this being empty"
+        );
+    }
+
     #[test]
     fn scrubs_detail_and_message_but_keeps_a_backend_sqlstate() {
         let mut body = BytesMut::new();

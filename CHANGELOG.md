@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.56 — the functions that decide whether authentication downgrades
+
+Triaging the campaign's survivors, `session.rs` had 69 and two of them were the
+guards on the SASL channel-binding arms. Following those:
+`strip_channel_binding` and `sasl_mechanisms` had **no test anywhere** — not a
+unit test, not a suite, not the demo. Nothing in the repository mentioned
+`-PLUS`, `Cause::ChannelBinding`, or either function outside its own definition.
+
+They matter because the proxy terminates TLS. Postgres advertises `-PLUS` on its
+own TLS leg, a client cannot satisfy channel binding against a certificate the
+proxy holds, and stripping is the only way a plaintext client connects at all.
+Wrong in one direction breaks every login; wrong in the other strips for a TLS
+client, which the server correctly reads as the downgrade attack it is.
+
+Three tests, and three poison controls that each fail one: stripping when there
+is no `-PLUS` to strip, keeping the `-PLUS` mechanism, and reading any
+authentication message as a mechanism list.
+
+THE THIRD POISON NEEDED A BETTER FIXTURE
+
+It did not fire at first. The test used `AuthenticationOk` as the non-SASL case,
+and that body has no payload — so misreading it still yields an empty list and
+the assertion passes either way.
+
+`AuthenticationMD5Password` carries a four-byte salt, and a salt containing a
+NUL reads as a perfectly good mechanism name if nothing checks the sub-code is
+10. That is the fixture that makes the check load-bearing, and it is the same
+lesson as every other control in this file: a negative case has to be one that
+could actually come out wrong.
+
+MOST OF `session.rs`'s SURVIVORS ARE NOT THIS
+
+Fourteen of the 69 are the `session closed` log line's condition — whether a log
+line is emitted, with nothing asserting the log. Six more are the
+`UnexpectedEof` arm in connection teardown. Worth saying so rather than letting
+a survivor count read as 69 gaps.
+
 ## 0.1.55 — the completeness check had the hole it was built to close
 
 The campaign finished and reported `attempted 814 of 814`. It had run 19 shards
