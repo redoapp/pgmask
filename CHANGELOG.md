@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.49 — the TOML classify writes had never been given to pgmask
+
+`classify --check` compares an existing catalog against a live schema.
+`validate_spec` checks a `MaskSpec` in memory. Neither of them ever took the
+actual artefact — the file a person copies out of their terminal — and fed it
+back to the thing that has to read it.
+
+That is the seam where a change in one crate breaks the other in silence.
+`classify` learned to emit `range` with `start`/`end` for postcodes two releases
+ago, and whether `pgmask` accepts that combination was a matter of reading two
+files and believing they agreed.
+
+`test-classify-roundtrip.sh` does the thing an operator does: run `classify`,
+prepend the four connection lines it cannot know, start the proxy with the
+result, and query through it. Ten checks, and three poison controls — emitting
+`bucket = 1`, emitting an empty `range` window, and reverting the postcode mask
+to `partial` — each fail it.
+
+TWO FINDINGS FROM WRITING IT, BOTH MINE
+
+The first control column was `city`, and it came back `***`. `classify` matches
+`^city$` with its `geo` rule, so it was classified, not unclassified — a control
+has to be a name no rule matches. It is `warehouse_label` now.
+
+And the salary assertion failed because the salary was 68000 under a bucket of
+1000. The mask had worked exactly as specified: **bucketing returns a value that
+sits on a bucket boundary unchanged.** Inherent rather than a defect, but worth
+knowing before choosing a bucket — one value in `bucket` is disclosed exactly,
+and round numbers are commoner in real salary data than a uniform distribution
+suggests. Written onto `Mask::NumericBucket`, where the `bucket >= 2` rule
+already lives for the degenerate case of that same property.
+
 ## 0.1.48 — a shard is a disk budget, measured this time
 
 The campaign filled the disk and died at shard 8 of 12. The accounting caught

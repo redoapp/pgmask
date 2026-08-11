@@ -318,6 +318,16 @@ pub enum Mask {
     /// Truncate a date or timestamp to the first of its month.
     DateMonth,
     /// Floor a number to a multiple of `bucket`.
+    ///
+    /// **A value already on a bucket boundary is returned exactly.** A salary of
+    /// 68000 under `bucket = 1000` comes back as 68000 — the mask worked, and
+    /// the output is the input. That is inherent to bucketing rather than a
+    /// defect, and it is worth knowing before choosing a bucket: one in
+    /// `bucket` values is disclosed exactly, and round numbers are commoner in
+    /// real salary data than a uniform distribution would suggest.
+    ///
+    /// `bucket >= 2` is enforced at config load, which stops the degenerate
+    /// case where *every* value is on a boundary.
     NumericBucket,
     /// Replace recognised identifiers inside free text with placeholders,
     /// leaving the rest of the sentence readable:

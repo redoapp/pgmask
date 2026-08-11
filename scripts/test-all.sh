@@ -135,6 +135,12 @@ run "demo (verify.sh)"        env KEEP=0 ./examples/demo/verify.sh
 # Asserts the limits, not the defence: each route it lists is one a client can
 # still take. It belongs in the gate because it now also asserts the routes we
 # closed, so undoing one is a suite failure rather than a quiet regression.
+# The seam between the two crates: the TOML `classify` writes has to load, start
+# a proxy and mask. `--check` compares a catalog against a schema and
+# `validate_spec` checks a spec in memory, but nothing fed the actual artefact
+# back to the thing that reads it.
+run "classify round trip"     ./scripts/test-classify-roundtrip.sh
+
 run "inference limits"        ./scripts/test-inference.sh
 # The generated counterpart to the inference suite's literal strings: every way
 # to spell "group by the key", crossed with every syntactic position that can
