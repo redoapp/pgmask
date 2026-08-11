@@ -109,6 +109,29 @@ pub enum Verdict {
 struct SnapshotCatalog(Arc<Snapshot>);
 
 impl CatalogProvider for SnapshotCatalog {
+    /// Required by the trait, and — measured — consulted by nothing.
+    ///
+    /// The campaign reports all four value-replacing mutants here as surviving,
+    /// and they are equivalent rather than untested. Replacing this with `None`,
+    /// an empty list or `["xyzzy"]` changes the verdict of **no** shape:
+    ///
+    /// ```text
+    ///   SELECT upper(ship_city) FROM demo.orders                     Release
+    ///   SELECT upper(c.city) FROM …customers c JOIN …orders o ON …   Release
+    ///   SELECT upper(city) FROM …customers JOIN …orders USING (id)   Release
+    ///   SELECT * FROM demo.orders                                    Unresolved
+    ///   SELECT upper(x.ship_city) FROM (SELECT * FROM …orders) x     Unresolved
+    ///   WITH q AS (SELECT * FROM …orders) SELECT upper(ship_city)    Unresolved
+    /// ```
+    ///
+    /// Identical with the real columns and with each mutant. The reason is that
+    /// a column list is wanted for star expansion, and every star shape is
+    /// already `Unresolved` — guard 2 refuses an empty source list — before the
+    /// answer could matter. Named columns resolve without it.
+    ///
+    /// Kept correct rather than stubbed: this is a `sqllineage` implementation
+    /// detail, not a contract, and a version bump could start consulting it.
+    /// The six shapes above are what was measured, not a proof over all SQL.
     fn list_columns(&self, table: &TableRef) -> Option<Vec<String>> {
         self.0
             .relation_columns(&qualify(table))

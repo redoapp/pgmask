@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.61 — a lineage method that looks load-bearing and is consulted by nothing
+
+The last untriaged survivor group: four value-replacing mutants on
+`SnapshotCatalog::list_columns`, in the module where under-reporting a source
+column is a *disclosure* rather than a utility cost. Worth checking properly
+rather than assuming.
+
+They are equivalent, and the evidence is that replacing the method with `None`,
+an empty list, or `["xyzzy"]` changes the verdict of no shape at all:
+
+```text
+  SELECT upper(ship_city) FROM demo.orders                     Release
+  SELECT upper(c.city) FROM …customers c JOIN …orders o ON …   Release
+  SELECT upper(city) FROM …customers JOIN …orders USING (id)   Release
+  SELECT * FROM demo.orders                                    Unresolved
+  SELECT upper(x.ship_city) FROM (SELECT * FROM …orders) x     Unresolved
+  WITH q AS (SELECT * FROM …orders) SELECT upper(ship_city)    Unresolved
+```
+
+Identical under all four. A column list is wanted for star expansion, and every
+star shape is already `Unresolved` — guard 2 refuses an empty source list —
+before the answer could matter. Named columns resolve without it, including the
+`USING` join where a bare column has to be attributed to one of two tables.
+
+Kept correct rather than stubbed. It is a `sqllineage` implementation detail
+rather than a contract, and a version bump could start consulting it — the same
+reasoning as the `FuncCall` guard that no engine can currently reach. The
+docstring records the six shapes as what was measured, not a proof over all SQL.
+
+That closes the triage of the 19-shard campaign: six real gaps fixed, and the
+rest equivalent, unreachable, or not safety-relevant, each said so in the place
+someone would next look.
+
 ## 0.1.60 — the Luhn floor, where a relaxed bound leaves a card in the text
 
 `is_luhn` is the `Scrub` mask's card detector, and `Scrub` is the one mask that
