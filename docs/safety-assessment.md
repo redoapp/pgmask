@@ -289,11 +289,10 @@ comment that asserted the case could not happen.
   script now compares planned against attempted and refuses to report a partial
   run. A complete run has not finished yet; until it does, treat mutation
   coverage of the release rules as unmeasured rather than as 45 known gaps.
-- The mutation harness does not mutate `protocol.rs` or `mask.rs`. It covers
-  `analysis.rs`, `catalog.rs`, `lineage.rs` and `session.rs`. `LEAKY_FIELDS` —
-  the error-field scrubbing that stops a unique violation echoing a masked value
-  back — is in `protocol.rs`, and the masks themselves are in `mask.rs`. Both
-  decide what reaches the client and neither is being mutated.
+- `protocol.rs` and `mask.rs` joined the mutated file list on 2026-08-11, taking
+  the campaign from 494 mutants to 827 — two thirds of the release-relevant
+  surface had never been mutated. See the note above on why that would not have
+  found any of the nine disclosures.
 - Two `classify` defects fixed 2026-08-11 that were proposals rather than
   disclosures, but would have become disclosures in a deployed catalog:
   `postal_code` was proposed as `partial`, which keeps the *last* characters —
@@ -320,5 +319,16 @@ comment that asserted the case could not happen.
   were wrong — a domain masks normally, because Postgres reports the base type
   OID in `RowDescription`, and a partitioned parent is masked by the parent's
   rule. Reading a partition by name falls to default-deny.
+- **`SET ROLE` has no effect on masking, and that is now documented rather than
+  merely true.** `[[role]]` maps a startup principal to pgmask role names,
+  resolved once at authentication; the database's own role state is unrelated.
+  Safe direction, but an operator who grants a Postgres role expecting the mask
+  to follow is configuring nothing. Pinned by a test with a live control.
+- **Lineage inverts the safety property and is off by default** (`lineage =
+  "refuse"`). It is the one place where failing to notice a source column
+  releases rather than refuses, which is why it carries six documented guards
+  and a name-based backstop. Read on 2026-08-11 and nothing found; that is a
+  reading, not a proof, and it is the module to hand a second reviewer first if
+  you intend to turn it on.
 - Production validation has never run: the intended host is a read-write primary
   and no read-only path has been supplied.
