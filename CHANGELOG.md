@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.1.57 — the result-format codes were only ever checked for not panicking
+
+`parse_bind_result_formats` and `format_for` decide whether each output field is
+text or binary, and the masker branches on that. Every value-replacing mutant
+survived — `Some(vec![])`, `Some(vec![0])`, `Some(vec![1])`, `None`, and
+`format_for -> 1`.
+
+The reason is visible once you look at what touches them:
+
+```rust
+let _ = parse_bind_result_formats(&body);
+let _ = format_for(&formats, index);
+```
+
+Both are reached only by the never-panics properties, which assert nothing about
+the answer.
+
+AND NOTHING ELSE WOULD HAVE CAUGHT IT
+
+The canary fixture is entirely text columns, and for text-family types the text
+and binary encodings are **the same bytes** — `MaskSpec::supports` says so, and
+it is why the string masks accept both formats. So a wrong format changes
+nothing there. It changes everything for a date, a numeric, or a uuid, and those
+live in the demo, which `cargo mutants` does not run.
+
+Two tests. One pins the protocol rule that a *single* result-format code governs
+every column rather than only column 0 — the subtlety a constant-returning
+mutant hides — and that more columns than codes means text rather than reusing
+the last one. The other reads the codes out of a `Bind` that actually carries
+parameters, because the codes come after them and a parser that does not step
+over a parameter by length reads them out of the middle of a value.
+
+Four poison controls, one per rule, all firing.
+
 ## 0.1.56 — the functions that decide whether authentication downgrades
 
 Triaging the campaign's survivors, `session.rs` had 69 and two of them were the

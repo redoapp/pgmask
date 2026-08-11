@@ -1066,6 +1066,84 @@ mod tests {
         b.freeze()
     }
 
+    /// A `Bind` carrying parameters, so the skip logic is exercised rather than
+    /// stepped over.
+    fn bind_body(params: &[&[u8]], result_formats: &[i16]) -> Bytes {
+        let mut b = BytesMut::new();
+        b.put_slice(b"portal\0");
+        b.put_slice(b"stmt\0");
+        b.put_i16(0); // no parameter format codes
+        b.put_i16(i16::try_from(params.len()).unwrap());
+        for p in params {
+            b.put_i32(i32::try_from(p.len()).unwrap());
+            b.put_slice(p);
+        }
+        b.put_i16(i16::try_from(result_formats.len()).unwrap());
+        for f in result_formats {
+            b.put_i16(*f);
+        }
+        b.freeze()
+    }
+
+    /// The result-format codes, which decide how every masked value is decoded.
+    ///
+    /// Both this and `format_for` were reached only by the never-panics
+    /// properties — `let _ = parse_bind_result_formats(&body)` — which assert
+    /// nothing about the answer, so every value-replacing mutant survived:
+    /// `Some(vec![])`, `Some(vec![0])`, `Some(vec![1])`, `None`.
+    ///
+    /// Nothing else would have caught it either. The canary fixture is entirely
+    /// text columns, and for text-family types the text and binary encodings
+    /// are the same bytes, so a wrong format changes nothing there. It changes
+    /// everything for a date, a numeric or a uuid.
+    #[test]
+    fn bind_result_formats_are_read_including_past_the_parameters() {
+        assert_eq!(
+            parse_bind_result_formats(&bind_body(&[], &[])),
+            Some(vec![])
+        );
+        assert_eq!(
+            parse_bind_result_formats(&bind_body(&[], &[1])),
+            Some(vec![1])
+        );
+        assert_eq!(
+            parse_bind_result_formats(&bind_body(&[], &[0, 1, 0])),
+            Some(vec![0, 1, 0])
+        );
+        // Parameters have to be stepped over by length, or the codes are read
+        // out of the middle of a parameter value.
+        assert_eq!(
+            parse_bind_result_formats(&bind_body(&[b"alice", b"", b"\x00\x01\x02"], &[1, 0])),
+            Some(vec![1, 0])
+        );
+        // Truncated after the count is not "no formats"; it is unreadable.
+        let mut short = BytesMut::new();
+        short.put_slice(b"p\0s\0");
+        short.put_i16(0);
+        short.put_i16(0);
+        short.put_i16(3); // claims three codes and supplies none
+        assert_eq!(parse_bind_result_formats(&short.freeze()), None);
+        assert_eq!(parse_bind_result_formats(&Bytes::new()), None);
+    }
+
+    /// One code applies to *every* column — the protocol rule that is easy to
+    /// read past, and the one a mutant returning a constant hides.
+    #[test]
+    fn a_single_result_format_code_governs_every_column() {
+        assert_eq!(format_for(&[], 0), 0, "no codes means all text");
+        assert_eq!(format_for(&[], 7), 0);
+
+        assert_eq!(format_for(&[1], 0), 1);
+        assert_eq!(format_for(&[1], 3), 1, "one code is not just for column 0");
+        assert_eq!(format_for(&[0], 3), 0);
+
+        assert_eq!(format_for(&[0, 1, 0], 0), 0);
+        assert_eq!(format_for(&[0, 1, 0], 1), 1);
+        assert_eq!(format_for(&[0, 1, 0], 2), 0);
+        // More columns than codes: text, rather than reusing the last code.
+        assert_eq!(format_for(&[0, 1, 0], 9), 0);
+    }
+
     #[test]
     fn sasl_mechanisms_reads_what_the_server_offered() {
         assert_eq!(
