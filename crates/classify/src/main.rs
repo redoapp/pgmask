@@ -247,7 +247,13 @@ fn rules() -> Vec<Rule> {
         r("phone", "partial", r"phone|mobile|telephone|^fax", Some(looks_like_phone)),
         r("person_name", "redact", r"first_name|last_name|given_name|family_name|surname|full_name|contact_name|person_name|owner_name|customer_name|employee_name", None),
         r("street_address", "redact", r"street|address_line|addr_line|^address$|^addr$", None),
-        r("postal_code", "partial", r"zip|postal|postcode", None),
+        // NOT `partial`. `partial` keeps the *last* characters, and a postcode's
+        // identifying half is its tail: the last two digits of a US ZIP narrow
+        // it from a state to a neighbourhood, and with the default `keep = 4` a
+        // five-digit ZIP came back as `*1234`. `range` from offset 2 keeps the
+        // coarse prefix instead — `94103` -> `94***`, `SW1A 1AA` -> `SW******` —
+        // and a value shorter than the offset is masked outright.
+        r("postal_code", "range", r"zip|postal|postcode", None),
         // Only the full date is confidently a date. TPC-DS splits birth across
         // `c_birth_day` / `_month` / `_year` / `_country`, none of which a date
         // mask can decode; they are handled in the unsure tier below.
@@ -328,6 +334,54 @@ fn mask_name(mask: &pgmask::mask::Mask) -> &'static str {
     }
 }
 
+/// Every mask pgmask has, so a test can check a proposal names a real one.
+///
+/// Kept honest by `index_of` below: adding a variant makes that match
+/// non-exhaustive and the crate stops compiling.
+#[cfg(test)]
+const ALL_MASKS: &[pgmask::mask::Mask] = {
+    use pgmask::mask::Mask::*;
+    &[
+        None,
+        Null,
+        Redact,
+        Partial,
+        Inner,
+        Outer,
+        Range,
+        Hash,
+        Pseudonym,
+        DateYear,
+        DateMonth,
+        NumericBucket,
+        IpPrefix,
+        Scrub,
+    ]
+};
+
+/// Not called. It exists so the compiler rejects a `Mask` variant that
+/// `ALL_MASKS` has not been told about.
+#[cfg(test)]
+fn _index_of(mask: pgmask::mask::Mask) -> usize {
+    use pgmask::mask::Mask;
+    match mask {
+        Mask::None => 0,
+        Mask::Null => 1,
+        Mask::Redact => 2,
+        Mask::Partial => 3,
+        Mask::Inner => 4,
+        Mask::Outer => 5,
+        Mask::Range => 6,
+        Mask::Hash => 7,
+        Mask::Pseudonym => 8,
+        Mask::DateYear => 9,
+        Mask::DateMonth => 10,
+        Mask::NumericBucket => 11,
+        Mask::IpPrefix => 12,
+        Mask::Scrub => 13,
+    }
+}
+
 /// Whether a proposed mask can actually apply to this column's type.
 ///
 /// Found by running this against TPC-DS, which has `c_birth_year` as an
@@ -346,12 +400,20 @@ fn mask_fits(mask: &str, data_type: &str) -> bool {
         }
         "numeric-bucket" | "numeric-range" => numeric,
         "ip-prefix" => textual || data_type == "inet" || data_type == "cidr",
-        // `redact` and `partial` rewrite text. TPC-DS's `i_manager_id` is an
+        // Every mask that rewrites text in place. TPC-DS's `i_manager_id` is an
         // integer that matched the manager rule; redacting it would fail.
-        "partial" | "redact" => textual,
+        //
+        // `inner`, `outer`, `range`, `hash` and `scrub` were missing and fell
+        // through to `_ => true`, so `--check` accepted any of them on an
+        // integer column and the proxy refused the result set at runtime —
+        // which is the outage this function exists to prevent, for five of the
+        // seven masks it applies to. Found while proposing `range` for a
+        // postcode and noticing the arm was not there.
+        "partial" | "redact" | "inner" | "outer" | "range" | "hash" | "scrub" => textual,
         // `null` withholds whatever it is, and `pseudonym` covers text and uuid.
-        "null" => true,
+        "null" | "none" => true,
         "pseudonym" => textual || data_type == "uuid",
+        // Unknown names are the catalog loader's problem, not this one's.
         _ => true,
     }
 }
@@ -953,7 +1015,13 @@ fn emit_catalog(proposals: &[Proposal], schema: &str) {
             println!("bucket = 1000        # pick a real bucket before using this");
         }
         if *mask == "partial" {
-            println!("keep = 4");
+            println!("keep = 4            # how many trailing characters to reveal");
+        }
+        if *mask == "range" {
+            // `end` is clamped to the value's length, so a large one means
+            // "to the end" and keeps exactly the first `start` characters.
+            println!("start = 2");
+            println!("end = 64           # clamped to the value: keeps the first 2");
         }
         println!();
     }
@@ -1200,22 +1268,58 @@ mod tests {
     fn every_pattern_compiles_and_every_mask_is_one_pgmask_knows() {
         // A typo'd mask name would produce a catalog that pgmask refuses to
         // load, and the failure would surface far from here.
-        const KNOWN: &[&str] = &[
-            "null",
-            "redact",
-            "partial",
-            "pseudonym",
-            "ip-prefix",
-            "date-year",
-            "date-month",
-            "date-quarter",
-            "numeric-bucket",
-            "numeric-range",
-            "none",
-        ];
+        // Derived from the type, not typed out again. This was a hand-written
+        // array and it drifted the moment `postal_code` moved to `range`:
+        // the mask was valid, the list had never heard of it. Adding a `Mask`
+        // variant now fails to compile in `index_of` below rather than passing
+        // a test that quietly covers one fewer mask.
+        let known: Vec<&'static str> = ALL_MASKS.iter().map(mask_name).collect();
         for rule in rules() {
-            assert!(KNOWN.contains(&rule.mask), "unknown mask `{}`", rule.mask);
+            assert!(known.contains(&rule.mask), "unknown mask `{}`", rule.mask);
         }
+    }
+
+    /// A text-only mask must not be proposed for a column that cannot take it.
+    ///
+    /// `mask_fits` covered `partial` and `redact` and fell through to
+    /// `_ => true` for `inner`, `outer`, `range`, `hash` and `scrub` — five of
+    /// the seven masks that rewrite text in place. `--check` accepted any of
+    /// them on an integer column and the proxy refused the result set at
+    /// runtime, which is the outage this function exists to prevent.
+    #[test]
+    fn every_text_only_mask_is_refused_on_a_non_text_column() {
+        for mask in [
+            "partial", "redact", "inner", "outer", "range", "hash", "scrub",
+        ] {
+            assert!(mask_fits(mask, "text"), "{mask} on text");
+            assert!(mask_fits(mask, "character varying"), "{mask} on varchar");
+            for wrong in ["integer", "bigint", "numeric", "uuid", "inet", "date"] {
+                assert!(
+                    !mask_fits(mask, wrong),
+                    "{mask} must not be proposed for {wrong}"
+                );
+            }
+        }
+        // The masks that legitimately reach beyond text.
+        assert!(mask_fits("pseudonym", "uuid"));
+        assert!(mask_fits("ip-prefix", "inet"));
+        assert!(mask_fits("null", "bigint"));
+        assert!(mask_fits("numeric-bucket", "numeric"));
+        assert!(!mask_fits("numeric-bucket", "text"));
+    }
+
+    /// A postcode's identifying half is its tail, which is what `partial` keeps.
+    ///
+    /// With the default `keep = 4` a five-digit ZIP came back as `*1234` — four
+    /// of five characters, narrowing a state to a neighbourhood. `range` from
+    /// offset 2 keeps the coarse prefix instead.
+    #[test]
+    fn a_postcode_keeps_its_prefix_not_its_tail() {
+        let rule = rules()
+            .into_iter()
+            .find(|r| r.semantic_type == "postal_code")
+            .expect("a postal_code rule");
+        assert_eq!(rule.mask, "range", "partial keeps the identifying end");
     }
 
     /// The shapes that only a checksum separates from noise.

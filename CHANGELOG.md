@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.43 — a postcode mask that kept the identifying half
+
+`classify` proposed `partial` for anything matching `zip|postal|postcode`, and
+emitted `keep = 4` alongside it. `partial` keeps the *last* characters. A
+five-digit US ZIP came back as `*1234`.
+
+Four of five characters, and the wrong four: the leading digits of a ZIP are a
+broad region, the trailing ones narrow it to a neighbourhood. The mask kept
+exactly the part that identifies.
+
+Now `range` from offset 2, which keeps the coarse prefix — `94103` -> `94***`,
+`SW1A 1AA` -> `SW******`, `K1A 0B1` -> `K1*****` — and masks outright anything
+shorter than the window. The emitted `end = 64` reads as nonsense until you know
+`end` is clamped to the value's length, so a test in `mask.rs` pins those exact
+shapes: the proposal lives in one crate and the clamp in another, and if the
+clamp ever stops clamping, a postcode column starts arriving verbatim.
+
+FIVE OF SEVEN TEXT-ONLY MASKS WERE UNCHECKED
+
+Found while making that change. `mask_fits` decides whether a proposed mask can
+apply to a column's type — it exists because TPC-DS has `c_birth_year` as an
+integer and a date mask cannot decode an int4. It had arms for `partial` and
+`redact` and fell through to `_ => true` for `inner`, `outer`, `range`, `hash`
+and `scrub`.
+
+So `--check` accepted any of those on an integer column, and the proxy refused
+the result set at runtime — the outage the function exists to prevent, for five
+of the seven masks it applies to. Noticed only because `range` had no arm and I
+was about to propose it.
+
+A HAND-WRITTEN LIST, DRIFTING ON CUE
+
+`every_pattern_compiles_and_every_mask_is_one_pgmask_knows` checked rule masks
+against an array of mask names typed out by hand. Moving `postal_code` to
+`range` failed it: the mask was valid, the list had never heard of it.
+
+The list is derived from the type now, and a `Mask` variant that `ALL_MASKS` has
+not been told about fails to compile rather than passing a test that quietly
+covers one fewer mask.
+
 ## 0.1.42 — the allowlist was right and was reviewed with the wrong question
 
 `ParameterStatus` is governed by an allowlist of GUC names, written after

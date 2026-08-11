@@ -209,6 +209,14 @@ comment that asserted the case could not happen.
   the error-field scrubbing that stops a unique violation echoing a masked value
   back — is in `protocol.rs`, and the masks themselves are in `mask.rs`. Both
   decide what reaches the client and neither is being mutated.
+- Two `classify` defects fixed 2026-08-11 that were proposals rather than
+  disclosures, but would have become disclosures in a deployed catalog:
+  `postal_code` was proposed as `partial`, which keeps the *last* characters —
+  with the emitted `keep = 4` a five-digit ZIP masked to `*1234`, four of five,
+  narrowing a state to a neighbourhood. And `mask_fits` covered `partial` and
+  `redact` but fell through to "fits anything" for `inner`, `outer`, `range`,
+  `hash` and `scrub`, so `--check` accepted five of the seven text-only masks on
+  an integer column and the proxy refused the result set at runtime.
 - `classify` can find seven shapes by content: card numbers (Luhn), IBANs
   (mod-97), US Social Security numbers (SSA allocation rules), email, IP, phone,
   and free text by absence. Names, street addresses, dates of birth, non-US

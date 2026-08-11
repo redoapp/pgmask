@@ -1237,6 +1237,27 @@ mod tests {
         assert_eq!(outer("topsecret", 2), "**psecr**");
     }
 
+    /// The window `classify` proposes for a postcode, against real shapes.
+    ///
+    /// `start = 2, end = 64` reads as nonsense until you know `end` is clamped
+    /// to the value's length, so it means "keep the first two". This is pinned
+    /// here because the proposal lives in another crate: if the clamp ever
+    /// stops clamping, a postcode column starts arriving verbatim and the only
+    /// thing that would notice is this.
+    #[test]
+    fn the_postcode_window_keeps_the_prefix_at_every_length() {
+        let mut s = spec(Mask::Range);
+        s.start = 2;
+        s.end = 64;
+        assert_eq!(apply_text(&s, "94103"), "94***", "US ZIP");
+        assert_eq!(apply_text(&s, "SW1A 1AA"), "SW******", "UK postcode");
+        assert_eq!(apply_text(&s, "K1A 0B1"), "K1*****", "Canadian");
+        // Shorter than the window: masked outright rather than passed through.
+        assert_eq!(apply_text(&s, "12"), "**");
+        assert_eq!(apply_text(&s, "1"), "*");
+        assert_eq!(apply_text(&s, ""), "");
+    }
+
     #[test]
     fn range_masks_the_requested_window() {
         let mut s = spec(Mask::Range);
