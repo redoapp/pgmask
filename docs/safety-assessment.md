@@ -213,10 +213,21 @@ the nine disclosures is a **missing case**, not wrong logic:
 * `scram_iterations` was on an allowlist.
 * The unique-key query never selected expression indexes.
 
-There is nothing to mutate in code that was never written. Measured rather than
-argued: after adding `protocol.rs` and `mask.rs` to the harness — 333 of the 827
-mutants — the first quarter of the campaign killed **every** mutant in both
-files and every survivor was in `catalog.rs` or `analysis.rs`.
+There is nothing to mutate in code that was never written.
+
+An earlier draft of this section quoted a survivor count from a campaign that
+was still running — "killed every mutant in both files" — and it was false
+within the hour. **Do not put a running total in a document.** The final numbers
+belong here when the run finishes; until then the claim is that the campaign is
+incomplete, which is what `test-mutants.sh` now refuses to let a partial run
+obscure.
+
+The qualitative point stands and does not depend on the count. Mutation testing
+found a class reading did not — untested *boundaries* in logic that exists, such
+as the `partial` and `inner` length floors, where a value exactly as long as the
+window it keeps came back verbatim. Reading found a class mutation testing
+cannot: *cases* that were never written. Neither substitutes for the other, and
+all nine disclosures were of the second kind.
 
 So adding them was right, and it closes a different gap than the one that let
 disclosure 7 through. What found all nine was reading, and what made reading
