@@ -914,6 +914,13 @@ fn grouping_may_reference(
         // "unbounded", refusing six honest aggregations in the fixture.
         resolve_alias: bool,
     ) -> Option<()> {
+        // `> 24` -> `== 24` or `>= 24` both survive the mutation campaign, and
+        // both are equivalent for safety: every path increments (`d =
+        // depth.saturating_add(1)`, passed to every recursive call), so all
+        // three still cap, one level earlier or later. Detecting the difference
+        // needs an expression nested exactly 24 deep, and the number is a
+        // stack guard rather than a property. What matters is that the cap
+        // returns `None` — refuse — and that is tested.
         if depth > 24 {
             return None;
         }
@@ -995,6 +1002,23 @@ fn grouping_may_reference(
             NodeEnum::NullTest(test) => walk(test.arg.as_ref()?, targets, into, d, false),
             NodeEnum::BooleanTest(test) => walk(test.arg.as_ref()?, targets, into, d, false),
             NodeEnum::FuncCall(call) => {
+                // Defence in depth, and the mutation campaign is right that
+                // nothing tests it: turning any of these `||` into `&&` breaks
+                // no test, because the server rejects the statement before a
+                // result set exists. Measured on Postgres 17 —
+                //
+                //   GROUP BY sum(id) OVER (PARTITION BY id)
+                //     ERROR: window functions are not allowed in GROUP BY
+                //   GROUP BY count(*) FILTER (WHERE id > 0)
+                //   GROUP BY string_agg(email, ',' ORDER BY id)
+                //   GROUP BY count(*)
+                //     ERROR: aggregate functions are not allowed in GROUP BY
+                //
+                // — and CockroachDB rejects them too. A statement the engine
+                // refuses cannot disclose. Kept because this walker's contract
+                // is "return None for anything that could reference more than
+                // it appears to", and an engine that one day allows one of
+                // these should meet a guard rather than a gap.
                 if call.over.is_some()
                     || call.agg_filter.is_some()
                     || !call.agg_order.is_empty()
@@ -1114,6 +1138,13 @@ fn group_item_columns(
         // `GROUP BY c+0` reports `column "c" does not exist`.
         as_element: bool,
     ) -> Option<()> {
+        // `> 16` -> `== 16` or `>= 16` both survive the mutation campaign, and
+        // both are equivalent for safety: every path increments (`d =
+        // depth.saturating_add(1)`, passed to every recursive call), so all
+        // three still cap, one level earlier or later. Detecting the difference
+        // needs an expression nested exactly 16 deep, and the number is a
+        // stack guard rather than a property. What matters is that the cap
+        // returns `None` — refuse — and that is tested.
         if depth > 16 {
             return None;
         }

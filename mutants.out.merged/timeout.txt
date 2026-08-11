@@ -1,1 +1,3 @@
 crates/proxy/src/catalog.rs:1145:12: delete ! in opaque_views
+crates/proxy/src/protocol.rs:143:9: replace StartupPacket::encode -> Bytes with Default::default()
+crates/proxy/src/protocol.rs:204:58: replace == with != in FrameReader<R>::read_message

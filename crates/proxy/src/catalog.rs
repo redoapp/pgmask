@@ -1770,6 +1770,44 @@ mask = "none"
         assert!(format!("{err:#}").contains("duplicate rule"));
     }
 
+    /// Both edges of every parameter guard, including the values `classify`
+    /// emits.
+    ///
+    /// `outer` had a boundary test; `numeric-bucket` and `range` did not, and
+    /// the campaign duly reported `bucket < 2` -> `<= 2` and the whole `range`
+    /// guard -> `true` as surviving. Over-rejection here is fail-closed, and it
+    /// would also mean the catalog `classify` writes no longer loads — it emits
+    /// `bucket = 1000` and `start = 2, end = 64`, and nothing connected the two
+    /// crates.
+    #[test]
+    fn every_parameter_guard_is_tested_on_both_sides_of_its_edge() {
+        let bucket = |b: i64| {
+            let mut spec = MaskSpec::new(Mask::NumericBucket);
+            spec.bucket = b;
+            validate_spec(&spec, "s.t.c")
+        };
+        assert!(bucket(1).is_err(), "1 floors every value to itself");
+        assert!(bucket(2).is_ok(), "2 is the smallest bucket that masks");
+        assert!(bucket(1000).is_ok(), "what classify emits");
+        assert!(bucket(0).is_err());
+        assert!(bucket(-5).is_err());
+
+        let range = |start: u16, end: u16| {
+            let mut spec = MaskSpec::new(Mask::Range);
+            spec.start = start;
+            spec.end = end;
+            validate_spec(&spec, "s.t.c")
+        };
+        assert!(range(2, 2).is_err(), "an empty window masks nothing");
+        assert!(range(3, 2).is_err(), "an inverted window masks nothing");
+        assert!(
+            range(2, 3).is_ok(),
+            "one character wide is the smallest that masks"
+        );
+        assert!(range(2, 64).is_ok(), "what classify emits for a postcode");
+        assert!(range(0, 1).is_ok());
+    }
+
     #[test]
     fn outer_with_keep_zero_is_refused() {
         let mut spec = MaskSpec::new(Mask::Outer);

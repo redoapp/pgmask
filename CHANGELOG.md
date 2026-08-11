@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.1.47 — triaging the rest: three tests, two comments, one measurement
+
+Continuing through the survivor list. The useful output of a mutation campaign
+is not a number, it is a decision per mutant, and there are three decisions.
+
+A REAL GAP: EVERY PARAMETER GUARD BUT ONE WAS UNTESTED ON ITS EDGE
+
+`outer`'s `keep = 0` had a boundary test. `numeric-bucket`'s `bucket < 2` and
+`range`'s `end <= start` did not, and the campaign reported `< 2` -> `<= 2` and
+the whole `range` guard -> `true` as surviving.
+
+Over-rejection here is fail-closed, and it would also mean the catalog
+`classify` writes no longer loads: it emits `bucket = 1000` and
+`start = 2, end = 64`, and nothing connected the two crates. Both edges of both
+guards are pinned now, including those exact values, and three poison controls
+fire.
+
+UNREACHABLE, AND MEASURED RATHER THAN ASSERTED
+
+`grouping_may_reference` refuses a `FuncCall` in a grouping element that carries
+`OVER`, `FILTER`, an ordered-set clause or `count(*)`. Turning any of those `||`
+into `&&` breaks no test — because the engine rejects the statement first:
+
+```text
+  GROUP BY sum(id) OVER (PARTITION BY id)
+    ERROR: window functions are not allowed in GROUP BY
+  GROUP BY count(*) FILTER (WHERE id > 0)
+  GROUP BY string_agg(email, ',' ORDER BY id)
+  GROUP BY count(*)
+    ERROR: aggregate functions are not allowed in GROUP BY
+```
+
+A statement the engine refuses cannot disclose. The guard stays — the walker's
+contract is "return None for anything that could reference more than it appears
+to", and an engine that one day allows one of these should meet a guard rather
+than a gap — but it is defence in depth and now says so.
+
+EQUIVALENT: THE DEPTH CAPS
+
+`depth > 24` and `depth > 16` both survive relaxation to `==` or `>=`. Every
+path increments — `d = depth.saturating_add(1)`, passed to every recursive call,
+which I checked because several call sites read as passing `depth` unchanged —
+so all three still cap, one level earlier or later. Telling them apart needs an
+expression nested exactly 24 deep, and the number is a stack guard rather than a
+property. What matters is that the cap refuses, and that is tested.
+
 ## 0.1.46 — the campaign's first real finding, and two mutants that are not one
 
 Triage of the 827-mutant campaign, at the halfway mark. Three categories, and

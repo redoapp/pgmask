@@ -75,3 +75,26 @@ crates/proxy/src/mask.rs:629:68: replace > with >= in partial
 crates/proxy/src/mask.rs:645:24: replace > with >= in inner
 crates/proxy/src/mask.rs:670:24: replace > with >= in outer
 crates/proxy/src/mask.rs:817:56: replace > with >= in truncate_date_text
+crates/proxy/src/mask.rs:861:9: delete match arm OID_TIMESTAMP in truncate_date
+crates/proxy/src/mask.rs:869:9: delete match arm OID_TIMESTAMPTZ in truncate_date
+crates/proxy/src/mask.rs:935:52: replace * with + in bucket_number
+crates/proxy/src/mask.rs:935:52: replace * with / in bucket_number
+crates/proxy/src/mask.rs:935:39: replace / with % in bucket_number
+crates/proxy/src/mask.rs:935:39: replace / with * in bucket_number
+crates/proxy/src/mask.rs:973:45: replace * with + in bucket_number
+crates/proxy/src/mask.rs:973:45: replace * with / in bucket_number
+crates/proxy/src/mask.rs:973:32: replace / with % in bucket_number
+crates/proxy/src/mask.rs:973:32: replace / with * in bucket_number
+crates/proxy/src/mask.rs:984:57: replace * with + in bucket_number
+crates/proxy/src/mask.rs:984:57: replace * with / in bucket_number
+crates/proxy/src/mask.rs:984:44: replace / with % in bucket_number
+crates/proxy/src/mask.rs:984:44: replace / with * in bucket_number
+crates/proxy/src/mask.rs:1051:30: replace | with ^ in uuid_bytes
+crates/proxy/src/mask.rs:1052:30: replace | with & in uuid_bytes
+crates/proxy/src/mask.rs:1052:30: replace | with ^ in uuid_bytes
+crates/proxy/src/mask.rs:1052:22: replace & with | in uuid_bytes
+crates/proxy/src/mask.rs:1052:22: replace & with ^ in uuid_bytes
+crates/proxy/src/mask.rs:1083:9: replace <impl std::fmt::Display for MaskError>::fmt -> std::fmt::Result with Ok(Default::default())
+crates/proxy/src/protocol.rs:195:9: replace FrameReader<R>::saw_eof -> bool with false
+crates/proxy/src/protocol.rs:223:9: replace FrameReader<R>::try_buffered_message -> Result<Option<Message>> with Ok(None)
+crates/proxy/src/protocol.rs:228:9: replace FrameReader<R>::read_startup -> Result<Option<StartupPacket>> with Ok(None)

@@ -318,3 +318,44 @@ crates/proxy/src/mask.rs:817:56: replace > with < in truncate_date_text
 crates/proxy/src/mask.rs:821:17: replace == with != in truncate_date_text
 crates/proxy/src/mask.rs:841:5: replace truncate_date -> Result<Bytes, MaskError> with Ok(Default::default())
 crates/proxy/src/mask.rs:841:25: replace == with != in truncate_date
+crates/proxy/src/mask.rs:843:15: replace == with != in truncate_date
+crates/proxy/src/mask.rs:854:9: delete match arm OID_DATE in truncate_date
+crates/proxy/src/mask.rs:896:5: replace bucket_number -> Result<Bytes, MaskError> with Ok(Default::default())
+crates/proxy/src/mask.rs:898:15: replace == with != in bucket_number
+crates/proxy/src/mask.rs:925:16: delete ! in bucket_number
+crates/proxy/src/mask.rs:946:9: delete match arm OID_INT2 in bucket_number
+crates/proxy/src/mask.rs:954:9: delete match arm OID_INT4 in bucket_number
+crates/proxy/src/mask.rs:962:9: delete match arm OID_INT8 in bucket_number
+crates/proxy/src/mask.rs:967:9: delete match arm OID_FLOAT4 in bucket_number
+crates/proxy/src/mask.rs:980:9: delete match arm OID_FLOAT8 in bucket_number
+crates/proxy/src/mask.rs:996:5: replace floor_to -> i64 with 0
+crates/proxy/src/mask.rs:996:5: replace floor_to -> i64 with 1
+crates/proxy/src/mask.rs:996:5: replace floor_to -> i64 with -1
+crates/proxy/src/mask.rs:1020:5: replace floor_within -> Option<i64> with None
+crates/proxy/src/mask.rs:1020:5: replace floor_within -> Option<i64> with Some(0)
+crates/proxy/src/mask.rs:1020:5: replace floor_within -> Option<i64> with Some(1)
+crates/proxy/src/mask.rs:1020:5: replace floor_within -> Option<i64> with Some(-1)
+crates/proxy/src/mask.rs:1030:5: replace hex_into with ()
+crates/proxy/src/mask.rs:1031:29: replace >> with << in hex_into
+crates/proxy/src/mask.rs:1031:40: replace & with | in hex_into
+crates/proxy/src/mask.rs:1031:40: replace & with ^ in hex_into
+crates/proxy/src/mask.rs:1038:43: replace < with == in hex_into
+crates/proxy/src/mask.rs:1038:43: replace < with > in hex_into
+crates/proxy/src/mask.rs:1038:43: replace < with <= in hex_into
+crates/proxy/src/mask.rs:1049:5: replace uuid_bytes -> [u8; 16] with [0; 16]
+crates/proxy/src/mask.rs:1049:5: replace uuid_bytes -> [u8; 16] with [1; 16]
+crates/proxy/src/mask.rs:1051:30: replace | with & in uuid_bytes
+crates/proxy/src/mask.rs:1051:22: replace & with | in uuid_bytes
+crates/proxy/src/mask.rs:1051:22: replace & with ^ in uuid_bytes
+crates/proxy/src/mask.rs:1057:5: replace uuid_text -> String with String::new()
+crates/proxy/src/mask.rs:1057:5: replace uuid_text -> String with "xyzzy".into()
+crates/proxy/src/protocol.rs:77:5: replace is_text_family -> bool with true
+crates/proxy/src/protocol.rs:77:5: replace is_text_family -> bool with false
+crates/proxy/src/protocol.rs:124:9: replace Message::encode -> Bytes with Default::default()
+crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![]
+crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![(String::new(), String::new())]
+crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![(String::new(), "xyzzy".into())]
+crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![("xyzzy".into(), String::new())]
+crates/proxy/src/protocol.rs:156:9: replace StartupPacket::parameters -> Vec<(String, String)> with vec![("xyzzy".into(), "xyzzy".into())]
+crates/proxy/src/protocol.rs:195:9: replace FrameReader<R>::saw_eof -> bool with true
+crates/proxy/src/protocol.rs:200:9: replace FrameReader<R>::read_message -> Result<Option<Message>> with Ok(None)

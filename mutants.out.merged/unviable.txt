@@ -14,3 +14,6 @@ crates/proxy/src/catalog.rs:1027:5: replace classify -> Result<Classification> w
 crates/proxy/src/lineage.rs:119:9: replace <impl CatalogProvider for SnapshotCatalog>::resolve_column -> Option<TableRef> with Some(Default::default())
 crates/proxy/src/lineage.rs:160:5: replace resolve -> Vec<Verdict> with vec![Default::default()]
 crates/proxy/src/lineage.rs:170:5: replace resolve_inspected -> Vec<Verdict> with vec![Default::default()]
+crates/proxy/src/protocol.rs:118:9: replace Message::from_frame -> Self with Default::default()
+crates/proxy/src/protocol.rs:200:9: replace FrameReader<R>::read_message -> Result<Option<Message>> with Ok(Some(Default::default()))
+crates/proxy/src/protocol.rs:223:9: replace FrameReader<R>::try_buffered_message -> Result<Option<Message>> with Ok(Some(Default::default()))
