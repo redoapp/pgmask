@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.53**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.54**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -597,9 +597,10 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   groupings and coarse date buckets are served unchanged.
 
 **Before deploying this, read [`docs/safety-assessment.md`](docs/safety-assessment.md).**
-It states what is guaranteed, what is explicitly not, what six disclosures were
-found in a single day, and why the instruments were wrong more often than the
-code was.
+It states what is guaranteed, what is explicitly not, the nine disclosures found
+across two days — six in the release rules, three more in the diagnostic and
+`ParameterStatus` channels — and why the instruments were wrong more often than
+the code was.
 
 ## Layout
 

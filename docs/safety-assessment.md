@@ -113,6 +113,16 @@ tested eleven spellings of the grouping without once wrapping one.
 
 ## What was found on 2026-08-11
 
+Numbered 7, 8 and 9 to continue the list above, and the letters are not
+decoration: 7 is four separate channels and 9 is two. "Nine disclosures" is the
+numbering, not the count of ways a value got out — that is 13, 6 in the
+release rules and 7 here. Where a count appears elsewhere in the repository it
+means the numbering.
+
+I wrote "fourteen" in the first draft of this paragraph without counting the
+rows, in a document whose subject is numbers asserted with more confidence than
+the measurement behind them.
+
 A seventh disclosure, in `protocol.rs` — a module neither the mutation harness
 nor any fuzzer touches, which is where I went looking *because* I had recorded
 that gap a few hours earlier.

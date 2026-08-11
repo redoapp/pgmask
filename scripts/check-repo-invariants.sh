@@ -76,6 +76,22 @@ claimed=$(grep -oE 'runs [0-9]+ suites' README.md | grep -oE '[0-9]+' | head -1)
 [ "${claimed:-none}" = "$suites" ] ||
   note "README claims the gate runs ${claimed:-no stated number of} suites; it runs $suites."
 
+# The disclosure count, against the tables it summarises.
+#
+# The README said "six disclosures" for four releases after there were nine, and
+# when I wrote the sentence fixing it I asserted a channel count of fourteen
+# without counting the rows. It is thirteen. Both are the same mistake this
+# repository keeps finding, so both get a check rather than a promise.
+channels=$(grep -cE '^\| ([1-9]|7[a-d]|9[ab]) \|' docs/safety-assessment.md)
+claimed_readme=$(grep -oE '(the )?(six|seven|eight|nine|ten|[0-9]+) disclosures' README.md | head -1)
+case "$claimed_readme" in
+  *nine*) ;;
+  "")     note "README no longer states a disclosure count; the tables list $channels channels." ;;
+  *)      note "README says '$claimed_readme'; the tables list $channels channels under 9 numbers." ;;
+esac
+grep -qE "that is $channels, " docs/safety-assessment.md ||
+  note "the assessment's channel count does not match its own tables ($channels rows)."
+
 [ "$fail" = 0 ] &&
   echo "repo invariants ok: v$cargo_version, $total entries, descending, seeds tracked"
 exit "$fail"

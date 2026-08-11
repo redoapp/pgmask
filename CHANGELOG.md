@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.54 — and the disclosure count, including the one I got wrong fixing it
+
+The README said "what six disclosures were found in a single day" for four
+releases after there were nine. Fixed.
+
+Then, in the sentence explaining that 7 and 9 have sub-parts, I wrote that the
+channel count "is fourteen" — without counting the rows. It is thirteen: six in
+the release rules, seven in the diagnostic and `ParameterStatus` channels. In a
+document whose subject is numbers asserted with more confidence than the
+measurement behind them.
+
+So both get a check rather than a promise. `check-repo-invariants.sh` counts the
+table rows in the assessment and requires two things of the prose: that the
+README's disclosure count is the current one, and that the assessment's own
+channel figure matches its own tables. Two poison controls, both reporting the
+real number rather than the claimed one.
+
+The convention is now stated where the tables are: **nine** is the numbering,
+**thirteen** is the count of ways a value got out.
+
 ## 0.1.53 — the front page undercounted the gate by a third
 
 > `./scripts/test-all.sh` runs thirteen suites … 265 cargo tests, 31 adversarial
