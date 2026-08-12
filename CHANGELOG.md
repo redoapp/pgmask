@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.63 — the foreign grammar, for hours instead of seconds
+
+`soak.sh` runs `shapegen` for hours. `soak-sqlsmith.sh` does the same with
+sqlsmith, which is the distinction that matters: running my own grammar longer
+explores more of what I already thought of, and before v0.1.36 no amount of that
+would have reached two of the six original disclosures.
+
+One container for the run and a fresh seed each round. sqlsmith builds from
+catalog OIDs, so a new seed against the *same* catalog is what varies the
+corpus — recreating the container per round would be slower and would change the
+OIDs, making a seed meaningless as a label.
+
+EVERY ROUND CHECKS ITS OWN CONTROLS
+
+A round that reaches no masked data, or serves no masked value, **aborts the
+run** rather than being counted. That is not caution for its own sake: the
+single-shot version of this reported zero leaks four times in a row while
+measuring nothing, and a long campaign averages such rounds into a total that
+looks like evidence. Half a million statements are worth less than they appear
+if some unknown fraction of the rounds never reached a masked column.
+
+The schema, catalog and control statements are lifted out of
+`test-sqlsmith.sh` rather than duplicated, so a finding here reproduces with the
+single-shot suite, and the two cannot drift into testing different things.
+
+On a leak the offending corpus is written to
+`/tmp/pgmask-sqlsmith-leak-<seed>.sql` — the seed alone does not reproduce it,
+so the statements themselves have to be kept.
+
 ## 0.1.62 — SQL from a grammar nobody here wrote, and four ways it said nothing
 
 Every campaign here generates from `shapegen`, which I wrote. That is the
