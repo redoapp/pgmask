@@ -48,10 +48,14 @@ pub fn backend_dsn(db: &str) -> String {
 /// nothing is the failure this project keeps finding.
 ///
 /// `PGMASK_ALLOW_SKIP=1` opts out, for running `cargo test` on a machine with
-/// no Postgres. The gate does not set it, and neither does CI — the first
-/// version of `.github/workflows/ci.yml` did, reproducing this exact defect in
-/// the workflow written to catch regressions. CI now runs a Postgres service
-/// container and asserts that nothing skipped.
+/// no Postgres. **The gate sets it deliberately** for the workspace sweep and
+/// then runs these suites for real, serially, as its own entry — two steps
+/// with two different jobs. An earlier version of this comment claimed the
+/// gate does not set it, which was wrong and briefly sent CI down the wrong
+/// path: removing the flag ran all 41 concurrently against one backend and the
+/// catalog loader failed with "could not open relation with OID 17545".
+///
+/// `--test-threads=1` is therefore load-bearing, not caution.
 ///
 /// The count above is checked by `scripts/check-repo-invariants.sh`; it read
 /// 31 for several releases after the suites grew to 41.

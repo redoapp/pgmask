@@ -3,30 +3,28 @@ name: CI
 # The part of `./scripts/test-all.sh` that a GitHub-hosted runner can honestly
 # run — which is more than the first version of this file assumed.
 #
-# WHAT CHANGED, AND WHY IT MATTERS MORE THAN THE REST OF THIS FILE
+# WHAT THE FIRST TWO VERSIONS GOT WRONG
 #
-# The first version set `PGMASK_ALLOW_SKIP=1` so the database-backed tests
-# would skip. That flag exists for running `cargo test` on a laptop with no
-# Postgres, and the macro it feeds carries this comment:
+# v1 ran no database at all. It set PGMASK_ALLOW_SKIP=1 and stopped there, so
+# the 41 tests behind `require_pg!` — every raw-wire adversarial test and every
+# resilience test, including negative_control_the_harness_can_see_a_leak —
+# never ran anywhere in CI. The justification was "these need containers, and
+# containers mean podman". Wrong: they need a reachable Postgres, and podman is
+# only how scripts/test-integration.sh obtains one locally.
 #
-#     This used to `return Ok(())`. test-all.sh runs cargo test without
-#     PGMASK_TEST_PG ... so all 31 tests behind this macro — every raw-wire
-#     adversarial test and every resilience test, including
-#     negative_control_the_harness_can_see_a_leak — reported PASS on every
-#     release gate having asserted nothing.
-#     ...
-#     PGMASK_ALLOW_SKIP=1 opts out. The gate does not set it.
+# v2 over-corrected by removing the skip flag from the workspace sweep. All 41
+# then ran concurrently against one backend, creating and dropping relations
+# under each other, and the catalog loader failed with "could not open relation
+# with OID 17545". Forty-one failures, one cause. `test-integration.sh` runs
+# them with --test-threads=1 for exactly this reason.
 #
-# The gate deliberately does not set it. The first version of this workflow
-# did, which quietly reproduced the exact defect that comment was written
-# about: forty-one call sites' worth of adversarial and resilience tests
-# reporting green having asserted nothing — including the negative control
-# whose entire job is to prove the harness can see a leak.
+# What the gate actually does, and what this now mirrors: the workspace sweep
+# sets PGMASK_ALLOW_SKIP=1 on purpose and lets those tests skip, and a separate
+# entry runs them for real, serially. Two steps, two jobs to do.
 #
-# The reason given was "these need containers, and containers mean podman".
-# That was wrong. They need a reachable Postgres; podman is only how
-# `test-integration.sh` obtains one locally. A service container is a Postgres,
-# so CI runs them for real and no skip flag appears anywhere in this file.
+# The skips are therefore expected here — which is precisely how a suite goes
+# quiet without anyone noticing. So the count is asserted against the number of
+# tests that carry the macro, and the serial runs are asserted to skip nothing.
 #
 # WHAT STILL CANNOT RUN HERE
 #
@@ -123,9 +121,6 @@ jobs:
           --health-retries 20
 
     env:
-      # Deliberately no PGMASK_ALLOW_SKIP. With this set and a database
-      # present, a test that cannot reach Postgres fails — which is the whole
-      # point of the macro it feeds.
       PGMASK_TEST_PG: 127.0.0.1:5432
 
     steps:
@@ -139,21 +134,29 @@ jobs:
         run: |
           psql "postgres://postgres@127.0.0.1:5432/postgres" -tAc 'select version()'
 
-      # Tee'd, because the assertion below has to be about *this* run. Running
-      # the suite a second time to inspect its output would double the job and
-      # still only prove something about the second run.
+      # The sweep, with the database-backed tests skipping — the same call the
+      # gate makes. They are run for real, serially, in the next two steps.
+      # Tee'd because the assertion below must be about *this* run.
       - name: workspace tests
+        env:
+          PGMASK_ALLOW_SKIP: "1"
         run: |
           set -o pipefail
           cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/workspace.log
 
-      # The two suites the old workflow skipped entirely. Serial by design:
-      # they drive a raw wire client against a shared backend.
-      - name: adversarial suite
-        run: cargo test --test adversarial -- --test-threads=1
+      # The two suites no CI run had ever executed. --test-threads=1 is not a
+      # precaution: they share one backend, and running them concurrently is
+      # what produced "could not open relation with OID 17545" 41 times.
+      # No PGMASK_ALLOW_SKIP here, so a missing database fails.
+      - name: adversarial suite (serial, real database)
+        run: |
+          set -o pipefail
+          cargo test --test adversarial -- --test-threads=1 2>&1 | tee /tmp/adversarial.log
 
-      - name: resilience suite
-        run: cargo test --test resilience -- --test-threads=1
+      - name: resilience suite (serial, real database)
+        run: |
+          set -o pipefail
+          cargo test --test resilience -- --test-threads=1 2>&1 | tee /tmp/resilience.log
 
       # The fuzzing feature gates an entire module in. Without it the
       # plan_state harness is not compiled at all, and `cargo test` reports a
@@ -161,19 +164,28 @@ jobs:
       - name: fuzzing-feature tests
         run: cargo test -p pgmask --lib --features fuzzing --no-fail-fast
 
-      # Nothing should skip now. If something does, it means a test lost its
-      # database and went quiet instead of failing — the defect this whole file
-      # is written around — so say so loudly.
-      - name: nothing skipped silently
+      # The skips in the sweep are expected, and "expected skips" is exactly
+      # how a suite stops asserting anything without anyone noticing. So:
+      # the sweep must skip precisely the tests that carry the macro, and the
+      # serial runs must skip none of them.
+      - name: the skips are the ones we intended
         if: always()
         run: |
-          n=$(grep -c 'skipping by request' /tmp/workspace.log || true)
-          if [ "$n" != "0" ]; then
-            echo "FAIL: $n tests skipped despite a database being present."
-            grep 'skipping by request' /tmp/workspace.log | head
-            exit 1
-          fi
-          echo "0 tests skipped, as required."
+          expected=$(cat crates/proxy/tests/adversarial.rs crates/proxy/tests/resilience.rs |
+            awk '/#\[(tokio::)?test\]/{t=1} /require_pg!/{if(t){c++;t=0}} END{print c+0}')
+          got=$(grep -c 'skipping by request' /tmp/workspace.log || true)
+          echo "sweep skipped $got, tests carrying require_pg!: $expected"
+          [ "$got" = "$expected" ] || {
+            echo "FAIL: the sweep skipped $got tests but $expected carry the macro."
+            echo "      A test that stopped asserting, or one that stopped skipping."
+            exit 1; }
+
+          for f in /tmp/adversarial.log /tmp/resilience.log; do
+            n=$(grep -c 'skipping by request' "$f" || true)
+            [ "$n" = "0" ] || { echo "FAIL: $n tests skipped in $f, which has a database."; exit 1; }
+            grep -E '^test result:' "$f" | sed "s|^|$(basename "$f"): |"
+          done
+          echo "The 41 database-backed tests ran for real."
 
   coverage:
     name: what CI does not cover
