@@ -1280,21 +1280,26 @@ async fn resolve_snapshot_retrying(
     types: &HashMap<String, SemanticType>,
     dsn: &str,
 ) -> Result<Snapshot> {
-    const ATTEMPTS: usize = 4;
-    let mut attempt = 1;
+    // One entry per retry, so the attempt count and the backoff cannot drift
+    // apart. Written as a table rather than as `100 * attempt` because this
+    // crate denies `clippy::arithmetic_side_effects` — a strict lint to carry,
+    // and the right one for a proxy where a wrapped length is a disclosure.
+    const BACKOFF_MS: &[u64] = &[100, 200, 400];
+    let mut backoff = BACKOFF_MS.iter();
     loop {
         match resolve_snapshot(rules, types, dsn).await {
             Ok(snapshot) => return Ok(snapshot),
-            Err(err) if attempt < ATTEMPTS && is_concurrent_ddl_race(&err) => {
-                tracing::warn!(
-                    attempt,
-                    error = %format!("{err:#}"),
-                    "catalog resolution raced concurrent DDL; retrying"
-                );
-                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                attempt += 1;
-            }
-            Err(err) => return Err(err),
+            Err(err) => match backoff.next() {
+                Some(&delay_ms) if is_concurrent_ddl_race(&err) => {
+                    tracing::warn!(
+                        delay_ms,
+                        error = %format!("{err:#}"),
+                        "catalog resolution raced concurrent DDL; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                _ => return Err(err),
+            },
         }
     }
 }

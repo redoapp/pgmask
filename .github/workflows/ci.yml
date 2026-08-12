@@ -120,9 +120,6 @@ jobs:
           --health-timeout 5s
           --health-retries 20
 
-    env:
-      PGMASK_TEST_PG: 127.0.0.1:5432
-
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -144,16 +141,23 @@ jobs:
           set -o pipefail
           cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/workspace.log
 
-      # The two suites no CI run had ever executed. --test-threads=1 is not a
-      # precaution: they share one backend, and running them concurrently is
-      # what produced "could not open relation with OID 17545" 41 times.
-      # No PGMASK_ALLOW_SKIP here, so a missing database fails.
+      # PGMASK_TEST_PG is set per-step, not per-job. Set job-wide it also
+      # reached the sweep above, which then ran these 41 concurrently *and*
+      # left a `canary` schema behind, so the serial run failed on
+      # "duplicate key ... Key (nspname)=(canary) already exists". They must
+      # run exactly once, here, serially: they share one backend, and
+      # --test-threads=1 is load-bearing rather than cautious.
+      # No PGMASK_ALLOW_SKIP, so a missing database fails instead of skipping.
       - name: adversarial suite (serial, real database)
+        env:
+          PGMASK_TEST_PG: 127.0.0.1:5432
         run: |
           set -o pipefail
           cargo test --test adversarial -- --test-threads=1 2>&1 | tee /tmp/adversarial.log
 
       - name: resilience suite (serial, real database)
+        env:
+          PGMASK_TEST_PG: 127.0.0.1:5432
         run: |
           set -o pipefail
           cargo test --test resilience -- --test-threads=1 2>&1 | tee /tmp/resilience.log
