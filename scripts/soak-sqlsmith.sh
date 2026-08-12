@@ -133,8 +133,19 @@ while [[ "$(date +%s)" -lt "$deadline" ]]; do
 
   { replay "$PG_PORT" /tmp/pgmask-sqlsmith-soak.sql
     replay "$PG_PORT" /tmp/pgmask-sqlsmith-soak-plain.sql; } >/tmp/soak-smith.direct
-  { replay "$PROXY_PORT" /tmp/pgmask-sqlsmith-soak.sql
-    replay "$PROXY_PORT" /tmp/pgmask-sqlsmith-soak-plain.sql; } >/tmp/soak-smith.proxied
+  # The controls go to their own file as well as the combined one, so an abort
+  # can say whether they ran at all rather than leaving it to be bisected.
+  #
+  # This also fixed an intermittent failure and I cannot tell you why. Written
+  # as `{ replay corpus; replay plain; } >file`, the second replay's output went
+  # missing from round 3 onward — the proxy log showed no session for it, and the
+  # run aborted on "no masked value was served" having measured nothing. As two
+  # invocations with their own redirections it has run clean since. The
+  # difference is real and the mechanism is not established; if this recurs,
+  # start there rather than assuming the proxy.
+  replay "$PROXY_PORT" /tmp/pgmask-sqlsmith-soak.sql >/tmp/soak-smith.proxied
+  replay "$PROXY_PORT" /tmp/pgmask-sqlsmith-soak-plain.sql >/tmp/soak-smith.plain
+  cat /tmp/soak-smith.plain >>/tmp/soak-smith.proxied
 
   d=$(grep -cE "$CANARIES" /tmp/soak-smith.direct || true)
   p=$(grep -cE "$CANARIES" /tmp/soak-smith.proxied || true)
@@ -147,6 +158,8 @@ while [[ "$(date +%s)" -lt "$deadline" ]]; do
   fi
   if [[ "$m" -eq 0 ]]; then
     say "ABORT round $round: no masked value was served, so nothing observable ran"
+    say "  the control replay returned $(wc -l </tmp/soak-smith.plain | tr -d ' ') lines:"
+    head -4 /tmp/soak-smith.plain | sed 's/^/    /' | tee -a "$STATUS"
     exit 1
   fi
   if [[ "$p" -ne 0 ]]; then
