@@ -103,6 +103,30 @@ locked=$(grep -A1 '^name = "pgmask"' Cargo.lock | grep -oE '"[0-9.]+"' | tr -d '
 [ "${locked:-none}" = "$cargo_version" ] ||
   note "Cargo.lock says pgmask ${locked:-nothing}; Cargo.toml says $cargo_version. Run cargo build."
 
+# Every released version needs its tag.
+#
+# Tagging is a separate command from committing, and I stopped doing it after
+# v0.1.52 without noticing for fourteen releases. The changelog said they had
+# shipped and `git tag` disagreed, which makes `git describe` useless and any
+# "what changed between X and Y" unanswerable.
+#
+# The newest entry is exempt: it is committed a moment before it is tagged, and
+# failing there would make the check impossible to satisfy while releasing.
+# What counts as released is "a commit carried this version in Cargo.toml", not
+# "the changelog has a heading". Four headings never had a commit of their own —
+# 0.1.17, 0.1.30, 0.1.50 and 0.1.51 were written alongside the release that
+# followed them, deliberately in the last case — and demanding tags for those
+# would invent releases that never happened. Derived rather than kept in a list
+# here, so it cannot go stale the way the list it replaced would have.
+released=$(git log -p --format='' -- Cargo.toml | grep -oE '^\+version = "[0-9][0-9.]*"' | cut -d'"' -f2 | sort -uV)
+missing=""
+for v in $released; do
+  [ "$v" = "$cargo_version" ] && continue   # committed a moment before it is tagged
+  [ "$v" = "0.0.0" ] && continue            # the scaffold's placeholder, never shipped
+  git rev-parse -q --verify "refs/tags/v$v" >/dev/null || missing="$missing v$v"
+done
+[ -z "$missing" ] || note "released versions with no tag:$missing"
+
 [ "$fail" = 0 ] &&
   echo "repo invariants ok: v$cargo_version, $total entries, descending, seeds tracked"
 exit "$fail"
