@@ -905,7 +905,7 @@ impl Catalog {
             .iter()
             .map(|t| (t.name.clone(), t.clone()))
             .collect();
-        let resolved = resolve_snapshot(rules, &types, dsn).await?;
+        let resolved = resolve_snapshot_retrying(rules, &types, dsn).await?;
         if !resolved.unresolved.is_empty() {
             bail!(
                 "catalog references {} column(s) that do not exist: {}. \
@@ -970,7 +970,7 @@ impl Catalog {
     /// coverage is the exact failure this mechanism exists to prevent.
     pub async fn refresh(&self) -> Result<()> {
         let previous = self.snapshot();
-        let next = match resolve_snapshot(&self.rules, &self.types, &self.dsn).await {
+        let next = match resolve_snapshot_retrying(&self.rules, &self.types, &self.dsn).await {
             Ok(next) => next,
             Err(err) => {
                 self.failed_refreshes.fetch_add(1, Ordering::Relaxed);
@@ -1235,6 +1235,67 @@ fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
              the surviving middle, so nothing is masked."
         ),
         _ => Ok(()),
+    }
+}
+
+/// Whether a catalog-resolution failure is a concurrent-DDL race rather than a
+/// real problem with the database or the configuration.
+///
+/// `resolve_snapshot` scans `pg_class` and calls `pg_get_viewdef(c.oid)` on
+/// each row. The scan runs against a snapshot; `pg_get_viewdef` looks the
+/// relation up as it stands *now*. Drop a view in between and the function
+/// errors on an OID the scan has already handed it:
+///
+/// ```text
+/// ERROR: could not open relation with OID 17041
+/// ```
+///
+/// This is not hypothetical and it is not only a test condition. It cost
+/// `resolve()` — which runs before the proxy binds — so a view dropped at the
+/// wrong instant stopped pgmask from starting at all, and an operator whose
+/// proxy will not start routes around the proxy.
+///
+/// Found by CI rather than by the local gate: on a Linux runner the window is
+/// wide enough to hit reliably, and on the development machine it never
+/// reproduced once in seventy releases.
+///
+/// Retrying the whole load is the right response rather than skipping the
+/// vanished relation, because this file already refuses to run on a partial
+/// catalog — "a half-loaded catalog has unknown coverage".
+fn is_concurrent_ddl_race(err: &anyhow::Error) -> bool {
+    // Matched on the message because the SQLSTATE for this is XX000
+    // (internal_error), which is far too broad to retry on.
+    let text = format!("{err:#}");
+    text.contains("could not open relation with OID")
+        || text.contains("cache lookup failed for relation")
+}
+
+/// `resolve_snapshot` with a bounded retry over concurrent DDL.
+///
+/// Bounded, and short: this covers a relation disappearing mid-scan, which
+/// resolves on the next attempt. A database genuinely churning its schema
+/// faster than pgmask can read it is a condition to report, not to spin on.
+async fn resolve_snapshot_retrying(
+    rules: &[ColumnRule],
+    types: &HashMap<String, SemanticType>,
+    dsn: &str,
+) -> Result<Snapshot> {
+    const ATTEMPTS: usize = 4;
+    let mut attempt = 1;
+    loop {
+        match resolve_snapshot(rules, types, dsn).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(err) if attempt < ATTEMPTS && is_concurrent_ddl_race(&err) => {
+                tracing::warn!(
+                    attempt,
+                    error = %format!("{err:#}"),
+                    "catalog resolution raced concurrent DDL; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -2051,5 +2112,48 @@ pseudonym_key = "a-long-enough-key"
         assert_eq!(config.require_client_tls, None);
         assert!(!config.client_tls_required());
         config.validate().expect("plaintext deployments still load");
+    }
+    #[test]
+    fn only_a_concurrent_ddl_race_is_retried() {
+        // The retry has to be narrow. Retrying a bad DSN, a refused
+        // connection, or a permissions error would turn a clear startup
+        // failure into a slow one with the reason buried in a warning.
+        for text in [
+            "db error: ERROR: could not open relation with OID 17041",
+            "loading view definitions: cache lookup failed for relation 17041",
+        ] {
+            assert!(
+                is_concurrent_ddl_race(&anyhow::anyhow!("{text}")),
+                "should retry: {text}"
+            );
+        }
+        for text in [
+            "password authentication failed for user \"pgmask\"",
+            "connection refused",
+            "permission denied for schema crm",
+            "relation \"demo.customers\" does not exist",
+            "invalid dsn",
+        ] {
+            assert!(
+                !is_concurrent_ddl_race(&anyhow::anyhow!("{text}")),
+                "must not retry: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_race_is_recognised_through_a_context_chain() {
+        // resolve_snapshot wraps the driver error in `.context("loading view
+        // definitions")`, so the text only appears via the `{:#}` alternate
+        // form. Matching on `to_string()` would have missed every real case
+        // while passing a test written against a bare error.
+        let inner = anyhow::anyhow!("db error: ERROR: could not open relation with OID 17041");
+        let wrapped = inner.context("loading view definitions");
+        assert!(is_concurrent_ddl_race(&wrapped));
+        assert!(
+            !wrapped.to_string().contains("could not open relation"),
+            "if this ever fails the alternate-form subtlety is gone and the \
+             comment above should go with it"
+        );
     }
 }

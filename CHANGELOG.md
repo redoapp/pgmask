@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.1.71 — CI found a startup bug the local gate never could
+
+Adding CI turned up a real defect on its second green-attempt, and it is not a
+test defect.
+
+`resolve_snapshot` scans `pg_class` and calls `pg_get_viewdef(c.oid)` per row.
+The scan runs against a snapshot; `pg_get_viewdef` resolves the relation as it
+stands *now*. Drop a view in between and it errors on an OID the scan already
+returned:
+
+    ERROR: could not open relation with OID 17041
+
+That error is not caught anywhere. `Catalog::resolve` runs **before the proxy
+binds**, so a view dropped at the wrong instant stopped pgmask from starting —
+and an operator whose proxy will not start routes around the proxy. On refresh
+it burns a `failed_refreshes` and keeps a stale snapshot, which is safe but
+silent.
+
+`resolve_snapshot_retrying` retries the whole load up to four times with a
+short backoff. Retrying the whole load rather than skipping the vanished
+relation is what this file already demands of itself: "a half-loaded catalog
+has unknown coverage".
+
+The classifier is deliberately narrow — matching the message, because the
+SQLSTATE is `XX000` (internal_error) and retrying on that would swallow a bad
+DSN, a refused connection, and a permissions error into a slow start with the
+reason buried in a warning. Tested both ways, including that the match works
+through the `.context("loading view definitions")` chain, which only appears in
+the `{:#}` alternate form. A test written against a bare error would have
+passed while missing every real case.
+
+WHY SEVENTY RELEASES DID NOT FIND IT
+
+It never reproduced on the development machine. On a Linux runner the window is
+wide enough to hit reliably: the first CI run that executed these suites failed
+41 of them, and the run after the concurrency fix still failed 6.
+
+That is the argument for CI that the test counts were not making. The local
+gate is more thorough in every dimension except one — it runs on one machine,
+with one timing profile, and this class of bug is invisible from there.
+
+TWO WRONG TURNS ON THE WAY, BOTH RECORDED
+
+The first CI never ran these suites at all, having reasoned "they need
+containers, and containers mean podman" — they need a reachable Postgres, and a
+service container is one.
+
+The second removed `PGMASK_ALLOW_SKIP` from the workspace sweep, on the
+strength of a doc comment saying "the gate does not set it". The gate does set
+it, deliberately, and runs these suites separately with `--test-threads=1`.
+Removing it ran all 41 concurrently against one backend — which is how the
+underlying race got found, so the wrong turn was productive, but the reasoning
+was wrong and the comment that caused it is fixed at the source.
+
 ## 0.1.70 — eight gate failures, one bug wearing three costumes
 
 The first full gate run since v0.1.61 finished **13 of 21**. Not one of the
