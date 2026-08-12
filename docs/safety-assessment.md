@@ -367,6 +367,20 @@ directions — releasing every mask produces 47 canary-carrying lines.
 `--seed` does not reproduce a corpus: sqlsmith builds from catalog OIDs, which
 differ per container. Each run is an independent sample.
 
+**The first campaign that ran to its own deadline (2026-08-12):** 516 rounds,
+**258,000 queries**, 2,964,017 replayed lines that reached masked data, 245,119
+masked values served through the proxy, **0 leaks**. It matters that it *ended*
+rather than aborting: every round asserts that it reached masked data and served
+a masked value, so a run reaching its deadline is 516 rounds each of which
+measured something. Earlier campaigns stopped early on exactly those assertions,
+which is how the DML problem below was found.
+
+What that does and does not buy: it is 258,000 statements from a grammar written
+by someone else against a policy that refuses most of what it generates. It is
+evidence that the release rules hold under SQL nobody here imagined. It is not
+evidence about anything sqlsmith cannot express, and its own harness reported
+something untrue six times before it reported this.
+
 **And the cause of all of it: sqlsmith generates DML.** Roughly one statement in
 ten is a `delete`, `update` or `insert` against the schema it read. Replaying a
 500-query corpus emptied `smith.people` outright — 200 rows before, 0 after.
