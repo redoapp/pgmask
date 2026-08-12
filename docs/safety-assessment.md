@@ -368,13 +368,21 @@ This is the finding that should shape how much weight a green run carries.
 | `test-mutants.sh` | printed a complete-looking summary for a run that attempted 102 of 494 mutants, twice |
 | `verify.sh` | checked the notice channel both ways and the error channel next to it only in the direction that preserved the leak |
 | `assert_no_canary` | looks for the whole token, so five characters of it through a SQLSTATE read as clean |
+| **the gate's own `cargo test`** | `out=$(a; b); status=$?` reports only `b`, so every integration test was unenforced |
+| `test-inference.sh` | detected the error oracle by grepping for "division by zero", so withholding error text read as the channel closing |
+| the generated campaign | counted 20,034 ordinary SQL errors as proxy refusals, because the withheld text began `pgmask:` |
+| `scrubbing_only_removes` | asserted a length bound as a stand-in for "does not rewrite content" |
+| `test-mutants.sh` again | `--shard k/n` is 0-indexed; the loop ran `1..20`, so a tenth was never tested and the accounting still said "814 of 814" |
+| `test-sqlsmith.sh` | reported zero leaks four separate ways while measuring nothing, then reported a leak that was not one |
+| sqlsmith itself | generates DML; a 500-query corpus emptied the fixture, and every earlier figure was measuring a table being destroyed |
+| `git tag` | fourteen releases the changelog called shipped had no tag at all |
 
 Every one produced a confident answer about something it was not measuring.
 Several were built specifically to prevent that.
 
 ## What the current suites do and do not bound
 
-`./scripts/test-all.sh` — 17 suites. Green means no regression in what is
+`./scripts/test-all.sh` — 21 suites. Green means no regression in what is
 covered. It does not bound what is uncovered.
 
 `./scripts/soak.sh [hours]` — sustained fresh corpora, both engines, both
@@ -385,17 +393,28 @@ a round producing no result aborts too.
 behind it. This is the check that bounds the campaigns: two of today's
 disclosures were in rules nothing could reach.
 
-`./scripts/test-mutants.sh` — mechanical mutation. Found seven predicates whose
-only proof lived in a shell script `cargo test` cannot invoke.
+`./scripts/test-mutants.sh` — mechanical mutation, 827 mutants. The first
+complete run scored 620 caught, 157 missed, 10 timed out, 40 unviable. Triage of
+it produced six real test gaps, every one "logic that exists and was never
+verified" rather than anything reading would surface.
+
+`./scripts/test-sqlsmith.sh [queries]` and `./scripts/soak-sqlsmith.sh [hours]`
+— the same idea against a grammar nobody here wrote. Read the section above on
+the six ways this harness reported something untrue before trusting a number
+from it.
 
 `./scripts/test-mutations.py` — 26 hand-picked guards, each verified to fail
 when broken.
 
 ## If you read one thing before deploying this
 
-**Only Claude has reviewed this security analysis.** Six rule-level disclosures
-in a single day, four found by reading code rather than by any test, is the
-argument for a second reader — not the test counts above.
+**Only Claude has reviewed this security analysis.** Nine disclosures over two
+days across thirteen channels, *all* of them found by reading rather than by any
+test, is the argument for a second reader — not the test counts above.
+
+The rate is the thing to weigh. It had not clearly plateaued when the reading
+stopped: the last was found late on the second day, and the clean sweep that
+followed covered six modules in one afternoon. That is a start, not a plateau.
 
 A human adversary should start with `crates/proxy/src/analysis.rs`, and should
 distrust the comments. They are unusually detailed and load-bearing, which makes

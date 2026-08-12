@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.68 — the assessment had gone stale about itself
+
+A coherence pass over `docs/safety-assessment.md`, which is the document this
+repository tells people to read before deploying, and which four releases of
+edits had left disagreeing with itself.
+
+It said the gate runs **17 suites**; it runs 21 — four releases after the same
+number was corrected in the README, because only the README was checked. Both
+documents are checked now.
+
+It said **six disclosures in a single day, four found by reading**. It is nine
+over two days across thirteen channels, and *all nine* were found by reading
+rather than by any test. Understating that weakens the only argument the section
+is making, which is for a second reader.
+
+It credited `test-mutants.sh` with "seven predicates whose only proof lived in a
+shell script". That was a partial run. The first complete campaign is 827
+mutants — 620 caught, 157 missed, 10 timed out, 40 unviable — and triage of it
+produced six real test gaps.
+
+NINE MORE ROWS FOR THE TABLE
+
+The instruments table is the document's central claim, and it was missing every
+failure from the second day, including the largest: **the gate's own
+`cargo test` could not fail**. Also added — the inference suite grepping for a
+message instead of a difference; the campaign miscounting 20,034 SQL errors as
+refusals; a length bound standing in for "does not rewrite content"; the shard
+that was never requested while the accounting said "814 of 814"; the six ways
+the sqlsmith harness reported something untrue; sqlsmith's DML deleting the
+fixture; and fourteen releases the changelog called shipped that had no tag.
+
+Twenty-five rows now. The sentence under it — "every one produced a confident
+answer about something it was not measuring, and several were built specifically
+to prevent that" — has not needed changing.
+
 ## 0.1.67 — fourteen releases were never tagged
 
 `git tag` is a separate command from `git commit`, and I stopped running it

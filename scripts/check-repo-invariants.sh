@@ -72,9 +72,13 @@ done
 # every `run "..."`. Written as a digit in the README so this can find it.
 suites=$(( $(grep -oE 'record "[^"$][^"]*"' scripts/test-all.sh | wc -l) \
          + $(grep -oE '^[[:space:]]*run "[^"]*"' scripts/test-all.sh | wc -l) ))
-claimed=$(grep -oE 'runs [0-9]+ suites' README.md | grep -oE '[0-9]+' | head -1)
-[ "${claimed:-none}" = "$suites" ] ||
-  note "README claims the gate runs ${claimed:-no stated number of} suites; it runs $suites."
+# Both documents that state the count, not just the README: the assessment said
+# 17 while the gate ran 21, four releases after the README had been corrected.
+for doc in README.md docs/safety-assessment.md; do
+  claimed=$(grep -oE '(runs|—) [0-9]+ suites' "$doc" | grep -oE '[0-9]+' | head -1)
+  [ "${claimed:-$suites}" = "$suites" ] ||
+    note "$doc claims $claimed suites; the gate runs $suites."
+done
 
 # The disclosure count, against the tables it summarises.
 #
