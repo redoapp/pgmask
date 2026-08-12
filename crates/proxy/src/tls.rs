@@ -19,7 +19,9 @@ use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme};
+use tokio_rustls::rustls::{
+    ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme,
+};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 /// How to reach the backend.
@@ -31,10 +33,14 @@ pub enum BackendTls {
     Disable,
     /// Encrypt, but do not authenticate the server's certificate.
     ///
-    /// Matches libpq's `sslmode=require`, and carries libpq's caveat: it stops
-    /// passive eavesdropping, not an active man in the middle. Certificate
-    /// verification against a CA is the follow-up (see `docs/phase4.md`).
+    /// Matches libpq's `sslmode=prefer`/`require`, and carries libpq's caveat:
+    /// it stops passive eavesdropping, not an active man in the middle.
     Require,
+    /// Encrypt and verify the server certificate (libpq `sslmode=verify-full`).
+    ///
+    /// Uses the webpki root store, plus any PEMs in `backend_ca` when set.
+    /// Self-signed or private-CA backends need `backend_ca`.
+    VerifyFull,
 }
 
 /// Anything we can run the protocol over: plain TCP or a TLS session.
@@ -73,15 +79,51 @@ pub fn load_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
 
 /// Shared by the proxy's backend leg and by catalog resolution, so both trust
 /// the same thing and neither can be TLS-capable while the other is not.
-pub fn backend_client_config() -> ClientConfig {
-    ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-        .with_no_client_auth()
+///
+/// `Disable` is not a client config — callers must not ask for one.
+pub fn backend_client_config(mode: BackendTls, ca_pem_path: Option<&str>) -> Result<ClientConfig> {
+    match mode {
+        BackendTls::Disable => bail!("backend_tls = \"disable\" has no TLS client config"),
+        BackendTls::Require => Ok(ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth()),
+        BackendTls::VerifyFull => {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            if let Some(path) = ca_pem_path {
+                let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+                let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&bytes)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .with_context(|| format!("parsing CA certificates from {path}"))?;
+                if certs.is_empty() {
+                    bail!("{path} contained no certificates");
+                }
+                for cert in certs {
+                    roots
+                        .add(cert)
+                        .with_context(|| format!("adding CA certificate from {path}"))?;
+                }
+            }
+            Ok(ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth())
+        }
+    }
 }
 
-pub fn backend_connector() -> TlsConnector {
-    TlsConnector::from(Arc::new(backend_client_config()))
+/// Encryption without authentication, matching `sslmode=require`. Kept for
+/// catalog tools and tests that talk to a local Postgres with no CA.
+pub fn backend_client_config_insecure() -> ClientConfig {
+    backend_client_config(BackendTls::Require, None)
+        .expect("require mode does not touch the filesystem")
+}
+
+pub fn backend_connector(mode: BackendTls, ca_pem_path: Option<&str>) -> Result<TlsConnector> {
+    Ok(TlsConnector::from(Arc::new(backend_client_config(
+        mode,
+        ca_pem_path,
+    )?)))
 }
 
 /// Encryption without authentication, matching `sslmode=require`.
@@ -149,7 +191,12 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 pub async fn upgrade_backend(
     mut stream: tokio::net::TcpStream,
     hostname: &str,
+    mode: BackendTls,
+    ca_pem_path: Option<&str>,
 ) -> Result<BoxStream> {
+    if matches!(mode, BackendTls::Disable) {
+        bail!("upgrade_backend called with backend_tls = \"disable\"");
+    }
     let mut request = [0u8; 8];
     request[..4].copy_from_slice(&8i32.to_be_bytes());
     request[4..].copy_from_slice(&crate::protocol::SSL_REQUEST_CODE.to_be_bytes());
@@ -161,7 +208,7 @@ pub async fn upgrade_backend(
     match answer[0] {
         b'S' => {}
         b'N' => bail!(
-            "backend_tls = \"require\" but the server refused TLS \
+            "backend_tls requires TLS but the server refused it \
              (is `ssl = on` in postgresql.conf?)"
         ),
         other => bail!("unexpected reply {:?} to SSLRequest", other as char),
@@ -169,7 +216,7 @@ pub async fn upgrade_backend(
 
     let server_name = ServerName::try_from(hostname.to_string())
         .with_context(|| format!("{hostname} is not a valid TLS server name"))?;
-    let tls = backend_connector()
+    let tls = backend_connector(mode, ca_pem_path)?
         .connect(server_name, stream)
         .await
         .map_err(|err: io::Error| anyhow::anyhow!("backend TLS handshake failed: {err}"))?;

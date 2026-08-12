@@ -47,6 +47,7 @@ sqllineage = "0.2"
 regex = "1.13.1"
 iban_validate = "5.0.1"
 rustls-pki-types = "1.15.1"
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

@@ -63,6 +63,7 @@
 //! no column data. Anything not on the list stays refused. Adding a shape is a
 //! deliberate, reviewable act; forgetting one costs utility, never safety.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use pg_query::protobuf::{node::Node as NodeEnum, SelectStmt, SetOperation};
@@ -1694,6 +1695,92 @@ fn every_relation_is_qualified_inspected(inspection: &StatementInspection<'_>) -
         })
 }
 
+/// Under `posture = "hostile"`: refuse when a masked column appears more often
+/// in the statement than as a bare `ColumnRef` in the outermost SELECT list.
+///
+/// That is the smallest rule that closes the measured inference routes
+/// (`WHERE`/`LIKE`, `ORDER BY`, single-row `sum`, error-channel `CASE`) while
+/// still allowing `SELECT email, id FROM t WHERE id = 1`. Unparseable or
+/// unscannable SQL refuses whenever any masked name is involved.
+///
+/// Deliberately lexical for the *count* of mentions (see
+/// [`referenced_identifiers`]) and parse-tree only for the outermost target
+/// list. A tree walk of WHERE/ORDER BY would miss `WindowDef` the same way the
+/// old lineage backstop did.
+pub fn masked_exceeds_outer_projection(sql: &str, masked: &HashSet<String>) -> bool {
+    use std::collections::HashMap;
+
+    let Some(idents) = referenced_identifiers(sql) else {
+        return !masked.is_empty();
+    };
+    let mut lex: HashMap<&str, usize> = HashMap::new();
+    for id in &idents {
+        if masked.contains(id) {
+            let n = lex
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(0usize)
+                .saturating_add(1);
+            lex.insert(id.as_str(), n);
+        }
+    }
+    if lex.is_empty() {
+        return false;
+    }
+    let Some(proj) = outer_bare_projection_counts(sql) else {
+        return true;
+    };
+    lex.iter()
+        .any(|(name, &n)| n > proj.get(*name).copied().unwrap_or(0))
+}
+
+fn outer_bare_projection_counts(sql: &str) -> Option<std::collections::HashMap<String, usize>> {
+    use std::collections::HashMap;
+    let parsed = pg_query::parse(sql).ok()?;
+    if parsed.protobuf.stmts.len() != 1 {
+        return None;
+    }
+    let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?;
+    let NodeEnum::SelectStmt(select) = stmt.node.as_ref()? else {
+        // Non-SELECT with a masked name: refuse.
+        return None;
+    };
+    // Set operations erase which branch a name came from; hostile refuses them
+    // when a masked name is present (caller already saw one).
+    if select.op() != SetOperation::SetopNone {
+        return None;
+    }
+    let mut counts = HashMap::new();
+    for entry in &select.target_list {
+        let Some(NodeEnum::ResTarget(target)) = entry.node.as_ref() else {
+            continue;
+        };
+        let Some(val) = target.val.as_ref() else {
+            continue;
+        };
+        if let Some(name) = bare_column_ref_name(val) {
+            let n = counts
+                .get(&name)
+                .copied()
+                .unwrap_or(0usize)
+                .saturating_add(1);
+            counts.insert(name, n);
+        }
+    }
+    Some(counts)
+}
+
+fn bare_column_ref_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    let NodeEnum::ColumnRef(column) = node.node.as_ref()? else {
+        return None;
+    };
+    let last = column.fields.last()?;
+    match last.node.as_ref()? {
+        NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
+        _ => None, // `*` or other
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -3070,5 +3157,44 @@ mod referenced_identifier_probe {
         for want in ["n", "email", "note", "last_ip", "birth_date"] {
             assert!(cols.contains(&want.to_string()), "missing {want}: {cols:?}");
         }
+    }
+
+    #[test]
+    fn hostile_projection_gate_closes_the_inference_routes() {
+        let masked: HashSet<String> = ["email", "annual_salary"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        // Allowed: bare projection, filter on a released key.
+        assert!(!masked_exceeds_outer_projection(
+            "SELECT email, id FROM demo.customers WHERE id = 1",
+            &masked
+        ));
+        // Predicate oracle.
+        assert!(masked_exceeds_outer_projection(
+            "SELECT id FROM demo.customers WHERE email LIKE 'u%'",
+            &masked
+        ));
+        // ORDER BY ranking.
+        assert!(masked_exceeds_outer_projection(
+            "SELECT id FROM demo.customers ORDER BY email",
+            &masked
+        ));
+        // Single-row aggregate.
+        assert!(masked_exceeds_outer_projection(
+            "SELECT sum(annual_salary) FROM demo.customers WHERE id = 1",
+            &masked
+        ));
+        // Error-channel CASE over a subquery that projects email.
+        assert!(masked_exceeds_outer_projection(
+            "SELECT 1/(CASE WHEN (SELECT email FROM demo.customers WHERE id=1) LIKE 'u%' \
+             THEN 0 ELSE 1 END)",
+            &masked
+        ));
+        // Equality on the masked column itself.
+        assert!(masked_exceeds_outer_projection(
+            "SELECT email FROM demo.customers WHERE email = 'user1@example.com'",
+            &masked
+        ));
     }
 }

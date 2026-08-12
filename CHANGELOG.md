@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.73 — hostile posture, and verify-full on the backend leg
+
+Two of the holes the poison run measured, closed with the smallest knobs that
+do it.
+
+`posture = "hostile"` forces `summaries = "refuse"` and refuses any statement
+where a masked column appears more often than as a bare outermost SELECT-list
+`ColumnRef`. That is enough to stop the routes that recovered a full email in
+~300 queries and an exact salary in one: `WHERE`/`LIKE`, `ORDER BY`,
+`sum(…) WHERE id = 1`, and the error-channel `CASE`. `SELECT email, id FROM t
+WHERE id = 1` still works; the email is projected and masked. Default posture
+is unchanged — the inference suite still asserts those routes are recoverable.
+
+`backend_tls = "verify-full"` encrypts and authenticates the proxy-to-database
+hop (libpq `sslmode=verify-full`). Optional `backend_ca` adds private CA PEMs
+on top of the webpki roots; setting `backend_ca` without `verify-full` is
+refused at load so a CA file cannot look like verification while
+`require` is still AcceptAny.
+
+Client TLS requirement and the catalog DDL-race retry were already in; this
+release does not change them.
+
 ## 0.1.71 — CI found a startup bug the local gate never could
 
 Adding CI turned up a real defect on its second green-attempt, and it is not a

@@ -446,8 +446,9 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let connector =
-        tokio_postgres_rustls::MakeRustlsConnect::new(pgmask::tls::backend_client_config());
+    let connector = tokio_postgres_rustls::MakeRustlsConnect::new(
+        pgmask::tls::backend_client_config_insecure(),
+    );
     let (dsn, _) = pgmask::catalog::sanitize_catalog_dsn(&dsn);
     // The DSN is deliberately not echoed: it carries a password.
     let (client, connection) = tokio_postgres::connect(&dsn, connector)

@@ -33,6 +33,25 @@ pub enum Summaries {
     Refuse,
 }
 
+/// Who the deployment is protecting against.
+///
+/// `Default` is the historical threat model: masked values do not appear in
+/// projections; filters, ordering and single-row aggregates remain usable as
+/// oracles. `Hostile` closes those routes at the cost of most analytical SQL
+/// and any predicate on a masked column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Posture {
+    /// Analyst who is not attacking you.
+    #[default]
+    Default,
+    /// Client who will try. Forces `summaries = "refuse"` and refuses any
+    /// statement where a masked column appears outside a bare outermost
+    /// SELECT-list `ColumnRef` (so `WHERE email …`, `ORDER BY email`,
+    /// `sum(salary)`, and the error-channel CASE all refuse).
+    Hostile,
+}
+
 /// Whether to trace expressions back to their base columns before refusing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -302,6 +321,12 @@ pub struct Config {
     /// Whether to encrypt the proxy-to-Postgres leg.
     #[serde(default)]
     pub backend_tls: crate::tls::BackendTls,
+    /// Extra CA PEMs trusted when `backend_tls = "verify-full"`.
+    ///
+    /// Unset means the webpki public roots only. Private or self-signed
+    /// backends need this file.
+    #[serde(default)]
+    pub backend_ca: Option<String>,
     /// How often to re-resolve the catalog against `pg_class`.
     #[serde(default = "default_refresh_seconds")]
     pub catalog_refresh_seconds: u64,
@@ -319,9 +344,12 @@ pub struct Config {
     /// information flows". A group of one row makes `sum(salary)` that person's
     /// salary; that is the same accepted trade as the predicate oracles in
     /// handoff §11. Set to `refuse` for the stricter reading, at the cost of
-    /// roughly 90% of analytical SQL.
+    /// roughly 90% of analytical SQL. `posture = "hostile"` forces refuse.
     #[serde(default = "default_summaries")]
     pub summaries: Summaries,
+    /// Opt into containing an adversarial client. See [`Posture`].
+    #[serde(default)]
+    pub posture: Posture,
     /// Off by default: turning it on is a deliberate decision to release
     /// engine metadata, and it is what makes DBeaver and `\d` work.
     #[serde(default = "default_system_catalogs")]
@@ -394,9 +422,39 @@ impl Config {
     /// column verbatim. Default-deny becomes default-allow with no warning.
     pub(crate) fn validate(&self) -> Result<()> {
         self.validate_client_tls()?;
+        self.validate_backend_tls()?;
         self.validate_pseudonym_key()?;
         self.validate_unique_column_rules()?;
         self.validate_unclassified_policy()
+    }
+
+    /// `backend_ca` without `verify-full` is a config that does nothing, which
+    /// is how operators come to believe they are verifying when they are not.
+    fn validate_backend_tls(&self) -> Result<()> {
+        if self.backend_ca.is_some()
+            && !matches!(self.backend_tls, crate::tls::BackendTls::VerifyFull)
+        {
+            bail!(
+                "backend_ca is set but backend_tls is {:?}; the CA file is only \
+                 consulted for verify-full. Set backend_tls = \"verify-full\", or \
+                 remove backend_ca.",
+                self.backend_tls
+            );
+        }
+        Ok(())
+    }
+
+    /// Summaries policy after posture is applied.
+    pub fn effective_summaries(&self) -> Summaries {
+        if self.posture == Posture::Hostile {
+            Summaries::Refuse
+        } else {
+            self.summaries
+        }
+    }
+
+    pub fn is_hostile(&self) -> bool {
+        self.posture == Posture::Hostile
     }
 
     /// `require_client_tls = true` with no certificate refuses every
@@ -788,6 +846,20 @@ impl Snapshot {
 
     pub fn knows_relation(&self, table_oid: u32) -> bool {
         self.relations.contains(&table_oid)
+    }
+
+    /// Bare column names that are masked for these roles (catalog rules only).
+    ///
+    /// Used by `posture = "hostile"` to decide which identifiers may only
+    /// appear as outermost SELECT-list ColumnRefs. Unclassified columns are
+    /// deliberately absent: including every column in the schema would refuse
+    /// almost every query, and default-deny already nulls them in projections.
+    pub fn masked_bare_names_for_roles(&self, roles: &HashSet<String>) -> HashSet<String> {
+        self.by_name
+            .iter()
+            .filter(|(_, classification)| !classification.for_roles(roles).is_passthrough())
+            .map(|((_, column), _)| column.clone())
+            .collect()
     }
 
     /// Bare column names we classify. Used only to bucket rejections for
@@ -1313,8 +1385,12 @@ async fn resolve_snapshot(
     // NoTls connector here meant the catalog could not be resolved against Neon
     // (or RDS with rds.force_ssl, or Cloud SQL) at all — the proxy would fail to
     // start against exactly the databases it is most useful in front of.
+    // Catalog resolution always spoke TLS with AcceptAny — matching
+    // `backend_tls = "require"`. verify-full for the session hop is a separate
+    // setting; the catalog DSN often points at the same host and should not
+    // start failing because an operator tightened the data path alone.
     let connector =
-        tokio_postgres_rustls::MakeRustlsConnect::new(crate::tls::backend_client_config());
+        tokio_postgres_rustls::MakeRustlsConnect::new(crate::tls::backend_client_config_insecure());
     let (dsn, note) = sanitize_catalog_dsn(dsn);
     if let Some(note) = note {
         // Once per resolve is noisy; once per process would need state. The
@@ -2118,6 +2194,25 @@ pseudonym_key = "a-long-enough-key"
         assert!(!config.client_tls_required());
         config.validate().expect("plaintext deployments still load");
     }
+
+    #[test]
+    fn hostile_posture_forces_summaries_refuse() {
+        let config = tls_test_config("posture = \"hostile\"\nsummaries = \"allow\"\n");
+        assert_eq!(config.posture, Posture::Hostile);
+        assert_eq!(config.summaries, Summaries::Allow);
+        assert_eq!(config.effective_summaries(), Summaries::Refuse);
+    }
+
+    #[test]
+    fn backend_ca_without_verify_full_is_refused() {
+        let config = tls_test_config("backend_tls = \"require\"\nbackend_ca = \"/tmp/ca.pem\"\n");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("verify-full"),
+            "must name the missing mode, got: {err}"
+        );
+    }
+
     #[test]
     fn only_a_concurrent_ddl_race_is_retried() {
         // The retry has to be narrow. Retrying a bad DSN, a refused

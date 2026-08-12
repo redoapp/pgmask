@@ -76,6 +76,9 @@ pub enum Cause {
     /// only signal distinguishing a certificate that is configured from one
     /// that is used.
     PlaintextSession,
+    /// `posture = "hostile"` refused a statement that named a masked column
+    /// outside a bare outermost projection.
+    HostileMaskedUse,
 }
 
 impl Cause {
@@ -93,6 +96,7 @@ impl Cause {
         Cause::ChannelBinding,
         Cause::PlaintextRefused,
         Cause::PlaintextSession,
+        Cause::HostileMaskedUse,
     ];
 
     pub fn label(self) -> &'static str {
@@ -110,6 +114,7 @@ impl Cause {
             Cause::ChannelBinding => "channel_binding",
             Cause::PlaintextRefused => "plaintext_refused",
             Cause::PlaintextSession => "plaintext_session",
+            Cause::HostileMaskedUse => "hostile_masked_use",
         }
     }
 

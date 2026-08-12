@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.71**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.73**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -303,10 +303,13 @@ unclassified      = "mask"   # mask | allow    — default-deny
 unclassified_mask = "null"
 opaque            = "reject" # reject | mask   — fields with no provenance
 lineage           = "refuse" # refuse | allow  — trace expressions to base columns
+summaries         = "allow"  # allow | refuse  — aggregates over masked columns
+posture           = "default" # default | hostile — see below
 
 tls_cert    = "/path/proxy.crt"   # omit both to serve plaintext
 tls_key     = "/path/proxy.key"
-backend_tls = "disable"           # disable | require — see the note below
+backend_tls = "disable"           # disable | require | verify-full
+backend_ca  = "/path/ca.pem"      # only for verify-full; public roots otherwise
 
 catalog_refresh_seconds     = 30  # OIDs are not stable across DDL
 catalog_refresh_min_seconds = 5   # floor on miss-triggered refreshes
@@ -330,6 +333,16 @@ relation = "demo.customers"
 column   = "email"
 type     = "email"          # or an inline `mask =`, which overrides the type
 ```
+
+**`posture = "hostile"`** is the containment profile: it forces `summaries =
+"refuse"` and refuses any statement where a masked column appears outside a bare
+outermost SELECT list. That closes the measured inference routes (`WHERE`/`LIKE`,
+`ORDER BY`, single-row aggregates, error-channel `CASE`) while still serving
+`SELECT email, id FROM t WHERE id = 1` (masked). Default posture is unchanged.
+
+**`backend_tls = "verify-full"`** authenticates the database certificate
+(optional `backend_ca` for private CAs). `require` still means encryption
+without verification.
 
 ### Masks
 
@@ -588,8 +601,11 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   transaction the client and server disagree about whether the statement
   succeeded.
 - **SCRAM channel binding is unsupported**, unavoidably — see above.
-- **Backend TLS does not verify the server certificate** (matching libpq's
-  `sslmode=require`): it stops a passive listener, not an active one.
+- **Backend TLS:** `disable` (plaintext), `require` (encrypt, no cert check),
+  or `verify-full` (encrypt and verify, optional `backend_ca` for private CAs).
+- **`posture = "hostile"`** refuses summaries over masked columns and any use of
+  a masked column outside a bare SELECT list — closes the measured inference
+  oracles at the cost of most analytical SQL. Default posture does not.
 - **Non-text types accept only `mask = "null"`.** Text-family types are
   byte-identical in text and binary formats so they mask correctly either way;
   anything else is refused rather than guessed at.

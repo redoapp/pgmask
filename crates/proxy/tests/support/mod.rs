@@ -374,11 +374,13 @@ pub async fn start_proxy_at_full(
         // wire client in plaintext and must keep working unchanged.
         require_client_tls: None,
         backend_tls: pgmask::tls::BackendTls::Disable,
+        backend_ca: None,
         // Tight intervals so tests can observe a refresh without waiting.
         catalog_refresh_seconds: 1,
         catalog_refresh_min_seconds: 1,
         metrics_interval_seconds: 0,
         summaries: pgmask::catalog::Summaries::Allow,
+        posture: pgmask::catalog::Posture::Default,
         system_catalogs: SystemCatalogs::Refuse,
         lineage: Lineage::Refuse,
         metrics_listen: None,

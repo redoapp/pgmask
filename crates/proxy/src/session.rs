@@ -28,7 +28,7 @@ use tokio::net::TcpStream;
 
 use crate::analysis::{self, Safety};
 use crate::catalog::{
-    Catalog, Config, Lineage, Opaque, Snapshot, Summaries, SystemCatalogs, Unclassified,
+    Catalog, Config, Lineage, Opaque, Posture, Snapshot, Summaries, SystemCatalogs, Unclassified,
 };
 use crate::lineage::{self, Verdict};
 use crate::mask::{Mask, MaskSpec, Masker};
@@ -54,6 +54,7 @@ pub struct Policy {
     opaque: Opaque,
     metrics: Arc<Metrics>,
     summaries: Summaries,
+    posture: Posture,
     system_catalogs: SystemCatalogs,
     lineage: Lineage,
     /// Principal -> roles, from `[[role]]`.
@@ -66,6 +67,7 @@ pub struct Policy {
     /// is a required certificate" lives in one place.
     require_client_tls: bool,
     backend_tls: BackendTls,
+    backend_ca: Option<String>,
 }
 
 impl Policy {
@@ -88,13 +90,15 @@ impl Policy {
             unclassified_mask: config.unclassified_mask,
             opaque: config.opaque,
             metrics: Arc::new(Metrics::default()),
-            summaries: config.summaries,
+            summaries: config.effective_summaries(),
+            posture: config.posture,
             system_catalogs: config.system_catalogs,
             lineage: config.lineage,
             roles: roles_by_principal(&config.role),
             tls,
             require_client_tls: config.client_tls_required(),
             backend_tls: config.backend_tls,
+            backend_ca: config.backend_ca.clone(),
         })
     }
 
@@ -829,6 +833,33 @@ impl Session {
         });
         let allow_summaries = self.policy.summaries == Summaries::Allow && !singleton_groups;
 
+        // Hostile posture: a masked column may only appear as a bare outermost
+        // SELECT-list ColumnRef. Closes WHERE/LIKE, ORDER BY, single-row
+        // aggregates and the error-channel CASE — see analysis.rs.
+        if self.policy.posture == Posture::Hostile {
+            let masked = snapshot.masked_bare_names_for_roles(&self.roles);
+            let sql = described_sql.as_deref().unwrap_or("");
+            if analysis::masked_exceeds_outer_projection(sql, &masked) {
+                self.plans.discard_description();
+                return self.reject(
+                    Rejection {
+                        cause: Cause::HostileMaskedUse,
+                        message: "pgmask: posture = \"hostile\" refuses use of a masked \
+                                  column outside a bare SELECT list"
+                            .into(),
+                        hint: Some(
+                            "Masked columns may be projected (and will be masked) but may \
+                             not appear in WHERE, ORDER BY, HAVING, expressions or \
+                             aggregates. Set posture = \"default\" for the looser analyst \
+                             threat model."
+                                .into(),
+                        ),
+                    },
+                    out,
+                );
+            }
+        }
+
         // `date_trunc` to a unit finer than a year can return more than a date
         // mask allows — `date_trunc('day', birth_date)` returned the whole
         // value through a year-masked column. Year and coarser are safe
@@ -1176,12 +1207,18 @@ pub async fn handle_connection(
     backend.set_nodelay(true).ok();
     let mut backend_stream: BoxStream = match policy.backend_tls {
         BackendTls::Disable => Box::new(backend),
-        BackendTls::Require => {
+        BackendTls::Require | BackendTls::VerifyFull => {
             // Strip the port: SNI carries a hostname, never host:port.
             let host = backend_addr
                 .rsplit_once(':')
                 .map_or(backend_addr, |(h, _)| h);
-            crate::tls::upgrade_backend(backend, host).await?
+            crate::tls::upgrade_backend(
+                backend,
+                host,
+                policy.backend_tls,
+                policy.backend_ca.as_deref(),
+            )
+            .await?
         }
     };
 
@@ -1318,12 +1355,14 @@ mod tests {
             opaque,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
+            posture: Posture::Default,
             system_catalogs: SystemCatalogs::Refuse,
             lineage: Lineage::Refuse,
             roles: HashMap::new(),
             tls: None,
             require_client_tls: false,
             backend_tls: BackendTls::Disable,
+            backend_ca: None,
         })
     }
 
@@ -1458,11 +1497,13 @@ mask = "none"
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
+            posture: Posture::Default,
             system_catalogs: SystemCatalogs::Refuse,
             lineage: Lineage::Refuse,
             roles: HashMap::new(),
             tls: None,
             backend_tls: BackendTls::Disable,
+            backend_ca: None,
         });
         // int4, not a text type: pseudonym rewrites values as text.
         let err = p

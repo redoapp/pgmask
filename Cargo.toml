@@ -34,7 +34,7 @@ indexing_slicing = "warn"
 arithmetic_side_effects = "warn"
 
 [workspace.package]
-version = "0.1.71"
+version = "0.1.73"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -50,6 +50,7 @@ tokio-postgres = "0.7"
 toml = "0.8"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-postgres-rustls = "0.13"
+webpki-roots = "1"
 pg_query = "6"
 proptest = "1"
 jiff = "0.2"
