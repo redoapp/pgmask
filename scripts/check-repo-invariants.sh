@@ -80,6 +80,16 @@ for doc in README.md docs/safety-assessment.md; do
     note "$doc claims $claimed suites; the gate runs $suites."
 done
 
+# PUSH THE BRANCH AND ITS TAGS IN ONE INVOCATION.
+#
+#   git push origin main v0.1.73 v0.1.74      # one command, all refs
+#
+# Pushing `main` first and the tags second races CI: the workflow checks out
+# the new commit before the tags arrive and this check fails with
+# "released versions with no tag: v0.1.73". That happened, and the check was
+# right — the push was wrong. These tags are lightweight, so `--follow-tags`
+# does not cover them.
+
 # The disclosure count, against the tables it summarises.
 #
 # The README said "six disclosures" for four releases after there were nine, and
