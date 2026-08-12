@@ -27,6 +27,7 @@
 #      wrong reason.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/container.sh"
 
 CONTAINER=pgmask-roundtrip
 PG_PORT=55437
@@ -69,13 +70,7 @@ echo "==> starting postgres on :$PG_PORT"
 podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 podman run -d --name "$CONTAINER" -e POSTGRES_HOST_AUTH_METHOD=trust \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null || exit 1
-for _ in $(seq 1 90); do
-  podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 1
-done
-podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 || {
-  echo "FAIL: postgres did not start"; podman logs "$CONTAINER" 2>&1 | tail -5; exit 1
-}
+pg_await "$CONTAINER" "$PG_PORT" "classify round trip" || exit 1
 
 # One row of each shape `classify` has a rule for, plus a column it must leave
 # alone.

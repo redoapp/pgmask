@@ -9,6 +9,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/container.sh"
 
 CONTAINER=pgmask-test
 PORT=55433
@@ -26,10 +27,7 @@ podman run -d --name "$CONTAINER" \
   -e POSTGRES_HOST_AUTH_METHOD=trust \
   -p "$PORT":5432 docker.io/library/postgres:17 >/dev/null
 
-for _ in $(seq 1 30); do
-  podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 1
-done
+pg_await "$CONTAINER" "$PORT" "integration" || exit 1
 
 echo "==> running adversarial suite"
 # Serially: each test rebuilds the canary schema in the same database.

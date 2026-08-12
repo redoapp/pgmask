@@ -32,6 +32,7 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/container.sh"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
 CONTAINER=pgmask-mutants
@@ -75,11 +76,7 @@ if ! podman run -d --name "$CONTAINER" \
   echo "FAIL: could not start the container (see the error above)"
   exit 1
 fi
-for _ in $(seq 1 90); do
-  podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 1
-done
-if ! podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then
+if ! pg_await "$CONTAINER" "$PORT" "mutation campaign"; then
   # Both halves of the answer, because they are different problems and the
   # `>/dev/null 2>&1` above hides which one you have. A run failed here with the
   # container's own log reading `database system is ready to accept connections`

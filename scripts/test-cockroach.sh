@@ -21,6 +21,7 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/container.sh"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
 CRDB_PORT=26257
@@ -60,8 +61,17 @@ if lsof -nP -iTCP:"$CRDB_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   podman ps --format '  {{.Names}} {{.Ports}}' | grep "$CRDB_PORT" || true
   exit 1
 fi
+# `--store=type=mem`: CockroachDB's own init step could not dial the node it had
+# just started, and the container exited 1 — four suites in one gate run. Not
+# resources (6.4 GB free, other containers using 60 MB) and not the image (the
+# version is pinned and the arch is native). It is disk latency inside the
+# podman VM: with an on-disk store the init exceeds its internal timeout, and
+# the node's own log reports "node might be overloaded" for 0.5s raft writes.
+# In memory it is ready in 20s. These containers are thrown away at the end of
+# the suite, so there is nothing for a durable store to buy.
 podman run -d --name "$CONTAINER" -p "$CRDB_PORT":26257 \
-  "docker.io/cockroachdb/cockroach:$VERSION" start-single-node --insecure --accept-sql-without-tls >/dev/null 2>&1
+  "docker.io/cockroachdb/cockroach:$VERSION" start-single-node --insecure \
+  --accept-sql-without-tls --store=type=mem,size=2GiB >/dev/null 2>&1
 D="postgresql://root@localhost:$CRDB_PORT/demo?sslmode=disable"
 ROOT="postgresql://root@localhost:$CRDB_PORT/defaultdb?sslmode=disable"
 for _ in $(seq 1 60); do psql -w "$ROOT" -tAc 'select 1' >/dev/null 2>&1 && break; sleep 2; done
@@ -113,7 +123,6 @@ pathlib.Path('/tmp/pgmask-crdb.toml').write_text(t)
 PY
 ./target/release/pgmask /tmp/pgmask-crdb.toml >/tmp/pgmask-crdb.log 2>&1 &
 PROXY_PID=$!
-sleep 4
 P="postgresql://root@localhost:$PROXY_PORT/demo?sslmode=disable"
 # All rows by default, not just the first.
 #
@@ -123,7 +132,7 @@ P="postgresql://root@localhost:$PROXY_PORT/demo?sslmode=disable"
 # them already kept all rows, with a comment saying why.
 p() { psql -w "$P" -X -tAq -c "$1" 2>&1 | head -"${2:-40}"; }
 d() { psql -w "$D" -X -tAq -c "$1" 2>&1; }   # all rows: the leak is in the second
-p 'select 1' >/dev/null 2>&1 || { echo "FAIL: proxy did not come up"; tail -5 /tmp/pgmask-crdb.log; exit 1; }
+proxy_await "$P" "cockroach main" || { tail -5 /tmp/pgmask-crdb.log; exit 1; }
 
 echo
 echo "CockroachDB $VERSION"
@@ -221,9 +230,8 @@ grep -q '^lineage = "allow"' /tmp/pgmask-crdb-lineage.toml \
   || { echo "FAIL: could not enable lineage in the config"; exit 1; }
 ./target/release/pgmask /tmp/pgmask-crdb-lineage.toml >/tmp/pgmask-crdb-lineage.log 2>&1 &
 PROXY_PID=$!
-sleep 4
 P="postgresql://root@localhost:$((PROXY_PORT+1))/demo?sslmode=disable"
-p 'select 1' >/dev/null 2>&1 || { echo "FAIL: lineage proxy did not come up"; tail -5 /tmp/pgmask-crdb-lineage.log; exit 1; }
+proxy_await "$P" "cockroach lineage" || { tail -5 /tmp/pgmask-crdb-lineage.log; exit 1; }
 
 # id 2 is Austin: the fixture cycles the array at `[1 + i % 4]`.
 check "expression over a released column is served" "AUSTIN" \

@@ -25,6 +25,7 @@
 # `test-all.sh` removes `pgmask-*` containers by name and kills proxies.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/container.sh"
 
 HOURS="${1:-4}"
 PER_ROUND="${2:-400}"
@@ -48,13 +49,7 @@ cargo build -q --release -p pgmask || { say "FAIL: build"; exit 1; }
 podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 podman run -d --name "$CONTAINER" -e POSTGRES_HOST_AUTH_METHOD=trust \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null || exit 1
-for _ in $(seq 1 90); do
-  podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 1
-done
-podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 || {
-  say "FAIL: postgres did not start"; podman logs "$CONTAINER" 2>&1 | tail -5; exit 1
-}
+pg_await "$CONTAINER" "$PG_PORT" "sqlsmith soak" || exit 1
 
 # Same schema and catalog as the gate's single-shot suite, so a finding here is
 # reproducible with `./scripts/test-sqlsmith.sh`.

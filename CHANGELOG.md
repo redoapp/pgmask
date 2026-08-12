@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.1.70 — eight gate failures, one bug wearing three costumes
+
+The first full gate run since v0.1.61 finished **13 of 21**. Not one of the
+eight failures was a masking defect. All eight were the same instrument bug:
+a readiness check that answers before the thing is ready, and falls through
+when it never is.
+
+**`pg_isready` is the wrong probe.** The official postgres image runs a
+*temporary* server during initialisation to build the cluster. It listens on
+the unix socket only, and `podman exec … pg_isready` talks to exactly that
+socket. Measured here: `pg_isready` says YES at **3s**, a socket query still
+fails at 3s, and the host TCP port is unreachable at **13s**. The temporary
+server is then stopped and the real one started, so "ready" is followed by "not
+ready" — after the loop has already returned.
+
+Seven suites had their own copy of that loop, and every copy `break`s on
+success and falls through on exhaustion, making a timeout indistinguishable
+from readiness. That is what skipped `ALTER SYSTEM SET ssl = on` in the TLS
+suite: the probe returned during the window, the ALTER hit a socket that was
+not accepting, its error went to a discarded stream, and the channel-binding
+assertion failed nine steps later reporting that the server refused TLS — true
+about the database, nothing to do with the proxy.
+
+The discriminator is that the temporary server is socket-only and the real one
+listens on TCP. So `pg_await` waits for a query answered *over the mapped host
+port*, which cannot be the init server and proves the exact path the suite is
+about to use.
+
+**CockroachDB was not resource-starved.** Four suites failed to start it. Not
+memory (6.4 GB free, other containers using 60 MB), not the image (pinned
+version, native arch). It is disk latency in the podman VM: with an on-disk
+store the init step cannot dial the node it just started and the container
+exits 1, while the node's own log reports "node might be overloaded" for 0.5s
+raft writes. `--store=type=mem` and it is ready in 20s. These containers are
+deleted at the end of the suite, so a durable store bought nothing.
+
+**`sleep 4` is not a proxy readiness check.** pgmask resolves its whole catalog
+before it binds, so its startup time scales with the catalog and the machine.
+Four suites guessed with `sleep 2`/`3`/`4`; under gate load the guesses expired
+and they reported "proxy did not come up" about a proxy that was starting
+normally. `proxy_await` polls the connection it is about to use.
+
+ONE DEFINITION INSTEAD OF SEVEN
+
+All three now live in `scripts/lib/container.sh`, the repository's first shared
+shell library. The bug existed seven times because the helper did.
+
+Worth recording: `test-versions.sh` had already found the `pg_isready` race and
+fixed it locally — its comment reads "pg_isready inside the container can go
+green before podman's port forward is live" — and it is the one Postgres suite
+that passed, 120 of 120. The knowledge was in the repository and could not
+travel, because there was nowhere for it to live.
+
+Verified, not assumed: `test-cockroach.sh` now passes 43 of 43, having failed
+to start the database at all.
+
 ## 0.1.69 — a configured certificate was optional
 
 **Disclosure 10.** Setting `tls_cert` did not require TLS. Postgres has no ALPN

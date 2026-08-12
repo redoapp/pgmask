@@ -29,6 +29,7 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/container.sh"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
 PG_PORT=55501
@@ -82,8 +83,8 @@ sed -e "s|^listen = .*|listen = \"127.0.0.1:$PROXY_PORT\"|" \
     -e 's|^metrics_listen.*||' examples/demo/catalog.toml > /tmp/pgmask-inference.toml
 ./target/release/pgmask /tmp/pgmask-inference.toml >/tmp/pgmask-inference.log 2>&1 &
 PROXY_PID=$!
-sleep 3
 P="postgresql://postgres:demo@localhost:$PROXY_PORT/demo"
+proxy_await "$P" "inference" || exit 1
 p() { psql -w "$P" -X -tAq -c "$1" 2>&1 | head -3 | tr '\n' ' '; }
 psql -w "$P" -X -tAc 'select 1' >/dev/null 2>&1 || { echo "FAIL: proxy did not come up"; exit 1; }
 

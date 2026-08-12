@@ -10,6 +10,7 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/container.sh"
 
 CONTAINER=pgmask-tls
 PG_PORT=55434
@@ -60,15 +61,7 @@ refute() {
 # off. The channel-binding assertion then failed with "the server refused TLS"
 # — a true statement about a database this script was supposed to have
 # configured. Nothing was wrong with the proxy.
-await_pg() { # label
-  for _ in $(seq 1 120); do
-    podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && return 0
-    sleep 1
-  done
-  echo "FATAL: postgres not ready after 120s ($1)"
-  podman logs "$CONTAINER" 2>&1 | tail -10
-  exit 1
-}
+await_pg() { pg_await "$CONTAINER" "$PG_PORT" "$1" || exit 1; }
 
 echo "==> starting postgres"
 podman rm -f -v "$CONTAINER" >/dev/null 2>&1

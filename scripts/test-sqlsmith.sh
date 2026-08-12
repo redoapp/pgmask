@@ -30,6 +30,7 @@
 # likelier outcome, since most of what sqlsmith emits errors out.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/container.sh"
 
 QUERIES="${1:-2000}"
 CONTAINER=pgmask-sqlsmith
@@ -59,13 +60,7 @@ echo "==> starting postgres on :$PG_PORT"
 podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 podman run -d --name "$CONTAINER" -e POSTGRES_HOST_AUTH_METHOD=trust \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null || exit 1
-for _ in $(seq 1 90); do
-  podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 1
-done
-podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 || {
-  echo "FAIL: postgres did not start"; podman logs "$CONTAINER" 2>&1 | tail -5; exit 1
-}
+pg_await "$CONTAINER" "$PG_PORT" "sqlsmith" || exit 1
 
 # A schema wide enough for sqlsmith to build joins and subqueries out of, with a
 # distinctive token in every masked column. Types are varied on purpose: a

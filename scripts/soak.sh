@@ -79,8 +79,17 @@ cargo build --release -q || { echo "FAIL: build"; exit 1; }
 # --- fixtures ---------------------------------------------------------------
 podman run -d --name "$PG_C" -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=fuzzdb \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null || exit 1
+# `--store=type=mem`: CockroachDB's own init step could not dial the node it had
+# just started, and the container exited 1 — four suites in one gate run. Not
+# resources (6.4 GB free, other containers using 60 MB) and not the image (the
+# version is pinned and the arch is native). It is disk latency inside the
+# podman VM: with an on-disk store the init exceeds its internal timeout, and
+# the node's own log reports "node might be overloaded" for 0.5s raft writes.
+# In memory it is ready in 20s. These containers are thrown away at the end of
+# the suite, so there is nothing for a durable store to buy.
 podman run -d --name "$CRDB_C" -p "$CRDB_PORT":26257 \
-  docker.io/cockroachdb/cockroach:v25.4.14 start-single-node --insecure >/dev/null || exit 1
+  docker.io/cockroachdb/cockroach:v25.4.14 start-single-node --insecure \
+  --store=type=mem,size=2GiB >/dev/null || exit 1
 
 PG="postgresql://postgres:demo@localhost:$PG_PORT/fuzzdb"
 for _ in $(seq 1 90); do psql -w "$PG" -tAc 'select 1' >/dev/null 2>&1 && break; sleep 1; done

@@ -44,8 +44,17 @@ echo "==> starting both engines"
 podman rm -f -v "$PG" "$CRDB" >/dev/null 2>&1
 podman run -d --name "$PG" -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=fuzzdb \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null 2>&1
+# `--store=type=mem`: CockroachDB's own init step could not dial the node it had
+# just started, and the container exited 1 — four suites in one gate run. Not
+# resources (6.4 GB free, other containers using 60 MB) and not the image (the
+# version is pinned and the arch is native). It is disk latency inside the
+# podman VM: with an on-disk store the init exceeds its internal timeout, and
+# the node's own log reports "node might be overloaded" for 0.5s raft writes.
+# In memory it is ready in 20s. These containers are thrown away at the end of
+# the suite, so there is nothing for a durable store to buy.
 podman run -d --name "$CRDB" -p "$CRDB_PORT":26257 \
   "docker.io/cockroachdb/cockroach:$CRDB_VERSION" start-single-node --insecure \
+  --store=type=mem,size=2GiB \
   --accept-sql-without-tls >/dev/null 2>&1
 
 export PGPASSWORD=demo

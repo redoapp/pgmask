@@ -68,7 +68,7 @@ ENGINES = {
     },
     "cockroach": {
         "image": "docker.io/cockroachdb/cockroach:v25.4.14",
-        "args": ["start-single-node", "--insecure"],
+        "args": ["start-single-node", "--insecure", "--store=type=mem,size=2GiB"],
         "env": [],
         "port": 26257,
         "dsn": "postgresql://root@localhost:{port}/defaultdb?sslmode=disable",
@@ -351,7 +351,17 @@ def main() -> int:
             stdout=log,
             stderr=subprocess.STDOUT,
         )
-    time.sleep(4)
+    # Poll, do not sleep. pgmask resolves the entire catalog before it binds,
+    # so on a machine running the full gate four seconds is not enough and the
+    # suite reported "proxy did not come up" about a proxy that was still
+    # starting. Same defect, and same fix, as the bare sleeps removed from
+    # test-tls.sh and verify.sh.
+    for _ in range(120):
+        if psql(proxied, "select 1")[0] == 0:
+            break
+        if proxy.poll() is not None:
+            break  # it exited; no point waiting out the budget
+        time.sleep(0.5)
     if psql(proxied, "select 1")[0] != 0:
         print(f"FAIL: proxy did not come up — {log_path}")
         print(open(log_path).read()[-1200:])

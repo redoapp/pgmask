@@ -29,6 +29,7 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/container.sh"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
 ENGINES="${1:-postgres cockroach}"
@@ -109,8 +110,17 @@ run_engine() {
     cockroach)
       container=pgmask-shapes-crdb; port=26259; proxy_port=6452
       podman rm -f -v "$container" >/dev/null 2>&1
+# `--store=type=mem`: CockroachDB's own init step could not dial the node it had
+# just started, and the container exited 1 — four suites in one gate run. Not
+# resources (6.4 GB free, other containers using 60 MB) and not the image (the
+# version is pinned and the arch is native). It is disk latency inside the
+# podman VM: with an on-disk store the init exceeds its internal timeout, and
+# the node's own log reports "node might be overloaded" for 0.5s raft writes.
+# In memory it is ready in 20s. These containers are thrown away at the end of
+# the suite, so there is nothing for a durable store to buy.
       podman run -d --name "$container" -p "$port":26257 \
         docker.io/cockroachdb/cockroach:v25.4.14 start-single-node --insecure \
+        --store=type=mem,size=2GiB \
         --accept-sql-without-tls >/dev/null 2>&1
       dsn="postgresql://root@localhost:$port/demo?sslmode=disable"
       ;;
@@ -227,11 +237,10 @@ CFG
   [[ -n "${PGMASK_BIN:-}" ]] || cargo build --release -q || return 1
   "$bin" "$cat" >"/tmp/pgmask-shapes-$engine.log" 2>&1 &
   local pid=$!
-  sleep 4
   local P="postgresql://postgres:demo@localhost:$proxy_port/demo"
   [[ "$engine" == cockroach ]] && P="postgresql://root@localhost:$proxy_port/demo?sslmode=disable"
-  psql -w "$P" -X -tAc 'select 1' >/dev/null 2>&1 || {
-    echo "FAIL: proxy did not come up"; tail -5 "/tmp/pgmask-shapes-$engine.log"
+  proxy_await "$P" "shapes/$engine" || {
+    tail -5 "/tmp/pgmask-shapes-$engine.log"
     kill "$pid" 2>/dev/null; podman rm -f -v "$container" >/dev/null 2>&1; return 1; }
 
   local clean=0 leaked=0 refused=0 vacuous=0 unsupported=0 executed=0
