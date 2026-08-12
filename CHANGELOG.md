@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.1.66 — sqlsmith writes as well as reads, and had been deleting the fixture
+
+The cause of every strange sqlsmith result so far, and it is one line:
+**sqlsmith generates DML.** Roughly a tenth of what it emits is a `delete`,
+`update` or `insert` against the schema it read.
+
+```text
+delete from smith.people
+update smith.people set
+insert into smith.orders values (
+```
+
+A 500-query corpus emptied the table: 200 rows before the replay, **0 after**,
+on both sides.
+
+WHAT THIS EXPLAINS
+
+Everything. The canary counts collapsing from 353 to 123 to 1 across runs — the
+data was being progressively destroyed. The "no masked value was served" aborts
+from round 3 onward — the table was empty. And the false positive in 0.1.65,
+where `city` contained `CANARYNAME…`: an sqlsmith `update` had written
+`full_name` into it. The fixture was not mysteriously corrupt; the corpus was
+rewriting it, and I diagnosed the symptom twice before finding the cause.
+
+**Every sqlsmith figure quoted before this fix was measuring a table being
+destroyed underneath it**, including the 353-canary pilot in 0.1.62. Those
+numbers should be read as "the harness ran", not as coverage.
+
+THE FIX
+
+`default_transaction_read_only=on` on the replay session. DML is refused, the
+SELECTs run, and every round sees the same data. sqlsmith has no flag for this —
+`--exclude-catalog` only keeps it out of `pg_catalog`.
+
+Confirmed by the shape of the totals rather than by argument: they now grow
+monotonically across rounds — 454, 934, 1498, 2243, 3070, 3601 lines reaching
+masked data — where before they shrank toward zero. The fixture check reports
+200 of 200 rows intact after six rounds.
+
+Worth stating plainly: pointing a random SQL generator at a database and reading
+its output requires knowing whether the generator writes. I did not check, and
+spent four rounds of debugging on the consequences.
+
 ## 0.1.65 — a leak that was not one, and the check that would have caught it
 
 The sqlsmith soak flagged its second round: **165 canary-carrying lines through

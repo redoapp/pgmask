@@ -283,6 +283,19 @@ directions — releasing every mask produces 47 canary-carrying lines.
 `--seed` does not reproduce a corpus: sqlsmith builds from catalog OIDs, which
 differ per container. Each run is an independent sample.
 
+**And the cause of all of it: sqlsmith generates DML.** Roughly one statement in
+ten is a `delete`, `update` or `insert` against the schema it read. Replaying a
+500-query corpus emptied `smith.people` outright — 200 rows before, 0 after.
+
+That single fact explains every anomaly above: canary counts collapsing from 353
+to 123 to 1 as the table was progressively destroyed; "no masked value was
+served" once it was empty; and the false positive below, where `city` held
+`CANARYNAME…` because an sqlsmith `update` had written `full_name` into it.
+**Every sqlsmith number produced before this fix was measuring a table being
+destroyed underneath it.** The replay now runs with
+`default_transaction_read_only=on`, and the fixture is verified intact — 200 of
+200 rows — after six rounds where it used to be gone by the third.
+
 **It also reported a leak that was not one, and that is the fifth failure worth
 recording.** A soak round flagged 165 canary-carrying lines through the proxy.
 The container's `city` column contained `CANARYNAME…`, and `city` is

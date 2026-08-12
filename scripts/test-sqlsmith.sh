@@ -286,7 +286,25 @@ kill -0 "$PROXY_PID" 2>/dev/null || {
 # Replay in one psql session per side, continuing past errors. Most of what
 # sqlsmith emits fails on types or functions, which is expected and fine — the
 # ones that succeed are the sample.
+#
+# THE CORPUS IS REPLAYED READ-ONLY, AND THAT IS NOT A PRECAUTION
+#
+# sqlsmith generates DML. Roughly one statement in ten is a `delete`, `update`
+# or `insert` against the schema it read, and replaying a 500-query corpus
+# emptied `smith.people` outright — 200 rows before, 0 after, on both sides.
+#
+# Everything strange about the early runs was this. Canary counts collapsing
+# from 353 to 123 to 1 across rounds; "no masked value was served" aborts once
+# the table was empty; and the false positive that looked like a tenth
+# disclosure, where `city` held `CANARYNAME…` because an sqlsmith `update` had
+# written `full_name` into it. The fixture was not mysteriously wrong. The
+# corpus was rewriting it.
+#
+# `default_transaction_read_only=on` in the replay session refuses the DML and
+# serves the SELECTs, so every round sees the same data. sqlsmith has no flag
+# for this; `--exclude-catalog` only keeps it out of `pg_catalog`.
 replay() {
+  PGOPTIONS='-c default_transaction_read_only=on' \
   psql "host=127.0.0.1 port=$1 user=postgres dbname=postgres" \
     -X -q -A -t -v ON_ERROR_STOP=0 -f /tmp/pgmask-sqlsmith.sql 2>&1
 }
@@ -294,6 +312,7 @@ replay() {
 # Two sessions per side. A connection the proxy closes mid-corpus must not take
 # the controls with it.
 replay_plain() {
+  PGOPTIONS='-c default_transaction_read_only=on' \
   psql "host=127.0.0.1 port=$1 user=postgres dbname=postgres" \
     -X -q -A -t -v ON_ERROR_STOP=0 -f /tmp/pgmask-sqlsmith-plain.sql 2>&1
 }
