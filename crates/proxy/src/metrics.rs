@@ -69,6 +69,13 @@ pub enum Cause {
     Malformed,
     /// SCRAM channel binding through a TLS-terminating proxy.
     ChannelBinding,
+    /// A client that had not negotiated TLS, refused because one is required.
+    PlaintextRefused,
+    /// A plaintext session that policy allows. Counted so that "we run with
+    /// TLS" is a claim the operator can check rather than assume: this is the
+    /// only signal distinguishing a certificate that is configured from one
+    /// that is used.
+    PlaintextSession,
 }
 
 impl Cause {
@@ -84,6 +91,8 @@ impl Cause {
         Cause::UnknownBackendMessage,
         Cause::Malformed,
         Cause::ChannelBinding,
+        Cause::PlaintextRefused,
+        Cause::PlaintextSession,
     ];
 
     pub fn label(self) -> &'static str {
@@ -99,6 +108,8 @@ impl Cause {
             Cause::UnknownBackendMessage => "unknown_backend_message",
             Cause::Malformed => "malformed",
             Cause::ChannelBinding => "channel_binding",
+            Cause::PlaintextRefused => "plaintext_refused",
+            Cause::PlaintextSession => "plaintext_session",
         }
     }
 

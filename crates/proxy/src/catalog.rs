@@ -282,6 +282,23 @@ pub struct Config {
     pub tls_cert: Option<String>,
     #[serde(default)]
     pub tls_key: Option<String>,
+    /// Whether a client that has not negotiated TLS is refused.
+    ///
+    /// Unset means *yes whenever `tls_cert` is set*, because configuring a
+    /// certificate and not requiring it is the shape of a mistake, not of a
+    /// decision. Postgres has no ALPN and no TLS port: a client simply omits
+    /// the `SSLRequest` packet (`sslmode=disable`) and gets a working
+    /// plaintext session. Nothing about that is visible in the startup log,
+    /// which reports the *configuration*.
+    ///
+    /// Masked output is not public output. Partial masks are partial by
+    /// design — the last four digits of a card, a pseudonym that is a stable
+    /// identifier across queries — and the SCRAM exchange and the client's own
+    /// SQL cross the same wire. Set this to `false` to allow plaintext
+    /// deliberately; those sessions are then counted under
+    /// `plaintext_session`, not silent.
+    #[serde(default)]
+    pub require_client_tls: Option<bool>,
     /// Whether to encrypt the proxy-to-Postgres leg.
     #[serde(default)]
     pub backend_tls: crate::tls::BackendTls,
@@ -376,9 +393,31 @@ impl Config {
     /// Both load clean, log `unclassified=Mask`, and return every undeclared
     /// column verbatim. Default-deny becomes default-allow with no warning.
     pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_client_tls()?;
         self.validate_pseudonym_key()?;
         self.validate_unique_column_rules()?;
         self.validate_unclassified_policy()
+    }
+
+    /// `require_client_tls = true` with no certificate refuses every
+    /// connection, which is fail-closed but useless, and reads at a glance as
+    /// the strictest setting rather than the broken one. Refuse it at load.
+    fn validate_client_tls(&self) -> Result<()> {
+        if self.require_client_tls == Some(true) && self.tls_cert.is_none() {
+            bail!(
+                "require_client_tls = true but no tls_cert is set, so no client could \
+                 ever negotiate TLS and every connection would be refused. Set \
+                 tls_cert/tls_key, or drop require_client_tls."
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a session that never negotiated TLS should be refused.
+    ///
+    /// Defaults to "yes if a certificate is configured": see the field.
+    pub fn client_tls_required(&self) -> bool {
+        self.require_client_tls.unwrap_or(self.tls_cert.is_some())
     }
 
     /// Checks that apply regardless of how undeclared columns are handled.
@@ -1944,5 +1983,73 @@ pseudonym_key = "correct-horse-battery-staple"
             "the key appeared in Debug output: {rendered}"
         );
         assert!(rendered.contains("REDACTED"));
+    }
+    /// The smallest config that loads, plus whatever the test is about.
+    fn tls_test_config(extra: &str) -> Config {
+        let src = format!(
+            r#"
+listen = "127.0.0.1:1"
+backend = "127.0.0.1:2"
+catalog_dsn = "postgres://x@y/z"
+pseudonym_key = "a-long-enough-key"
+{extra}"#
+        );
+        toml::from_str(&src).expect("parses")
+    }
+
+    #[test]
+    fn a_configured_certificate_is_a_required_certificate() {
+        // The default is the whole point of the field. An operator who sets up
+        // TLS has expressed an intent; leaving it optional means one client
+        // flag silently undoes it, and the startup log still says tls=true.
+        let mut config = tls_test_config("");
+        assert!(
+            !config.client_tls_required(),
+            "no certificate: nothing to require"
+        );
+
+        config.tls_cert = Some("/tmp/cert.pem".into());
+        config.tls_key = Some("/tmp/key.pem".into());
+        assert!(
+            config.client_tls_required(),
+            "a certificate with no explicit setting must be required"
+        );
+
+        config.require_client_tls = Some(false);
+        assert!(
+            !config.client_tls_required(),
+            "an operator can still opt out, but has to say so"
+        );
+
+        config.require_client_tls = Some(true);
+        assert!(config.client_tls_required());
+    }
+
+    #[test]
+    fn requiring_tls_without_a_certificate_is_refused_at_load() {
+        let mut config = tls_test_config("require_client_tls = true\n");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("no tls_cert"),
+            "the error must name the missing piece, got: {err}"
+        );
+
+        // ...and is fine once the certificate is there. Paths are not read
+        // during validation, only during acceptor construction.
+        config.tls_cert = Some("/tmp/cert.pem".into());
+        config.tls_key = Some("/tmp/key.pem".into());
+        config
+            .validate()
+            .expect("a required certificate that exists");
+    }
+
+    #[test]
+    fn requiring_tls_is_not_defaulted_on_for_a_plaintext_deployment() {
+        // The counterpart to the test above: adding this knob must not turn a
+        // working certificate-free deployment into one that refuses everyone.
+        let config = tls_test_config("");
+        assert_eq!(config.require_client_tls, None);
+        assert!(!config.client_tls_required());
+        config.validate().expect("plaintext deployments still load");
     }
 }

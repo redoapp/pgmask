@@ -61,6 +61,10 @@ pub struct Policy {
     /// Present when `tls_cert`/`tls_key` are configured. Absent means we answer
     /// `SSLRequest` with `N` and clients using `sslmode=prefer` fall back.
     tls: Option<tokio_rustls::TlsAcceptor>,
+    /// Whether a session that did not negotiate TLS is refused. Resolved from
+    /// `Config::client_tls_required`, so the default "a configured certificate
+    /// is a required certificate" lives in one place.
+    require_client_tls: bool,
     backend_tls: BackendTls,
 }
 
@@ -89,6 +93,7 @@ impl Policy {
             lineage: config.lineage,
             roles: roles_by_principal(&config.role),
             tls,
+            require_client_tls: config.client_tls_required(),
             backend_tls: config.backend_tls,
         })
     }
@@ -102,8 +107,16 @@ impl Policy {
         self.roles.len()
     }
 
-    pub fn has_client_tls(&self) -> bool {
+    /// Whether a certificate is *configured*. Deliberately not named
+    /// `has_client_tls`: that reads as a property of the connection, and a
+    /// configured certificate says nothing about whether any given client
+    /// used it. `Session::client_tls` is the per-connection fact.
+    pub fn client_tls_configured(&self) -> bool {
         self.tls.is_some()
+    }
+
+    pub fn client_tls_required(&self) -> bool {
+        self.require_client_tls
     }
 
     pub fn metrics(&self) -> Arc<Metrics> {
@@ -1115,6 +1128,47 @@ pub async fn handle_connection(
         }
     };
 
+    // --- The certificate is only a boundary if it is required ----------------
+    // Postgres has no ALPN and no TLS port. A client that never sends
+    // `SSLRequest` — `sslmode=disable`, one flag — reaches here with
+    // `client_tls == false` and, before this check existed, went on to a fully
+    // working plaintext session against a proxy whose startup log said
+    // `tls=true`. Masking held; confidentiality did not. Partial masks are
+    // partial on purpose, pseudonyms are stable identifiers, and the SCRAM
+    // exchange crosses the same wire.
+    //
+    // The refusal is deliberately *not* the code path that strips channel
+    // binding for plaintext clients above. That path exists so pgmask can sit
+    // in front of a TLS-only managed Postgres, and it makes the plaintext
+    // client work smoothly — which is exactly why the downgrade needed its own
+    // gate rather than being left to friction.
+    if !client_tls && policy.client_tls_required() {
+        policy.metrics.record(Cause::PlaintextRefused);
+        // A CancelRequest is a fire-and-forget packet: the client sends it and
+        // closes without reading a reply, so an ErrorResponse would go into a
+        // socket nobody reads. Drop it. It carries the backend's cancel key,
+        // which is precisely something not to hand over in plaintext.
+        if startup.code != protocol::CANCEL_REQUEST_CODE {
+            let err = protocol::build_error(
+                protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                "pgmask: this connection is not using TLS",
+                Some(
+                    "pgmask serves masked data, which is not public data. Connect with \
+                     sslmode=require or stronger. An operator who wants plaintext \
+                     sessions must set require_client_tls = false.",
+                ),
+            );
+            client_stream.write_all(&err.encode()).await?;
+            client_stream.flush().await?;
+        }
+        return Ok(());
+    }
+    if !client_tls {
+        // Allowed by policy, but never silent: this is the only signal that
+        // tells "a certificate is configured" apart from "a certificate is used".
+        policy.metrics.record(Cause::PlaintextSession);
+    }
+
     // --- Backend connection -------------------------------------------------
     let backend = TcpStream::connect(backend_addr)
         .await
@@ -1268,6 +1322,7 @@ mod tests {
             lineage: Lineage::Refuse,
             roles: HashMap::new(),
             tls: None,
+            require_client_tls: false,
             backend_tls: BackendTls::Disable,
         })
     }
@@ -1395,6 +1450,7 @@ mask = "none"
         let mut snapshot = crate::catalog::Snapshot::default();
         snapshot.insert_for_test(16391, 1, Mask::Pseudonym, "demo.t.id");
         let p = Arc::new(Policy {
+            require_client_tls: false,
             catalog: Arc::new(Catalog::from_snapshot_for_test(snapshot)),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified: Unclassified::Allow,

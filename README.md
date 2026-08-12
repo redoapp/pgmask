@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.68**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.69**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -64,7 +64,7 @@ done, and [LICENSE](LICENSE).
 `./scripts/test-all.sh` runs 21 suites and reports one line each, with a
 skipped suite counted as a failure: 505 cargo tests, 40 adversarial and
 resilience tests against a real Postgres, 98 demo assertions, an 18-check
-`classify` round trip, 7 TLS, 120 across Postgres 13–17, 43 against CockroachDB,
+`classify` round trip, 18 TLS, 120 across Postgres 13–17, 43 against CockroachDB,
 an 86-shape canary sweep over both engines, a generated-SQL campaign on Postgres
 and a 7,200-shape campaign on CockroachDB, both of which must report zero leaks.
 The adversarial cargo suite drives a raw wire client and asserts no sentinel byte
@@ -505,6 +505,21 @@ nothing here changes what gets masked.
 Postgres negotiates TLS with an `SSLRequest` packet rather than ALPN or a
 separate port; pgmask handles that on both legs.
 
+**A configured certificate is a required certificate.** Because Postgres has no
+ALPN and no TLS port, a client that never sends `SSLRequest` — `sslmode=disable`
+— gets a plaintext session. Until v0.1.69 it got a working one, against a proxy
+whose startup log said `tls=true`, because that line reported the configuration
+rather than the connection. So setting `tls_cert` now also requires TLS: a
+plaintext client is refused with an error telling it what to do, and the refusal
+is counted as `plaintext_refused`.
+
+Set `require_client_tls = false` to allow plaintext deliberately. Those sessions
+are counted as `plaintext_session` and the startup log warns, because the
+dangerous configuration is not "no certificate" — that is a choice an operator
+made — but a certificate any client may decline, which looks like protection in
+both the config file and the log. Setting `require_client_tls = true` without a
+certificate is refused at load rather than silently refusing every connection.
+
 **Use `backend_tls = "disable"` if your clients authenticate with SCRAM.**
 `SCRAM-SHA-256-PLUS` binds authentication to the TLS certificate of the endpoint
 the client is talking to, and pgmask terminates TLS and re-originates — so the
@@ -597,7 +612,7 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   groupings and coarse date buckets are served unchanged.
 
 **Before deploying this, read [`docs/safety-assessment.md`](docs/safety-assessment.md).**
-It states what is guaranteed, what is explicitly not, the nine disclosures found
+It states what is guaranteed, what is explicitly not, the ten disclosures found
 across two days — six in the release rules, three more in the diagnostic and
 `ParameterStatus` channels — and why the instruments were wrong more often than
 the code was.

@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.1.69 — a configured certificate was optional
+
+**Disclosure 10.** Setting `tls_cert` did not require TLS. Postgres has no ALPN
+and no TLS port: a client that never sends `SSLRequest` — `sslmode=disable`,
+one flag — got a fully working plaintext session, against a proxy whose own
+startup log said `tls=true`.
+
+Not a masking bypass, and worth saying first: the invariant held, and no
+unmasked value reached a plaintext client that would not have reached a TLS one.
+What failed is the sentence at the top of `tls.rs` — "a masking proxy reachable
+over plaintext is not a security boundary" — which the module states and did not
+enforce. Masked output is not public output: partial masks are partial by
+design, a pseudonym is a stable identifier across queries, and the SCRAM
+exchange and the client's SQL cross the same wire.
+
+`client_tls` existed. It decided whether to strip SCRAM channel binding and
+nothing else. There was no way to require TLS, no refusal, no warning, no
+counter — and `has_client_tls()`, the accessor behind `tls=true`, returned
+`self.tls.is_some()`: a fact about the configuration, named like a fact about
+the connection. It is now `client_tls_configured()`.
+
+Worse in one specific way: the channel-binding strip *smooths* the plaintext
+path, because it exists so pgmask can front a TLS-only managed Postgres. The
+downgrade had no friction to run into, so it needed a gate.
+
+`require_client_tls` defaults to **true whenever `tls_cert` is set**.
+Configuring a certificate and not requiring it is the shape of a mistake, not of
+a decision. `false` allows plaintext deliberately: those sessions warn at
+startup and count as `plaintext_session`, because the dangerous configuration is
+not "no certificate" — that is a choice — but a certificate any client may
+decline. `true` without a certificate is refused at load: it refuses every
+connection, which is fail-closed and useless, and reads like the strictest
+setting rather than the broken one.
+
+WHY THE SWEEP AND SEVEN PASSING TLS TESTS BOTH MISSED IT
+
+The 08-11 sweep enumerated everything reaching the client and asked what each
+could carry. A question about contents. Nothing in it asked what the contents
+travelled over, so `tls.rs` was never opened — a blind spot exactly the width of
+the method's own framing.
+
+`test-tls.sh` connected with `sslmode=require` in all seven assertions, which is
+the right way to test that TLS works and structurally incapable of testing that
+it is required. It now runs 18 checks including the downgrade, with a poison
+control: with enforcement stubbed out, 7 fail and the 4 opt-out checks still
+pass. Verified, not assumed.
+
+AND THE SUITE WAS HIDING A SECOND FAILURE
+
+Its two `pg_isready` loops broke on success and fell through on timeout. Run
+next to a soak, Postgres exceeded the 30s budget, `ALTER SYSTEM SET ssl = on`
+ran against a socket that did not exist, its error went to a discarded stream,
+and the run continued with SSL off — so the channel-binding assertion failed
+reporting that the server refused TLS. True about the database, nothing to do
+with the proxy. Both loops abort now and `SHOW ssl` is read back.
+
+ALSO
+
+* **Documented: pgmask authenticates nobody.** It forwards the exchange and
+  watches for `AuthenticationOk`, so `[[role]]` relaxations are exactly as
+  strong as the backend's `pg_hba.conf`. A backend using `trust` makes every
+  relaxation self-service. The parts pgmask controls are in place and tested —
+  an unauthenticated session gets the most restrictive classification, a startup
+  packet naming `user` twice is refused — and none of them help there.
+* The disclosure-count invariant hardcoded "nine" and used a regex that could
+  not match a two-digit number, so adding number 10 would have left it passing
+  while counting 13 of 14 rows: a drift gate with the drift built in. Both
+  counts are now derived from the tables.
+* The README said 7 TLS checks; that number is now derived from the call sites,
+  as the suite count already was.
+
 ## 0.1.68 — the assessment had gone stale about itself
 
 A coherence pass over `docs/safety-assessment.md`, which is the document this

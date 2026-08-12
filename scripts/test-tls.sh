@@ -14,6 +14,7 @@ cd "$(dirname "$0")/.."
 CONTAINER=pgmask-tls
 PG_PORT=55434
 PROXY_PORT=6433
+METRICS_PORT=9899
 CERTS=$(mktemp -d)
 # SCRAM channel binding cannot survive TLS termination, so the workable shape is
 # client TLS + plaintext backend leg. See protocol::sasl_mechanisms.
@@ -50,15 +51,31 @@ refute() {
   fi
 }
 
+# A readiness loop that falls through on timeout is not a readiness check.
+#
+# Both loops here used to `break` on success and simply continue on exhaustion.
+# On a machine busy with a soak, postgres:17 took longer than 30s to accept
+# connections, so `ALTER SYSTEM SET ssl = on` ran against a socket that did not
+# exist, its error went to a discarded stream, and the run continued with SSL
+# off. The channel-binding assertion then failed with "the server refused TLS"
+# — a true statement about a database this script was supposed to have
+# configured. Nothing was wrong with the proxy.
+await_pg() { # label
+  for _ in $(seq 1 120); do
+    podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "FATAL: postgres not ready after 120s ($1)"
+  podman logs "$CONTAINER" 2>&1 | tail -10
+  exit 1
+}
+
 echo "==> starting postgres"
 podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 podman run -d --name "$CONTAINER" \
   -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=demo \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null
-for _ in $(seq 1 30); do
-  podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 1
-done
+await_pg "initial boot"
 
 echo "==> generating the backend cert inside the container"
 # Postgres refuses a key that is group- or world-readable, and refuses one it
@@ -69,12 +86,19 @@ podman exec -u postgres "$CONTAINER" bash -c '
     -out server.crt -keyout server.key -subj "/CN=localhost" 2>/dev/null &&
   chmod 600 server.key
 ' || { echo "could not generate backend cert"; exit 1; }
-podman exec -u postgres "$CONTAINER" psql -U postgres -c "ALTER SYSTEM SET ssl = on" >/dev/null
+podman exec -u postgres "$CONTAINER" psql -U postgres -c "ALTER SYSTEM SET ssl = on" >/dev/null ||
+  { echo "FATAL: could not set ssl = on"; exit 1; }
 podman restart "$CONTAINER" >/dev/null
-for _ in $(seq 1 30); do
-  podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 1
-done
+await_pg "after enabling ssl"
+
+# And confirm it took, rather than trusting the ALTER. This is the setting the
+# channel-binding assertion at the end depends on; if it is off, that assertion
+# reports a proxy failure for a database reason.
+ssl_state="$(podman exec -u postgres "$CONTAINER" psql -U postgres -tAc 'SHOW ssl' 2>&1)"
+[[ "$ssl_state" == "on" ]] || {
+  echo "FATAL: the backend reports ssl = $ssl_state after being told to enable it"
+  exit 1
+}
 
 echo "==> generating the pgmask cert"
 # -addext forces an X.509 v3 certificate. Without any extension openssl emits
@@ -186,6 +210,67 @@ if [[ "$BACKEND_TLS" == "disable" ]]; then
   check "channel-binding conflict is explained, not opaque" \
     "cannot work through a proxy that terminates TLS" "$cb"
 fi
+
+# --- The downgrade -----------------------------------------------------------
+#
+# Everything above connects with `sslmode=require`, which is why this suite
+# passed 7 of 7 for weeks while a configured certificate was entirely optional.
+# Postgres has no ALPN and no TLS port: a client that omits the SSLRequest
+# packet gets a plaintext session, and before v0.1.69 it got a working one
+# against a proxy whose own startup log said `tls=true`.
+kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null
+sed -i.bak 's|^backend_tls = .*|backend_tls = "disable"|' "$CERTS/tls.toml"
+# The demo catalog already sets metrics_interval_seconds, and TOML rejects a
+# duplicate key in the document root — so replace rather than prepend.
+# Top level, before the first [[column]]: a bare key written after a table
+# array belongs to that table, which is the trap noted where the TLS keys are
+# written above. Strip the existing occurrence from the body, do not append.
+{ echo "metrics_listen = \"127.0.0.1:$METRICS_PORT\""
+  echo "metrics_interval_seconds = 1"
+  grep -v '^metrics_interval_seconds' "$CERTS/tls.toml"; } > "$CERTS/tls-metrics.toml"
+mv "$CERTS/tls-metrics.toml" "$CERTS/tls.toml"
+
+PGMASK_LOG=info ./target/release/pgmask "$CERTS/tls.toml" > /tmp/pgmask-tls-down.log 2>&1 &
+PROXY_PID=$!
+await_listener "$PROXY_PORT" || { cat /tmp/pgmask-tls-down.log; exit 1; }
+
+check "a certificate is reported as required by default" \
+  "tls_required=true" "$(cat /tmp/pgmask-tls-down.log)"
+
+plain="$(psql "host=localhost port=$PROXY_PORT user=postgres dbname=demo sslmode=disable" \
+  -tAq -c 'SELECT email, name, city FROM demo.customers WHERE id = 1;' 2>&1)"
+check  "a plaintext client is refused"        "not using TLS" "$plain"
+check  "the refusal says how to fix it"       "sslmode=require" "$plain"
+refute "no row reaches a plaintext client"    "Denver" "$plain"
+# The point of the refusal is the data, so assert on the data too: a masked
+# value crossing in the clear is the thing being prevented.
+refute "no masked value reaches it either"    "@" "$plain"
+
+metrics="$(curl -s --max-time 5 http://127.0.0.1:$METRICS_PORT/metrics 2>&1)"
+check "the refusal is counted" "plaintext_refused" "$metrics"
+check "the refusal count is not zero" \
+  "1" "$(printf '%s' "$metrics" | grep -oE 'plaintext_refused[^0-9]*[0-9]+' | grep -oE '[0-9]+$')"
+
+# POISON CONTROL. The checks above pass if the proxy is simply broken for
+# plaintext for any reason — a crash, a bad listener, a refusal that predates
+# this feature. Turn the requirement off and the very same client must succeed,
+# which is the only thing that distinguishes enforcement from breakage.
+kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null
+{ echo "require_client_tls = false"; cat "$CERTS/tls.toml"; } > "$CERTS/tls-off.toml"  # top level
+PGMASK_LOG=info ./target/release/pgmask "$CERTS/tls-off.toml" > /tmp/pgmask-tls-off.log 2>&1 &
+PROXY_PID=$!
+await_listener "$PROXY_PORT" || { cat /tmp/pgmask-tls-off.log; exit 1; }
+
+allowed="$(psql "host=localhost port=$PROXY_PORT user=postgres dbname=demo sslmode=disable" \
+  -tAq -c 'SELECT email, name, city FROM demo.customers WHERE id = 1;' 2>&1)"
+check  "opting out restores the plaintext session" "Denver" "$allowed"
+refute "and masking still applies to it"           "user1@example.com" "$allowed"
+check "an optional certificate warns at startup" \
+  "configured but not required" "$(cat /tmp/pgmask-tls-off.log)"
+
+off_metrics="$(curl -s --max-time 5 http://127.0.0.1:$METRICS_PORT/metrics 2>&1)"
+check "an allowed plaintext session is still counted" \
+  "1" "$(printf '%s' "$off_metrics" | grep -oE 'plaintext_session[^0-9]*[0-9]+' | grep -oE '[0-9]+$')"
 
 echo
 echo "------------"

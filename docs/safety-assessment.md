@@ -65,6 +65,26 @@ proxy-to-database connection reads every masked column unmasked, and no rule in
 short — a unix socket, a sidecar, a private subnet — and treat "pgmask is in
 front of it" as saying nothing about network position.
 
+**Who the client is.** pgmask does not authenticate anybody. It forwards the
+authentication exchange to Postgres and watches for `AuthenticationOk`, and the
+principal it resolves masking policy from is the `user` in the startup packet.
+That is the right division of labour, and it has a consequence worth stating
+plainly: **role relaxations are exactly as strong as the backend's `pg_hba.conf`
+and no stronger.**
+
+A backend that authenticates with `trust` hands out `AuthenticationOk` to
+whoever asks. Every `[[role]]` relaxation then becomes self-service — a client
+picks `user=analyst`, gets `AuthenticationOk`, and pgmask applies the looser
+mask because from its side that principal *was* authenticated. The proxy is
+behaving correctly and the deployment is wide open.
+
+The parts pgmask does control are in place: an unauthenticated session can only
+ever get the default (most restrictive) classification, and a startup packet
+naming `user` twice is refused rather than guessed at, because the backend
+resolves the duplicate one way and a naive reader the other. Both are tested.
+Neither helps if the backend authenticates nobody. If you use `[[role]]`, read
+`pg_hba.conf` first.
+
 **Byte-length side channels.** `pg_column_size(email)` returns an exact length
 and no detector covers it. The campaigns generate the shape and cannot tell
 whether it leaked.
@@ -114,10 +134,10 @@ tested eleven spellings of the grouping without once wrapping one.
 ## What was found on 2026-08-11
 
 Numbered 7, 8 and 9 to continue the list above, and the letters are not
-decoration: 7 is four separate channels and 9 is two. "Nine disclosures" is the
-numbering, not the count of ways a value got out — that is 13, 6 in the
-release rules and 7 here. Where a count appears elsewhere in the repository it
-means the numbering.
+decoration: 7 is four separate channels and 9 is two. "Ten disclosures" is the
+numbering, not the count of ways a value got out — that is 14, 6 in the
+release rules, 7 here, and 1 in the transport the day after. Where a count
+appears elsewhere in the repository it means the numbering.
 
 I wrote "fourteen" in the first draft of this paragraph without counting the
 rows, in a document whose subject is numbers asserted with more confidence than
@@ -196,6 +216,70 @@ Ordinary errors — missing relation, division by zero, bad cast — carry no
 An application whose PL/pgSQL raises custom SQLSTATEs for business logic will
 lose them. That is over-withholding, in the direction that does not disclose,
 and it is visible to whoever runs it.
+
+## What was found on 2026-08-12
+
+| # | disclosure | found by |
+|---|---|---|
+| 10 | a configured TLS certificate was entirely optional: `sslmode=disable` got a working plaintext session, silently | reading `tls.rs`, the one module the 08-11 sweep never opened |
+
+This one is not a masking bypass, and saying so first is the honest framing. The
+invariant held throughout: no unmasked value ever reached a plaintext client
+that would not have reached a TLS one. What failed is the sentence at the top of
+`tls.rs` — *"a masking proxy reachable over plaintext is not a security
+boundary"* — which the module states as a principle and does not enforce.
+
+Postgres has no ALPN and no TLS port. A client asks to upgrade with an
+`SSLRequest` packet, and one that never asks simply proceeds in the clear. The
+proxy tracked that as `client_tls`, used it to decide whether to strip SCRAM
+channel binding, and used it for nothing else. There was no setting that could
+require TLS, no refusal, no warning, and no counter. The startup log printed
+`tls=true`, because the accessor behind it — named `has_client_tls`, which reads
+as a property of a connection — returned `self.tls.is_some()`, a property of the
+configuration.
+
+So an operator who generated a certificate, wired it into the config, and read
+their own startup log confirming TLS had no way to discover that some client was
+connecting with `sslmode=disable`. Masked output is not public output: partial
+masks are partial deliberately, a pseudonym is a stable identifier across
+queries, and the SCRAM exchange and the client's SQL cross the same wire.
+
+Worse in one specific way: the channel-binding strip *smooths the path*. That
+code exists so pgmask can sit in front of a TLS-only managed Postgres, and its
+effect is to make the plaintext client work well. The downgrade had no friction
+to run into, which is why it needed a gate rather than an inconvenience.
+
+The fix is `require_client_tls`, defaulting to **true whenever `tls_cert` is
+set**. Configuring a certificate and not requiring it is the shape of a mistake
+rather than of a decision, so the default is fail-closed and the operator who
+genuinely wants mixed-mode writes `require_client_tls = false` — which now warns
+at startup and counts those sessions as `plaintext_session`. Setting it true
+without a certificate is refused at load: that refuses every connection, which
+is fail-closed and useless, and reads at a glance like the strictest setting
+rather than the broken one.
+
+**Why the 08-11 sweep missed it.** That sweep enumerated everything that reaches
+the client and asked what shape of value each thing could carry. It was a
+question about *contents*, and it was answered well. Nothing in it asked about
+the transport those contents travel over, so `tls.rs` was never opened. The
+method had a blind spot exactly the width of its own framing.
+
+**Why seven passing TLS tests missed it.** `test-tls.sh` connects with
+`sslmode=require` in every assertion, which is the correct way to test that TLS
+works and structurally incapable of testing that it is required. A suite that
+only ever exercises the good path measures the good path. It now tests the
+downgrade, with a poison control: turn `require_client_tls` off and the same
+refused client must succeed, because otherwise "refused" is indistinguishable
+from "broken".
+
+**And the suite was concealing a second failure.** Its two `pg_isready` loops
+broke on success and fell through on timeout. Run on a machine busy with a soak,
+Postgres took longer than the 30s budget, so `ALTER SYSTEM SET ssl = on` ran
+against a socket that did not exist, its error went to a discarded stream, and
+the run continued with SSL off — after which the channel-binding assertion
+failed reporting that the server refused TLS. A true statement about a database
+the script was supposed to have configured, and nothing to do with the proxy.
+Both loops now abort, and `SHOW ssl` is read back before anything depends on it.
 
 ### What the same sweep did *not* find
 
@@ -309,7 +393,7 @@ masked columns. Both scripts now verify all 200 fixture rows before trusting any
 result, and abort otherwise. A false positive here is not harmless: it would
 have been reported as a tenth disclosure.
 
-### Mutation testing would not have found any of the nine
+### Mutation testing would not have found any of the ten
 
 Worth stating because the opposite conclusion is the tempting one. Disclosure 7
 was in `protocol.rs`, which nothing mutated, and I went looking there *because*
@@ -317,7 +401,7 @@ I had written that down — so it reads as "the missing instrument was the cause
 It was not.
 
 A mutant changes existing logic and asks whether a test notices. Every one of
-the nine disclosures is a **missing case**, not wrong logic:
+the ten disclosures is a **missing case**, not wrong logic:
 
 * `LEAKY_FIELDS` did not contain `W`.
 * The error branch did not replace the message at all.
@@ -339,7 +423,7 @@ found a class reading did not — untested *boundaries* in logic that exists, su
 as the `partial` and `inner` length floors, where a value exactly as long as the
 window it keeps came back verbatim. Reading found a class mutation testing
 cannot: *cases* that were never written. Neither substitutes for the other, and
-all nine disclosures were of the second kind.
+all ten disclosures were of the second kind.
 
 So adding them was right, and it closes a different gap than the one that let
 disclosure 7 through. What found all nine was reading, and what made reading
@@ -408,13 +492,15 @@ when broken.
 
 ## If you read one thing before deploying this
 
-**Only Claude has reviewed this security analysis.** Nine disclosures over two
-days across thirteen channels, *all* of them found by reading rather than by any
+**Only Claude has reviewed this security analysis.** Ten disclosures over three
+days across fourteen channels, *all* of them found by reading rather than by any
 test, is the argument for a second reader — not the test counts above.
 
-The rate is the thing to weigh. It had not clearly plateaued when the reading
-stopped: the last was found late on the second day, and the clean sweep that
-followed covered six modules in one afternoon. That is a start, not a plateau.
+The rate is the thing to weigh, and it has not plateaued. The draft of this
+paragraph one day earlier said the rate "had not clearly plateaued"; number 10
+arrived the next morning, in the one module the preceding sweep never opened,
+and the sweep missed it because it asked what values could reach the client and
+never asked what carried them. Each sweep has found the previous sweep's frame.
 
 A human adversary should start with `crates/proxy/src/analysis.rs`, and should
 distrust the comments. They are unusually detailed and load-bearing, which makes
@@ -444,7 +530,7 @@ comment that asserted the case could not happen.
 - `protocol.rs` and `mask.rs` joined the mutated file list on 2026-08-11, taking
   the campaign from 494 mutants to 827 — two thirds of the release-relevant
   surface had never been mutated. See the note above on why that would not have
-  found any of the nine disclosures.
+  found any of the ten disclosures.
 - Two `classify` defects fixed 2026-08-11 that were proposals rather than
   disclosures, but would have become disclosures in a deployed catalog:
   `postal_code` was proposed as `partial`, which keeps the *last* characters —

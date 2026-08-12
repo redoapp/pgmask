@@ -86,15 +86,38 @@ done
 # when I wrote the sentence fixing it I asserted a channel count of fourteen
 # without counting the rows. It is thirteen. Both are the same mistake this
 # repository keeps finding, so both get a check rather than a promise.
-channels=$(grep -cE '^\| ([1-9]|7[a-d]|9[ab]) \|' docs/safety-assessment.md)
-claimed_readme=$(grep -oE '(the )?(six|seven|eight|nine|ten|[0-9]+) disclosures' README.md | head -1)
+# Both numbers are derived, not written down twice. The first version of this
+# check hardcoded "nine" and a regex that could not match a two-digit
+# disclosure, so adding number 10 would have left it passing while counting 13
+# of 14 rows — a drift gate with the drift built in.
+rows=$(grep -oE '^\| [0-9]+[a-d]? \|' docs/safety-assessment.md)
+channels=$(printf '%s\n' "$rows" | grep -c .)
+numbered=$(printf '%s\n' "$rows" | grep -oE '[0-9]+' | sort -un | grep -c .)
+word() { case "$1" in
+  6) echo six ;; 7) echo seven ;; 8) echo eight ;; 9) echo nine ;;
+  10) echo ten ;; 11) echo eleven ;; 12) echo twelve ;; *) echo "$1" ;;
+esac; }
+expected_word=$(word "$numbered")
+claimed_readme=$(grep -oE '(the )?(six|seven|eight|nine|ten|eleven|twelve|[0-9]+) disclosures' README.md | head -1)
 case "$claimed_readme" in
-  *nine*) ;;
-  "")     note "README no longer states a disclosure count; the tables list $channels channels." ;;
-  *)      note "README says '$claimed_readme'; the tables list $channels channels under 9 numbers." ;;
+  *"$expected_word"*) ;;
+  "")     note "README no longer states a disclosure count; the tables list $numbered." ;;
+  *)      note "README says '$claimed_readme'; the tables list $numbered ($expected_word), $channels channels." ;;
 esac
 grep -qE "that is $channels, " docs/safety-assessment.md ||
   note "the assessment's channel count does not match its own tables ($channels rows)."
+grep -qE "\b$expected_word disclosures\b" docs/safety-assessment.md ||
+  note "the assessment does not state '$expected_word disclosures'; its tables list $numbered."
+
+# The TLS suite's check count, which the README quotes.
+#
+# It said 7 while the suite ran 18, having grown a downgrade section — and one
+# of the original 7 had been failing for several commits while the README
+# reported all of them passing. Count the call sites rather than the claim.
+tls_checks=$(grep -cE '^ *(check|refute) ' scripts/test-tls.sh)
+claimed_tls=$(grep -oE '[0-9]+ TLS,' README.md | grep -oE '[0-9]+')
+[ "${claimed_tls:-$tls_checks}" = "$tls_checks" ] ||
+  note "README says $claimed_tls TLS checks; test-tls.sh has $tls_checks."
 
 # Cargo.lock's copy of the workspace version.
 #

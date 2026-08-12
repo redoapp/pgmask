@@ -62,14 +62,24 @@ async fn main() -> Result<()> {
         opaque = ?config.opaque,
         system_catalogs = ?config.system_catalogs,
         summaries = ?config.summaries,
-        tls = policy.has_client_tls(),
+        tls = policy.client_tls_configured(),
+        tls_required = policy.client_tls_required(),
         backend_tls = ?config.backend_tls,
         "pgmask listening"
     );
-    if !policy.has_client_tls() {
+    if !policy.client_tls_configured() {
         tracing::warn!(
             "no tls_cert/tls_key — clients connect in plaintext, and a masking proxy \
              reachable in plaintext is not a security boundary"
+        );
+    } else if !policy.client_tls_required() {
+        // The dangerous configuration is not "no certificate", which is a
+        // choice. It is "a certificate that any client may decline", which
+        // looks like protection in the startup log and in the config file.
+        tracing::warn!(
+            "require_client_tls = false — a certificate is configured but not required, \
+             so any client may connect with sslmode=disable and read masked output in \
+             plaintext. Such sessions are counted as plaintext_session"
         );
     }
     if catalog.is_empty() {

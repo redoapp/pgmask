@@ -219,6 +219,7 @@ async fn start_proxy(
         role: Vec::new(),
         tls_cert: None,
         tls_key: None,
+        require_client_tls: None,
         backend_tls: Default::default(),
         catalog_refresh_seconds: 30,
         catalog_refresh_min_seconds: 5,

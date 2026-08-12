@@ -360,6 +360,9 @@ pub async fn start_proxy_at_full(
         role: roles,
         tls_cert: None,
         tls_key: None,
+        // No certificate, so nothing to require: these harnesses drive a raw
+        // wire client in plaintext and must keep working unchanged.
+        require_client_tls: None,
         backend_tls: pgmask::tls::BackendTls::Disable,
         // Tight intervals so tests can observe a refresh without waiting.
         catalog_refresh_seconds: 1,
