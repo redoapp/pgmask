@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.67 — fourteen releases were never tagged
+
+`git tag` is a separate command from `git commit`, and I stopped running it
+after v0.1.52 without noticing for fourteen releases. The changelog said they
+had shipped; git disagreed. `git describe` was useless and "what changed between
+X and Y" unanswerable.
+
+All fourteen now tagged at the commit that carried each version.
+
+The check requires a tag for every *released* version, where released means "a
+commit carried this version in `Cargo.toml`" and not "the changelog has a
+heading". Four headings never had a commit of their own — 0.1.17, 0.1.30, 0.1.50
+and 0.1.51 were written alongside the release that followed, deliberately in the
+last case — and demanding tags for them would invent releases that never
+happened.
+
+Derived from Cargo.toml's history rather than kept in an exemption list, so it
+cannot go stale the way the list would have. Two exclusions: the current
+version, committed a moment before it is tagged, and `0.0.0`, the scaffold
+placeholder.
+
+Then I tagged the fix itself `v0.1.67` while `Cargo.toml` still read 0.1.66 — a
+tag pointing at a version that did not exist, in the commit that added the check
+for exactly that class of mistake. Deleted and done properly.
+
 ## 0.1.66 — sqlsmith writes as well as reads, and had been deleting the fixture
 
 The cause of every strange sqlsmith result so far, and it is one line:
