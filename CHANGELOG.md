@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.64 — the first complete mutation campaign
+
+`attempted 827 of 827`. Five runs were needed to get one that measured the whole
+set: two died part-way and printed a tidy summary, one filled the disk, one
+skipped shard 0 and errored on shard 20 while reporting "814 of 814", and this
+one finished.
+
+```text
+  caught     620
+  missed     157
+  timeout    10
+  unviable    40
+```
+
+A 79.8% kill rate on viable mutants, against 71.9% for the 19-shard run before
+it. Survivors fell from 215 to 157 while *more* mutants were tested — that
+difference is the six gaps triage found and closed, which is the first time
+today's work has been measured rather than asserted.
+
+By file: `session.rs` 55, `catalog.rs` 45, `mask.rs` 27, `protocol.rs` 14,
+`analysis.rs` 12, `lineage.rs` 4. `protocol.rs` came down from 54 as the
+channel-binding, result-format and startup-frame tests landed.
+
+Two things stated rather than glossed. The 10 timeouts may be contention: I was
+building the sqlsmith harness alongside, which is the thing this file has told
+people twice today not to do. And a campaign with survivors exits non-zero —
+that is cargo-mutants saying "there are mutants to triage", not "the harness
+broke", and the script now says so next to the summary, because `EXIT=3` on an
+otherwise complete run reads like a failure.
+
 ## 0.1.63 — the foreign grammar, for hours instead of seconds
 
 `soak.sh` runs `shapegen` for hours. `soak-sqlsmith.sh` does the same with

@@ -379,14 +379,17 @@ comment that asserted the case could not happen.
 ## Still unverified
 
 - Nine findings from an internal audit, mostly documentation overstating code.
-- **Mutation coverage: one complete-looking run, actually 19 shards of 20.**
-  550 caught, 215 missed, 12 timed out, 37 unviable — but `--shard k/n` is
-  0-indexed and the loop ran `1..20`, so shard 0 was never requested and shard
-  `20/20` was rejected outright. About a tenth of the campaign never ran, and
-  the accounting still printed "814 of 814" because a shard that fails to start
-  contributes zero to both sides of the comparison. Fixed, with a per-shard
-  check, but no complete run has finished yet and the 215 survivors are from
-  90% of the mutant set.
+- **Mutation coverage, first complete run (2026-08-11): `attempted 827 of 827`.**
+  620 caught, 157 missed, 10 timed out, 40 unviable — a 79.8% kill rate on
+  viable mutants. The preceding run covered 19 shards of 20 and killed 71.9%;
+  the difference is the six test gaps triage found and closed, measured rather
+  than claimed. Survivors by file: `session.rs` 55, `catalog.rs` 45, `mask.rs`
+  27, `protocol.rs` 14, `analysis.rs` 12, `lineage.rs` 4 — `protocol.rs` fell
+  from 54 as the channel-binding, result-format and startup-frame tests landed.
+  The remaining survivors are the categories documented in place: config
+  accessors and defaults, logging conditions, depth caps, and guards no engine
+  can reach. Caveat: sqlsmith harness work was running alongside, so the 10
+  timeouts may be contention rather than genuinely slow mutants.
 - *(historical)* **The number previously quoted here was wrong.** Two runs died part-way — the second on a full disk — and both printed
   their four outcome counts and nothing else, so "45 survivors" was carried
   here as a finding when 200 of 493 mutants had never been attempted. The

@@ -240,6 +240,11 @@ if [ -n "${planned:-}" ] && [ "$accounted" != "$planned" ]; then
   echo "      Check the error above; a full disk is the usual cause."
   exit 1
 fi
+# A campaign with survivors exits non-zero, and that is cargo-mutants saying
+# "there are mutants to triage" rather than "the harness broke". Its codes:
+# 1 an error, 2 missed mutants, 3 timeouts, 4 unviable. Read `attempted N of N`
+# above first — that is the line that says whether the run is worth reading at
+# all.
 echo "Survivors are in mutants.out/missed.txt. Each is one of:"
 echo "  * a real gap    — the code is right and no test says so; write the test"
 echo "  * equivalent    — the mutation changes nothing observable; say why in a"
