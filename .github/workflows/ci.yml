@@ -1,0 +1,117 @@
+name: CI
+
+# The container-free half of `./scripts/test-all.sh`.
+#
+# WHAT THIS IS AND IS NOT
+#
+# The full gate is 21 suites and about an hour, and most of it drives real
+# Postgres and CockroachDB containers through podman. That does not belong on a
+# GitHub-hosted runner, so this workflow runs only the part that needs nothing
+# but a toolchain: the static checks, the repo invariants, and every Rust test
+# that does not require a database.
+#
+# Green here does NOT mean the gate is green. It means nothing regressed in the
+# fastest third of it. Run `./scripts/test-all.sh` locally before a release —
+# the suites this cannot run are the ones that have caught real disclosures.
+#
+# It is still worth having: two of the last three defects found in this
+# repository were documentation drift that `check-repo-invariants.sh` catches in
+# under a second, and the TLS suite spent several commits reporting a passing
+# assertion that had silently stopped matching.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental output is pure cost on a runner that starts from cold.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  static:
+    name: static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # check-repo-invariants.sh derives the untagged-release list from
+          # Cargo.toml's history and compares tags against it, so a shallow
+          # clone would make it report every release as untagged.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      # The gate counts findings rather than trusting the exit code, because
+      # clippy can report warnings and still exit 0 depending on configuration.
+      # -D warnings makes that unambiguous here.
+      - name: clippy (warnings fatal)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Not redundant with clippy: a doc link to an item that does not exist
+      # compiles, lints clean, and is only ever read by someone following it.
+      - name: rustdoc (warnings fatal)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+      - name: repo invariants
+        run: ./scripts/check-repo-invariants.sh
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Advisories appear without anything in this repository changing, so this
+      # is its own job: a new RUSTSEC entry should not read as "the tests broke".
+      - run: cargo audit
+
+  test:
+    name: cargo test (no database)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # PGMASK_ALLOW_SKIP lets the database-backed integration tests skip
+      # instead of failing. That is the whole compromise of this workflow, and
+      # the next step makes the size of it visible rather than leaving it in a
+      # comment.
+      - name: workspace tests
+        env:
+          PGMASK_ALLOW_SKIP: "1"
+        run: cargo test --workspace --no-fail-fast
+
+      # The fuzzing feature gates an entire module in. Without this the
+      # plan_state harness is not compiled at all — `cargo test` reports a real
+      # count and a verdict that covered none of it.
+      - name: fuzzing-feature tests
+        env:
+          PGMASK_ALLOW_SKIP: "1"
+        run: cargo test -p pgmask --lib --features fuzzing --no-fail-fast
+
+      - name: say what was skipped
+        if: always()
+        run: |
+          echo "Suites this workflow cannot run (they need podman + a real database):"
+          echo "  adversarial, demo, classify round trip, sqlsmith, inference limits,"
+          echo "  grouping spellings (x2), release paths, TLS, Postgres 13-17,"
+          echo "  CockroachDB, shape sweep, generated SQL campaign,"
+          echo "  generated shapes (CockroachDB), cross-engine differential"
+          echo
+          echo "Run ./scripts/test-all.sh locally before releasing."
