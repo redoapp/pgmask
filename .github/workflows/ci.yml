@@ -134,12 +134,18 @@ jobs:
       # The sweep, with the database-backed tests skipping — the same call the
       # gate makes. They are run for real, serially, in the next two steps.
       # Tee'd because the assertion below must be about *this* run.
+      # --nocapture is load-bearing, not noise. "skipping by request" is an
+      # eprintln! inside a passing test, and libtest captures the output of
+      # passing tests, so the line never reaches the log. Without this the
+      # count below reads 0 no matter how many skipped — which is exactly what
+      # scripts/test-all.sh has been reporting for its entire life:
+      # "521 tests (0 need Postgres)", with 41 skipping.
       - name: workspace tests
         env:
           PGMASK_ALLOW_SKIP: "1"
         run: |
           set -o pipefail
-          cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/workspace.log
+          cargo test --workspace --no-fail-fast -- --nocapture 2>&1 | tee /tmp/workspace.log
 
       # PGMASK_TEST_PG is set per-step, not per-job. Set job-wide it also
       # reached the sweep above, which then ran these 41 concurrently *and*
