@@ -37,7 +37,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 31
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 41
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -48,7 +48,13 @@ pub fn backend_dsn(db: &str) -> String {
 /// nothing is the failure this project keeps finding.
 ///
 /// `PGMASK_ALLOW_SKIP=1` opts out, for running `cargo test` on a machine with
-/// no Postgres. The gate does not set it.
+/// no Postgres. The gate does not set it, and neither does CI — the first
+/// version of `.github/workflows/ci.yml` did, reproducing this exact defect in
+/// the workflow written to catch regressions. CI now runs a Postgres service
+/// container and asserts that nothing skipped.
+///
+/// The count above is checked by `scripts/check-repo-invariants.sh`; it read
+/// 31 for several releases after the suites grew to 41.
 #[macro_export]
 macro_rules! require_pg {
     () => {

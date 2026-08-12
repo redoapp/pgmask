@@ -119,6 +119,14 @@ claimed_tls=$(grep -oE '[0-9]+ TLS,' README.md | grep -oE '[0-9]+')
 [ "${claimed_tls:-$tls_checks}" = "$tls_checks" ] ||
   note "README says $claimed_tls TLS checks; test-tls.sh has $tls_checks."
 
+# The count of database-backed tests, quoted in the macro's own documentation
+# and in the CI workflow's header. It said 31 while the suites held 41.
+guarded=$(cat crates/proxy/tests/adversarial.rs crates/proxy/tests/resilience.rs |
+  awk '/#\[(tokio::)?test\]/{t=1} /require_pg!/{if(t){c++;t=0}} END{print c+0}')
+claimed_guarded=$(grep -oE 'so all [0-9]+' crates/proxy/tests/support/mod.rs | grep -oE '[0-9]+')
+[ "${claimed_guarded:-$guarded}" = "$guarded" ] ||
+  note "support/mod.rs says $claimed_guarded database-backed tests; there are $guarded."
+
 # Cargo.lock's copy of the workspace version.
 #
 # Nothing bumped it, so it trailed the real version by however many releases had

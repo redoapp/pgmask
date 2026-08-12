@@ -1,23 +1,39 @@
 name: CI
 
-# The container-free half of `./scripts/test-all.sh`.
+# The part of `./scripts/test-all.sh` that a GitHub-hosted runner can honestly
+# run — which is more than the first version of this file assumed.
 #
-# WHAT THIS IS AND IS NOT
+# WHAT CHANGED, AND WHY IT MATTERS MORE THAN THE REST OF THIS FILE
 #
-# The full gate is 21 suites and about an hour, and most of it drives real
-# Postgres and CockroachDB containers through podman. That does not belong on a
-# GitHub-hosted runner, so this workflow runs only the part that needs nothing
-# but a toolchain: the static checks, the repo invariants, and every Rust test
-# that does not require a database.
+# The first version set `PGMASK_ALLOW_SKIP=1` so the database-backed tests
+# would skip. That flag exists for running `cargo test` on a laptop with no
+# Postgres, and the macro it feeds carries this comment:
 #
-# Green here does NOT mean the gate is green. It means nothing regressed in the
-# fastest third of it. Run `./scripts/test-all.sh` locally before a release —
-# the suites this cannot run are the ones that have caught real disclosures.
+#     This used to `return Ok(())`. test-all.sh runs cargo test without
+#     PGMASK_TEST_PG ... so all 31 tests behind this macro — every raw-wire
+#     adversarial test and every resilience test, including
+#     negative_control_the_harness_can_see_a_leak — reported PASS on every
+#     release gate having asserted nothing.
+#     ...
+#     PGMASK_ALLOW_SKIP=1 opts out. The gate does not set it.
 #
-# It is still worth having: two of the last three defects found in this
-# repository were documentation drift that `check-repo-invariants.sh` catches in
-# under a second, and the TLS suite spent several commits reporting a passing
-# assertion that had silently stopped matching.
+# The gate deliberately does not set it. The first version of this workflow
+# did, which quietly reproduced the exact defect that comment was written
+# about: forty-one call sites' worth of adversarial and resilience tests
+# reporting green having asserted nothing — including the negative control
+# whose entire job is to prove the harness can see a leak.
+#
+# The reason given was "these need containers, and containers mean podman".
+# That was wrong. They need a reachable Postgres; podman is only how
+# `test-integration.sh` obtains one locally. A service container is a Postgres,
+# so CI runs them for real and no skip flag appears anywhere in this file.
+#
+# WHAT STILL CANNOT RUN HERE
+#
+# The suites that orchestrate podman themselves — starting several engines,
+# swapping catalogs between runs, driving psql corpora. Those are the ones that
+# have caught real disclosures, so green here is not a green gate. The
+# `coverage` job below prints the current list rather than leaving it implied.
 
 on:
   push:
@@ -25,20 +41,26 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A superseded push should not keep burning a runner. Never cancel on main:
+# those runs are the record of what the default branch actually did.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
-  # Incremental output is pure cost on a runner that starts from cold.
   CARGO_INCREMENTAL: "0"
 
 jobs:
   static:
     name: static checks
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           # check-repo-invariants.sh derives the untagged-release list from
-          # Cargo.toml's history and compares tags against it, so a shallow
+          # Cargo.toml's history and compares it against the tags, so a shallow
           # clone would make it report every release as untagged.
           fetch-depth: 0
 
@@ -48,12 +70,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
+      - run: cargo fmt --all --check
 
-      # The gate counts findings rather than trusting the exit code, because
-      # clippy can report warnings and still exit 0 depending on configuration.
-      # -D warnings makes that unambiguous here.
       - name: clippy (warnings fatal)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -70,48 +88,114 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: install cargo-audit
-        run: cargo install cargo-audit --locked
-      # Advisories appear without anything in this repository changing, so this
-      # is its own job: a new RUSTSEC entry should not read as "the tests broke".
+      # A prebuilt binary. Compiling cargo-audit from source cost minutes on
+      # every run to check a file that changes rarely.
+      - uses: taiki-e/install-action@cargo-audit
+      # Its own job: a new RUSTSEC advisory appears without anything in this
+      # repository changing, and that must not read as "the tests broke".
       - run: cargo audit
 
   test:
-    name: cargo test (no database)
+    name: cargo test (real Postgres)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:17
+        # The harness connects as `postgres://postgres@host:port/db` with no
+        # password, so trust auth is what it needs — the same thing
+        # scripts/test-integration.sh passes to podman.
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        # Unlike the local suites, this health check is the runner's job and it
+        # gates the step rather than racing it.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # Deliberately no PGMASK_ALLOW_SKIP. With this set and a database
+      # present, a test that cannot reach Postgres fails — which is the whole
+      # point of the macro it feeds.
+      PGMASK_TEST_PG: 127.0.0.1:5432
+
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # PGMASK_ALLOW_SKIP lets the database-backed integration tests skip
-      # instead of failing. That is the whole compromise of this workflow, and
-      # the next step makes the size of it visible rather than leaving it in a
-      # comment.
-      - name: workspace tests
-        env:
-          PGMASK_ALLOW_SKIP: "1"
-        run: cargo test --workspace --no-fail-fast
+      # Prove the service is actually reachable from the job before running
+      # anything that would otherwise skip or fail confusingly.
+      - name: the database is really there
+        run: |
+          psql "postgres://postgres@127.0.0.1:5432/postgres" -tAc 'select version()'
 
-      # The fuzzing feature gates an entire module in. Without this the
-      # plan_state harness is not compiled at all — `cargo test` reports a real
-      # count and a verdict that covered none of it.
+      # Tee'd, because the assertion below has to be about *this* run. Running
+      # the suite a second time to inspect its output would double the job and
+      # still only prove something about the second run.
+      - name: workspace tests
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/workspace.log
+
+      # The two suites the old workflow skipped entirely. Serial by design:
+      # they drive a raw wire client against a shared backend.
+      - name: adversarial suite
+        run: cargo test --test adversarial -- --test-threads=1
+
+      - name: resilience suite
+        run: cargo test --test resilience -- --test-threads=1
+
+      # The fuzzing feature gates an entire module in. Without it the
+      # plan_state harness is not compiled at all, and `cargo test` reports a
+      # real count with a verdict that covered none of it.
       - name: fuzzing-feature tests
-        env:
-          PGMASK_ALLOW_SKIP: "1"
         run: cargo test -p pgmask --lib --features fuzzing --no-fail-fast
 
-      - name: say what was skipped
+      # Nothing should skip now. If something does, it means a test lost its
+      # database and went quiet instead of failing — the defect this whole file
+      # is written around — so say so loudly.
+      - name: nothing skipped silently
         if: always()
         run: |
-          echo "Suites this workflow cannot run (they need podman + a real database):"
-          echo "  adversarial, demo, classify round trip, sqlsmith, inference limits,"
-          echo "  grouping spellings (x2), release paths, TLS, Postgres 13-17,"
-          echo "  CockroachDB, shape sweep, generated SQL campaign,"
-          echo "  generated shapes (CockroachDB), cross-engine differential"
+          n=$(grep -c 'skipping by request' /tmp/workspace.log || true)
+          if [ "$n" != "0" ]; then
+            echo "FAIL: $n tests skipped despite a database being present."
+            grep 'skipping by request' /tmp/workspace.log | head
+            exit 1
+          fi
+          echo "0 tests skipped, as required."
+
+  coverage:
+    name: what CI does not cover
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # Derived, not transcribed. A hand-written list of suite names in a shell
+      # `echo` is precisely the kind of thing that goes stale and then reassures
+      # someone — the same drift check-repo-invariants.sh exists to catch.
+      - name: list the suites only the local gate runs
+        run: |
+          echo "Suites in ./scripts/test-all.sh that need podman and do not run here:"
+          grep -oE '\./scripts/[a-z-]+\.(sh|py)' scripts/test-all.sh \
+            | sort -u \
+            | grep -v 'test-all.sh' \
+            | while read -r s; do
+                # test-integration.sh is excluded: podman is only how it gets a
+                # Postgres locally, and the `test` job above has a real one, so
+                # those suites do run here.
+                [ "$s" = "./scripts/test-integration.sh" ] && continue
+                grep -q 'podman' "$s" 2>/dev/null && echo "  $s"
+              done
           echo
-          echo "Run ./scripts/test-all.sh locally before releasing."
+          echo "Green CI is not a green gate. Run ./scripts/test-all.sh before releasing."
