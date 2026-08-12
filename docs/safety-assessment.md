@@ -474,6 +474,10 @@ This is the finding that should shape how much weight a green run carries.
 | `test-sqlsmith.sh` | reported zero leaks four separate ways while measuring nothing, then reported a leak that was not one |
 | sqlsmith itself | generates DML; a 500-query corpus emptied the fixture, and every earlier figure was measuring a table being destroyed |
 | `git tag` | fourteen releases the changelog called shipped had no tag at all |
+| the gate's skip counter | printed "(0 need Postgres)" on every run ever made, with 41 skipping — libtest captures `eprintln!` from a passing test, so the line it counted never existed |
+| seven `pg_isready` loops | answered YES against the socket-only init server, then fell through on timeout, so "ready" and "timed out" were the same outcome |
+| four `sleep 4`s | called a proxy that was still resolving its catalog "did not come up" |
+| the local gate itself | one machine, one timing profile: a concurrent-DDL race that fails reliably on a Linux runner never reproduced here in seventy releases |
 
 Every one produced a confident answer about something it was not measuring.
 Several were built specifically to prevent that.
@@ -505,6 +509,13 @@ from it.
 when broken.
 
 ## If you read one thing before deploying this
+
+One more, added 2026-08-12 and worth its own line: the counter that was
+supposed to make the skipping visible had never once counted a skip. It was
+added *because* 41 tests had previously reported PASS while asserting nothing,
+and it reported `0 need Postgres` from the day it was written. The defect was
+found only because a CI assertion failed and the first reading of that failure
+was wrong.
 
 **Only Claude has reviewed this security analysis.** Ten disclosures over three
 days across fourteen channels, *all* of them found by reading rather than by any

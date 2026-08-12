@@ -130,12 +130,21 @@ record "repo invariants" "$?"
 echo "=== rust tests ==="
 # --no-fail-fast, or one failing target hides every target after it.
 #
-# PGMASK_ALLOW_SKIP is set here on purpose: 31 of these tests need a live
+# PGMASK_ALLOW_SKIP is set here on purpose: 41 of these tests need a live
 # Postgres, and they are run for real by the "adversarial (real Postgres)"
 # suite below, which supplies one. Without the variable `require_pg!` now
-# panics rather than returning Ok — it used to return Ok, which meant those 31
+# panics rather than returning Ok — it used to return Ok, which meant those 41
 # reported PASS on every gate run having asserted nothing, the adversarial
 # raw-wire suite among them.
+#
+# `--nocapture` is load-bearing. "skipping by request" is an eprintln! inside a
+# test that then *passes*, and libtest captures the output of passing tests, so
+# the line never reached this log. The skip count below therefore read 0 on
+# every run ever made — this gate has been printing "521 tests (0 need
+# Postgres)" with 41 of them skipping. A counter added to make skipping visible
+# and reporting zero for its whole life is the same defect this repository
+# keeps finding in its own instruments, and it was found by a CI assertion
+# failing for what looked like the wrong reason.
 # The `fuzzing` feature too, in a second run.
 #
 # `plan_state_fuzz` is feature-gated so `libfuzzer-sys` stays out of the main
@@ -153,9 +162,9 @@ echo "=== rust tests ==="
 # said `ok cargo test 489 tests`. The count was real; the verdict was not. Same
 # shape as three other status losses in a day: a pipeline or a substitution
 # quietly reporting the wrong command's exit code.
-workspace_out=$(PGMASK_ALLOW_SKIP=1 cargo test --workspace --no-fail-fast -q 2>&1)
+workspace_out=$(PGMASK_ALLOW_SKIP=1 cargo test --workspace --no-fail-fast -q -- --nocapture 2>&1)
 workspace_status=$?
-fuzzing_out=$(PGMASK_ALLOW_SKIP=1 cargo test -p pgmask --lib --features fuzzing --no-fail-fast -q 2>&1)
+fuzzing_out=$(PGMASK_ALLOW_SKIP=1 cargo test -p pgmask --lib --features fuzzing --no-fail-fast -q -- --nocapture 2>&1)
 fuzzing_status=$?
 out="$workspace_out
 $fuzzing_out"
@@ -164,7 +173,20 @@ status=0
 [ "$fuzzing_status" = 0 ] || status=$fuzzing_status
 total=$(printf '%s\n' "$out" | grep -E '^test result' | awk '{s+=$4} END {print s+0}')
 skipped=$(printf '%s\n' "$out" | grep -c 'skipping by request')
-record "cargo test" "$status" "$total tests ($skipped need Postgres)"
+# And check the count rather than just printing it. A number in a summary line
+# is exactly what nobody rereads; "0 need Postgres" sat there for seventy
+# releases. Derived from the source both sides, so adding a test moves both.
+guarded=$(cat crates/proxy/tests/adversarial.rs crates/proxy/tests/resilience.rs |
+  awk '/#\[(tokio::)?test\]/{t=1} /require_pg!/{if(t){c++;t=0}} END{print c+0}')
+# One `record` call, deliberately. check-repo-invariants.sh derives the suite
+# count by counting these, so an if/else around two of them reported 22 suites
+# where the gate runs 21 — a drift check broken by the fix for a drift bug.
+skip_note="$skipped need Postgres, run for real below"
+if [ "$skipped" != "$guarded" ]; then
+  status=1
+  skip_note="SKIP COUNT WRONG: $skipped skipped, $guarded carry require_pg!"
+fi
+record "cargo test" "$status" "$total tests ($skip_note)"
 [[ "$status" == "0" ]] || printf '%s\n' "$out" | grep -E 'FAILED|panicked' | head -8
 
 echo "=== end to end ==="

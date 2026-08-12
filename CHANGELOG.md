@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.74 — the skip counter had never counted a skip
+
+`scripts/test-all.sh` has printed this on every run it has ever made:
+
+    ok    cargo test    521 tests (0 need Postgres)
+
+Forty-one of them were skipping. `skipping by request` is an `eprintln!` inside
+a test that then *passes*, and libtest captures the output of passing tests, so
+the line the counter greps for never reached the log.
+
+The counter exists **because** those 41 tests once reported PASS while
+asserting nothing. It was added to make that visible, and it reported zero from
+the day it was written.
+
+`--nocapture` on both sweeps makes the skips real — verified: 41 visible, and
+319 + 202 = the 521 the summary already claimed. The count is now compared
+against the number of tests carrying `require_pg!`, derived from the source, so
+a mismatch fails the gate instead of printing quietly. The historical value, 0,
+fails it.
+
+Found sideways. A CI assertion failed reporting "sweep skipped 0, tests
+carrying require_pg!: 41", and the first reading was that the assertion was
+wrong. It was right about the discrepancy and wrong about which side was
+broken.
+
+Also: the comment above that code said 31 where the suites hold 41 — the same
+stale number fixed in `support/mod.rs` two releases ago, in the other place it
+had been copied to.
+
+And the first cut of this fix broke a different drift check: it wrapped the
+summary in an if/else with a `record` call in each branch, and
+`check-repo-invariants.sh` derives the suite count by counting those, so it
+reported 22 suites where the gate runs 21. One `record`, message chosen first.
+
+There is no 0.1.72. It was written, then renumbered when a concurrent session
+landed 0.1.73 first; leaving the gap is more honest than renumbering theirs.
+
 ## 0.1.73 — hostile posture, and verify-full on the backend leg
 
 Two of the holes the poison run measured, closed with the smallest knobs that
