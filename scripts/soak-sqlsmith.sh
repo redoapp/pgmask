@@ -60,6 +60,30 @@ podman exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1 || {
 # reproducible with `./scripts/test-sqlsmith.sh`.
 sed -n '/^CREATE SCHEMA smith;/,/^ANALYZE;/p' scripts/test-sqlsmith.sh |
   podman exec -i "$CONTAINER" psql -U postgres -q
+# The fixture has to be the fixture. Verified, not assumed.
+#
+# A soak run reported 165 canary-carrying lines through the proxy and it was a
+# false positive: that container's `city` column contained `CANARYNAME…`, and
+# `city` is deliberately *released*, so the proxy was correctly passing through
+# a column that happened to hold the token the check greps for. Bisecting to the
+# statement and diffing direct against proxied is what exposed it — the direct
+# output read `CANARYNAME150|CANARYNAME150`, which no correct fixture produces.
+#
+# A canary check is only as good as the assumption that canaries appear *only*
+# in masked columns. That assumption is now tested rather than trusted.
+fixture_ok=$(psql "host=127.0.0.1 port=$PG_PORT user=postgres dbname=postgres" -X -tAq -c "
+  SELECT count(*) FROM smith.people
+   WHERE id BETWEEN 1 AND 200
+     AND email = 'CANARYMAIL' || id || '@example.com'
+     AND full_name = 'CANARYNAME' || id
+     AND note = 'CANARYNOTE' || id
+     AND city IN ('Portland','Denver','Austin')" 2>/dev/null)
+if [[ "${fixture_ok:-0}" != "200" ]]; then
+  say "FAIL: the fixture is not what this test assumes (${fixture_ok:-0}/200 rows correct)."
+  say "      A canary in a released column reads as a leak. Recreate the container."
+  exit 1
+fi
+
 sed -n '/^listen        =/,/^mask     = "date-month"/p' scripts/test-sqlsmith.sh |
   sed "s/\$PROXY_PORT/$PROXY_PORT/; s/\$PG_PORT/$PG_PORT/" >/tmp/pgmask-sqlsmith-soak.toml
 grep -q '^\[\[column\]\]' /tmp/pgmask-sqlsmith-soak.toml || {

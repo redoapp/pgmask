@@ -283,6 +283,19 @@ directions — releasing every mask produces 47 canary-carrying lines.
 `--seed` does not reproduce a corpus: sqlsmith builds from catalog OIDs, which
 differ per container. Each run is an independent sample.
 
+**It also reported a leak that was not one, and that is the fifth failure worth
+recording.** A soak round flagged 165 canary-carrying lines through the proxy.
+The container's `city` column contained `CANARYNAME…`, and `city` is
+deliberately *released* — so the proxy was correctly passing through an unmasked
+column that happened to hold the token the check greps for. Bisecting to the
+statement and diffing direct against proxied is what exposed it: the direct
+output read `CANARYNAME150|CANARYNAME150`, which no correct fixture produces.
+
+A canary check is only as sound as the assumption that canaries appear *only* in
+masked columns. Both scripts now verify all 200 fixture rows before trusting any
+result, and abort otherwise. A false positive here is not harmless: it would
+have been reported as a tenth disclosure.
+
 ### Mutation testing would not have found any of the nine
 
 Worth stating because the opposite conclusion is the tempting one. Disclosure 7

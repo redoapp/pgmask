@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.1.65 — a leak that was not one, and the check that would have caught it
+
+The sqlsmith soak flagged its second round: **165 canary-carrying lines through
+the proxy**, saved corpus, the lot. It was a false positive, and I was one step
+from reporting it as a tenth disclosure.
+
+That container's `city` column contained `CANARYNAME…`. `city` is deliberately
+*released* by the catalog, so the proxy was correctly passing through an
+unmasked column that happened to hold the token the check greps for.
+
+WHAT EXPOSED IT
+
+Bisecting the corpus to a single statement, then running that statement both
+ways. The offender was:
+
+```sql
+select ref_0.city as c0, ref_0.note as c1 from smith.people as ref_0
+where ref_0.born is not NULL limit 151;
+```
+
+— which does not select `full_name` at all. Direct returned
+`CANARYNAME150|CANARYNAME150`: the canary was in `city`, and `note` came back
+correctly nulled. No correct fixture produces that row, and a fresh container
+loaded from the same extraction produces `Denver|CANARYNOTE150`.
+
+THE ASSUMPTION UNDERNEATH EVERY CANARY TEST
+
+A canary check is sound only if canaries appear **only** in masked columns. That
+had never been verified — the fixture was assumed to be the fixture. Both
+scripts now count all 200 rows against their expected values before trusting any
+result, and abort otherwise. Poison-controlled with the exact scenario: put a
+canary in the released `city` column and the run fails with
+`the fixture is not what this test assumes (0/200 rows correct)`.
+
+Five ways this harness has now reported something untrue — four saying "no
+leaks" while measuring nothing, and one saying "leak" when there was none. The
+tool is worth having. It has needed more scepticism than the code it tests.
+
 ## 0.1.64 — the first complete mutation campaign
 
 `attempted 827 of 827`. Five runs were needed to get one that measured the whole

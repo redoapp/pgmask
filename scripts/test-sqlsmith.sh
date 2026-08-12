@@ -108,6 +108,30 @@ FROM generate_series(1, 200) g;
 ANALYZE;
 SQL
 
+# The fixture has to be the fixture. Verified, not assumed.
+#
+# A soak run reported 165 canary-carrying lines through the proxy and it was a
+# false positive: that container's `city` column contained `CANARYNAME…`, and
+# `city` is deliberately *released*, so the proxy was correctly passing through
+# a column that happened to hold the token the check greps for. Bisecting to the
+# statement and diffing direct against proxied is what exposed it — the direct
+# output read `CANARYNAME150|CANARYNAME150`, which no correct fixture produces.
+#
+# A canary check is only as good as the assumption that canaries appear *only*
+# in masked columns. That assumption is now tested rather than trusted.
+fixture_ok=$(psql "host=127.0.0.1 port=$PG_PORT user=postgres dbname=postgres" -X -tAq -c "
+  SELECT count(*) FROM smith.people
+   WHERE id BETWEEN 1 AND 200
+     AND email = 'CANARYMAIL' || id || '@example.com'
+     AND full_name = 'CANARYNAME' || id
+     AND note = 'CANARYNOTE' || id
+     AND city IN ('Portland','Denver','Austin')" 2>/dev/null)
+if [[ "${fixture_ok:-0}" != "200" ]]; then
+  echo "FAIL: the fixture is not what this test assumes (${fixture_ok:-0}/200 rows correct)."
+  echo "      A canary in a released column reads as a leak. Recreate the container."
+  exit 1
+fi
+
 cat >/tmp/pgmask-sqlsmith.toml <<EOF
 listen        = "127.0.0.1:$PROXY_PORT"
 backend       = "127.0.0.1:$PG_PORT"
