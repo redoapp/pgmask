@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.1.62 — SQL from a grammar nobody here wrote, and four ways it said nothing
+
+Every campaign here generates from `shapegen`, which I wrote. That is the
+sharpest criticism of all the evidence in this repository, and it is not
+hypothetical: before v0.1.36 the generator could not express `SELECT * FROM (…)`
+or `GROUPING SETS`, so two of the six original disclosures were unreachable by
+it no matter how long it ran.
+
+sqlsmith reads the live catalog and builds semantically-valid random queries
+against whatever it finds. Hundreds of real PostgreSQL bugs to its name, and no
+opinion about which shapes are interesting here.
+
+FOUR WAYS THE HARNESS REPORTED ZERO LEAKS WHILE MEASURING NOTHING
+
+1. **Pointed at the proxy, sqlsmith finds no tables.** It introspects
+   `pg_catalog`, which the proxy refuses, so it generates nothing — and that
+   reads as a clean run. It generates against a direct connection instead.
+2. **Releasing one column as a poison does not fire.** A 150-query corpus may
+   never touch that column, so the control was consistent with both a working
+   harness and a blind one.
+3. **Releasing *every* mask still does not fire.** sqlsmith writes
+   expression-heavy SQL and the proxy refuses any field without column
+   provenance whatever the catalog says. A corpus of refusals looks exactly like
+   a corpus being masked correctly.
+4. **Control statements appended to the corpus never ran.** Several refusal
+   paths set `out.close = true`, psql then fails everything after that point,
+   and anything at the end of a long corpus is never reached. This also explains
+   direct canary counts of 353, 123 and 1 across runs at the same seed: each
+   replay died at a different statement.
+
+WHAT IT ASSERTS NOW
+
+The corpus must reach masked data — the direct replay has to surface canaries.
+Masked values must be *served* through the proxy, or nothing observable
+happened. And no canary may cross. Five plain provenance-bearing statements run
+in their own session so a closed connection cannot take the controls with it.
+
+Verified both ways: clean is 35 canaries direct, 0 proxied, 32 masked values
+served; releasing every mask puts **47 canary-carrying lines** through the proxy
+and fails.
+
+Also recorded: `--seed` does not reproduce a corpus, because sqlsmith builds
+from catalog OIDs and those differ per container. Each run is an independent
+sample, not a repeatable one.
+
+The gate is 21 suites.
+
 ## 0.1.61 — a lineage method that looks load-bearing and is consulted by nothing
 
 The last untriaged survivor group: four value-replacing mutants on

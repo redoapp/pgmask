@@ -56,7 +56,7 @@ fi
 # letting the next person read the failures as real.
 OWNED="pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb \
 pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference \
-pgmask-grouping-postgres pgmask-grouping-cockroach pgmask-roundtrip"
+pgmask-grouping-postgres pgmask-grouping-cockroach pgmask-roundtrip pgmask-sqlsmith"
 running=$(podman ps --filter 'name=pgmask-' --format '{{.Names}}' 2>/dev/null)
 clash=""
 other=""
@@ -99,7 +99,7 @@ run() { # name command...
   # Every container name any suite uses. `pgmask-roundtrip` was missing, and a
   # leftover one from a KEEP=1 run made the round-trip suite fail with "postgres
   # did not start" — the port was taken by its own previous container.
-  podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference pgmask-grouping-postgres pgmask-grouping-cockroach pgmask-roundtrip >/dev/null 2>&1
+  podman rm -f -v pgmask-demo pgmask-fuzz pgmask-crdb pgmask-shapes-pg pgmask-shapes-crdb pgmask-fuzz-crdb pgmask-diff-pg pgmask-diff-crdb pgmask-test pgmask-tls pgmask-inference pgmask-grouping-postgres pgmask-grouping-cockroach pgmask-roundtrip pgmask-sqlsmith >/dev/null 2>&1
   sleep 1
   local out
   out=$("$@" 2>&1)
@@ -179,6 +179,11 @@ run "demo (verify.sh)"        env KEEP=0 ./examples/demo/verify.sh
 # `validate_spec` checks a spec in memory, but nothing fed the actual artefact
 # back to the thing that reads it.
 run "classify round trip"     ./scripts/test-classify-roundtrip.sh
+
+# SQL from a grammar nobody here wrote. Every other campaign generates from
+# `shapegen`, so it explores the shapes I thought of — and before v0.1.36 that
+# grammar could not express two of the six disclosures at all.
+run "sqlsmith (foreign grammar)" ./scripts/test-sqlsmith.sh 400
 
 run "inference limits"        ./scripts/test-inference.sh
 # The generated counterpart to the inference suite's literal strings: every way

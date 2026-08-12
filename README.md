@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.61**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.62**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -61,7 +61,7 @@ done, and [LICENSE](LICENSE).
 | CockroachDB v25.4 | supported, fuzzed on both protocols; closed three disclosures ([why](docs/engines.md)) |
 | Diagnostic channels — `RAISE`, `CONTEXT`, `SQLSTATE`, `ParameterStatus` | closed on both engines, 2026-08-11 ([what they were](docs/safety-assessment.md)) |
 
-`./scripts/test-all.sh` runs 20 suites and reports one line each, with a
+`./scripts/test-all.sh` runs 21 suites and reports one line each, with a
 skipped suite counted as a failure: 505 cargo tests, 40 adversarial and
 resilience tests against a real Postgres, 98 demo assertions, an 18-check
 `classify` round trip, 7 TLS, 120 across Postgres 13–17, 43 against CockroachDB,

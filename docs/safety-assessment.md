@@ -246,6 +246,43 @@ method reads as infallible.
   for their window, and `range` was the one whose absence of that guard had
   already been found and fixed.
 
+### SQL from a grammar nobody here wrote
+
+Added 2026-08-11, and it is the answer to the sharpest criticism of everything
+above: every campaign in this repository generates from `shapegen`, which I
+wrote, so it explores the shapes I thought of. That is not hypothetical —
+before v0.1.36 the generator could not express `SELECT * FROM (…)` or
+`GROUPING SETS`, and two of the six original disclosures were unreachable by it
+for that reason alone.
+
+`scripts/test-sqlsmith.sh` uses **sqlsmith**, which reads the live catalog and
+builds semantically-valid random queries against whatever it finds. It has found
+hundreds of bugs in PostgreSQL itself and knows nothing about pgmask.
+
+It took four attempts to make the harness say anything true, and each failure is
+worth more than the eventual pass:
+
+1. Pointing sqlsmith at the proxy finds no tables — it introspects `pg_catalog`,
+   which the proxy refuses — so it generates nothing and reports no leaks.
+2. Releasing one column as a poison does not fire, because a 150-query corpus
+   may never touch that column.
+3. Releasing *every* mask still does not fire, because sqlsmith writes
+   expression-heavy SQL and the proxy refuses a field with no provenance
+   whatever the catalog says. A corpus of refusals is indistinguishable from a
+   corpus being masked correctly.
+4. Control statements appended to the corpus never ran: several refusal paths
+   close the connection, and psql then fails everything after that point. This
+   also explains direct canary counts of 353, 123 and 1 across runs — each
+   replay died at a different statement.
+
+What it asserts now: the corpus must reach masked data (the direct replay has to
+surface canaries), masked values must actually be *served* through the proxy
+(or nothing observable happened), and no canary may cross. Verified in both
+directions — releasing every mask produces 47 canary-carrying lines.
+
+`--seed` does not reproduce a corpus: sqlsmith builds from catalog OIDs, which
+differ per container. Each run is an independent sample.
+
 ### Mutation testing would not have found any of the nine
 
 Worth stating because the opposite conclusion is the tempting one. Disclosure 7
