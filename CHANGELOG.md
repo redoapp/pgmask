@@ -56,6 +56,50 @@ Four regression tests, each failing without the fix — including one that pins
 the fail-closed path the fix must not open: executing a portal that was never
 bound still has no plan.
 
+### And `--check` called plaintext a coverage gap
+
+A second adversarial pass, this time against objects an attacker would find in
+a real database rather than SQL they could write. Still no way to unmask a
+value under the default posture — views, materialised views, inherited children
+and partitions over a classified table all came back NULL, with rows returned
+1/1 so it is masking and not an empty result. But:
+
+**Under `unclassified = "allow"` an undeclared view over a classified table
+serves plaintext.** `SELECT email FROM demo.v_plain` returned
+`user1@example.com`. So did a view that renames the columns, so the column
+*named* `city` returned the address.
+
+That much is documented — README says views need their own entries, `classify`
+does propose them, and `allow` releases what is undeclared. The defect is what
+the drift gate says about it:
+
+    19 column(s) have no rule. Default-deny masks them, so this is a
+    coverage gap and not an exposure
+
+printed unconditionally, against a catalog that sets `unclassified = "allow"`,
+by a function holding that parsed catalog in a local called `config`. The one
+setting that decides whether those columns are an exposure was never consulted.
+`--check` is the command operators are told to run in CI, so this is a green
+build asserting safety about columns being served in the clear.
+
+It now reads the setting. Under `allow` it names them as SERVED IN PLAINTEXT
+and fails with a reason; under default-deny the wording is unchanged except to
+say which posture it is describing.
+
+TWO OF THE THREE TESTS I WROTE FOR THIS COULD NOT FAIL
+
+Worth more than the fix. The first refuted the string `"not an exposure"` —
+which never appears, because that wording wraps across a newline. The second
+asserted a non-zero exit, which a coverage gap already produced in both
+postures. Both passed no matter what the code did; the poison run failed 1 of 3
+and that is how they were found. All three discriminate now: 23/0 clean, 3
+failures with the fix stubbed out.
+
+And the first version of the harness had the postures backwards — it built an
+"allow" catalog from a file that was already `allow`, because this suite writes
+that setting itself so its "unclassified column arrives intact" test can work.
+Both halves then described the same posture.
+
 ## 0.1.74 — the skip counter had never counted a skip
 
 `scripts/test-all.sh` has printed this on every run it has ever made:

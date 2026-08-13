@@ -197,6 +197,51 @@ else
 fi
 check "and it names them"  "no rule"        "$(cat /tmp/pgmask-roundtrip.check)"
 
+# --- the claim `--check` makes about unruled columns -------------------------
+#
+# It told operators that unruled columns are "a coverage gap and not an
+# exposure" because "default-deny masks them" — unconditionally, while holding
+# the parsed catalog that decides it. Against `unclassified = "allow"`, the
+# documented incremental-rollout posture, that is false: those columns are
+# served in plaintext. Measured on a live proxy, an undeclared view over a
+# classified table returned a real address while `--check` called it safe.
+#
+# Both postures are asserted, because a gate that always says "exposure" is as
+# useless as one that never does.
+echo "==> what --check claims about unruled columns"
+# This suite's own catalog already sets `unclassified = "allow"` (see where it
+# is written above) so that the "arrives intact" test can work — so it is the
+# allow posture, and the deny posture is the one that has to be constructed.
+#
+# The first cut of this had it backwards, built an "allow" catalog that was
+# already allow, and compared the deny half against the same file. Both halves
+# then described the same posture and two assertions failed for a reason that
+# had nothing to do with the code under test.
+{ echo 'unclassified = "mask"'
+  grep -v '^unclassified' /tmp/pgmask-roundtrip.toml; } > /tmp/pgmask-roundtrip-deny.toml
+grep -q '^unclassified = "mask"' /tmp/pgmask-roundtrip-deny.toml \
+  || { echo "FAIL: could not build the deny-posture catalog"; exit 1; }
+
+allow_out=$(chk)
+allow_status=$?
+check  "unclassified=allow is reported as plaintext" "SERVED IN PLAINTEXT" "$allow_out"
+# "not an exposure" would never match: that wording wraps across a newline, so
+# the refute passed whatever the code did. Match a phrase that is really on one
+# line and really differs between the two postures.
+refute "and is not called merely a coverage gap"     "coverage gap"        "$allow_out"
+# Likewise the exit code: a coverage gap already failed the gate before this
+# change, so "exits non-zero" is true in both postures and discriminates
+# nothing. The reason it fails is the assertion worth making.
+check  "and fails for the right reason" "served in plaintext under" "$allow_out"
+
+# The other half. A gate that always cries exposure is as useless as one that
+# never does, so default-deny must still read as a coverage gap.
+deny_out=$(DSN="postgres://postgres@127.0.0.1:$PG_PORT/postgres" \
+  ./target/debug/classify --check --catalog /tmp/pgmask-roundtrip-deny.toml --schema rt 2>&1)
+refute "default-deny is not called plaintext" "SERVED IN PLAINTEXT" "$deny_out"
+check  "default-deny still says default-deny masks them" "default-deny masks them" "$deny_out"
+
+
 # Decide them, the way an operator would, and it goes green.
 {
   echo

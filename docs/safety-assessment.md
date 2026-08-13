@@ -477,6 +477,8 @@ This is the finding that should shape how much weight a green run carries.
 | the gate's skip counter | printed "(0 need Postgres)" on every run ever made, with 41 skipping — libtest captures `eprintln!` from a passing test, so the line it counted never existed |
 | seven `pg_isready` loops | answered YES against the socket-only init server, then fell through on timeout, so "ready" and "timed out" were the same outcome |
 | four `sleep 4`s | called a proxy that was still resolving its catalog "did not come up" |
+| `classify --check` again | told operators unruled columns were "not an exposure" **without reading the setting that decides it** — while holding the parsed catalog |
+| two of the three tests written for that fix | one matched a phrase that wraps across a newline, one asserted an exit code that was non-zero in both postures; both passed whatever the code did |
 | the local gate itself | one machine, one timing profile: a concurrent-DDL race that fails reliably on a Linux runner never reproduced here in seventy releases |
 
 Every one produced a confident answer about something it was not measuring.

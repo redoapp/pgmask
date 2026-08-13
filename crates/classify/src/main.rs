@@ -759,8 +759,36 @@ fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
         live.len().saturating_sub(unclassified.len())
     );
 
+    // Whether an unruled column is masked is a property of *this catalog*, not a
+    // constant — and this function has been holding the answer in `config` the
+    // whole time without asking it.
+    //
+    // The message below used to read "Default-deny masks them, so this is a
+    // coverage gap and not an exposure" unconditionally. Against a catalog
+    // carrying `unclassified = "allow"` — the documented incremental-rollout
+    // posture — that is false, and it is false about the one setting that
+    // decides it. Measured on a live proxy in that posture: an undeclared view
+    // over a classified table served `user1@example.com` in plaintext while
+    // `--check` called it "not an exposure".
+    //
+    // Under `allow` this is now a failure, not a note. `--check` is the command
+    // operators are told to run in CI, and a green build that says "not an
+    // exposure" about columns being served in the clear is worse than no check.
+    let exposed = config.unclassified == pgmask::catalog::Unclassified::Allow;
     if !unclassified.is_empty() {
-        println!("\n{} column(s) have no rule. Default-deny masks them, so this is a\ncoverage gap and not an exposure — but nothing here has been decided:", unclassified.len());
+        // Only the wording branches. Listing the columns must not: the first
+        // cut put the loop below inside the default-deny arm, so the `allow`
+        // posture — the one where these columns are actually being served —
+        // printed a count and no names. The round-trip suite caught it.
+        if exposed {
+            println!(
+                "\n{} column(s) have no rule, and this catalog sets \
+                 `unclassified = \"allow\"`.\nThey are SERVED IN PLAINTEXT, not masked:",
+                unclassified.len()
+            );
+        } else {
+            println!("\n{} column(s) have no rule. This catalog leaves `unclassified` at\nits default, so default-deny masks them — a coverage gap and not an\nexposure, but nothing here has been decided:", unclassified.len());
+        }
         for (relation, column) in unclassified.iter().take(40) {
             let hint = proposals
                 .iter()
@@ -794,6 +822,13 @@ fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
         }
     }
 
+    if exposed && !unclassified.is_empty() {
+        bail!(
+            "{} column(s) are served in plaintext under `unclassified = \"allow\"`.\n\
+             Declare them, or set `unclassified = \"mask\"` to fall back to default-deny.",
+            unclassified.len()
+        );
+    }
     if unclassified.is_empty() && stale.is_empty() && incompatible.is_empty() {
         println!("\nevery column has a rule and every rule matches. no drift.");
         return Ok(());
