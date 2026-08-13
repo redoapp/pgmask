@@ -357,7 +357,13 @@ async fn error_detail_cannot_leak() -> Result<()> {
     load_schema(DB).await?;
     let proxy = start_proxy(DB, default_rules()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
-    // A unique violation echoes the conflicting value in DETAIL.
+    // A unique violation would echo the conflicting value in DETAIL — the leak
+    // this test was written for. The read-only allowlist now refuses the INSERT
+    // before it reaches the backend, so that error is never produced: the
+    // DETAIL vector is closed one layer earlier than error scrubbing. (General
+    // error-text withholding, with the SQLSTATE preserved, is exercised by
+    // `a_client_chosen_sqlstate_is_replaced_and_an_ordinary_one_is_not` on the
+    // read path, which read-only leaves reachable.)
     client
         .simple_query(
             "INSERT INTO canary.subjects VALUES \
@@ -365,21 +371,15 @@ async fn error_detail_cannot_leak() -> Result<()> {
         )
         .await?;
     let text = client.received_text();
-    // The message used to be asserted here. It is withheld now, because
-    // `RAISE EXCEPTION` lets SQL choose one and there is no locale-independent
-    // way to tell those apart — see `an_error_message_chosen_by_sql_cannot_
-    // carry_a_value`. What has to survive is the SQLSTATE: 23505 is
-    // unique_violation, and this error has no CONTEXT, so the code is Postgres'
-    // own and is forwarded.
+    assert!(
+        text.contains("read-only"),
+        "the write must be refused before it can echo a row:\n{text}"
+    );
     assert!(
         !text.contains("duplicate key"),
-        "the message is SQL-choosable and must not survive:\n{text}"
+        "no backend DETAIL exists when the write never runs:\n{text}"
     );
-    assert!(
-        text.contains("23505"),
-        "but the SQLSTATE must, or the proxy is merely opaque:\n{text}"
-    );
-    assert_no_canary(&client, "error DETAIL");
+    assert_no_canary(&client, "error DETAIL (write refused)");
     Ok(())
 }
 
@@ -659,7 +659,12 @@ async fn a_client_chosen_sqlstate_is_replaced_and_an_ordinary_one_is_not() -> Re
         "an ordinary error must keep its SQLSTATE"
     );
 
-    // A CONTEXT proves it came through user SQL, so the code is replaced.
+    // Choosing a SQLSTATE takes a `DO` block or a user function, and the
+    // read-only allowlist now refuses both before the backend runs them — a
+    // stronger close than replacing the code after the fact. The chosen
+    // `ZZZZZ` never reaches Postgres at all; the refusal is pgmask's own
+    // 42501. (The replace-CONTEXT-bearing-codes logic remains as defence in
+    // depth for any error that reaches this path another way.)
     let mut client = RawClient::connect(proxy.addr, DB).await?;
     client
         .simple_query("DO $$ BEGIN RAISE EXCEPTION 'x' USING ERRCODE = 'ZZZZZ'; END $$;")
@@ -669,7 +674,10 @@ async fn a_client_chosen_sqlstate_is_replaced_and_an_ordinary_one_is_not() -> Re
         !text.contains("ZZZZZ"),
         "a chosen SQLSTATE must not pass:\n{text}"
     );
-    assert!(text.contains("XX000"), "and it must be replaced:\n{text}");
+    assert!(
+        text.contains("read-only"),
+        "a DO block that chooses a SQLSTATE is refused before Postgres runs it:\n{text}"
+    );
     Ok(())
 }
 
@@ -724,18 +732,22 @@ async fn a_reportable_guc_cannot_carry_a_value() -> Result<()> {
     let proxy = start_proxy(DB, default_rules()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
 
-    // Control: a reportable GUC set to a constant must arrive, or the rest of
-    // this test is asserting nothing.
+    // Control: a reportable GUC set by a plain `SET` — which read-only allows —
+    // must arrive as ParameterStatus, or the injection cases below prove
+    // nothing. The old control used `set_config` inside a `DO` block, which the
+    // read-only allowlist now refuses, so it could no longer demonstrate that
+    // the channel is real.
     client
-        .simple_query(
-            "DO $$ BEGIN PERFORM set_config('TimeZone', 'Australia/Eucla', false); END $$;",
-        )
+        .simple_query("SET TimeZone = 'Australia/Eucla'")
         .await?;
     assert!(
         client.received_text().contains("Australia/Eucla"),
-        "the control did not arrive, so nothing below is being tested"
+        "the reportable-GUC channel is real, or nothing below is being tested"
     );
 
+    // Injecting a masked value needs `set_config` (a function) in a `DO` block —
+    // both refused by read-only — or a `SET` whose value is a subquery, which
+    // `SET` does not accept. Every route is closed before the backend runs it.
     for (guc, expr) in [
         (
             "scram_iterations",
@@ -751,6 +763,10 @@ async fn a_reportable_guc_cannot_carry_a_value() -> Result<()> {
         let sql = format!("DO $$ BEGIN PERFORM set_config('{guc}', {expr}, false); END $$;");
         let _ = client.simple_query(&sql).await;
         let text = client.received_text();
+        assert!(
+            text.contains("read-only"),
+            "GUC injection through a DO block is refused before the backend:\n{text}"
+        );
         assert!(
             !text.contains("987001"),
             "{guc} carried a value derived from a masked column:\n{text}"

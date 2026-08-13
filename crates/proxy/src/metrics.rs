@@ -79,6 +79,19 @@ pub enum Cause {
     /// `posture = "hostile"` refused a statement that named a masked column
     /// outside a bare outermost projection.
     HostileMaskedUse,
+    /// Authenticated principal exceeded `rate_limit_per_minute` /
+    /// `rate_limit_burst`. The statement never reached the backend.
+    RateLimited,
+    /// A statement emitted more notices than `max_notices_per_exchange`.
+    /// Excess notices are dropped for the rest of the exchange.
+    NoticeFlood,
+    /// DML, DDL, `DO`/`CALL`, or other mutating SQL — pgmask is read-only.
+    WriteRefused,
+    /// A function call outside the trusted `pg_catalog` allowlist.
+    UntrustedFunction,
+    /// Statement named a system catalog that holds sampled user data,
+    /// passwords, or other sessions' SQL (`pg_stats`, `pg_authid`, …).
+    LeakyCatalog,
 }
 
 impl Cause {
@@ -97,6 +110,11 @@ impl Cause {
         Cause::PlaintextRefused,
         Cause::PlaintextSession,
         Cause::HostileMaskedUse,
+        Cause::RateLimited,
+        Cause::NoticeFlood,
+        Cause::WriteRefused,
+        Cause::UntrustedFunction,
+        Cause::LeakyCatalog,
     ];
 
     pub fn label(self) -> &'static str {
@@ -115,6 +133,11 @@ impl Cause {
             Cause::PlaintextRefused => "plaintext_refused",
             Cause::PlaintextSession => "plaintext_session",
             Cause::HostileMaskedUse => "hostile_masked_use",
+            Cause::RateLimited => "rate_limited",
+            Cause::NoticeFlood => "notice_flood",
+            Cause::WriteRefused => "write_refused",
+            Cause::UntrustedFunction => "untrusted_function",
+            Cause::LeakyCatalog => "leaky_catalog",
         }
     }
 
@@ -232,6 +255,12 @@ impl Metrics {
             .iter()
             .map(|c| c.load(Ordering::Relaxed))
             .sum()
+    }
+
+    pub fn count(&self, cause: Cause) -> u64 {
+        self.counters
+            .get(cause.index())
+            .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
     /// One line, zero-valued causes omitted. Empty when nothing has happened.

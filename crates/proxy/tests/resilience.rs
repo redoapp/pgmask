@@ -48,12 +48,18 @@ async fn cancel_request_actually_cancels() -> Result<()> {
         let _ = connection.await;
     });
 
-    // The sleep goes in the FROM clause, not the target list: a bare
-    // `SELECT pg_sleep(30)` projects an expression with no provenance and gets
-    // refused before it is ever slow enough to cancel.
+    // A genuinely slow query the read-only allowlist serves. `pg_sleep` used to
+    // do this, but it is not on the trusted-function allowlist and is refused
+    // before it can be slow. A table-free recursive CTE counted with a bare
+    // aggregate is provably safe (a reducing aggregate carries no value), so it
+    // is served and runs long enough to cancel.
     let query = tokio::spawn(async move {
         client
-            .simple_query("SELECT s.email FROM canary.subjects s CROSS JOIN pg_sleep(30)")
+            .simple_query(
+                "WITH RECURSIVE t(n) AS \
+                 (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000000000) \
+                 SELECT count(*) FROM t",
+            )
             .await
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -319,12 +325,15 @@ async fn rejections_are_bucketed_by_cause() -> Result<()> {
     client
         .simple_query("SELECT lower(email) FROM canary.subjects")
         .await?;
-    // A literal and count(*) are now *rescued* rather than rejected, so use
-    // shapes that still cannot be proven safe for the anonymous and aggregate
-    // buckets: a concatenation is anonymous, and max() emits a stored value.
+    // A literal and count(*) are now *rescued* rather than rejected, so use a
+    // shape that still cannot be proven safe for the anonymous bucket: a
+    // concatenation is anonymous.
     client
         .simple_query("SELECT email || '' FROM canary.subjects")
         .await?;
+    // `max(email)` used to reach the opaque_aggregate bucket. It no longer does:
+    // `max` is not on the trusted-function allowlist, so it is refused as an
+    // untrusted function before the result is ever classified.
     client
         .simple_query("SELECT max(email) FROM canary.subjects")
         .await?;
@@ -333,7 +342,8 @@ async fn rejections_are_bucketed_by_cause() -> Result<()> {
     client
         .simple_query("SELECT count(*) FROM canary.subjects")
         .await?;
-    // And a refused COPY.
+    // COPY ... TO STDOUT used to reach the copy_stream bucket; the read-only
+    // allowlist now refuses it as a write before that handler runs.
     client
         .simple_query("COPY canary.subjects TO STDOUT")
         .await?;
@@ -343,8 +353,10 @@ async fn rejections_are_bucketed_by_cause() -> Result<()> {
         "opaque_named_like_column=1",
         "opaque_function=1",
         "opaque_anonymous=1",
-        "opaque_aggregate=1",
-        "copy_stream=1",
+        // max() is refused as untrusted, COPY as a write — earlier gates than
+        // the opaque_aggregate / copy_stream buckets they used to land in.
+        "untrusted_function=1",
+        "write_refused=1",
         "set_op_like_share=",
         // SELECT 1 and count(*) are served now, not refused.
         "fields_rescued=2",

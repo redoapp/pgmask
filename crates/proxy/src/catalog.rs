@@ -47,8 +47,9 @@ pub enum Posture {
     Default,
     /// Client who will try. Forces `summaries = "refuse"` and refuses any
     /// statement where a masked column appears outside a bare outermost
-    /// SELECT-list `ColumnRef` (so `WHERE email …`, `ORDER BY email`,
-    /// `sum(salary)`, and the error-channel CASE all refuse).
+    /// SELECT-list `ColumnRef`, after crediting `ORDER BY` mentions
+    /// (`WHERE email …`, `sum(salary)`, and the error-channel CASE refuse;
+    /// cleartext sort order of masked values is accepted).
     Hostile,
 }
 
@@ -365,6 +366,26 @@ pub struct Config {
     /// start listening on anything the operator did not ask for.
     #[serde(default)]
     pub metrics_listen: Option<String>,
+    /// Statements per authenticated principal per minute. `0` disables
+    /// (default). Charged on `Query` and `Execute` — the notice-channel
+    /// oracle under `posture = "hostile"` is a few hundred `DO` blocks, and
+    /// this is what makes that campaign expensive without a PL/pgSQL
+    /// interpreter. Shared across connections for the same username.
+    #[serde(default)]
+    pub rate_limit_per_minute: u32,
+    /// Burst size when rate limiting is on. `0` means "same as
+    /// `rate_limit_per_minute`". Ignored when rate limiting is off.
+    #[serde(default)]
+    pub rate_limit_burst: u32,
+    /// Cap on `NoticeResponse` messages (NOTICE/INFO/WARNING/…) forwarded
+    /// between `ReadyForQuery` markers. `0` disables (default).
+    ///
+    /// Rate limits charge one token per `Query`/`Execute`, so a single `DO`
+    /// block can still encode a full masked value as hundreds of notices.
+    /// This cap is the blunt instrument for that channel: drop excess notices
+    /// for the rest of the exchange and count `notice_flood`.
+    #[serde(default)]
+    pub max_notices_per_exchange: u32,
 }
 
 fn default_listen() -> String {
@@ -425,7 +446,37 @@ impl Config {
         self.validate_backend_tls()?;
         self.validate_pseudonym_key()?;
         self.validate_unique_column_rules()?;
-        self.validate_unclassified_policy()
+        self.validate_unclassified_policy()?;
+        self.validate_rate_limit()
+    }
+
+    /// A positive per-minute budget with a zero burst is a config that cannot
+    /// admit a single statement. Prefer the explicit default (burst equals
+    /// per-minute) over letting `governor` refuse construction with a less
+    /// readable error.
+    fn validate_rate_limit(&self) -> Result<()> {
+        if self.rate_limit_per_minute > 0 && self.rate_limit_burst == 0 {
+            // Resolved at Policy construction via `effective_rate_limit_burst`.
+            return Ok(());
+        }
+        if self.rate_limit_per_minute == 0 && self.rate_limit_burst > 0 {
+            bail!(
+                "rate_limit_burst is set but rate_limit_per_minute is 0; burst \
+                 only applies when rate limiting is enabled. Set \
+                 rate_limit_per_minute, or drop rate_limit_burst."
+            );
+        }
+        Ok(())
+    }
+
+    /// Burst used when constructing the limiter. `0` collapses to the
+    /// per-minute budget so a single knob is enough.
+    pub fn effective_rate_limit_burst(&self) -> u32 {
+        if self.rate_limit_burst == 0 {
+            self.rate_limit_per_minute
+        } else {
+            self.rate_limit_burst
+        }
     }
 
     /// `backend_ca` without `verify-full` is a config that does nothing, which
@@ -848,18 +899,58 @@ impl Snapshot {
         self.relations.contains(&table_oid)
     }
 
-    /// Bare column names that are masked for these roles (catalog rules only).
+    /// Bare column names that are masked for these roles.
     ///
     /// Used by `posture = "hostile"` to decide which identifiers may only
-    /// appear as outermost SELECT-list ColumnRefs. Unclassified columns are
-    /// deliberately absent: including every column in the schema would refuse
-    /// almost every query, and default-deny already nulls them in projections.
+    /// appear as outermost SELECT-list ColumnRefs.
+    ///
+    /// Includes:
+    /// - catalog rules whose effective mask is not passthrough
+    /// - **unclassified** columns anywhere in `relation_columns` (default-deny
+    ///   nulls them in projections). Leaving them out let
+    ///   `WHERE internal_note = 'secret'` / `WHERE token = '…'` on an
+    ///   uncatalogued table recover values the SELECT list had nulled.
+    ///
+    /// Bare names that are passthrough (`mask = "none"`) on any catalogued
+    /// column are not added from the unclassified pass — so a filter key like
+    /// `id` stays usable even when some other table also has an unclassified
+    /// `id`.
     pub fn masked_bare_names_for_roles(&self, roles: &HashSet<String>) -> HashSet<String> {
-        self.by_name
+        let mut names: HashSet<String> = self
+            .by_name
             .iter()
             .filter(|(_, classification)| !classification.for_roles(roles).is_passthrough())
             .map(|((_, column), _)| column.clone())
-            .collect()
+            .collect();
+
+        let passthrough: HashSet<String> = self
+            .by_name
+            .iter()
+            .filter(|(_, classification)| classification.for_roles(roles).is_passthrough())
+            .map(|((_, column), _)| column.clone())
+            .collect();
+
+        for (relation, columns) in &self.relation_columns {
+            for column in columns {
+                if self
+                    .by_name
+                    .contains_key(&(relation.clone(), column.clone()))
+                {
+                    continue;
+                }
+                if passthrough.contains(column) {
+                    continue;
+                }
+                names.insert(column.clone());
+            }
+        }
+        names
+    }
+
+    /// Relation → column list from the last catalog refresh. Used by hostile
+    /// whole-row detection (alias vs column collision on the same relation).
+    pub fn relation_columns_map(&self) -> &std::collections::HashMap<String, Vec<String>> {
+        &self.relation_columns
     }
 
     /// Bare column names we classify. Used only to bucket rejections for
@@ -1775,6 +1866,42 @@ mod tests {
         assert!(!snapshot.is_system_relation(16385));
     }
 
+    /// Hostile must treat default-deny columns like masked ones for predicates.
+    ///
+    /// `internal_note` is absent from the catalog on purpose (projection nulls
+    /// it). Before 0.1.81 it was also absent from the hostile name set, so
+    /// `WHERE internal_note = 'secret'` recovered the value. Uncatalogued
+    /// tables had the same hole for every column.
+    #[test]
+    fn hostile_masked_names_include_unclassified_columns() {
+        let mut snapshot = Snapshot::default();
+        snapshot.insert_relation_for_test(
+            "demo.customers",
+            &[
+                ("id", Mask::None),
+                ("email", Mask::Redact),
+                ("city", Mask::None),
+            ],
+        );
+        snapshot
+            .relation_columns_for_test("demo.customers", &["id", "email", "internal_note", "city"]);
+        snapshot.relation_columns_for_test("public.secrets", &["id", "token"]);
+
+        let roles = HashSet::new();
+        let names = snapshot.masked_bare_names_for_roles(&roles);
+        assert!(names.contains("email"));
+        assert!(names.contains("internal_note"));
+        assert!(names.contains("token"));
+        assert!(
+            !names.contains("id"),
+            "passthrough id must stay usable in WHERE"
+        );
+        assert!(
+            !names.contains("city"),
+            "passthrough city must stay usable in WHERE"
+        );
+    }
+
     /// The 16-byte floor on `pseudonym_key`, at its edge.
     ///
     /// Added in 0.1.9 after an unvalidated key made every pseudonym a
@@ -2255,5 +2382,29 @@ pseudonym_key = "a-long-enough-key"
             "if this ever fails the alternate-form subtlety is gone and the \
              comment above should go with it"
         );
+    }
+
+    #[test]
+    fn rate_limit_burst_without_per_minute_is_refused() {
+        let config = tls_test_config("rate_limit_burst = 5");
+        let err = config.validate().expect_err("burst alone is a noop config");
+        assert!(
+            err.to_string().contains("rate_limit_per_minute"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_burst_defaults_to_per_minute() {
+        let config = tls_test_config("rate_limit_per_minute = 30");
+        config.validate().expect("valid");
+        assert_eq!(config.effective_rate_limit_burst(), 30);
+        let with_burst = tls_test_config(
+            r#"
+rate_limit_per_minute = 30
+rate_limit_burst = 5
+"#,
+        );
+        assert_eq!(with_burst.effective_rate_limit_burst(), 5);
     }
 }

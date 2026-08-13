@@ -11,6 +11,7 @@ pub mod mask;
 pub mod metrics;
 mod plan_state;
 pub mod protocol;
+pub mod rate_limit;
 pub mod session;
 pub mod tls;
 

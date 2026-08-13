@@ -396,6 +396,9 @@ pub async fn start_proxy_at_full(
         system_catalogs: SystemCatalogs::Refuse,
         lineage: Lineage::Refuse,
         metrics_listen: None,
+        rate_limit_per_minute: 0,
+        rate_limit_burst: 0,
+        max_notices_per_exchange: 0,
     };
     let catalog = Arc::new(
         Catalog::resolve(&config.column, &config.semantic_type, &config.catalog_dsn).await?,

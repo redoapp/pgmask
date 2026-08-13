@@ -1356,6 +1356,28 @@ const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     "pg_backend_memory_contexts",
 ];
 
+/// True when the statement names a catalog that holds sampled user data,
+/// other sessions' SQL, passwords, or similar — values default-deny nulling
+/// is not enough for, because the query still runs and soft stats / empty
+/// shapes remain. Refused at the frontend on every posture.
+pub fn touches_leaky_system_catalog(sql: &str) -> bool {
+    use pg_query::NodeRef;
+
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        let NodeRef::RangeVar(v) = node else {
+            continue;
+        };
+        let relation = v.relname.to_ascii_lowercase();
+        if LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Functions that reach data the parse tree never names.
 ///
 /// `query_to_xml('SELECT * FROM demo.customers', …)` takes its query as a
@@ -1696,43 +1718,1260 @@ fn every_relation_is_qualified_inspected(inspection: &StatementInspection<'_>) -
 }
 
 /// Under `posture = "hostile"`: refuse when a masked column appears more often
-/// in the statement than as a bare `ColumnRef` in the outermost SELECT list.
+/// in the statement than as a bare `ColumnRef` in the outermost SELECT list,
+/// after discounting mentions that are only a *simple* `ORDER BY` key.
 ///
-/// That is the smallest rule that closes the measured inference routes
-/// (`WHERE`/`LIKE`, `ORDER BY`, single-row `sum`, error-channel `CASE`) while
-/// still allowing `SELECT email, id FROM t WHERE id = 1`. Unparseable or
-/// unscannable SQL refuses whenever any masked name is involved.
+/// That closes the measured *value* inference routes (`WHERE`/`LIKE`,
+/// single-row `sum`, error-channel `CASE`) while still allowing
+/// `SELECT email, id FROM t WHERE id = 1` and cleartext **ordering** of masked
+/// projections (`ORDER BY email`, `ORDER BY 1`, …). Sorting by cleartext does
+/// not put the cleartext in the wire result; the operator accepts that trade.
 ///
-/// Deliberately lexical for the *count* of mentions (see
-/// [`referenced_identifiers`]) and parse-tree only for the outermost target
-/// list. A tree walk of WHERE/ORDER BY would miss `WindowDef` the same way the
-/// old lineage backstop did.
+/// Counts come from both the token stream and the parse tree (max per name):
+/// unicode-escaped identifiers (`u&"email"`) never appear as the bare word
+/// `email` in the text, but show up decoded on `ColumnRef` nodes. Unparseable
+/// or unscannable SQL refuses whenever any masked name is involved.
+///
+/// `ORDER BY email = 'x'` is **not** credited — that is a membership oracle
+/// smuggled through the sort clause, not cleartext ordering of a column.
 pub fn masked_exceeds_outer_projection(sql: &str, masked: &HashSet<String>) -> bool {
     use std::collections::HashMap;
 
+    if masked.is_empty() {
+        return false;
+    }
     let Some(idents) = referenced_identifiers(sql) else {
-        return !masked.is_empty();
+        return true;
     };
-    let mut lex: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
     for id in &idents {
         if masked.contains(id) {
-            let n = lex
-                .get(id.as_str())
-                .copied()
-                .unwrap_or(0usize)
-                .saturating_add(1);
-            lex.insert(id.as_str(), n);
+            counts
+                .entry(id.clone())
+                .and_modify(|c| *c = c.saturating_add(1))
+                .or_insert(1);
         }
     }
-    if lex.is_empty() {
+    for (name, n) in masked_column_ref_counts(sql, masked) {
+        let entry = counts.entry(name).or_insert(0);
+        *entry = (*entry).max(n);
+    }
+    if counts.is_empty() {
         return false;
     }
     let Some(proj) = outer_bare_projection_counts(sql) else {
         return true;
     };
-    lex.iter()
-        .any(|(name, &n)| n > proj.get(*name).copied().unwrap_or(0))
+    let sort_credit = simple_masked_order_by_credits(sql, masked);
+    counts.iter().any(|(name, &n)| {
+        let credited = n.saturating_sub(sort_credit.get(name).copied().unwrap_or(0));
+        credited > proj.get(name).copied().unwrap_or(0)
+    })
 }
+
+/// How often each masked name appears as a `ColumnRef` (or decoded name String)
+/// in the parse tree. Walks `SelectStmt` clauses comprehensively — including
+/// `WHERE`/`LIMIT`/`ARRAY`/`CASE`/`(t).col` subtrees that `nodes()` skips —
+/// plus join `USING`, alias colnames, and CTE colnames.
+fn masked_column_ref_counts(
+    sql: &str,
+    masked: &HashSet<String>,
+) -> std::collections::HashMap<String, usize> {
+    use pg_query::NodeRef;
+    use std::collections::HashMap;
+
+    let mut counts = HashMap::new();
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return counts;
+    };
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        match node {
+            // Full clause walk — do not also tally bare ColumnRefs from
+            // `nodes()` or the same name is double-counted against the
+            // projection credit (breaking `SELECT email … WHERE id = 1`).
+            NodeRef::SelectStmt(select) => {
+                tally_select_stmt_masked(select, masked, &mut counts);
+            }
+            NodeRef::JoinExpr(join) => {
+                for entry in &join.using_clause {
+                    tally_masked_string_node(entry, masked, &mut counts);
+                }
+                if let Some(quals) = join.quals.as_ref() {
+                    tally_masked_column_refs_in(quals, masked, &mut counts);
+                }
+            }
+            NodeRef::CommonTableExpr(cte) => {
+                for entry in &cte.aliascolnames {
+                    tally_masked_string_node(entry, masked, &mut counts);
+                }
+            }
+            NodeRef::Alias(alias) => {
+                for entry in &alias.colnames {
+                    tally_masked_string_node(entry, masked, &mut counts);
+                }
+            }
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn tally_select_stmt_masked(
+    select: &pg_query::protobuf::SelectStmt,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    for entry in &select.distinct_clause {
+        tally_masked_column_refs_in(entry, masked, counts);
+    }
+    for target in &select.target_list {
+        if let Some(NodeEnum::ResTarget(t)) = target.node.as_ref() {
+            if let Some(val) = t.val.as_ref() {
+                tally_masked_column_refs_in(val, masked, counts);
+            }
+        }
+    }
+    if let Some(w) = select.where_clause.as_ref() {
+        tally_masked_column_refs_in(w, masked, counts);
+    }
+    for entry in &select.group_clause {
+        tally_masked_column_refs_in(entry, masked, counts);
+    }
+    if let Some(having) = select.having_clause.as_ref() {
+        tally_masked_column_refs_in(having, masked, counts);
+    }
+    for window in &select.window_clause {
+        if let Some(NodeEnum::WindowDef(w)) = window.node.as_ref() {
+            tally_masked_in_window_def(w, masked, counts);
+        }
+    }
+    for sort in &select.sort_clause {
+        if let Some(NodeEnum::SortBy(s)) = sort.node.as_ref() {
+            if let Some(expr) = s.node.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+    }
+    // LIMIT/OFFSET/FETCH scalar subqueries that embed masked predicates.
+    if let Some(lim) = select.limit_count.as_ref() {
+        tally_masked_column_refs_in(lim, masked, counts);
+    }
+    if let Some(off) = select.limit_offset.as_ref() {
+        tally_masked_column_refs_in(off, masked, counts);
+    }
+    for list in &select.values_lists {
+        tally_masked_column_refs_in(list, masked, counts);
+    }
+    // JOIN … ON quals live under from_clause, not WHERE.
+    for from in &select.from_clause {
+        tally_from_item_masked(from, masked, counts);
+    }
+    if let Some(left) = select.larg.as_ref() {
+        tally_select_stmt_masked(left, masked, counts);
+    }
+    if let Some(right) = select.rarg.as_ref() {
+        tally_select_stmt_masked(right, masked, counts);
+    }
+}
+
+fn tally_from_item_masked(
+    node: &pg_query::protobuf::Node,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    match node.node.as_ref() {
+        Some(NodeEnum::JoinExpr(join)) => {
+            for entry in &join.using_clause {
+                tally_masked_string_node(entry, masked, counts);
+            }
+            if let Some(quals) = join.quals.as_ref() {
+                tally_masked_column_refs_in(quals, masked, counts);
+            }
+            if let Some(left) = join.larg.as_ref() {
+                tally_from_item_masked(left, masked, counts);
+            }
+            if let Some(right) = join.rarg.as_ref() {
+                tally_from_item_masked(right, masked, counts);
+            }
+        }
+        Some(NodeEnum::RangeSubselect(sub)) => {
+            if let Some(alias) = sub.alias.as_ref() {
+                for entry in &alias.colnames {
+                    tally_masked_string_node(entry, masked, counts);
+                }
+            }
+            if let Some(query) = sub.subquery.as_ref() {
+                tally_masked_column_refs_in(query, masked, counts);
+            }
+        }
+        Some(NodeEnum::RangeFunction(func)) => {
+            if let Some(alias) = func.alias.as_ref() {
+                for entry in &alias.colnames {
+                    tally_masked_string_node(entry, masked, counts);
+                }
+            }
+            for call in &func.functions {
+                tally_masked_column_refs_in(call, masked, counts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tally_masked_in_window_def(
+    window: &pg_query::protobuf::WindowDef,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    for part in &window.partition_clause {
+        tally_masked_column_refs_in(part, masked, counts);
+    }
+    for sort in &window.order_clause {
+        if let Some(NodeEnum::SortBy(s)) = sort.node.as_ref() {
+            if let Some(expr) = s.node.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+    }
+}
+
+fn tally_masked_string_node(
+    node: &pg_query::protobuf::Node,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    if let Some(NodeEnum::String(s)) = node.node.as_ref() {
+        let name = s.sval.to_ascii_lowercase();
+        if masked.contains(&name) {
+            counts
+                .entry(name)
+                .and_modify(|c| *c = c.saturating_add(1))
+                .or_insert(1);
+        }
+    }
+}
+
+fn tally_masked_column_ref(
+    column: &pg_query::protobuf::ColumnRef,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    if let Some(last) = column.fields.last() {
+        if let Some(NodeEnum::String(s)) = last.node.as_ref() {
+            let name = s.sval.to_ascii_lowercase();
+            if masked.contains(&name) {
+                counts
+                    .entry(name)
+                    .and_modify(|c| *c = c.saturating_add(1))
+                    .or_insert(1);
+            }
+        }
+    }
+}
+
+fn tally_masked_column_refs_in(
+    node: &pg_query::protobuf::Node,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    match node.node.as_ref() {
+        Some(NodeEnum::ColumnRef(column)) => tally_masked_column_ref(column, masked, counts),
+        Some(NodeEnum::TypeCast(cast)) => {
+            if let Some(arg) = cast.arg.as_ref() {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::CollateClause(c)) => {
+            if let Some(arg) = c.arg.as_ref() {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::AExpr(expr)) => {
+            for side in [expr.lexpr.as_ref(), expr.rexpr.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                tally_masked_column_refs_in(side, masked, counts);
+            }
+        }
+        Some(NodeEnum::BoolExpr(expr)) => {
+            for arg in &expr.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::NullTest(n)) => {
+            if let Some(arg) = n.arg.as_ref() {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::FuncCall(call)) => {
+            for arg in &call.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+            if let Some(filter) = call.agg_filter.as_ref() {
+                tally_masked_column_refs_in(filter, masked, counts);
+            }
+            if let Some(over) = call.over.as_ref() {
+                tally_masked_in_window_def(over, masked, counts);
+            }
+        }
+        Some(NodeEnum::CoalesceExpr(c)) => {
+            for arg in &c.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::MinMaxExpr(m)) => {
+            for arg in &m.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::SubLink(sub)) => {
+            if let Some(t) = sub.testexpr.as_ref() {
+                tally_masked_column_refs_in(t, masked, counts);
+            }
+            if let Some(s) = sub.subselect.as_ref() {
+                tally_masked_column_refs_in(s, masked, counts);
+            }
+        }
+        Some(NodeEnum::CaseExpr(c)) => {
+            if let Some(a) = c.arg.as_ref() {
+                tally_masked_column_refs_in(a, masked, counts);
+            }
+            for arm in &c.args {
+                tally_masked_column_refs_in(arm, masked, counts);
+            }
+            if let Some(d) = c.defresult.as_ref() {
+                tally_masked_column_refs_in(d, masked, counts);
+            }
+        }
+        Some(NodeEnum::CaseWhen(w)) => {
+            if let Some(e) = w.expr.as_ref() {
+                tally_masked_column_refs_in(e, masked, counts);
+            }
+            if let Some(r) = w.result.as_ref() {
+                tally_masked_column_refs_in(r, masked, counts);
+            }
+        }
+        Some(NodeEnum::GroupingSet(set)) => {
+            for member in &set.content {
+                tally_masked_column_refs_in(member, masked, counts);
+            }
+        }
+        Some(NodeEnum::AArrayExpr(arr)) => {
+            for el in &arr.elements {
+                tally_masked_column_refs_in(el, masked, counts);
+            }
+        }
+        Some(NodeEnum::ArrayExpr(arr)) => {
+            for el in &arr.elements {
+                tally_masked_column_refs_in(el, masked, counts);
+            }
+        }
+        Some(NodeEnum::AIndirection(ind)) => {
+            if let Some(arg) = ind.arg.as_ref() {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+            for part in &ind.indirection {
+                tally_masked_string_node(part, masked, counts);
+                tally_masked_column_refs_in(part, masked, counts);
+            }
+        }
+        Some(NodeEnum::XmlExpr(xml)) => {
+            for arg in xml.args.iter().chain(xml.named_args.iter()) {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::NamedArgExpr(named)) => {
+            if let Some(arg) = named.arg.as_ref() {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::SubscriptingRef(sub)) => {
+            if let Some(expr) = sub.refexpr.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+            for idx in sub.refupperindexpr.iter().chain(sub.reflowerindexpr.iter()) {
+                tally_masked_column_refs_in(idx, masked, counts);
+            }
+        }
+        Some(NodeEnum::RowExpr(row)) => {
+            for arg in &row.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::ResTarget(target)) => {
+            if let Some(val) = target.val.as_ref() {
+                tally_masked_column_refs_in(val, masked, counts);
+            }
+        }
+        Some(NodeEnum::List(list)) => {
+            for item in &list.items {
+                tally_masked_column_refs_in(item, masked, counts);
+            }
+        }
+        Some(NodeEnum::SelectStmt(select)) => {
+            tally_select_stmt_masked(select, masked, counts);
+        }
+        Some(NodeEnum::BooleanTest(b)) => {
+            if let Some(arg) = b.arg.as_ref() {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::XmlSerialize(x)) => {
+            if let Some(expr) = x.expr.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonObjectConstructor(j)) => {
+            for expr in &j.exprs {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonArrayConstructor(j)) => {
+            for expr in &j.exprs {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonConstructorExpr(j)) => {
+            for arg in &j.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+            if let Some(func) = j.func.as_ref() {
+                tally_masked_column_refs_in(func, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonKeyValue(kv)) => {
+            if let Some(key) = kv.key.as_ref() {
+                tally_masked_column_refs_in(key, masked, counts);
+            }
+            if let Some(value) = kv.value.as_ref() {
+                if let Some(raw) = value.raw_expr.as_ref() {
+                    tally_masked_column_refs_in(raw, masked, counts);
+                }
+                if let Some(formatted) = value.formatted_expr.as_ref() {
+                    tally_masked_column_refs_in(formatted, masked, counts);
+                }
+            }
+        }
+        Some(NodeEnum::JsonValueExpr(v)) => {
+            if let Some(raw) = v.raw_expr.as_ref() {
+                tally_masked_column_refs_in(raw, masked, counts);
+            }
+            if let Some(formatted) = v.formatted_expr.as_ref() {
+                tally_masked_column_refs_in(formatted, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonArrayAgg(agg)) => {
+            if let Some(arg) = agg.arg.as_ref() {
+                if let Some(raw) = arg.raw_expr.as_ref() {
+                    tally_masked_column_refs_in(raw, masked, counts);
+                }
+            }
+            if let Some(ctor) = agg.constructor.as_ref() {
+                if let Some(filter) = ctor.agg_filter.as_ref() {
+                    tally_masked_column_refs_in(filter, masked, counts);
+                }
+                for order in &ctor.agg_order {
+                    if let Some(NodeEnum::SortBy(s)) = order.node.as_ref() {
+                        if let Some(expr) = s.node.as_ref() {
+                            tally_masked_column_refs_in(expr, masked, counts);
+                        }
+                    }
+                }
+            }
+        }
+        Some(NodeEnum::JsonObjectAgg(agg)) => {
+            if let Some(arg) = agg.arg.as_ref() {
+                if let Some(key) = arg.key.as_ref() {
+                    tally_masked_column_refs_in(key, masked, counts);
+                }
+                if let Some(value) = arg.value.as_ref() {
+                    if let Some(raw) = value.raw_expr.as_ref() {
+                        tally_masked_column_refs_in(raw, masked, counts);
+                    }
+                }
+            }
+            if let Some(ctor) = agg.constructor.as_ref() {
+                if let Some(filter) = ctor.agg_filter.as_ref() {
+                    tally_masked_column_refs_in(filter, masked, counts);
+                }
+                for order in &ctor.agg_order {
+                    if let Some(NodeEnum::SortBy(s)) = order.node.as_ref() {
+                        if let Some(expr) = s.node.as_ref() {
+                            tally_masked_column_refs_in(expr, masked, counts);
+                        }
+                    }
+                }
+            }
+        }
+        Some(NodeEnum::JsonIsPredicate(p)) => {
+            if let Some(expr) = p.expr.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonArrayQueryConstructor(j)) => {
+            if let Some(query) = j.query.as_ref() {
+                tally_masked_column_refs_in(query, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonParseExpr(j)) => {
+            if let Some(expr) = j.expr.as_ref() {
+                if let Some(raw) = expr.raw_expr.as_ref() {
+                    tally_masked_column_refs_in(raw, masked, counts);
+                }
+            }
+        }
+        Some(NodeEnum::JsonScalarExpr(j)) => {
+            if let Some(expr) = j.expr.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonSerializeExpr(j)) => {
+            if let Some(expr) = j.expr.as_ref() {
+                if let Some(raw) = expr.raw_expr.as_ref() {
+                    tally_masked_column_refs_in(raw, masked, counts);
+                }
+            }
+        }
+        Some(NodeEnum::NullIfExpr(n)) => {
+            for arg in &n.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::ScalarArrayOpExpr(s)) => {
+            for arg in &s.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Credit only *simple* sort keys (`ORDER BY email`, `ORDER BY email::text`,
+/// `ORDER BY email COLLATE "C"`). Comparisons and functions in the sort list
+/// (`ORDER BY email = 'x'`, `ORDER BY length(email)`) are value oracles and
+/// must not be discounted.
+fn simple_masked_order_by_credits(
+    sql: &str,
+    masked: &HashSet<String>,
+) -> std::collections::HashMap<String, usize> {
+    use pg_query::NodeRef;
+    use std::collections::HashMap;
+
+    let mut counts = HashMap::new();
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return counts;
+    };
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        let NodeRef::SelectStmt(select) = node else {
+            continue;
+        };
+        for sort in &select.sort_clause {
+            if let Some(NodeEnum::SortBy(s)) = sort.node.as_ref() {
+                if let Some(expr) = s.node.as_ref() {
+                    if let Some(name) = simple_sort_key_masked_name(expr, masked) {
+                        counts
+                            .entry(name)
+                            .and_modify(|c| *c = c.saturating_add(1))
+                            .or_insert(1);
+                    }
+                }
+            }
+        }
+        for window in &select.window_clause {
+            if let Some(NodeEnum::WindowDef(w)) = window.node.as_ref() {
+                for sort in &w.order_clause {
+                    if let Some(NodeEnum::SortBy(s)) = sort.node.as_ref() {
+                        if let Some(expr) = s.node.as_ref() {
+                            if let Some(name) = simple_sort_key_masked_name(expr, masked) {
+                                counts
+                                    .entry(name)
+                                    .and_modify(|c| *c = c.saturating_add(1))
+                                    .or_insert(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    counts
+}
+
+fn simple_sort_key_masked_name(
+    node: &pg_query::protobuf::Node,
+    masked: &HashSet<String>,
+) -> Option<String> {
+    match node.node.as_ref()? {
+        NodeEnum::ColumnRef(column) => {
+            let last = column.fields.last()?;
+            let NodeEnum::String(s) = last.node.as_ref()? else {
+                return None;
+            };
+            let name = s.sval.to_ascii_lowercase();
+            masked.contains(&name).then_some(name)
+        }
+        NodeEnum::TypeCast(cast) => simple_sort_key_masked_name(cast.arg.as_ref()?, masked),
+        NodeEnum::CollateClause(c) => simple_sort_key_masked_name(c.arg.as_ref()?, masked),
+        _ => None,
+    }
+}
+
+/// Under hostile: refuse NATURAL JOIN / column-alias-lists that hide masked
+/// columns behind other names.
+///
+/// - `FROM customers AS t(c1,c2,…)` renames `email` to `c2`, then
+///   `WHERE c2 = '…'` is a cleartext membership oracle with no masked token.
+/// - `NATURAL JOIN` equates on every same-named column including masked ones,
+///   with or without those names appearing in the SQL text.
+///
+/// Unparseable SQL fails closed when any masked name exists.
+pub fn hostile_join_or_rename_masked(
+    sql: &str,
+    relation_columns: &std::collections::HashMap<String, Vec<String>>,
+    masked: &HashSet<String>,
+) -> bool {
+    use pg_query::NodeRef;
+
+    if masked.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return true;
+    };
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        match node {
+            NodeRef::RangeVar(v) => {
+                let Some(alias) = v.alias.as_ref() else {
+                    continue;
+                };
+                if alias.colnames.is_empty() {
+                    continue;
+                }
+                let rel = v.relname.to_ascii_lowercase();
+                let schema = v.schemaname.to_ascii_lowercase();
+                let cols = columns_for_relation(relation_columns, &schema, &rel);
+                if cols.iter().any(|c| masked.contains(c)) {
+                    return true;
+                }
+            }
+            NodeRef::JoinExpr(join)
+                if join.is_natural
+                    && (join_side_has_masked_relation(
+                        join.larg.as_deref(),
+                        relation_columns,
+                        masked,
+                    ) || join_side_has_masked_relation(
+                        join.rarg.as_deref(),
+                        relation_columns,
+                        masked,
+                    )) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn join_side_has_masked_relation(
+    node: Option<&pg_query::protobuf::Node>,
+    relation_columns: &std::collections::HashMap<String, Vec<String>>,
+    masked: &HashSet<String>,
+) -> bool {
+    let Some(node) = node else {
+        return false;
+    };
+    match node.node.as_ref() {
+        Some(NodeEnum::RangeVar(v)) => {
+            let rel = v.relname.to_ascii_lowercase();
+            let schema = v.schemaname.to_ascii_lowercase();
+            let cols = columns_for_relation(relation_columns, &schema, &rel);
+            cols.iter().any(|c| masked.contains(c))
+        }
+        Some(NodeEnum::JoinExpr(join)) => {
+            join_side_has_masked_relation(join.larg.as_deref(), relation_columns, masked)
+                || join_side_has_masked_relation(join.rarg.as_deref(), relation_columns, masked)
+        }
+        Some(NodeEnum::RangeSubselect(sub)) => {
+            // Subquery / VALUES side of NATURAL JOIN: if it exposes a colnames
+            // alias that matches a masked name, the join equates on cleartext.
+            if let Some(alias) = sub.alias.as_ref() {
+                for entry in &alias.colnames {
+                    if let Some(NodeEnum::String(s)) = entry.node.as_ref() {
+                        if masked.contains(&s.sval.to_ascii_lowercase()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            // Also: subquery body selecting masked columns — walk SelectStmt.
+            if let Some(query) = sub.subquery.as_deref() {
+                return select_projects_or_names_masked(query, masked);
+            }
+            false
+        }
+        Some(NodeEnum::RangeFunction(func)) => {
+            if let Some(alias) = func.alias.as_ref() {
+                for entry in &alias.colnames {
+                    if let Some(NodeEnum::String(s)) = entry.node.as_ref() {
+                        if masked.contains(&s.sval.to_ascii_lowercase()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn select_projects_or_names_masked(
+    node: &pg_query::protobuf::Node,
+    masked: &HashSet<String>,
+) -> bool {
+    match node.node.as_ref() {
+        Some(NodeEnum::SelectStmt(select)) => {
+            for target in &select.target_list {
+                if let Some(NodeEnum::ResTarget(t)) = target.node.as_ref() {
+                    if !t.name.is_empty() && masked.contains(&t.name.to_ascii_lowercase()) {
+                        return true;
+                    }
+                    if let Some(val) = t.val.as_ref() {
+                        let mut counts = std::collections::HashMap::new();
+                        tally_masked_column_refs_in(val, masked, &mut counts);
+                        if !counts.is_empty() {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Under hostile: refuse whole-row references to a FROM item.
+///
+/// `t::text`, `format('%s', t)`, `concat(t)`, and `customers::text` never name
+/// a masked column, so [`masked_exceeds_outer_projection`] allows them — but
+/// Postgres still embeds every column's cleartext in the row text. That is a
+/// full cleartext membership oracle.
+///
+/// `relation_columns` maps qualified (and possibly bare) relation names to
+/// their bare column names. A FROM alias that collides with a column *of that
+/// relation* (`FROM demo.customers email`) is not treated as a row variable —
+/// Postgres prefers the column, and the lexical gate covers masked names.
+/// Unparseable SQL fails closed.
+pub fn hostile_uses_whole_row(
+    sql: &str,
+    relation_columns: &std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    use pg_query::NodeRef;
+
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return true;
+    };
+    let mut row_names = HashSet::new();
+    let mut qualified = HashSet::new();
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        match node {
+            NodeRef::RangeVar(v) => {
+                let rel = v.relname.to_ascii_lowercase();
+                if rel.is_empty() {
+                    continue;
+                }
+                let schema = v.schemaname.to_ascii_lowercase();
+                if !schema.is_empty() {
+                    qualified.insert(format!("{schema}.{rel}"));
+                }
+                let cols_on_rel = columns_for_relation(relation_columns, &schema, &rel);
+                let mut consider = |binder: String| {
+                    if !binder.is_empty() && !cols_on_rel.iter().any(|c| c == &binder) {
+                        row_names.insert(binder);
+                    }
+                };
+                if let Some(alias) = v.alias.as_ref() {
+                    consider(alias.aliasname.to_ascii_lowercase());
+                }
+                // Table name is always a possible row variable (with or without alias).
+                consider(rel);
+            }
+            // `FROM (SELECT …) t` — alias is a row variable; no catalog columns.
+            NodeRef::RangeSubselect(sub) => {
+                if let Some(alias) = sub.alias.as_ref() {
+                    let a = alias.aliasname.to_ascii_lowercase();
+                    if !a.is_empty() {
+                        row_names.insert(a);
+                    }
+                }
+            }
+            NodeRef::RangeFunction(func) => {
+                if let Some(alias) = func.alias.as_ref() {
+                    let a = alias.aliasname.to_ascii_lowercase();
+                    if !a.is_empty() {
+                        row_names.insert(a);
+                    }
+                }
+            }
+            NodeRef::JoinExpr(join) => {
+                if let Some(alias) = join.alias.as_ref() {
+                    let a = alias.aliasname.to_ascii_lowercase();
+                    if !a.is_empty() {
+                        row_names.insert(a);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if row_names.is_empty() && qualified.is_empty() {
+        return false;
+    }
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        match node {
+            NodeRef::ColumnRef(column) => {
+                if column_ref_is_whole_row(column, &row_names, &qualified) {
+                    return true;
+                }
+            }
+            // `protobuf.nodes()` does not descend into aggregate FILTER
+            // clauses (`count(*) FILTER (WHERE t::text …)`), which is how
+            // this oracle survived the first pass.
+            NodeRef::FuncCall(call) => {
+                if let Some(filter) = call.agg_filter.as_ref() {
+                    if subtree_has_whole_row(filter, &row_names, &qualified) {
+                        return true;
+                    }
+                }
+            }
+            NodeRef::Aggref(agg) => {
+                if let Some(filter) = agg.aggfilter.as_ref() {
+                    if subtree_has_whole_row(filter, &row_names, &qualified) {
+                        return true;
+                    }
+                }
+            }
+            NodeRef::WindowFunc(win) => {
+                if let Some(filter) = win.aggfilter.as_ref() {
+                    if subtree_has_whole_row(filter, &row_names, &qualified) {
+                        return true;
+                    }
+                }
+            }
+            // Same gap: COLLATE hides the TypeCast/ColumnRef from `nodes()`.
+            NodeRef::CollateClause(c) => {
+                if let Some(arg) = c.arg.as_ref() {
+                    if subtree_has_whole_row(arg, &row_names, &qualified) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn subtree_has_whole_row(
+    node: &pg_query::protobuf::Node,
+    row_names: &HashSet<String>,
+    qualified: &HashSet<String>,
+) -> bool {
+    match node.node.as_ref() {
+        Some(NodeEnum::ColumnRef(column)) => column_ref_is_whole_row(column, row_names, qualified),
+        Some(NodeEnum::TypeCast(cast)) => cast
+            .arg
+            .as_ref()
+            .is_some_and(|a| subtree_has_whole_row(a, row_names, qualified)),
+        Some(NodeEnum::CollateClause(c)) => c
+            .arg
+            .as_ref()
+            .is_some_and(|a| subtree_has_whole_row(a, row_names, qualified)),
+        Some(NodeEnum::AExpr(expr)) => [expr.lexpr.as_ref(), expr.rexpr.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|side| subtree_has_whole_row(side, row_names, qualified)),
+        Some(NodeEnum::BoolExpr(expr)) => expr
+            .args
+            .iter()
+            .any(|arg| subtree_has_whole_row(arg, row_names, qualified)),
+        Some(NodeEnum::NullTest(n)) => n
+            .arg
+            .as_ref()
+            .is_some_and(|a| subtree_has_whole_row(a, row_names, qualified)),
+        Some(NodeEnum::FuncCall(call)) => {
+            call.args
+                .iter()
+                .any(|arg| subtree_has_whole_row(arg, row_names, qualified))
+                || call
+                    .agg_filter
+                    .as_ref()
+                    .is_some_and(|f| subtree_has_whole_row(f, row_names, qualified))
+        }
+        Some(NodeEnum::CoalesceExpr(c)) => c
+            .args
+            .iter()
+            .any(|arg| subtree_has_whole_row(arg, row_names, qualified)),
+        Some(NodeEnum::MinMaxExpr(m)) => m
+            .args
+            .iter()
+            .any(|arg| subtree_has_whole_row(arg, row_names, qualified)),
+        Some(NodeEnum::SubLink(sub)) => {
+            sub.testexpr
+                .as_ref()
+                .is_some_and(|t| subtree_has_whole_row(t, row_names, qualified))
+                || sub
+                    .subselect
+                    .as_ref()
+                    .is_some_and(|s| subtree_has_whole_row(s, row_names, qualified))
+        }
+        Some(NodeEnum::CaseExpr(c)) => {
+            c.arg
+                .as_ref()
+                .is_some_and(|a| subtree_has_whole_row(a, row_names, qualified))
+                || c.args
+                    .iter()
+                    .any(|arm| subtree_has_whole_row(arm, row_names, qualified))
+                || c.defresult
+                    .as_ref()
+                    .is_some_and(|d| subtree_has_whole_row(d, row_names, qualified))
+        }
+        Some(NodeEnum::CaseWhen(w)) => {
+            w.expr
+                .as_ref()
+                .is_some_and(|e| subtree_has_whole_row(e, row_names, qualified))
+                || w.result
+                    .as_ref()
+                    .is_some_and(|r| subtree_has_whole_row(r, row_names, qualified))
+        }
+        _ => false,
+    }
+}
+
+fn columns_for_relation<'a>(
+    relation_columns: &'a std::collections::HashMap<String, Vec<String>>,
+    schema: &str,
+    rel: &str,
+) -> &'a [String] {
+    if !schema.is_empty() {
+        let q = format!("{schema}.{rel}");
+        if let Some(cols) = relation_columns.get(&q) {
+            return cols.as_slice();
+        }
+    }
+    if let Some(cols) = relation_columns.get(rel) {
+        return cols.as_slice();
+    }
+    // Unqualified FROM with search_path: match any schema.rel suffix.
+    for (name, cols) in relation_columns {
+        if name == rel || name.ends_with(&format!(".{rel}")) {
+            return cols.as_slice();
+        }
+    }
+    &[]
+}
+
+fn column_ref_is_whole_row(
+    column: &pg_query::protobuf::ColumnRef,
+    row_names: &HashSet<String>,
+    qualified: &HashSet<String>,
+) -> bool {
+    let fields: Vec<&str> = column
+        .fields
+        .iter()
+        .filter_map(|f| match f.node.as_ref() {
+            Some(NodeEnum::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    match fields.as_slice() {
+        [name] => row_names.contains(&name.to_ascii_lowercase()),
+        [schema, rel] => {
+            let q = format!(
+                "{}.{}",
+                schema.to_ascii_lowercase(),
+                rel.to_ascii_lowercase()
+            );
+            qualified.contains(&q)
+        }
+        _ => false,
+    }
+}
+
+/// `DO` / `CALL` / `CREATE FUNCTION` (and `CREATE PROCEDURE`) — they run or
+/// install PL/pgSQL without a maskable projection, which is how the timing and
+/// exception-presence oracles under `posture = "hostile"` still worked after
+/// notice caps. Exploration does not need them; refuse the statement class.
+pub fn is_procedural_statement(sql: &str) -> bool {
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    for raw in &parsed.protobuf.stmts {
+        let Some(node) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        match node {
+            NodeEnum::DoStmt(_) | NodeEnum::CallStmt(_) | NodeEnum::CreateFunctionStmt(_) => {
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Anything that is not on the read-only allowlist.
+///
+/// Fail-closed: every `*Stmt` node must be explicitly permitted, or the
+/// statement is refused. A denylist missed `CREATE VIEW` / `LOAD` /
+/// `CHECKPOINT` (and would miss the next DDL variant pg_query adds). pgmask
+/// is a read-only masking proxy — writes and admin DDL are refused on every
+/// posture, not only hostile.
+pub fn is_write_statement(sql: &str) -> bool {
+    use pg_query::NodeRef;
+
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        match node {
+            // --- read-only / session allowlist ---------------------------------
+            NodeRef::SelectStmt(select) => {
+                // Row locks and SELECT INTO are write-adjacent.
+                if select.into_clause.is_some() || !select.locking_clause.is_empty() {
+                    return true;
+                }
+            }
+            NodeRef::SetOperationStmt(_)
+            | NodeRef::ExplainStmt(_)
+            | NodeRef::VariableSetStmt(_)
+            | NodeRef::VariableShowStmt(_)
+            | NodeRef::TransactionStmt(_)
+            | NodeRef::PrepareStmt(_)
+            | NodeRef::ExecuteStmt(_)
+            | NodeRef::DeallocateStmt(_)
+            | NodeRef::DiscardStmt(_)
+            | NodeRef::DeclareCursorStmt(_)
+            | NodeRef::FetchStmt(_)
+            | NodeRef::ClosePortalStmt(_)
+            | NodeRef::ConstraintsSetStmt(_)
+            | NodeRef::RawStmt(_) => {}
+
+            // --- every other statement class is refused ------------------------
+            NodeRef::InsertStmt(_)
+            | NodeRef::UpdateStmt(_)
+            | NodeRef::DeleteStmt(_)
+            | NodeRef::MergeStmt(_)
+            | NodeRef::TruncateStmt(_)
+            | NodeRef::CopyStmt(_)
+            | NodeRef::ViewStmt(_)
+            | NodeRef::LoadStmt(_)
+            | NodeRef::CheckPointStmt(_)
+            | NodeRef::CreateStmt(_)
+            | NodeRef::CreateTableAsStmt(_)
+            | NodeRef::CreateSchemaStmt(_)
+            | NodeRef::CreateSeqStmt(_)
+            | NodeRef::CreateForeignTableStmt(_)
+            | NodeRef::CreateFunctionStmt(_)
+            | NodeRef::CreateTrigStmt(_)
+            | NodeRef::CreateRoleStmt(_)
+            | NodeRef::CreatedbStmt(_)
+            | NodeRef::CreateEnumStmt(_)
+            | NodeRef::CreateDomainStmt(_)
+            | NodeRef::CreateExtensionStmt(_)
+            | NodeRef::CreatePlangStmt(_)
+            | NodeRef::CreateConversionStmt(_)
+            | NodeRef::CreateCastStmt(_)
+            | NodeRef::CreateOpClassStmt(_)
+            | NodeRef::CreateOpFamilyStmt(_)
+            | NodeRef::CreateTableSpaceStmt(_)
+            | NodeRef::CreateFdwStmt(_)
+            | NodeRef::CreateForeignServerStmt(_)
+            | NodeRef::CreateUserMappingStmt(_)
+            | NodeRef::CreateEventTrigStmt(_)
+            | NodeRef::CreatePolicyStmt(_)
+            | NodeRef::CreateTransformStmt(_)
+            | NodeRef::CreateAmStmt(_)
+            | NodeRef::CreatePublicationStmt(_)
+            | NodeRef::CreateSubscriptionStmt(_)
+            | NodeRef::CreateStatsStmt(_)
+            | NodeRef::CreateRangeStmt(_)
+            | NodeRef::CompositeTypeStmt(_)
+            | NodeRef::DefineStmt(_)
+            | NodeRef::IndexStmt(_)
+            | NodeRef::RuleStmt(_)
+            | NodeRef::DropStmt(_)
+            | NodeRef::DropRoleStmt(_)
+            | NodeRef::DropdbStmt(_)
+            | NodeRef::DropTableSpaceStmt(_)
+            | NodeRef::DropUserMappingStmt(_)
+            | NodeRef::DropOwnedStmt(_)
+            | NodeRef::DropSubscriptionStmt(_)
+            | NodeRef::AlterTableStmt(_)
+            | NodeRef::AlterSeqStmt(_)
+            | NodeRef::AlterRoleStmt(_)
+            | NodeRef::AlterDatabaseStmt(_)
+            | NodeRef::AlterDatabaseSetStmt(_)
+            | NodeRef::AlterDatabaseRefreshCollStmt(_)
+            | NodeRef::AlterFunctionStmt(_)
+            | NodeRef::AlterOwnerStmt(_)
+            | NodeRef::AlterObjectSchemaStmt(_)
+            | NodeRef::AlterObjectDependsStmt(_)
+            | NodeRef::AlterEnumStmt(_)
+            | NodeRef::AlterSystemStmt(_)
+            | NodeRef::AlterDomainStmt(_)
+            | NodeRef::AlterDefaultPrivilegesStmt(_)
+            | NodeRef::AlterOpFamilyStmt(_)
+            | NodeRef::AlterOperatorStmt(_)
+            | NodeRef::AlterTypeStmt(_)
+            | NodeRef::AlterRoleSetStmt(_)
+            | NodeRef::AlterTsdictionaryStmt(_)
+            | NodeRef::AlterTsconfigurationStmt(_)
+            | NodeRef::AlterFdwStmt(_)
+            | NodeRef::AlterForeignServerStmt(_)
+            | NodeRef::AlterUserMappingStmt(_)
+            | NodeRef::AlterTableSpaceOptionsStmt(_)
+            | NodeRef::AlterTableMoveAllStmt(_)
+            | NodeRef::AlterExtensionStmt(_)
+            | NodeRef::AlterExtensionContentsStmt(_)
+            | NodeRef::AlterEventTrigStmt(_)
+            | NodeRef::AlterPolicyStmt(_)
+            | NodeRef::AlterPublicationStmt(_)
+            | NodeRef::AlterSubscriptionStmt(_)
+            | NodeRef::AlterStatsStmt(_)
+            | NodeRef::AlterCollationStmt(_)
+            | NodeRef::RenameStmt(_)
+            | NodeRef::GrantStmt(_)
+            | NodeRef::GrantRoleStmt(_)
+            | NodeRef::ReassignOwnedStmt(_)
+            | NodeRef::CommentStmt(_)
+            | NodeRef::SecLabelStmt(_)
+            | NodeRef::ImportForeignSchemaStmt(_)
+            | NodeRef::ReplicaIdentityStmt(_)
+            | NodeRef::VacuumStmt(_)
+            | NodeRef::ReindexStmt(_)
+            | NodeRef::ClusterStmt(_)
+            | NodeRef::RefreshMatViewStmt(_)
+            | NodeRef::LockStmt(_)
+            | NodeRef::DoStmt(_)
+            | NodeRef::CallStmt(_)
+            | NodeRef::NotifyStmt(_)
+            | NodeRef::ListenStmt(_)
+            | NodeRef::UnlistenStmt(_)
+            | NodeRef::ReturnStmt(_)
+            | NodeRef::PlassignStmt(_) => return true,
+
+            // Expression / type / utility nodes inside an allowed statement.
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A function call that is not on the trusted `pg_catalog` allowlist.
+///
+/// Schema-qualified calls outside `pg_catalog` (e.g. `demo.sleep_if`) are how a
+/// preinstalled PL/pgSQL function still ran under read-only + hostile: the
+/// return value was opaque-refused, but timing / side effects happened first.
+/// Unqualified names must appear on the same allowlists `classify` already
+/// trusts; everything else is refused before the backend sees it.
+///
+/// Metadata-only catalog queries are exempt — they need `format_type` and
+/// friends, and [`reads_only_server_metadata`] already gates that path.
+pub fn calls_untrusted_function(sql: &str) -> bool {
+    use pg_query::NodeRef;
+
+    if reads_only_server_metadata(sql) {
+        return false;
+    }
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        let NodeRef::FuncCall(call) = node else {
+            continue;
+        };
+        if !func_call_is_trusted(call) {
+            return true;
+        }
+    }
+    false
+}
+
+fn func_call_name_parts(call: &pg_query::protobuf::FuncCall) -> Option<Vec<String>> {
+    let mut parts = Vec::with_capacity(call.funcname.len());
+    for node in &call.funcname {
+        let NodeEnum::String(s) = node.node.as_ref()? else {
+            return None;
+        };
+        parts.push(s.sval.to_ascii_lowercase());
+    }
+    Some(parts)
+}
+
+fn func_call_is_trusted(call: &pg_query::protobuf::FuncCall) -> bool {
+    let Some(parts) = func_call_name_parts(call) else {
+        return false;
+    };
+    let name = match parts.as_slice() {
+        [name] => name.as_str(),
+        [schema, name] if schema == "pg_catalog" => name.as_str(),
+        _ => return false,
+    };
+    is_trusted_function_name(name)
+}
+
+fn is_trusted_function_name(name: &str) -> bool {
+    CONTEXT_FUNCTIONS.contains(&name)
+        || SIZE_FUNCTIONS.contains(&name)
+        || REDUCING_AGGREGATES.contains(&name)
+        || RANKING_WINDOWS.contains(&name)
+        || PURE_SCALARS.contains(&name)
+        || TEXT_FUNCTIONS.contains(&name)
+        || name == "date_trunc"
+}
+
+/// Unqualified text helpers that analysis already treats as ordinary expressions
+/// (usually opaque). Listed so a `lower(city)` under default posture is not
+/// mistaken for a user-defined function; they never get a free pass past the
+/// projection / opaque gates.
+const TEXT_FUNCTIONS: &[&str] = &[
+    "length",
+    "char_length",
+    "character_length",
+    "octet_length",
+    "lower",
+    "upper",
+    "initcap",
+    "substr",
+    "substring",
+    "left",
+    "right",
+    "trim",
+    "btrim",
+    "ltrim",
+    "rtrim",
+    "replace",
+    "translate",
+    "overlay",
+    "concat",
+    "concat_ws",
+    "format",
+    "repeat",
+    "reverse",
+    "ascii",
+    "chr",
+    "md5",
+    "convert",
+    "convert_from",
+    "convert_to",
+    "encode",
+    "decode",
+];
 
 fn outer_bare_projection_counts(sql: &str) -> Option<std::collections::HashMap<String, usize>> {
     use std::collections::HashMap;
@@ -1842,6 +3081,10 @@ mod tests {
             assert!(
                 !reads_only_server_metadata(sql),
                 "must not be released: {sql}"
+            );
+            assert!(
+                touches_leaky_system_catalog(sql),
+                "must be frontend-refused: {sql}"
             );
         }
     }
@@ -3176,7 +4419,7 @@ mod referenced_identifier_probe {
             &masked
         ));
         // ORDER BY ranking.
-        assert!(masked_exceeds_outer_projection(
+        assert!(!masked_exceeds_outer_projection(
             "SELECT id FROM demo.customers ORDER BY email",
             &masked
         ));
@@ -3191,10 +4434,309 @@ mod referenced_identifier_probe {
              THEN 0 ELSE 1 END)",
             &masked
         ));
+        // Cleartext ORDER BY is accepted — values stay masked on the wire.
+        assert!(!masked_exceeds_outer_projection(
+            "SELECT email FROM demo.customers ORDER BY 1",
+            &masked
+        ));
+        assert!(!masked_exceeds_outer_projection(
+            "SELECT email AS e FROM demo.customers ORDER BY e",
+            &masked
+        ));
+        // ORDER BY with a predicate is a membership oracle — not credited.
+        assert!(masked_exceeds_outer_projection(
+            "SELECT id FROM demo.customers ORDER BY email = 'user1@example.com' DESC",
+            &masked
+        ));
+        // Unicode-escaped identifiers decode on ColumnRef; lexical scan misses them.
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT id FROM demo.customers WHERE u&"email" = 'user1@example.com'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers WHERE u&"e\006dail" LIKE 'u%'"#,
+            &masked
+        ));
         // Equality on the masked column itself.
         assert!(masked_exceeds_outer_projection(
             "SELECT email FROM demo.customers WHERE email = 'user1@example.com'",
             &masked
+        ));
+    }
+
+    #[test]
+    fn hostile_closes_whole_row_cleartext_oracles() {
+        use std::collections::HashMap;
+        let mut relations = HashMap::new();
+        relations.insert(
+            "demo.customers".into(),
+            vec!["id".into(), "email".into(), "name".into(), "city".into()],
+        );
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM demo.customers t WHERE t::text LIKE '%u%'",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM demo.customers t WHERE format('%s', t) LIKE '%u%'",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM demo.customers WHERE customers::text LIKE '%u%'",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT id FROM demo.customers t ORDER BY t::text",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM demo.customers a JOIN demo.customers b ON a::text = b::text",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FILTER (WHERE t::text LIKE '%u%') FROM demo.customers t",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM demo.customers t WHERE t::text COLLATE \"C\" LIKE '%u%'",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM (SELECT * FROM demo.customers) t WHERE t::text LIKE '%u%'",
+            &relations
+        ));
+        assert!(!hostile_uses_whole_row(
+            "SELECT email, id FROM demo.customers WHERE id = 1",
+            &relations
+        ));
+        assert!(!hostile_uses_whole_row(
+            "SELECT id FROM demo.customers t WHERE t.id = 1",
+            &relations
+        ));
+        assert!(!hostile_uses_whole_row(
+            "SELECT email FROM demo.customers email WHERE id = 1",
+            &relations
+        ));
+    }
+
+    #[test]
+    fn hostile_closes_join_rename_and_window_oracles() {
+        use std::collections::HashMap;
+        let masked: HashSet<String> = ["email", "name"].into_iter().map(str::to_string).collect();
+        let mut relations = HashMap::new();
+        relations.insert(
+            "demo.customers".into(),
+            vec![
+                "id".into(),
+                "email".into(),
+                "name".into(),
+                "phone".into(),
+                "city".into(),
+                "birth_date".into(),
+                "annual_salary".into(),
+                "last_ip".into(),
+                "account_uuid".into(),
+                "internal_note".into(),
+                "lookup_key".into(),
+            ],
+        );
+        assert!(hostile_join_or_rename_masked(
+            "SELECT count(*) FROM demo.customers AS t(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) \
+             WHERE c2 = 'user1@example.com'",
+            &relations,
+            &masked
+        ));
+        assert!(hostile_join_or_rename_masked(
+            "SELECT count(*) FROM demo.customers a NATURAL JOIN demo.customers b",
+            &relations,
+            &masked
+        ));
+        assert!(hostile_join_or_rename_masked(
+            r#"SELECT count(*) FROM demo.customers NATURAL JOIN (VALUES ('x')) v(u&"email")"#,
+            &relations,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers a
+               JOIN (VALUES ('x')) v(u&"email") USING (u&"email")"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT id, count(*) OVER (PARTITION BY u&"email" = 'x')
+               FROM demo.customers"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"WITH q(u&"email") AS (SELECT 'x')
+               SELECT count(*) FROM demo.customers NATURAL JOIN q"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               GROUP BY GROUPING SETS ((u&"email"))"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers GROUP BY ROLLUP (u&"email")"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE 'x' = ANY(ARRAY[u&"email"])"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE CASE u&"email" WHEN 'x' THEN true ELSE false END"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT id FROM demo.customers
+               LIMIT (SELECT count(*) FROM demo.customers WHERE u&"email" = 'x')"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers t WHERE (t).u&"email" = 'x'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers WHERE (ARRAY[u&"email"])[1] = 'x'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers WHERE xmlforest(u&"email") IS NOT NULL"#,
+            &masked
+        ));
+        // JOIN … ON, BooleanTest, JSON constructors, xmlserialize — previously live OPEN.
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers a
+               JOIN (VALUES (1)) v(x) ON a.u&"email" = 'user1@example.com'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE (u&"email" = 'user1@example.com') IS TRUE"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE JSON_OBJECT('e': u&"email")->>'e' = 'user1@example.com'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE JSON_ARRAY(u&"email")->>0 = 'user1@example.com'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE xmlserialize(CONTENT xmlforest(u&"email" AS e) AS text)
+                     LIKE '%user1@example.com%'"#,
+            &masked
+        ));
+        assert!(!hostile_join_or_rename_masked(
+            "SELECT email, id FROM demo.customers WHERE id = 1",
+            &relations,
+            &masked
+        ));
+    }
+
+    #[test]
+    fn procedural_statements_are_recognised() {
+        assert!(is_procedural_statement(
+            "DO $$ BEGIN RAISE NOTICE 'x'; END $$"
+        ));
+        assert!(is_procedural_statement("CALL demo.do_thing()"));
+        assert!(is_procedural_statement(
+            "CREATE FUNCTION f() RETURNS void AS $$ BEGIN END $$ LANGUAGE plpgsql"
+        ));
+        assert!(is_procedural_statement(
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$"
+        ));
+        assert!(is_procedural_statement(
+            "SELECT 1; DO $$ BEGIN NULL; END $$"
+        ));
+        assert!(!is_procedural_statement(
+            "SELECT email, id FROM demo.customers WHERE id = 1"
+        ));
+        assert!(!is_procedural_statement("SELECT now()"));
+    }
+
+    #[test]
+    fn write_statements_are_recognised() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET x = 1",
+            "DELETE FROM t WHERE id = 1",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "TRUNCATE t",
+            "CREATE TABLE t (id int)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN x int",
+            "CREATE INDEX ON t (id)",
+            "GRANT SELECT ON t TO u",
+            "SELECT * INTO t FROM s",
+            "CREATE TABLE t AS SELECT 1",
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+            "COPY t FROM STDIN",
+            "COPY t TO STDOUT",
+            "DO $$ BEGIN NULL; END $$",
+            "CALL foo()",
+            "NOTIFY x",
+            "VACUUM t",
+            "SELECT email FROM t FOR UPDATE",
+            "SELECT email FROM t FOR SHARE",
+            "CREATE VIEW v AS SELECT email FROM t",
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "LOAD 'auto_explain'",
+            "CHECKPOINT",
+            "LOCK TABLE t",
+            "COMMENT ON TABLE t IS 'x'",
+            "CREATE STATISTICS s ON a FROM t",
+            "IMPORT FOREIGN SCHEMA s FROM SERVER x INTO public",
+        ] {
+            assert!(is_write_statement(sql), "expected write: {sql}");
+        }
+        for sql in [
+            "SELECT email, id FROM demo.customers WHERE id = 1",
+            "SELECT 1",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "EXPLAIN SELECT 1",
+            "SHOW search_path",
+            "SET search_path TO public",
+            "PREPARE q AS SELECT 1",
+            "EXECUTE q",
+            "DEALLOCATE q",
+            "DISCARD ALL",
+            "RESET ALL",
+        ] {
+            assert!(!is_write_statement(sql), "expected read: {sql}");
+        }
+    }
+
+    #[test]
+    fn untrusted_functions_are_caught_before_execution() {
+        assert!(calls_untrusted_function("SELECT demo.sleep_if(1, 'u')"));
+        assert!(calls_untrusted_function(
+            "SELECT * FROM demo.sleep_if(1, 'u') AS t"
+        ));
+        assert!(calls_untrusted_function(
+            "SELECT id FROM t WHERE demo.email_ok(id, 'u')"
+        ));
+        assert!(calls_untrusted_function("SELECT pg_sleep(0.1)"));
+        assert!(calls_untrusted_function("SELECT evil.sum(1)"));
+        // Trusted builtins / pg_catalog.
+        assert!(!calls_untrusted_function("SELECT now()"));
+        assert!(!calls_untrusted_function("SELECT pg_catalog.now()"));
+        assert!(!calls_untrusted_function(
+            "SELECT count(*) FROM demo.customers"
+        ));
+        assert!(!calls_untrusted_function(
+            "SELECT lower(city) FROM demo.customers"
+        ));
+        assert!(!calls_untrusted_function(
+            "SELECT email, id FROM demo.customers WHERE id = 1"
         ));
     }
 }
