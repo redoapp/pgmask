@@ -72,7 +72,13 @@ pub(crate) struct PlanState {
     /// all a statement-level Describe can say, since formats are not chosen
     /// until Bind. The binary DataRows that followed then failed to decode:
     ///
-    ///     pgmask: value of type OID 1082 did not decode in text format
+    /// ```text
+    /// pgmask: value of type OID 1082 did not decode in text format
+    /// ```
+    ///
+    /// (Fenced as `text`, not indented. An indented block in a doc comment is a
+    /// Rust code block, and rustdoc compiles it — `cargo test --lib` does not
+    /// run doctests, so this only surfaced in CI's `--workspace` sweep.)
     ///
     /// Fail-closed, so nothing leaked, and text-family types were unaffected
     /// because their text and binary encodings are identical. But it refused
