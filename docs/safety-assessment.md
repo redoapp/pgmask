@@ -523,6 +523,24 @@ from it.
 `./scripts/test-mutations.py` — 26 hand-picked guards, each verified to fail
 when broken.
 
+**Under `allow`, DDL that moves a masked column briefly releases it.** An
+`ALTER TABLE ... DROP COLUMN x; ADD COLUMN x` gives `x` a new attnum while the
+table OID is unchanged. The proxy's snapshot, resolved to the old attnum, then
+misses on the new one — and under `allow` a miss releases. So a column the
+operator *explicitly* masked is served in the clear until the catalog
+re-resolves.
+
+Measured on a live proxy: before the fix below, every query leaked for the full
+refresh interval (30s by default), because a known table OID nudged no refresh.
+The fix nudges a refresh on any lookup miss, not only unknown relations, which
+bounds the window to `catalog_refresh_min_seconds` (5s by default). The residual
+is inherent to an asynchronous catalog under `allow`: a genuinely new column is
+released there by design, and a reshaped one is indistinguishable from a new one
+until the refresh lands. **Default-deny is not affected** — a miss masks, with
+no dependence on refresh timing, and
+`a_reshaped_masked_column_stays_masked_under_default_deny` pins that. Mask
+anything sensitive rather than leaving it to `allow`.
+
 ## Point it at a read-only upstream
 
 The single highest-value deployment choice, and the one that makes most of the

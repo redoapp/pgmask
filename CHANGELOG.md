@@ -56,6 +56,27 @@ Four regression tests, each failing without the fix — including one that pins
 the fail-closed path the fix must not open: executing a portal that was never
 bound still has no plan.
 
+### And a catalog-race window under allow (with a fix)
+
+Hammering the catalog-refresh path turned up a real leak — the first read-side
+one this red-team found. Under `unclassified = "allow"`, an
+`ALTER TABLE ... DROP COLUMN x; ADD COLUMN x` moves `x` to a new attnum while
+keeping the table OID. The snapshot misses on the new attnum, and under `allow`
+a miss releases, so an explicitly-masked column was served in plaintext — and
+because a known table OID nudged no refresh, for the *entire* refresh interval:
+measured at 30s, every query in a 200-query poll leaking.
+
+Fixed by nudging a refresh on any lookup miss, not only unknown relations,
+which bounds the window to `catalog_refresh_min_seconds` (5s default, measured
+1s at floor 1s). The residual is inherent to `allow` + async refresh: a
+reshaped column is indistinguishable from a genuinely new one, which `allow`
+releases by design.
+
+Default-deny was and is safe — a miss masks with no timing dependence — and
+`a_reshaped_masked_column_stays_masked_under_default_deny` pins it (poisoned:
+forcing release-on-miss fails it with the canary crossing). 45s of DDL churn
+against a query storm under default-deny leaked nothing.
+
 ### Deployment guidance: point it at a read-only upstream
 
 The write-side hardening — parser-based write refusal, and any backend

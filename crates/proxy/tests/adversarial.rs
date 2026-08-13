@@ -1115,3 +1115,61 @@ async fn summaries_are_served_without_leaking() -> Result<()> {
     }
     Ok(())
 }
+
+/// A masked column stays masked after DDL moves its attnum — the catalog-race
+/// guarantee, under the default (deny) posture.
+///
+/// `ALTER TABLE ... DROP COLUMN secret; ADD COLUMN secret` gives `secret` a new
+/// attnum while the table OID is unchanged, so the proxy's snapshot — resolved
+/// at startup to the old attnum — no longer recognises the column. Under
+/// default-deny a lookup miss masks, so this must show nothing in the clear no
+/// matter when the query lands relative to the next refresh.
+///
+/// Found by hammering a live proxy: under `allow` the same reshape served the
+/// column in plaintext for the whole refresh interval, because a known table
+/// OID nudged no refresh. Default-deny was and is safe; this pins that, since
+/// it is the guarantee the product rests on.
+#[tokio::test]
+async fn a_reshaped_masked_column_stays_masked_under_default_deny() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    exec_direct(
+        DB,
+        "DROP TABLE IF EXISTS canary.reshape;
+         CREATE TABLE canary.reshape (id int, secret text);
+         INSERT INTO canary.reshape VALUES (1, 'CANARY_NOTE_97h8i9')",
+    )
+    .await?;
+
+    let rules = vec![
+        rule("canary.reshape", "id", pgmask::mask::Mask::None),
+        rule("canary.reshape", "secret", pgmask::mask::Mask::Redact),
+    ];
+    let proxy = start_proxy_with(DB, rules, Unclassified::Mask, Opaque::Reject).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    client
+        .simple_query("SELECT secret FROM canary.reshape")
+        .await?;
+    assert_no_canary(&client, "reshape: before ALTER");
+
+    // Move the attnum out from under the snapshot.
+    exec_direct(
+        DB,
+        "ALTER TABLE canary.reshape DROP COLUMN secret;
+         ALTER TABLE canary.reshape ADD COLUMN secret text;
+         UPDATE canary.reshape SET secret = 'CANARY_NOTE_97h8i9'",
+    )
+    .await?;
+
+    // The snapshot still points at the old attnum; the new one is a lookup
+    // miss. Default-deny must mask it, with no dependence on refresh timing.
+    let mut after = RawClient::connect(proxy.addr, DB).await?;
+    after
+        .simple_query("SELECT secret FROM canary.reshape")
+        .await?;
+    assert_no_canary(&after, "reshape: immediately after ALTER");
+
+    exec_direct(DB, "DROP TABLE IF EXISTS canary.reshape").await?;
+    Ok(())
+}
