@@ -191,6 +191,10 @@ jobs:
             exit 1; }
 
           for f in /tmp/adversarial.log /tmp/resilience.log; do
+            # This step is `if: always()`, so it also runs when an earlier step
+            # failed and the suite never wrote its log. Say that, rather than
+            # reporting an empty count as a skip and burying the real failure.
+            [ -f "$f" ] || { echo "NOTE: $f absent — that suite did not run; see the failing step above."; continue; }
             n=$(grep -c 'skipping by request' "$f" || true)
             [ "$n" = "0" ] || { echo "FAIL: $n tests skipped in $f, which has a database."; exit 1; }
             grep -E '^test result:' "$f" | sed "s|^|$(basename "$f"): |"

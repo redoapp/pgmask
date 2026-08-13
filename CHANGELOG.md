@@ -1,5 +1,196 @@
 # Changelog
 
+## 0.1.90 — adversarial hardening of the masking path (six findings)
+
+Found by attacking a running proxy with a raw wire client, in an adversarial
+session that set out to unmask data and could not.
+
+A client that pipelines `Parse, Describe(Statement), Bind, Execute` in one
+flush — sending all four before reading anything — got:
+
+    ERROR: pgmask: value of type OID 1082 did not decode in text format
+
+when it asked for binary results. Two round trips worked. Postgres served both.
+
+Three things had to line up. `bind` runs while the backend's RowDescription is
+still in flight, so there is no statement plan to stamp and the Bind's format
+codes were dropped. `execute` then finds no portal plan. And
+`finish_description` sets the active plan to the *statement's*, whose formats
+are text — all a statement-level Describe can report, since formats are not
+chosen until Bind. The binary rows then failed to decode.
+
+The re-stamp for this case already existed and carried a comment describing it
+exactly. Only the pipelined arrival order was missed, and that order is what
+performance-minded drivers use — pgjdbc's binary transfer and libpq pipeline
+mode both qualify.
+
+Fixed by remembering each portal's Bind formats and applying them at
+BindComplete, which the measured message order puts after the RowDescription
+and before the first DataRow: ParseComplete, ParameterDescription,
+RowDescription, BindComplete, DataRow.
+
+NOT A LEAK, AND THE REASON MATTERS
+
+It failed closed, and text-family types were never affected because their text
+and binary encodings are identical — verified, not assumed: pipelined binary on
+`email` and `name` returned the pseudonym and `***` both before and after.
+
+It still deserved fixing at this weight. A proxy that refuses legitimate
+queries is one an operator routes around, which is the same argument the TLS
+startup bug made.
+
+WHAT ELSE THE SESSION TRIED
+
+Around forty queries in eight classes, none of which unmasked anything:
+whole-row and composite escapes (`SELECT c FROM t c`, `row_to_json`, `(c).email`,
+`ROW(email)`); aliasing a masked column to a released column's name; CTAS, temp
+tables, attacker-defined views and functions, `RETURNING`, `COPY TO STDOUT` —
+all dead because pgmask is read-only on every posture; SQL-as-a-string
+(`table_to_xml`, `query_to_xml`, `xpath` over it, `schema_to_xml`) and superuser
+`pg_read_file`, all refused as opaque; provenance confusion via `UNION ALL`,
+`COALESCE`, `CASE`, scalar subqueries, LATERAL, window functions, CTE
+reordering and recursive CTEs; and the binary-format matrix above, including
+mixed per-column format codes in both orders.
+
+Four regression tests, each failing without the fix — including one that pins
+the fail-closed path the fix must not open: executing a portal that was never
+bound still has no plan.
+
+### The plan cache is safe; the column-rename trap is not, and --check now catches it
+
+Closed the last catalog-race question: can a cached extended-protocol plan
+outlive a refresh and mask the wrong data? No. A raw wire client that Parses,
+Describes, Binds and Executes, then reshapes the table from another connection
+and re-Executes, is refused both ways — invalidate_if_stale clears the plans on
+the generation bump, and the SELECT * reorder is caught by the backend's own
+result-type check. Nothing served.
+
+But going deeper found one more real exposure — name-based masking defeated by a
+column rename. RENAME ssn <-> city leaves the rule "release city" pointing at
+the SSN column, and a plain SELECT city returns it in the clear, under
+default-deny. It needs DDL (a rename) from a privileged source, so a read-only
+client cannot cause it — but a read-only SELECT then exposes it. It is inherent
+to name-based classification.
+
+The fixable part is detection. classify --check was structural — it compares
+rules to schema shape, which a rename leaves intact — and classify's generate
+mode name-matches first and skips content sampling, so both missed it.
+`--check --sample N` now samples the columns the catalog releases and fails if
+their values look sensitive (verified: flags a released column that is 100%
+SSN-shaped, does not flag one holding real city names). Without --sample,
+--check now says it did not look at values rather than implying it did.
+
+### And a catalog-race window under allow (with a fix)
+
+Hammering the catalog-refresh path turned up a real leak — the first read-side
+one this red-team found. Under `unclassified = "allow"`, an
+`ALTER TABLE ... DROP COLUMN x; ADD COLUMN x` moves `x` to a new attnum while
+keeping the table OID. The snapshot misses on the new attnum, and under `allow`
+a miss releases, so an explicitly-masked column was served in plaintext — and
+because a known table OID nudged no refresh, for the *entire* refresh interval:
+measured at 30s, every query in a 200-query poll leaking.
+
+Fixed by nudging a refresh on any lookup miss, not only unknown relations,
+which bounds the window to `catalog_refresh_min_seconds` (5s default, measured
+1s at floor 1s). The residual is inherent to `allow` + async refresh: a
+reshaped column is indistinguishable from a genuinely new one, which `allow`
+releases by design.
+
+Default-deny was and is safe — a miss masks with no timing dependence — and
+`a_reshaped_masked_column_stays_masked_under_default_deny` pins it (poisoned:
+forcing release-on-miss fails it with the canary crossing). 45s of DDL churn
+against a query storm under default-deny leaked nothing.
+
+### Deployment guidance: point it at a read-only upstream
+
+The write-side hardening — parser-based write refusal, and any backend
+`default_transaction_read_only` flag — is defense in depth for one
+configuration: pgmask in front of a writable primary with a privileged role.
+Verified against a live backend that a read-only *upstream* moots it entirely:
+as a `SELECT`-only role, the escape that defeats a per-session read-only GUC
+(`SET default_transaction_read_only = off; INSERT`) is refused by privilege
+alone, before pgmask's parser is consulted. A hot standby is stronger still —
+writes are physically impossible with no GUC to flip.
+
+A prototype backend-read-only injection was built and then dropped: on its own
+it is a per-session GUC the client can switch off, so shipping it as a
+"read-only" guarantee would be the false-assurance pattern this document keeps
+cataloguing. The honest guard is a read-only role or replica, now documented as
+the strongest of the three write layers. None of this touches the masking
+surface, which is where every real disclosure lives.
+
+### And a multi-statement test that could not see a leak
+
+A third adversarial pass. Still no way to read a masked value — role
+relaxations do not escalate through `SET ROLE` or `SET SESSION AUTHORIZATION`
+(keyed on the startup user, which those do not change), portal suspension and
+resume mask every page, describing one portal while executing another uses the
+executed portal's plan, and rebinding a portal name is refused.
+
+But `multi_statement_simple_query_stays_masked` was another vacuous test. It
+sent three result sets in one `Query` and asserted only that no canary crossed
+— which a *refusal* satisfies exactly as well as correct masking, because an
+error carries no canary. And a refusal is what happens: pgmask cannot pair the
+Nth RowDescription with the Nth statement, so
+`analysis::provenance_is_trustworthy` returns false for any multi-statement
+parse and every field is treated as opaque. The test passed whether each set
+was masked by its own plan, nulled, or the whole query rejected — so it could
+not have caught the very mispairing its comment describes, a second set served
+under the first statement's plaintext plan.
+
+Rewritten to pin the real behaviour: fail-closed, and specifically not that
+leak. Poisoned by pointing it at a served single statement, which now fails
+with "a served result set here is a mispairing that must be proven masked."
+
+The behaviour itself — every multi-statement simple query refused, including
+`SET search_path = x; SELECT ...` — is now documented as the compatibility
+limitation it is, verified fail-closed in both the `reject` and `mask`
+postures.
+
+### And `--check` called plaintext a coverage gap
+
+A second adversarial pass, this time against objects an attacker would find in
+a real database rather than SQL they could write. Still no way to unmask a
+value under the default posture — views, materialised views, inherited children
+and partitions over a classified table all came back NULL, with rows returned
+1/1 so it is masking and not an empty result. But:
+
+**Under `unclassified = "allow"` an undeclared view over a classified table
+serves plaintext.** `SELECT email FROM demo.v_plain` returned
+`user1@example.com`. So did a view that renames the columns, so the column
+*named* `city` returned the address.
+
+That much is documented — README says views need their own entries, `classify`
+does propose them, and `allow` releases what is undeclared. The defect is what
+the drift gate says about it:
+
+    19 column(s) have no rule. Default-deny masks them, so this is a
+    coverage gap and not an exposure
+
+printed unconditionally, against a catalog that sets `unclassified = "allow"`,
+by a function holding that parsed catalog in a local called `config`. The one
+setting that decides whether those columns are an exposure was never consulted.
+`--check` is the command operators are told to run in CI, so this is a green
+build asserting safety about columns being served in the clear.
+
+It now reads the setting. Under `allow` it names them as SERVED IN PLAINTEXT
+and fails with a reason; under default-deny the wording is unchanged except to
+say which posture it is describing.
+
+TWO OF THE THREE TESTS I WROTE FOR THIS COULD NOT FAIL
+
+Worth more than the fix. The first refuted the string `"not an exposure"` —
+which never appears, because that wording wraps across a newline. The second
+asserted a non-zero exit, which a coverage gap already produced in both
+postures. Both passed no matter what the code did; the poison run failed 1 of 3
+and that is how they were found. All three discriminate now: 23/0 clean, 3
+failures with the fix stubbed out.
+
+And the first version of the harness had the postures backwards — it built an
+"allow" catalog from a file that was already `allow`, because this suite writes
+that setting itself so its "unclassified column arrives intact" test can work.
+Both halves then described the same posture.
+
 ## 0.1.89 — hostile closes ARRAY/CASE/LIMIT/indirection unicode oracles
 
 Unicode-escaped masked names still slipped through inside node kinds the tally
@@ -178,6 +369,8 @@ PL/pgSQL interpreter means making the campaign expensive.
 authenticated `Query` and `Execute` against a shared per-username budget. Over
 budget: SQLSTATE `54000`, metric `rate_limited`. Simple queries get a synthetic
 `ReadyForQuery`; extended `Execute` waits for the client's `Sync`.
+||||||| f2b04a4
+
 
 ## 0.1.74 — the skip counter had never counted a skip
 

@@ -226,12 +226,21 @@ impl Policy {
                 match snapshot.lookup(field.table_oid, field.column_id) {
                     Some(classification) => classification.for_roles(roles).clone(),
                     None => {
-                        // A relation we have never resolved may mean the catalog
-                        // has gone stale — a recreated view gets a new OID. Nudge
-                        // the refresher; it enforces its own rate floor.
-                        if !snapshot.knows_relation(field.table_oid) {
-                            self.catalog.note_unknown_relation();
-                        }
+                        // A lookup miss is a staleness signal, and not only when
+                        // the whole relation is unknown. A known relation with an
+                        // unrecognised attnum means its columns changed under the
+                        // snapshot — `ALTER TABLE ... DROP COLUMN x; ADD COLUMN x`
+                        // moves x to a new attnum while keeping the table OID.
+                        //
+                        // Nudging only on unknown *relations* left that case to
+                        // wait out the full refresh interval, and under `allow` a
+                        // miss releases — so an explicitly-masked column that was
+                        // reshaped was served in the clear for the whole window
+                        // (measured: 30s of refresh interval, every query
+                        // leaking). Nudge on any miss; the refresher keeps its own
+                        // rate floor, so a storm of misses cannot become a query
+                        // storm against the catalog.
+                        self.catalog.note_unknown_relation();
                         MaskSpec::new(match self.unclassified {
                             Unclassified::Mask => self.unclassified_mask,
                             Unclassified::Allow => Mask::None,
@@ -1987,9 +1996,7 @@ mask = "none"
         assert!(text.contains("54000"), "SQLSTATE 54000 expected: {text}");
         // Synthetic ReadyForQuery so the client is not left hanging.
         assert!(
-            out.to_client
-                .iter()
-                .any(|&b| b == protocol::B_READY_FOR_QUERY),
+            out.to_client.contains(&protocol::B_READY_FOR_QUERY),
             "simple-query refusal must synthesise ReadyForQuery"
         );
         assert_eq!(
@@ -2019,9 +2026,7 @@ mask = "none"
         let text = String::from_utf8_lossy(&out.to_client);
         assert!(text.contains("rate limit"), "got: {text}");
         assert!(
-            !out.to_client
-                .iter()
-                .any(|&b| b == protocol::B_READY_FOR_QUERY),
+            !out.to_client.contains(&protocol::B_READY_FOR_QUERY),
             "Execute refusal waits for the client's Sync"
         );
     }

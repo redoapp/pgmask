@@ -34,7 +34,7 @@ indexing_slicing = "warn"
 arithmetic_side_effects = "warn"
 
 [workspace.package]
-version = "0.1.89"
+version = "0.1.90"
 edition = "2021"
 license = "MIT"
 publish = false

@@ -37,7 +37,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 41
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 42
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -206,6 +206,18 @@ INSERT INTO canary.derived (id, email) VALUES (1, 'CANARY_EMAIL_a1b2c3');
 
 /// Apply the canary schema. Uses tokio-postgres for convenience; the raw client
 /// is only for driving the proxy.
+/// Run DDL/DML straight at the backend, bypassing the proxy — for tests that
+/// need to reshape a table underneath a running proxy.
+pub async fn exec_direct(db: &str, sql: &str) -> Result<()> {
+    let (client, connection) =
+        tokio_postgres::connect(&backend_dsn(db), tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client.batch_execute(sql).await?;
+    Ok(())
+}
+
 pub async fn load_schema(db: &str) -> Result<()> {
     let (client, connection) =
         tokio_postgres::connect(&backend_dsn(db), tokio_postgres::NoTls).await?;

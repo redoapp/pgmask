@@ -1746,7 +1746,10 @@ pub fn masked_exceeds_outer_projection(sql: &str, masked: &HashSet<String>) -> b
     let mut counts: HashMap<String, usize> = HashMap::new();
     for id in &idents {
         if masked.contains(id) {
-            *counts.entry(id.clone()).or_insert(0) += 1;
+            counts
+                .entry(id.clone())
+                .and_modify(|c| *c = c.saturating_add(1))
+                .or_insert(1);
         }
     }
     for (name, n) in masked_column_ref_counts(sql, masked) {
@@ -1889,7 +1892,10 @@ fn tally_masked_string_node(
     if let Some(NodeEnum::String(s)) = node.node.as_ref() {
         let name = s.sval.to_ascii_lowercase();
         if masked.contains(&name) {
-            *counts.entry(name).or_insert(0) += 1;
+            counts
+                .entry(name)
+                .and_modify(|c| *c = c.saturating_add(1))
+                .or_insert(1);
         }
     }
 }
@@ -1903,7 +1909,10 @@ fn tally_masked_column_ref(
         if let Some(NodeEnum::String(s)) = last.node.as_ref() {
             let name = s.sval.to_ascii_lowercase();
             if masked.contains(&name) {
-                *counts.entry(name).or_insert(0) += 1;
+                counts
+                    .entry(name)
+                    .and_modify(|c| *c = c.saturating_add(1))
+                    .or_insert(1);
             }
         }
     }
@@ -2079,7 +2088,10 @@ fn simple_masked_order_by_credits(
             if let Some(NodeEnum::SortBy(s)) = sort.node.as_ref() {
                 if let Some(expr) = s.node.as_ref() {
                     if let Some(name) = simple_sort_key_masked_name(expr, masked) {
-                        *counts.entry(name).or_insert(0) += 1;
+                        counts
+                            .entry(name)
+                            .and_modify(|c| *c = c.saturating_add(1))
+                            .or_insert(1);
                     }
                 }
             }
@@ -2090,7 +2102,10 @@ fn simple_masked_order_by_credits(
                     if let Some(NodeEnum::SortBy(s)) = sort.node.as_ref() {
                         if let Some(expr) = s.node.as_ref() {
                             if let Some(name) = simple_sort_key_masked_name(expr, masked) {
-                                *counts.entry(name).or_insert(0) += 1;
+                                counts
+                                    .entry(name)
+                                    .and_modify(|c| *c = c.saturating_add(1))
+                                    .or_insert(1);
                             }
                         }
                     }
@@ -2158,12 +2173,19 @@ pub fn hostile_join_or_rename_masked(
                     return true;
                 }
             }
-            NodeRef::JoinExpr(join) if join.is_natural => {
-                if join_side_has_masked_relation(join.larg.as_deref(), relation_columns, masked)
-                    || join_side_has_masked_relation(join.rarg.as_deref(), relation_columns, masked)
-                {
-                    return true;
-                }
+            NodeRef::JoinExpr(join)
+                if join.is_natural
+                    && (join_side_has_masked_relation(
+                        join.larg.as_deref(),
+                        relation_columns,
+                        masked,
+                    ) || join_side_has_masked_relation(
+                        join.rarg.as_deref(),
+                        relation_columns,
+                        masked,
+                    )) =>
+            {
+                return true;
             }
             _ => {}
         }
