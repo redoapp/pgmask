@@ -56,6 +56,24 @@ Four regression tests, each failing without the fix — including one that pins
 the fail-closed path the fix must not open: executing a portal that was never
 bound still has no plan.
 
+### Deployment guidance: point it at a read-only upstream
+
+The write-side hardening — parser-based write refusal, and any backend
+`default_transaction_read_only` flag — is defense in depth for one
+configuration: pgmask in front of a writable primary with a privileged role.
+Verified against a live backend that a read-only *upstream* moots it entirely:
+as a `SELECT`-only role, the escape that defeats a per-session read-only GUC
+(`SET default_transaction_read_only = off; INSERT`) is refused by privilege
+alone, before pgmask's parser is consulted. A hot standby is stronger still —
+writes are physically impossible with no GUC to flip.
+
+A prototype backend-read-only injection was built and then dropped: on its own
+it is a per-session GUC the client can switch off, so shipping it as a
+"read-only" guarantee would be the false-assurance pattern this document keeps
+cataloguing. The honest guard is a read-only role or replica, now documented as
+the strongest of the three write layers. None of this touches the masking
+surface, which is where every real disclosure lives.
+
 ### And a multi-statement test that could not see a leak
 
 A third adversarial pass. Still no way to read a masked value — role

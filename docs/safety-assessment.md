@@ -523,6 +523,45 @@ from it.
 `./scripts/test-mutations.py` — 26 hand-picked guards, each verified to fail
 when broken.
 
+## Point it at a read-only upstream
+
+The single highest-value deployment choice, and the one that makes most of the
+write-side hardening moot: **give pgmask a connection that cannot write in the
+first place** — a physical read replica / hot standby, or a role with `SELECT`
+and nothing else.
+
+pgmask refuses writes by inspecting SQL: it parses each statement and rejects
+DML, DDL, `DO`, `CALL`, and untrusted functions. That is a real layer, but it
+is a parser-based denylist, and `is_write_statement` returns false for anything
+`pg_query` cannot parse — a statement Postgres executes but the bundled parser
+does not recognise would be forwarded to a read-write backend.
+
+A read-only upstream removes that whole question. Verified against a live
+backend: connect through pgmask as a `SELECT`-only role and the escape that
+defeats a per-session read-only GUC —
+`SET default_transaction_read_only = off; INSERT ...` — is refused by privilege
+alone, 0 rows written, before pgmask's parser or any backend flag is consulted.
+A hot standby is stronger still: writes are physically impossible, per session,
+with no GUC to flip.
+
+What this does **not** buy is anything on the masking side. A read-only role
+still reads unmasked rows, so the proxy still has to mask them, and every
+disclosure in this document is about that path. A read-only upstream closes the
+write surface completely and the read surface not at all.
+
+So the order of guards, strongest first:
+
+1. **A read-only role or replica upstream.** The database refuses writes. Use
+   this if you can; it is free and unbypassable.
+2. **pgmask's write refusal.** Defense in depth for when (1) is not available —
+   e.g. pgmask in front of a writable primary with a privileged role, which is
+   exactly the risky case. Parser-based, so treat it as a strong filter rather
+   than a guarantee.
+3. Setting `default_transaction_read_only` on the backend session is **not** a
+   guarantee: it is a per-session GUC the client can turn off
+   (`SET default_transaction_read_only = off`, `BEGIN READ WRITE`). It is worth
+   having as a default, but it does not replace (1).
+
 ## If you read one thing before deploying this
 
 One more, added 2026-08-12 and worth its own line: the counter that was
