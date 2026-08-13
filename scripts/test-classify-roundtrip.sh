@@ -208,6 +208,51 @@ check "and it names them"  "no rule"        "$(cat /tmp/pgmask-roundtrip.check)"
 #
 # Both postures are asserted, because a gate that always says "exposure" is as
 # useless as one that never does.
+# --- the column-rename trap: a released column that holds sensitive data -----
+#
+# --check compares rules to schema *shape*, which a rename leaves intact, so it
+# cannot see that `ssn` and `city` swapped names and sensitive data now sits
+# under a released column. Sampling the released columns is the only thing that
+# catches it — and only with --sample, so this asserts both halves.
+echo "==> --check --sample flags a released column that turned sensitive"
+psql "postgres://postgres@127.0.0.1:$PG_PORT/postgres" -X -q >/dev/null 2>&1 <<'SQL'
+CREATE SCHEMA rt2;
+CREATE TABLE rt2.t (id int PRIMARY KEY, label text);
+INSERT INTO rt2.t SELECT g, '111-22-' || lpad(g::text, 4, '0') FROM generate_series(1, 40) g;
+SQL
+cat > /tmp/pgmask-rt2.toml <<TOML
+listen        = "127.0.0.1:$PROXY_PORT"
+backend       = "127.0.0.1:$PG_PORT"
+catalog_dsn   = "postgres://postgres@127.0.0.1:$PG_PORT/postgres"
+pseudonym_key = "roundtrip-key-not-for-production"
+[[column]]
+relation = "rt2.t"
+column   = "id"
+mask     = "none"
+[[column]]
+relation = "rt2.t"
+column   = "label"
+mask     = "none"
+TOML
+
+# Without --sample: structure passes, and it must SAY it did not look at values.
+nosample=$(DSN="postgres://postgres@127.0.0.1:$PG_PORT/postgres" \
+  ./target/debug/classify --check --catalog /tmp/pgmask-rt2.toml --schema rt2 2>&1)
+check "without --sample the rename trap is invisible" "no drift" "$nosample"
+check "and it says to pass --sample"                  "run with --sample" "$nosample"
+
+# With --sample: the released `label` column is 100% SSN-shaped -> must fail.
+withsample=$(DSN="postgres://postgres@127.0.0.1:$PG_PORT/postgres" \
+  ./target/debug/classify --check --catalog /tmp/pgmask-rt2.toml --schema rt2 --sample 40 2>&1)
+ws_status=$?
+check "with --sample the released column is flagged" "RELEASED column(s) hold sensitive" "$withsample"
+check "and it names the column"                      "rt2.t.label" "$withsample"
+if [[ "$ws_status" -ne 0 ]]; then
+  printf '  \033[32mPASS\033[0m  %s\n' "--sample fails the build on the trap"; pass=$((pass + 1))
+else
+  printf '  \033[31mFAIL\033[0m  %s\n' "--sample exited 0 on a sensitive released column"; fail=$((fail + 1))
+fi
+
 echo "==> what --check claims about unruled columns"
 # This suite's own catalog already sets `unclassified = "allow"` (see where it
 # is written above) so that the "arrives intact" test can work — so it is the

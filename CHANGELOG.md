@@ -56,6 +56,30 @@ Four regression tests, each failing without the fix — including one that pins
 the fail-closed path the fix must not open: executing a portal that was never
 bound still has no plan.
 
+### The plan cache is safe; the column-rename trap is not, and --check now catches it
+
+Closed the last catalog-race question: can a cached extended-protocol plan
+outlive a refresh and mask the wrong data? No. A raw wire client that Parses,
+Describes, Binds and Executes, then reshapes the table from another connection
+and re-Executes, is refused both ways — invalidate_if_stale clears the plans on
+the generation bump, and the SELECT * reorder is caught by the backend's own
+result-type check. Nothing served.
+
+But going deeper found one more real exposure — name-based masking defeated by a
+column rename. RENAME ssn <-> city leaves the rule "release city" pointing at
+the SSN column, and a plain SELECT city returns it in the clear, under
+default-deny. It needs DDL (a rename) from a privileged source, so a read-only
+client cannot cause it — but a read-only SELECT then exposes it. It is inherent
+to name-based classification.
+
+The fixable part is detection. classify --check was structural — it compares
+rules to schema shape, which a rename leaves intact — and classify's generate
+mode name-matches first and skips content sampling, so both missed it.
+`--check --sample N` now samples the columns the catalog releases and fails if
+their values look sensitive (verified: flags a released column that is 100%
+SSN-shaped, does not flag one holding real city names). Without --sample,
+--check now says it did not look at values rather than implying it did.
+
 ### And a catalog-race window under allow (with a fix)
 
 Hammering the catalog-refresh path turned up a real leak — the first read-side

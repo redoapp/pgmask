@@ -293,6 +293,18 @@ failed reporting that the server refused TLS. A true statement about a database
 the script was supposed to have configured, and nothing to do with the proxy.
 Both loops now abort, and `SHOW ssl` is read back before anything depends on it.
 
+### The extended-protocol plan cache is safe across a refresh
+
+A cached statement or portal plan could, in principle, outlive a catalog
+refresh and mask the wrong data. It does not. Driven with a raw wire client:
+Parse + Describe + Bind + Execute a statement (masked correctly), reshape the
+table from another connection, wait for the refresh, then re-Execute the same
+portal and re-Bind the cached statement. Both are refused —
+`invalidate_if_stale` clears the plans on the generation bump, so the following
+DataRows arrive with no described result set and fail closed. The `SELECT *`
+column-reorder variant is refused one layer earlier, by the backend's own
+"cached plan must not change result type". Neither served a byte.
+
 ### What the same sweep did *not* find
 
 The 08-11 disclosures came from one method: enumerate everything that reaches

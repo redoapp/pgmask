@@ -314,6 +314,10 @@ fn width_permits(semantic_type: &str, max_length: Option<i32>) -> bool {
 
 /// The config name of a mask, matching the strings `mask_fits` expects and the
 /// kebab-case serde uses in the catalog file.
+fn mask_name_opt(mask: Option<&pgmask::mask::Mask>) -> Option<&'static str> {
+    mask.map(mask_name)
+}
+
 fn mask_name(mask: &pgmask::mask::Mask) -> &'static str {
     use pgmask::mask::Mask;
     match mask {
@@ -638,7 +642,7 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--check") {
         let path = arg(&args, "--catalog")
             .context("--check needs --catalog <path> to compare the schema against")?;
-        return check(&path, &schema, &proposals);
+        return check(&client, &path, &schema, &proposals, sample).await;
     }
     report(&proposals, &schema, sample, refuted_by_width);
     emit_catalog(&proposals, &schema);
@@ -657,7 +661,13 @@ async fn main() -> Result<()> {
 ///
 /// Neither is detectable from inside the proxy at the moment it matters, which
 /// is why this is a build step rather than a runtime warning.
-fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
+async fn check(
+    client: &tokio_postgres::Client,
+    path: &str,
+    schema: &str,
+    proposals: &[Proposal],
+    sample: usize,
+) -> Result<()> {
     let config =
         pgmask::catalog::Config::load(path).with_context(|| format!("loading catalog {path}"))?;
 
@@ -819,6 +829,83 @@ fn check(path: &str, schema: &str, proposals: &[Proposal]) -> Result<()> {
         );
         for (relation, column, mask, data_type) in &incompatible {
             println!("  {relation}.{column}  mask `{mask}` vs {data_type}");
+        }
+    }
+
+    // A released column that now holds sensitive-looking data — the trap the
+    // structural checks above cannot see. A rule masking `none` is a promise
+    // the column is safe to serve; a column *rename* can move sensitive data
+    // under a benign name (`ssn` <-> `city`), and then that promise is stale.
+    // Every earlier check compares rules to the schema *shape*, which a rename
+    // leaves intact — and classify's own name-first sampling skips a column
+    // whose name already matched a benign type, so generate mode misses it too.
+    // Sampling the released columns directly is the only thing that catches it.
+    //
+    // Requires --sample: without values there is nothing to inspect. The note
+    // below says so when it was not passed, because a green --check that never
+    // looked at a value is the false confidence this whole tool exists against.
+    if sample == 0 {
+        println!(
+            "\nnote: run with --sample N to also check whether a *released* column \
+             holds sensitive-looking data (the column-rename trap). Structure alone \
+             cannot see it."
+        );
+    } else {
+        let mut released_but_sensitive: Vec<(String, String, String)> = Vec::new();
+        for rule in &config.column {
+            if !rule.relation.starts_with(&prefix) {
+                continue;
+            }
+            let effective = rule.mask.as_ref().or_else(|| {
+                rule.semantic_type
+                    .as_deref()
+                    .and_then(|t| mask_of_type.get(t).copied())
+            });
+            if mask_name_opt(effective) != Some("none") {
+                continue;
+            }
+            let Some(proposal) = proposals.iter().find(|p| {
+                format!("{}.{}", p.column.schema, p.column.table) == rule.relation
+                    && p.column.name == rule.column
+            }) else {
+                continue;
+            };
+            let texty = {
+                let d = proposal.column.data_type.to_ascii_lowercase();
+                d.contains("char") || d.contains("text")
+            };
+            if !texty {
+                continue;
+            }
+            // Every detector in `detectors()` is a sensitive shape, so any hit
+            // on a released column is worth stopping the build over.
+            if let Some((label, rate, checked)) = sample_shapes(client, &proposal.column, sample)
+                .await
+                .unwrap_or_default()
+                .first()
+                .copied()
+            {
+                released_but_sensitive.push((
+                    rule.relation.clone(),
+                    rule.column.clone(),
+                    format!("{rate:.0}% of {checked} sampled values look like {label}"),
+                ));
+            }
+        }
+        if !released_but_sensitive.is_empty() {
+            println!(
+                "\n{} RELEASED column(s) hold sensitive-looking data — released by rule, \
+                 but the values say otherwise (a rename or restructure is the usual cause):",
+                released_but_sensitive.len()
+            );
+            for (relation, column, why) in &released_but_sensitive {
+                println!("  {relation}.{column}  ({why})");
+            }
+            bail!(
+                "{} released column(s) look sensitive; mask them or confirm the release is \
+                 still correct after the schema change.",
+                released_but_sensitive.len()
+            );
         }
     }
 
