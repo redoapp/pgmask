@@ -35,6 +35,7 @@ use crate::mask::{Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
 use crate::plan_state::{FieldPlan, Plan, PlanState};
 use crate::protocol::{self, FrameReader, Message};
+use crate::rate_limit::PrincipalRateLimit;
 use crate::tls::{BackendTls, BoxStream};
 use secrecy::ExposeSecret;
 
@@ -68,6 +69,11 @@ pub struct Policy {
     require_client_tls: bool,
     backend_tls: BackendTls,
     backend_ca: Option<String>,
+    /// Shared across sessions so one user with many connections shares one
+    /// budget. `None` when `rate_limit_per_minute = 0`.
+    rate_limit: Option<PrincipalRateLimit>,
+    /// `None` when `max_notices_per_exchange = 0` (unlimited).
+    max_notices_per_exchange: Option<u32>,
 }
 
 impl Policy {
@@ -80,6 +86,18 @@ impl Policy {
             (Some(cert), Some(key)) => Some(crate::tls::load_acceptor(cert, key)?),
             (None, None) => None,
             _ => anyhow::bail!("tls_cert and tls_key must be set together"),
+        };
+        let rate_limit = if config.rate_limit_per_minute > 0 {
+            Some(PrincipalRateLimit::new(
+                config.rate_limit_per_minute,
+                config.effective_rate_limit_burst(),
+            )?)
+        } else {
+            None
+        };
+        let max_notices_per_exchange = match config.max_notices_per_exchange {
+            0 => None,
+            n => Some(n),
         };
         Ok(Self {
             catalog,
@@ -99,6 +117,8 @@ impl Policy {
             require_client_tls: config.client_tls_required(),
             backend_tls: config.backend_tls,
             backend_ca: config.backend_ca.clone(),
+            rate_limit,
+            max_notices_per_exchange,
         })
     }
 
@@ -360,6 +380,14 @@ pub struct Session {
     /// The username from `StartupMessage`. Claimed until Postgres vouches.
     principal: String,
     pub authenticated: bool,
+    /// Last `ReadyForQuery` transaction status byte (`I`/`T`/`E`). Needed when
+    /// a simple-query rate-limit refusal synthesises its own ReadyForQuery —
+    /// inventing `I` inside an open transaction would desync the client.
+    txn_status: u8,
+    /// Notices forwarded since the last `ReadyForQuery`. Reset there so a
+    /// multi-statement simple query shares one budget, matching how a dense
+    /// `DO` encodes a value inside one exchange.
+    notices_this_exchange: u32,
 }
 
 impl Session {
@@ -374,6 +402,8 @@ impl Session {
             roles: HashSet::new(),
             principal: String::new(),
             authenticated: false,
+            txn_status: b'I',
+            notices_this_exchange: 0,
         }
     }
 
@@ -433,6 +463,179 @@ impl Session {
         out.client(Vetted::synthetic(&err));
     }
 
+    /// Spend one statement token, or refuse. Unauthenticated traffic is not
+    /// charged: burning the victim's budget before `AuthenticationOk` would
+    /// turn a failed login into a DoS against a real session.
+    fn allow_statement(&self) -> bool {
+        match &self.policy.rate_limit {
+            None => true,
+            Some(_) if !self.authenticated || self.principal.is_empty() => true,
+            Some(lim) => lim.try_acquire(&self.principal),
+        }
+    }
+
+    /// Local refusal that never reached the backend. Simple queries need a
+    /// synthetic `ReadyForQuery` so the client is not left waiting; extended
+    /// `Execute` waits for the client's `Sync`, which still goes through.
+    fn refuse_rate_limited(&mut self, out: &mut Batch, with_ready: bool) {
+        self.policy.metrics.record(Cause::RateLimited);
+        let err = protocol::build_error(
+            protocol::SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            "pgmask: statement rate limit exceeded for this user",
+            Some("Wait and retry, or raise rate_limit_per_minute / rate_limit_burst."),
+        );
+        out.client(Vetted::synthetic(&err));
+        if with_ready {
+            let ready = Message::new(
+                protocol::B_READY_FOR_QUERY,
+                Bytes::copy_from_slice(&[self.txn_status]),
+            );
+            out.client(Vetted::synthetic(&ready));
+        }
+    }
+
+    /// DML / DDL / `DO` / `CALL` — pgmask never writes.
+    fn refuse_write(&mut self, out: &mut Batch, with_ready: bool) {
+        self.policy.metrics.record(Cause::WriteRefused);
+        let err = protocol::build_error(
+            protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "pgmask: read-only — writes, DDL, DO, and CALL are not permitted",
+            Some(
+                "pgmask is a masking proxy for SELECT. Mutating SQL and anonymous \
+                 blocks are refused on every posture.",
+            ),
+        );
+        out.client(Vetted::synthetic(&err));
+        if with_ready {
+            self.synthetic_ready(out);
+        }
+    }
+
+    fn refuse_untrusted_function(&mut self, out: &mut Batch, with_ready: bool) {
+        self.policy.metrics.record(Cause::UntrustedFunction);
+        let err = protocol::build_error(
+            protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "pgmask: only trusted pg_catalog functions may be called",
+            Some(
+                "User-defined and schema-qualified functions can run before their \
+                 result is masked (timing and side effects). Call only built-ins, \
+                 or set system_catalogs = \"allow\" for metadata-only catalog SQL.",
+            ),
+        );
+        out.client(Vetted::synthetic(&err));
+        if with_ready {
+            self.synthetic_ready(out);
+        }
+    }
+
+    fn synthetic_ready(&self, out: &mut Batch) {
+        let ready = Message::new(
+            protocol::B_READY_FOR_QUERY,
+            Bytes::copy_from_slice(&[self.txn_status]),
+        );
+        out.client(Vetted::synthetic(&ready));
+    }
+
+    /// Frontend gates that must run before the statement reaches Postgres.
+    fn refuse_frontend_sql(&mut self, sql: &str, out: &mut Batch, with_ready: bool) -> bool {
+        if analysis::is_write_statement(sql) {
+            self.refuse_write(out, with_ready);
+            return true;
+        }
+        if analysis::calls_untrusted_function(sql) {
+            self.refuse_untrusted_function(out, with_ready);
+            return true;
+        }
+        if analysis::touches_leaky_system_catalog(sql) {
+            self.refuse_leaky_catalog(out, with_ready);
+            return true;
+        }
+        // Hostile masked-column use must not reach Postgres: execute-then-refuse
+        // on RowDescription still ran the statement (timing / error-presence
+        // oracles on WHERE and CASE). Refuse here with the same rule the
+        // RowDescription path uses.
+        if self.policy.posture == Posture::Hostile {
+            let snapshot = self.policy.catalog.snapshot();
+            let masked = snapshot.masked_bare_names_for_roles(&self.roles);
+            let relations = snapshot.relation_columns_map();
+            if analysis::masked_exceeds_outer_projection(sql, &masked)
+                || analysis::hostile_uses_whole_row(sql, relations)
+                || analysis::hostile_join_or_rename_masked(sql, relations, &masked)
+            {
+                self.refuse_hostile_masked_use(out, with_ready);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn refuse_leaky_catalog(&mut self, out: &mut Batch, with_ready: bool) {
+        self.policy.metrics.record(Cause::LeakyCatalog);
+        let err = protocol::build_error(
+            protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "pgmask: refusing catalog that can carry user data",
+            Some(
+                "pg_stats, pg_statistic, pg_stat_activity, pg_authid and similar \
+                 hold sampled values, other sessions' SQL, or secrets. They are \
+                 refused on every posture.",
+            ),
+        );
+        out.client(Vetted::synthetic(&err));
+        if with_ready {
+            self.synthetic_ready(out);
+        }
+    }
+
+    fn refuse_hostile_masked_use(&mut self, out: &mut Batch, with_ready: bool) {
+        self.policy.metrics.record(Cause::HostileMaskedUse);
+        let err = protocol::build_error(
+            protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "pgmask: posture = \"hostile\" refuses use of a masked \
+             column outside a bare SELECT list",
+            Some(
+                "Masked columns may be projected (and will be masked) and may \
+                 appear in ORDER BY, but not in WHERE, HAVING, expressions, \
+                 aggregates, or whole-row casts (t::text). Set posture = \
+                 \"default\" for the looser analyst threat model.",
+            ),
+        );
+        out.client(Vetted::synthetic(&err));
+        if with_ready {
+            self.synthetic_ready(out);
+        }
+    }
+
+    fn note_txn_status(&mut self, msg: &Message) {
+        if msg.tag != protocol::B_READY_FOR_QUERY {
+            return;
+        }
+        if let Some(&status) = msg.body.first() {
+            self.txn_status = status;
+        }
+        self.notices_this_exchange = 0;
+    }
+
+    /// Forward a notice, or drop it once this exchange is over budget.
+    fn handle_notice(&mut self, msg: Message, out: &mut Batch) {
+        // Saturating: a u32 cannot overflow from notices in any real session,
+        // and wrapping would re-admit traffic after a flood.
+        self.notices_this_exchange = self.notices_this_exchange.saturating_add(1);
+        if let Some(max) = self.policy.max_notices_per_exchange {
+            if self.notices_this_exchange > max {
+                // One metric event per crossing, not per dropped notice — a
+                // 1600-notice DO would otherwise drown the counters.
+                if self.notices_this_exchange == max.saturating_add(1) {
+                    self.policy.metrics.record(Cause::NoticeFlood);
+                }
+                return;
+            }
+        }
+        match protocol::scrub_notice(&msg.body) {
+            Some(scrubbed) => out.client(Vetted::synthetic(&Message::new(msg.tag, scrubbed))),
+            None => out.client(Vetted::control(&msg)),
+        }
+    }
+
     fn handle_frontend(&mut self, msg: Message, out: &mut Batch) {
         // A cached plan is a decision made against one catalog snapshot; a
         // refresh can tighten a classification underneath it.
@@ -456,13 +659,24 @@ impl Session {
             // A new simple query invalidates everything: if the backend does not
             // describe the next result set, we must not mask it with a stale plan.
             protocol::F_QUERY => {
-                self.plans
-                    .begin_simple_query(protocol::parse_simple_query(&msg.body));
+                let sql = protocol::parse_simple_query(&msg.body);
+                if let Some(sql) = sql.as_deref() {
+                    if self.refuse_frontend_sql(sql, out, true) {
+                        return;
+                    }
+                }
+                if !self.allow_statement() {
+                    return self.refuse_rate_limited(out, true);
+                }
+                self.plans.begin_simple_query(sql);
                 out.backend(msg.encode())
             }
 
             protocol::F_PARSE => {
                 if let Some((name, sql)) = protocol::parse_parse(&msg.body) {
+                    if self.refuse_frontend_sql(&sql, out, false) {
+                        return;
+                    }
                     self.plans.parse(name, sql);
                 }
                 out.backend(msg.encode())
@@ -492,7 +706,18 @@ impl Session {
 
             protocol::F_EXECUTE => {
                 if let Some(portal) = protocol::parse_execute(&msg.body) {
+                    let portal_sql = self.plans.sql_for_portal(&portal).map(str::to_owned);
+                    if let Some(sql) = portal_sql.as_deref() {
+                        if self.refuse_frontend_sql(sql, out, false) {
+                            return;
+                        }
+                    }
+                    if !self.allow_statement() {
+                        return self.refuse_rate_limited(out, false);
+                    }
                     self.plans.execute(&portal);
+                } else if !self.allow_statement() {
+                    return self.refuse_rate_limited(out, false);
                 }
                 out.backend(msg.encode())
             }
@@ -513,6 +738,7 @@ impl Session {
 
     fn handle_backend(&mut self, msg: Message, out: &mut Batch) {
         self.note_backend_auth(&msg);
+        self.note_txn_status(&msg);
 
         // While suppressing, everything is dropped until the cycle ends.
         if let Some(suppressed_epoch) = self.suppressing {
@@ -650,10 +876,7 @@ impl Session {
                 }
             }
 
-            protocol::B_NOTICE_RESPONSE => match protocol::scrub_notice(&msg.body) {
-                Some(scrubbed) => out.client(Vetted::synthetic(&Message::new(msg.tag, scrubbed))),
-                None => out.client(Vetted::control(&msg)),
-            },
+            protocol::B_NOTICE_RESPONSE => self.handle_notice(msg, out),
 
             // No result set for this Describe; consume its slot.
             b'n' => {
@@ -834,12 +1057,19 @@ impl Session {
         let allow_summaries = self.policy.summaries == Summaries::Allow && !singleton_groups;
 
         // Hostile posture: a masked column may only appear as a bare outermost
-        // SELECT-list ColumnRef. Closes WHERE/LIKE, ORDER BY, single-row
-        // aggregates and the error-channel CASE — see analysis.rs.
+        // SELECT-list ColumnRef (ORDER BY mentions are credited — cleartext
+        // sort order of masked values is accepted). Whole-row casts/refs
+        // (`t::text`) are refused — they embed cleartext without naming
+        // columns. Closes WHERE/LIKE, single-row aggregates and the
+        // error-channel CASE — see analysis.rs.
         if self.policy.posture == Posture::Hostile {
             let masked = snapshot.masked_bare_names_for_roles(&self.roles);
+            let relations = snapshot.relation_columns_map();
             let sql = described_sql.as_deref().unwrap_or("");
-            if analysis::masked_exceeds_outer_projection(sql, &masked) {
+            if analysis::masked_exceeds_outer_projection(sql, &masked)
+                || analysis::hostile_uses_whole_row(sql, relations)
+                || analysis::hostile_join_or_rename_masked(sql, relations, &masked)
+            {
                 self.plans.discard_description();
                 return self.reject(
                     Rejection {
@@ -848,10 +1078,10 @@ impl Session {
                                   column outside a bare SELECT list"
                             .into(),
                         hint: Some(
-                            "Masked columns may be projected (and will be masked) but may \
-                             not appear in WHERE, ORDER BY, HAVING, expressions or \
-                             aggregates. Set posture = \"default\" for the looser analyst \
-                             threat model."
+                            "Masked columns may be projected (and will be masked) and may \
+                             appear in ORDER BY, but not in WHERE, HAVING, expressions, \
+                             aggregates, or whole-row casts (t::text). Set posture = \
+                             \"default\" for the looser analyst threat model."
                                 .into(),
                         ),
                     },
@@ -1363,6 +1593,8 @@ mod tests {
             require_client_tls: false,
             backend_tls: BackendTls::Disable,
             backend_ca: None,
+            rate_limit: None,
+            max_notices_per_exchange: None,
         })
     }
 
@@ -1504,6 +1736,8 @@ mask = "none"
             tls: None,
             backend_tls: BackendTls::Disable,
             backend_ca: None,
+            rate_limit: None,
+            max_notices_per_exchange: None,
         });
         // int4, not a text type: pseudonym rewrites values as text.
         let err = p
@@ -1659,6 +1893,243 @@ mask = "none"
         // session that never authenticated cannot pick up a looser mask.
         let session = Session::new(policy(Unclassified::Mask, Opaque::Reject));
         assert!(session.roles.is_empty());
+    }
+
+    fn policy_with_rate_limit(per_minute: u32, burst: u32) -> Arc<Policy> {
+        Arc::new(Policy {
+            catalog: Arc::new(Catalog::default()),
+            masker: Arc::new(Masker::new(b"k".to_vec())),
+            unclassified: Unclassified::Allow,
+            unclassified_mask: Mask::Null,
+            opaque: Opaque::Reject,
+            metrics: Arc::new(Metrics::default()),
+            summaries: Summaries::Allow,
+            posture: Posture::Default,
+            system_catalogs: SystemCatalogs::Refuse,
+            lineage: Lineage::Refuse,
+            roles: HashMap::new(),
+            tls: None,
+            require_client_tls: false,
+            backend_tls: BackendTls::Disable,
+            backend_ca: None,
+            rate_limit: Some(PrincipalRateLimit::new(per_minute, burst).unwrap()),
+            max_notices_per_exchange: None,
+        })
+    }
+
+    fn policy_with_notice_cap(max: u32) -> Arc<Policy> {
+        Arc::new(Policy {
+            catalog: Arc::new(Catalog::default()),
+            masker: Arc::new(Masker::new(b"k".to_vec())),
+            unclassified: Unclassified::Allow,
+            unclassified_mask: Mask::Null,
+            opaque: Opaque::Reject,
+            metrics: Arc::new(Metrics::default()),
+            summaries: Summaries::Allow,
+            posture: Posture::Default,
+            system_catalogs: SystemCatalogs::Refuse,
+            lineage: Lineage::Refuse,
+            roles: HashMap::new(),
+            tls: None,
+            require_client_tls: false,
+            backend_tls: BackendTls::Disable,
+            backend_ca: None,
+            rate_limit: None,
+            max_notices_per_exchange: Some(max),
+        })
+    }
+
+    fn sample_notice() -> Message {
+        let mut body = bytes::BytesMut::new();
+        for (tag, value) in [
+            (b'S', "NOTICE"),
+            (b'V', "NOTICE"),
+            (b'C', "00000"),
+            (b'M', "x"),
+        ] {
+            bytes::BufMut::put_u8(&mut body, tag);
+            bytes::BufMut::put_slice(&mut body, value.as_bytes());
+            bytes::BufMut::put_u8(&mut body, 0);
+        }
+        bytes::BufMut::put_u8(&mut body, 0);
+        Message::new(protocol::B_NOTICE_RESPONSE, body.freeze())
+    }
+
+    #[test]
+    fn simple_query_rate_limit_refuses_after_burst() {
+        let mut session = Session::new(policy_with_rate_limit(60, 2)).with_principal("alice");
+        session.authenticated = true;
+
+        for i in 0..2 {
+            let mut out = Batch::default();
+            session.handle_frontend(
+                Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1\0")),
+                &mut out,
+            );
+            assert!(
+                !out.to_backend.is_empty(),
+                "query {i} under burst must reach the backend"
+            );
+            assert!(out.to_client.is_empty());
+        }
+
+        let mut out = Batch::default();
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1\0")),
+            &mut out,
+        );
+        assert!(
+            out.to_backend.is_empty(),
+            "over-budget Query must not reach the backend"
+        );
+        let text = String::from_utf8_lossy(&out.to_client);
+        assert!(text.contains("rate limit"), "got: {text}");
+        assert!(text.contains("54000"), "SQLSTATE 54000 expected: {text}");
+        // Synthetic ReadyForQuery so the client is not left hanging.
+        assert!(
+            out.to_client
+                .iter()
+                .any(|&b| b == protocol::B_READY_FOR_QUERY),
+            "simple-query refusal must synthesise ReadyForQuery"
+        );
+        assert_eq!(
+            session.policy.metrics.count(Cause::RateLimited),
+            1,
+            "metric must fire once"
+        );
+    }
+
+    #[test]
+    fn execute_rate_limit_refuses_without_ready_for_query() {
+        let mut session = Session::new(policy_with_rate_limit(60, 1)).with_principal("alice");
+        session.authenticated = true;
+
+        // Spend the single token.
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1\0")),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        let mut exec = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut exec, b"\0"); // unnamed portal
+        bytes::BufMut::put_i32(&mut exec, 0); // no row limit
+        session.handle_frontend(Message::new(protocol::F_EXECUTE, exec.freeze()), &mut out);
+        assert!(out.to_backend.is_empty());
+        let text = String::from_utf8_lossy(&out.to_client);
+        assert!(text.contains("rate limit"), "got: {text}");
+        assert!(
+            !out.to_client
+                .iter()
+                .any(|&b| b == protocol::B_READY_FOR_QUERY),
+            "Execute refusal waits for the client's Sync"
+        );
+    }
+
+    #[test]
+    fn unauthenticated_queries_are_not_rate_limited() {
+        // Burning the claimed username's budget before AuthenticationOk would
+        // turn a failed login into a DoS against a real session.
+        let mut session = Session::new(policy_with_rate_limit(60, 1)).with_principal("alice");
+        assert!(!session.authenticated);
+        for _ in 0..3 {
+            let mut out = Batch::default();
+            session.handle_frontend(
+                Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1\0")),
+                &mut out,
+            );
+            assert!(!out.to_backend.is_empty());
+            assert!(out.to_client.is_empty());
+        }
+    }
+
+    #[test]
+    fn notice_cap_drops_excess_and_resets_on_ready() {
+        let mut session = Session::new(policy_with_notice_cap(2));
+        let notice = sample_notice();
+
+        for i in 0..2 {
+            let mut out = Batch::default();
+            session.handle_backend(notice.clone(), &mut out);
+            assert!(
+                !out.to_client.is_empty(),
+                "notice {i} under the cap must be forwarded"
+            );
+        }
+
+        let mut out = Batch::default();
+        session.handle_backend(notice.clone(), &mut out);
+        assert!(
+            out.to_client.is_empty(),
+            "notice over the cap must be dropped"
+        );
+        assert_eq!(session.policy.metrics.count(Cause::NoticeFlood), 1);
+
+        // Further excess notices do not re-fire the metric.
+        session.handle_backend(notice.clone(), &mut Batch::default());
+        assert_eq!(session.policy.metrics.count(Cause::NoticeFlood), 1);
+
+        // ReadyForQuery replenishes the budget.
+        session.handle_backend(
+            Message::new(protocol::B_READY_FOR_QUERY, Bytes::from_static(b"I")),
+            &mut Batch::default(),
+        );
+        let mut out = Batch::default();
+        session.handle_backend(notice, &mut out);
+        assert!(
+            !out.to_client.is_empty(),
+            "a new exchange must admit notices again"
+        );
+    }
+
+    #[test]
+    fn read_only_refuses_writes_and_do_before_the_backend() {
+        // Read-only applies on every posture, including default.
+        let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
+        for sql in [
+            "INSERT INTO t VALUES (1)\0",
+            "UPDATE t SET x=1\0",
+            "DELETE FROM t\0",
+            "CREATE TABLE t (id int)\0",
+            "DO $$ BEGIN RAISE NOTICE 'x'; END $$\0",
+            "CALL demo.do_thing()\0",
+        ] {
+            let mut out = Batch::default();
+            session.handle_frontend(
+                Message::new(protocol::F_QUERY, Bytes::from(sql.as_bytes().to_vec())),
+                &mut out,
+            );
+            assert!(out.to_backend.is_empty(), "must not reach Postgres: {sql}");
+            let text = String::from_utf8_lossy(&out.to_client);
+            assert!(text.contains("read-only"), "got: {text} for {sql}");
+        }
+        assert!(session.policy.metrics.count(Cause::WriteRefused) >= 6);
+
+        // Ordinary SELECT still goes through.
+        let mut out = Batch::default();
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1\0")),
+            &mut out,
+        );
+        assert!(!out.to_backend.is_empty());
+        assert!(out.to_client.is_empty());
+    }
+
+    #[test]
+    fn untrusted_functions_never_reach_the_backend() {
+        let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
+        let mut out = Batch::default();
+        session.handle_frontend(
+            Message::new(
+                protocol::F_QUERY,
+                Bytes::from_static(b"SELECT demo.sleep_if(1, 'u')\0"),
+            ),
+            &mut out,
+        );
+        assert!(out.to_backend.is_empty());
+        let text = String::from_utf8_lossy(&out.to_client);
+        assert!(text.contains("trusted pg_catalog"), "got: {text}");
+        assert_eq!(session.policy.metrics.count(Cause::UntrustedFunction), 1);
     }
 
     #[test]

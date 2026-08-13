@@ -522,6 +522,8 @@ pub fn sasl_mechanisms(body: &Bytes) -> Vec<String> {
 /// Insufficient privilege. The right SQLSTATE for "policy refused this", and one
 /// every driver already surfaces sensibly.
 pub const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
+/// Program limit exceeded — statement rate limit for this principal.
+pub const SQLSTATE_PROGRAM_LIMIT_EXCEEDED: &str = "54000";
 
 pub fn build_error(sqlstate: &str, message: &str, hint: Option<&str>) -> Message {
     let mut body = BytesMut::new();

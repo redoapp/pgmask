@@ -122,8 +122,8 @@ extended-statistics objects exist, while the values live in
 `pg_statistic_ext_data`. `\d` reads the former, so denying both would have
 broken table description for no gain.
 
-A denied catalog does not get a special error — it simply drops out of the rule
-and meets default-deny like anything else, which nulls it.
+A denied catalog is refused at the frontend on every posture (`leaky_catalog`) —
+it never reaches Postgres — rather than being nulled after the fact.
 
 ## Functions that take SQL as a string
 

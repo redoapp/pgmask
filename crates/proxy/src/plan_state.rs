@@ -192,6 +192,14 @@ impl PlanState {
         self.active_epoch = Some(self.sync_epoch);
     }
 
+    /// SQL text bound into this portal, when we still have it.
+    pub(crate) fn sql_for_portal(&self, portal: &Bytes) -> Option<&str> {
+        self.portal_statement
+            .get(portal)
+            .and_then(|statement| self.statement_sql.get(statement))
+            .map(String::as_str)
+    }
+
     /// Mirror PostgreSQL's resource lifetime after a frontend `Close`.
     /// Closing a statement also closes every portal constructed from it.
     ///

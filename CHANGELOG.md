@@ -1,5 +1,184 @@
 # Changelog
 
+## 0.1.89 — hostile closes ARRAY/CASE/LIMIT/indirection unicode oracles
+
+Unicode-escaped masked names still slipped through inside node kinds the tally
+did not descend into:
+
+- `ARRAY[u&"email"]` / `(ARRAY[…])[1]` / `ANY(ARRAY[…])`
+- `CASE u&"email" WHEN …`
+- `LIMIT` / `OFFSET` scalar subqueries with masked predicates
+- `(t).u&"email"` (`A_Indirection`)
+- `FILTER (WHERE … ARRAY[u&"email"] …)`
+- `xmlforest(u&"email")` / other `XmlExpr` named args (`ResTarget` wrappers)
+
+Hostile now walks each `SelectStmt`'s clauses comprehensively (including
+`WHERE`/`LIMIT`/`OFFSET` and the new expression node kinds) so decoded names
+inside those containers are counted once against the projection gate.
+
+## 0.1.88 — hostile closes NATURAL JOIN, column-alias rename, unicode USING/PARTITION
+
+Further membership oracles that never named a masked column in a tallied place:
+
+1. **`FROM t AS x(c1,c2,…)`** renames `email`→`c2`, then `WHERE c2 = '…'` /
+   `LIKE` recovers cleartext membership.
+2. **`NATURAL JOIN`** (including `NATURAL JOIN (VALUES (…)) v(u&"email")`)
+   equates on masked columns without naming them in predicates.
+3. **`USING (u&"email")`**, **`PARTITION BY u&"email" = …`**, **`GROUP BY
+   GROUPING SETS / ROLLUP / CUBE (u&"email")`**, and CTE `aliascolnames` with
+   unicode-escaped masked names — decoded `String` / `WindowDef` / `GroupingSet`
+   nodes the previous tally missed.
+
+Hostile now refuses column-alias lists on relations that have masked columns,
+refuses NATURAL JOIN when a side carries masked columns, and extends the
+ColumnRef/name tally into `USING`, window `PARTITION BY`/`OVER`, `DISTINCT ON`,
+`GROUP BY` (including grouping sets), CTE colnames, and `Alias.colnames`.
+
+## 0.1.87 — hostile closes unicode-identifier and ORDER BY predicate oracles
+
+Two bypasses of the hostile masked-column gate:
+
+1. **Unicode-escaped identifiers** (`u&"email"`, `u&"e\006dail"`) never appear as
+   the bare word `email` in the token stream, so the lexical count missed them
+   while Postgres still evaluated the cleartext column. Hostile now also counts
+   decoded `ColumnRef` names from the parse tree (max with the lexical count).
+2. **`ORDER BY email = '…'`** was credited as an accepted cleartext sort, but is
+   a membership oracle. Only *simple* sort keys (`ORDER BY email`, optional
+   cast/collate) are credited now.
+
+## 0.1.86 — hostile closes whole-row cleartext oracles
+
+`SELECT count(*) FROM customers t WHERE t::text LIKE '%secret%'` (and
+`format('%s', t)`, `concat(t)`, `customers::text`, `JOIN … ON a::text = b::text`,
+`count(*) FILTER (WHERE t::text …)`) never named a masked column, so the lexical
+hostile gate allowed them. Postgres still embeds every column's cleartext in the
+row text — a full membership oracle.
+
+Hostile now refuses whole-row references to FROM items (`hostile_uses_whole_row`)
+at the frontend, before Postgres runs — including aggregate `FILTER` and
+`COLLATE` subtrees that `pg_query`'s node walk does not descend into, and row
+aliases from `FROM (subquery) t` / `RangeFunction` / joined aliases.
+
+## 0.1.85 — hostile accepts cleartext ORDER BY of masked values
+
+Sorting by a masked column (`ORDER BY email`, `ORDER BY 1`, `SELECT * ORDER BY
+n`) does not put cleartext on the wire — only the row order of already-masked
+cells. That is an accepted trade for exploration; 0.1.83 / 0.1.84 refused it.
+
+Hostile still refuses predicates and other *value* inference
+(`WHERE`/`LIKE`, single-row aggregates, error-channel `CASE`). `ORDER BY`
+mentions of masked names are credited in the projection gate so
+`SELECT id … ORDER BY email` works again.
+
+## 0.1.84 — hostile closes SELECT * ORDER BY n
+
+`SELECT * FROM customers ORDER BY 2` (when column 2 is `email`) still sorted by
+cleartext after 0.1.83: the star made ordinals unresolvable, and the fail-closed
+path only triggered when a *bare* masked column was projected. Hostile treated
+an unreadable sort/group key under `SELECT *` as masked whenever the FROM
+clause named a relation that has masked columns. Superseded by 0.1.85 (accepted
+cleartext sort order).
+
+## 0.1.83 — hostile closes ORDER BY 1 / alias cleartext-order oracles
+
+`SELECT email FROM t ORDER BY 1` (and `ORDER BY alias` / `GROUP BY 1` /
+`DISTINCT ON (1)`) named the masked column only once, as a bare projection, so
+the lexical hostile gate allowed it. Postgres still sorted by cleartext, then
+the proxy masked — returning pseudonyms in cleartext order.
+
+Hostile resolved sort/group/distinct keys (including ordinals and output
+aliases) and refused when any key was a masked column. Superseded by 0.1.85.
+
+## 0.1.82 — hostile + leaky catalogs refused before Postgres
+
+Two execute-then-refuse gaps remained after the projection and write gates:
+
+1. **Hostile predicates still ran on the backend.** The masked-column rule lived
+   only on `RowDescription`, so `WHERE email = …` / error-channel `CASE` still
+   executed (timing and error-presence) before the client saw a refusal. The
+   same rule now runs in the frontend gate, before the statement is forwarded.
+2. **Leaky system catalogs** (`pg_stats`, `pg_statistic`, `pg_stat_activity`,
+   `pg_authid`, …) were nulled rather than refused. Cleartext MCV cells did not
+   return, but the query still ran. They are now refused at the frontend on
+   every posture (`leaky_catalog`).
+
+## 0.1.81 — hostile closes WHERE on unclassified columns
+
+Default-deny nulls unclassified columns in the projection (`internal_note` in
+the demo, and every column of an uncatalogued table). Under
+`posture = "hostile"` those names were still usable in `WHERE` / `LIKE` /
+error-channel `CASE`, so `WHERE internal_note = 'secret'` or
+`WHERE token = '…'` recovered the cleartext the SELECT list had nulled.
+
+Hostile's masked-name set now includes unclassified columns from the schema
+snapshot. Bare names that are passthrough (`mask = "none"`) on any catalogued
+column stay usable as filters (`WHERE id = 1`, `WHERE city = …`).
+
+## 0.1.80 — fail-closed read-only allowlist
+
+The write gate was a denylist of statement nodes. `CREATE VIEW` was missing:
+under hostile read-only a client could still `CREATE VIEW demo.v AS SELECT email
+…` and the backend stored a cleartext definition (direct DB access then saw
+emails; the proxy continued to mask `SELECT` from that view). `LOAD` and
+`CHECKPOINT` slipped through the same hole.
+
+`is_write_statement` is now an allowlist of read/session statement classes
+(`SELECT` without row locks / `INTO`, `EXPLAIN`, `SET`/`SHOW`, transactions,
+prepare/execute, cursors, `DISCARD`). Every other `*Stmt` is refused
+(`write_refused`) before Postgres runs it.
+
+## 0.1.79 — refuse untrusted functions and FOR UPDATE
+
+Preinstalled `SELECT demo.sleep_if(…)` still ran under read-only + hostile: the
+result was opaque-refused, but timing recovered email prefixes. Any `FuncCall`
+outside a trusted `pg_catalog` allowlist is now refused at the frontend
+(`untrusted_function`), before Postgres executes it. Metadata-only catalog SQL
+is exempt. `SELECT … FOR UPDATE` / `FOR SHARE` join the read-only write gate.
+
+## 0.1.78 — read-only: refuse all writes
+
+pgmask is a masking proxy for reading. Under every posture it now refuses DML,
+DDL, `COPY`, data-modifying CTEs, `DO`, `CALL`, `NOTIFY`/`LISTEN`, and similar
+mutating SQL at the frontend (metric `write_refused`) — before Postgres runs
+them.
+
+That closes the live exfil paths found under hostile: `INSERT … SELECT email`,
+`UPDATE … WHERE email = …` rowcount oracles, and `CREATE TABLE` through the
+proxy. `SELECT` of a preinstalled function can still *execute* for timing side
+effects; its return value remains opaque-refused.
+
+## 0.1.77 — hostile refuses DO / CALL / CREATE FUNCTION
+
+Timing and exception-presence oracles under `posture = "hostile"` never needed
+a projection: a `DO` block reads masked columns with `SELECT … INTO` and encodes
+the answer as sleep or success-vs-error. Notice caps and rate limits only raise
+the cost.
+
+Hostile now refuses `DO`, `CALL`, and `CREATE FUNCTION`/`PROCEDURE` at the
+frontend (metric `hostile_procedural`). Exploration stays on `SELECT`.
+
+## 0.1.76 — cap notices per exchange
+
+Rate limits charge one token per `Query`/`Execute`, so a single `DO` block can
+still encode a full masked value as hundreds of NOTICE/INFO messages — measured:
+full email recovery in one statement via run-length encoding.
+
+`max_notices_per_exchange` (0 = off) drops excess `NoticeResponse` traffic until
+the next `ReadyForQuery` and counts `notice_flood` once per crossing. Pair with
+`posture = "hostile"` and `rate_limit_per_minute`.
+
+## 0.1.75 — per-principal statement rate limits
+
+The notice-channel oracle under `posture = "hostile"` recovers a full email in
+a few hundred `DO` blocks: each is a simple query that never projects a masked
+column, so the projection gate has nothing to refuse. Closing that without a
+PL/pgSQL interpreter means making the campaign expensive.
+
+`rate_limit_per_minute` / `rate_limit_burst` (off by default) charge every
+authenticated `Query` and `Execute` against a shared per-username budget. Over
+budget: SQLSTATE `54000`, metric `rate_limited`. Simple queries get a synthetic
+`ReadyForQuery`; extended `Execute` waits for the client's `Sync`.
+
 ## 0.1.74 — the skip counter had never counted a skip
 
 `scripts/test-all.sh` has printed this on every run it has ever made:

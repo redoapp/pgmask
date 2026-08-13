@@ -27,7 +27,7 @@ work:
 | `count(*)` with a `LIKE` predicate | recovers a full address in **313 queries** |
 | `WHERE` on a masked column | confirms a guess exactly |
 | an error as a one-bit channel | `1/(CASE WHEN … THEN 0 ELSE 1 END)` |
-| `ORDER BY` a masked column | ranks rows by it |
+| `ORDER BY` a masked column | ranks rows by it (accepted: cells stay masked) |
 | `sum(x)` filtered to one row | is that row |
 
 The last one is the boundary: pgmask refuses a summary whose *grouping* makes
@@ -103,6 +103,37 @@ vary — how many notices it emits, which severity each one carries, how long th
 statement takes, how many rows come back. Severity alone is roughly two bits per
 notice and a loop emits as many as it likes. Closing those would mean refusing
 `DO` blocks and user-defined functions outright, which is a different product.
+`rate_limit_per_minute` (off by default) is the blunt instrument that makes a
+few-hundred-query campaign expensive without inventing that interpreter.
+`max_notices_per_exchange` (also off by default) caps NOTICE/INFO/WARNING
+messages between `ReadyForQuery` markers. Under every posture, mutating SQL
+(`INSERT`/`UPDATE`/`DELETE`/DDL/`DO`/`CALL`/…) is refused outright —
+measured exfil via `INSERT … SELECT` and DML rowcount oracles. Under
+`posture = "hostile"`, masked columns outside bare projections are refused
+as well. As of 0.1.79, `SELECT` of non-allowlisted / non-`pg_catalog` functions is
+refused before execution, and `FOR UPDATE` joins the read-only gate. As of
+0.1.80 the read-only gate is a fail-closed statement allowlist (closing
+`CREATE VIEW` / `LOAD` / `CHECKPOINT` and other DDL the denylist missed).
+As of 0.1.81, hostile also treats unclassified columns (including on
+uncatalogued tables) like masked ones for predicates — closing
+`WHERE internal_note = …` / `WHERE token = …` after default-deny nulls the
+projection. As of 0.1.82, hostile predicate checks and leaky-catalog reads
+(`pg_stats`, `pg_authid`, …) are refused at the frontend before Postgres runs
+them — closing the remaining execute-then-refuse timing/error channel for
+those paths. As of 0.1.85, cleartext `ORDER BY` of masked columns is an
+accepted residual (cells stay masked on the wire; 0.1.83/0.1.84 briefly
+refused it). As of 0.1.86, hostile also refuses whole-row casts/refs
+(`t::text`, `format('%s', t)`, aggregate `FILTER` on row text) that embed
+cleartext without naming masked columns. As of 0.1.87, hostile also closes
+unicode-escaped identifiers (`u&"email"`) and `ORDER BY email = '…'` membership
+oracles (only simple `ORDER BY email` stays accepted). As of 0.1.88, also
+NATURAL JOIN / `FROM t AS x(c1,c2,…)` renames / unicode `USING` &
+`PARTITION BY`. As of 0.1.89, also `ARRAY`/`CASE`/`LIMIT`/`(t).col`/
+`xmlforest` containers around unicode-escaped masked names. Residual
+disclosure under hostile + read-only SELECT is the intentional mask surface
+(partial phone, salary buckets, filters on columns with `mask = "none"`, and
+cleartext sort order among masked projections).
+Default posture still allows predicate oracles on masked columns by design.
 
 The distinction is whether the channel carries the value or carries a message
 the attacker encoded. pgmask stops the first.

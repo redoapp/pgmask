@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.74**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.89**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -306,6 +306,15 @@ lineage           = "refuse" # refuse | allow  — trace expressions to base col
 summaries         = "allow"  # allow | refuse  — aggregates over masked columns
 posture           = "default" # default | hostile — see below
 
+# Optional blunt instrument against notice-oracle campaigns (and any other
+# high-volume authenticated traffic). 0 disables. Burst defaults to the
+# per-minute budget when omitted / zero.
+# rate_limit_per_minute = 60
+# rate_limit_burst      = 10
+# Cap NoticeResponse messages (NOTICE/INFO/WARNING) per ReadyForQuery exchange.
+# Stops a single DO from encoding a value as hundreds of notices. 0 disables.
+# max_notices_per_exchange = 32
+
 tls_cert    = "/path/proxy.crt"   # omit both to serve plaintext
 tls_key     = "/path/proxy.key"
 backend_tls = "disable"           # disable | require | verify-full
@@ -336,9 +345,17 @@ type     = "email"          # or an inline `mask =`, which overrides the type
 
 **`posture = "hostile"`** is the containment profile: it forces `summaries =
 "refuse"` and refuses any statement where a masked column appears outside a bare
-outermost SELECT list. That closes the measured inference routes (`WHERE`/`LIKE`,
-`ORDER BY`, single-row aggregates, error-channel `CASE`) while still serving
-`SELECT email, id FROM t WHERE id = 1` (masked). Default posture is unchanged.
+outermost SELECT list — including unclassified columns (default-deny nulls them
+in the projection; hostile also blocks predicate oracles on them). That closes
+the measured *value* inference routes (`WHERE`/`LIKE`, single-row aggregates,
+error-channel `CASE`) while still serving `SELECT email, id FROM t WHERE id = 1`
+(masked) and cleartext **ordering** of masked values (`ORDER BY email`). Default
+posture is unchanged.
+On every posture, pgmask is **read-only**: only an allowlist of read/session
+statements reach Postgres (`SELECT` without row locks, `EXPLAIN`, `SET`/`SHOW`,
+transactions, prepare/execute, cursors). DML, DDL (including `CREATE VIEW`),
+`LOAD`, `DO`, `CALL`, and similar are refused first. Pair with
+`rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
 
 **`backend_tls = "verify-full"`** authenticates the database certificate
 (optional `backend_ca` for private CAs). `require` still means encryption
@@ -603,9 +620,24 @@ analytical ones, and which you have decides whether Phase 6 is optional.
 - **SCRAM channel binding is unsupported**, unavoidably — see above.
 - **Backend TLS:** `disable` (plaintext), `require` (encrypt, no cert check),
   or `verify-full` (encrypt and verify, optional `backend_ca` for private CAs).
+- **Read-only.** Fail-closed allowlist: DML, DDL (including `CREATE VIEW`),
+  `LOAD`, `COPY`, `DO`, `CALL`, `FOR UPDATE`, and other mutating SQL are refused
+  on every posture (`write_refused`). The proxy is for SELECT.
+- **Trusted functions only.** Schema-qualified calls outside `pg_catalog`, and
+  unqualified names not on the built-in allowlist, are refused before execution
+  (`untrusted_function`) — closes timing/side-effect oracles via preinstalled
+  PL/pgSQL. Pair with a SELECT-only DB role that also revokes `EXECUTE` on
+  non-essential functions.
 - **`posture = "hostile"`** refuses summaries over masked columns and any use of
-  a masked column outside a bare SELECT list — closes the measured inference
-  oracles at the cost of most analytical SQL. Default posture does not.
+  a masked (or unclassified) column outside a bare SELECT list — checked
+  **before** Postgres runs the statement (`hostile_masked_use`). Also refuses
+  whole-row casts/refs, NATURAL JOIN / column-alias renames that hide masked
+  columns, and unicode-escaped names in `USING` / `PARTITION BY`. Cleartext
+  `ORDER BY` of masked values is accepted (cells stay masked). Default posture
+  does not close predicate oracles; use hostile for containment. Pair with
+  `rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
+- **Leaky catalogs refused.** `pg_stats`, `pg_authid`, `pg_stat_activity`, and
+  similar are refused at the frontend on every posture (`leaky_catalog`).
 - **Non-text types accept only `mask = "null"`.** Text-family types are
   byte-identical in text and binary formats so they mask correctly either way;
   anything else is refused rather than guessed at.
@@ -647,6 +679,7 @@ crates/proxy/session.rs    the per-connection state machine, and Vetted
 crates/proxy/catalog.rs    config and (OID, attnum) resolution
 crates/proxy/mask.rs       masking algorithms, semantic-type domains
 crates/proxy/metrics.rs    rejection causes and counters
+crates/proxy/rate_limit.rs per-principal statement rate limits
 crates/proxy/tls.rs        TLS on both legs
 crates/proxy/tests/        canary, adversarial and resilience suites
 crates/proxy/plan_state.rs         extended-query lifecycle: which plan, which rows

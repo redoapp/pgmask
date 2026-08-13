@@ -230,6 +230,9 @@ async fn start_proxy(
         system_catalogs: SystemCatalogs::Refuse,
         lineage: Lineage::Refuse,
         metrics_listen: None,
+        rate_limit_per_minute: 0,
+        rate_limit_burst: 0,
+        max_notices_per_exchange: 0,
     };
     let policy = Arc::new(
         Policy::from_config(&config, Arc::new(Catalog::default()))
