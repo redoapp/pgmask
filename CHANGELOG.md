@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.1.75 — a pipelined binary Bind was refused
+
+Found by attacking a running proxy with a raw wire client, in an adversarial
+session that set out to unmask data and could not.
+
+A client that pipelines `Parse, Describe(Statement), Bind, Execute` in one
+flush — sending all four before reading anything — got:
+
+    ERROR: pgmask: value of type OID 1082 did not decode in text format
+
+when it asked for binary results. Two round trips worked. Postgres served both.
+
+Three things had to line up. `bind` runs while the backend's RowDescription is
+still in flight, so there is no statement plan to stamp and the Bind's format
+codes were dropped. `execute` then finds no portal plan. And
+`finish_description` sets the active plan to the *statement's*, whose formats
+are text — all a statement-level Describe can report, since formats are not
+chosen until Bind. The binary rows then failed to decode.
+
+The re-stamp for this case already existed and carried a comment describing it
+exactly. Only the pipelined arrival order was missed, and that order is what
+performance-minded drivers use — pgjdbc's binary transfer and libpq pipeline
+mode both qualify.
+
+Fixed by remembering each portal's Bind formats and applying them at
+BindComplete, which the measured message order puts after the RowDescription
+and before the first DataRow: ParseComplete, ParameterDescription,
+RowDescription, BindComplete, DataRow.
+
+NOT A LEAK, AND THE REASON MATTERS
+
+It failed closed, and text-family types were never affected because their text
+and binary encodings are identical — verified, not assumed: pipelined binary on
+`email` and `name` returned the pseudonym and `***` both before and after.
+
+It still deserved fixing at this weight. A proxy that refuses legitimate
+queries is one an operator routes around, which is the same argument the TLS
+startup bug made.
+
+WHAT ELSE THE SESSION TRIED
+
+Around forty queries in eight classes, none of which unmasked anything:
+whole-row and composite escapes (`SELECT c FROM t c`, `row_to_json`, `(c).email`,
+`ROW(email)`); aliasing a masked column to a released column's name; CTAS, temp
+tables, attacker-defined views and functions, `RETURNING`, `COPY TO STDOUT` —
+all dead because pgmask is read-only on every posture; SQL-as-a-string
+(`table_to_xml`, `query_to_xml`, `xpath` over it, `schema_to_xml`) and superuser
+`pg_read_file`, all refused as opaque; provenance confusion via `UNION ALL`,
+`COALESCE`, `CASE`, scalar subqueries, LATERAL, window functions, CTE
+reordering and recursive CTEs; and the binary-format matrix above, including
+mixed per-column format codes in both orders.
+
+Four regression tests, each failing without the fix — including one that pins
+the fail-closed path the fix must not open: executing a portal that was never
+bound still has no plan.
+
 ## 0.1.74 — the skip counter had never counted a skip
 
 `scripts/test-all.sh` has printed this on every run it has ever made:
