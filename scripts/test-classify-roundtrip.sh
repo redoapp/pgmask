@@ -197,6 +197,96 @@ else
 fi
 check "and it names them"  "no rule"        "$(cat /tmp/pgmask-roundtrip.check)"
 
+# --- the claim `--check` makes about unruled columns -------------------------
+#
+# It told operators that unruled columns are "a coverage gap and not an
+# exposure" because "default-deny masks them" — unconditionally, while holding
+# the parsed catalog that decides it. Against `unclassified = "allow"`, the
+# documented incremental-rollout posture, that is false: those columns are
+# served in plaintext. Measured on a live proxy, an undeclared view over a
+# classified table returned a real address while `--check` called it safe.
+#
+# Both postures are asserted, because a gate that always says "exposure" is as
+# useless as one that never does.
+# --- the column-rename trap: a released column that holds sensitive data -----
+#
+# --check compares rules to schema *shape*, which a rename leaves intact, so it
+# cannot see that `ssn` and `city` swapped names and sensitive data now sits
+# under a released column. Sampling the released columns is the only thing that
+# catches it — and only with --sample, so this asserts both halves.
+echo "==> --check --sample flags a released column that turned sensitive"
+psql "postgres://postgres@127.0.0.1:$PG_PORT/postgres" -X -q >/dev/null 2>&1 <<'SQL'
+CREATE SCHEMA rt2;
+CREATE TABLE rt2.t (id int PRIMARY KEY, label text);
+INSERT INTO rt2.t SELECT g, '111-22-' || lpad(g::text, 4, '0') FROM generate_series(1, 40) g;
+SQL
+cat > /tmp/pgmask-rt2.toml <<TOML
+listen        = "127.0.0.1:$PROXY_PORT"
+backend       = "127.0.0.1:$PG_PORT"
+catalog_dsn   = "postgres://postgres@127.0.0.1:$PG_PORT/postgres"
+pseudonym_key = "roundtrip-key-not-for-production"
+[[column]]
+relation = "rt2.t"
+column   = "id"
+mask     = "none"
+[[column]]
+relation = "rt2.t"
+column   = "label"
+mask     = "none"
+TOML
+
+# Without --sample: structure passes, and it must SAY it did not look at values.
+nosample=$(DSN="postgres://postgres@127.0.0.1:$PG_PORT/postgres" \
+  ./target/debug/classify --check --catalog /tmp/pgmask-rt2.toml --schema rt2 2>&1)
+check "without --sample the rename trap is invisible" "no drift" "$nosample"
+check "and it says to pass --sample"                  "run with --sample" "$nosample"
+
+# With --sample: the released `label` column is 100% SSN-shaped -> must fail.
+withsample=$(DSN="postgres://postgres@127.0.0.1:$PG_PORT/postgres" \
+  ./target/debug/classify --check --catalog /tmp/pgmask-rt2.toml --schema rt2 --sample 40 2>&1)
+ws_status=$?
+check "with --sample the released column is flagged" "RELEASED column(s) hold sensitive" "$withsample"
+check "and it names the column"                      "rt2.t.label" "$withsample"
+if [[ "$ws_status" -ne 0 ]]; then
+  printf '  \033[32mPASS\033[0m  %s\n' "--sample fails the build on the trap"; pass=$((pass + 1))
+else
+  printf '  \033[31mFAIL\033[0m  %s\n' "--sample exited 0 on a sensitive released column"; fail=$((fail + 1))
+fi
+
+echo "==> what --check claims about unruled columns"
+# This suite's own catalog already sets `unclassified = "allow"` (see where it
+# is written above) so that the "arrives intact" test can work — so it is the
+# allow posture, and the deny posture is the one that has to be constructed.
+#
+# The first cut of this had it backwards, built an "allow" catalog that was
+# already allow, and compared the deny half against the same file. Both halves
+# then described the same posture and two assertions failed for a reason that
+# had nothing to do with the code under test.
+{ echo 'unclassified = "mask"'
+  grep -v '^unclassified' /tmp/pgmask-roundtrip.toml; } > /tmp/pgmask-roundtrip-deny.toml
+grep -q '^unclassified = "mask"' /tmp/pgmask-roundtrip-deny.toml \
+  || { echo "FAIL: could not build the deny-posture catalog"; exit 1; }
+
+allow_out=$(chk)
+allow_status=$?
+check  "unclassified=allow is reported as plaintext" "SERVED IN PLAINTEXT" "$allow_out"
+# "not an exposure" would never match: that wording wraps across a newline, so
+# the refute passed whatever the code did. Match a phrase that is really on one
+# line and really differs between the two postures.
+refute "and is not called merely a coverage gap"     "coverage gap"        "$allow_out"
+# Likewise the exit code: a coverage gap already failed the gate before this
+# change, so "exits non-zero" is true in both postures and discriminates
+# nothing. The reason it fails is the assertion worth making.
+check  "and fails for the right reason" "served in plaintext under" "$allow_out"
+
+# The other half. A gate that always cries exposure is as useless as one that
+# never does, so default-deny must still read as a coverage gap.
+deny_out=$(DSN="postgres://postgres@127.0.0.1:$PG_PORT/postgres" \
+  ./target/debug/classify --check --catalog /tmp/pgmask-roundtrip-deny.toml --schema rt 2>&1)
+refute "default-deny is not called plaintext" "SERVED IN PLAINTEXT" "$deny_out"
+check  "default-deny still says default-deny masks them" "default-deny masks them" "$deny_out"
+
+
 # Decide them, the way an operator would, and it goes green.
 {
   echo

@@ -65,6 +65,18 @@ proxy-to-database connection reads every masked column unmasked, and no rule in
 short — a unix socket, a sidecar, a private subnet — and treat "pgmask is in
 front of it" as saying nothing about network position.
 
+**Multi-statement simple queries are refused, not masked.** A single `Query`
+message carrying more than one statement — `SET search_path = x; SELECT ...`,
+the pattern a lot of ORMs open a connection with — fails closed with "output
+column has no column provenance". pgmask cannot reliably pair the Nth
+RowDescription with the Nth statement (`analysis::provenance_is_trustworthy`
+returns false for anything but a single parsed statement), so it treats every
+field as opaque rather than risk serving the second result set under the first
+statement's plan. Verified fail-closed in both postures: `reject` refuses,
+`mask` nulls, neither serves the value. It is a real compatibility limitation
+and not a leak — but send one statement per `Query`, or use the extended
+protocol, if a client depends on the combined form.
+
 **Who the client is.** pgmask does not authenticate anybody. It forwards the
 authentication exchange to Postgres and watches for `AuthenticationOk`, and the
 principal it resolves masking policy from is the `user` in the startup packet.
@@ -281,6 +293,18 @@ failed reporting that the server refused TLS. A true statement about a database
 the script was supposed to have configured, and nothing to do with the proxy.
 Both loops now abort, and `SHOW ssl` is read back before anything depends on it.
 
+### The extended-protocol plan cache is safe across a refresh
+
+A cached statement or portal plan could, in principle, outlive a catalog
+refresh and mask the wrong data. It does not. Driven with a raw wire client:
+Parse + Describe + Bind + Execute a statement (masked correctly), reshape the
+table from another connection, wait for the refresh, then re-Execute the same
+portal and re-Bind the cached statement. Both are refused —
+`invalidate_if_stale` clears the plans on the generation bump, so the following
+DataRows arrive with no described result set and fail closed. The `SELECT *`
+column-reorder variant is refused one layer earlier, by the backend's own
+"cached plan must not change result type". Neither served a byte.
+
 ### What the same sweep did *not* find
 
 The 08-11 disclosures came from one method: enumerate everything that reaches
@@ -477,6 +501,9 @@ This is the finding that should shape how much weight a green run carries.
 | the gate's skip counter | printed "(0 need Postgres)" on every run ever made, with 41 skipping — libtest captures `eprintln!` from a passing test, so the line it counted never existed |
 | seven `pg_isready` loops | answered YES against the socket-only init server, then fell through on timeout, so "ready" and "timed out" were the same outcome |
 | four `sleep 4`s | called a proxy that was still resolving its catalog "did not come up" |
+| `classify --check` again | told operators unruled columns were "not an exposure" **without reading the setting that decides it** — while holding the parsed catalog |
+| two of the three tests written for that fix | one matched a phrase that wraps across a newline, one asserted an exit code that was non-zero in both postures; both passed whatever the code did |
+| `multi_statement_simple_query_stays_masked` | named for masking, asserted only canary-absence — which a fail-closed *refusal* satisfies as readily, so it could not tell "each set masked by its own plan" from "whole query rejected" |
 | the local gate itself | one machine, one timing profile: a concurrent-DDL race that fails reliably on a Linux runner never reproduced here in seventy releases |
 
 Every one produced a confident answer about something it was not measuring.
@@ -507,6 +534,63 @@ from it.
 
 `./scripts/test-mutations.py` — 26 hand-picked guards, each verified to fail
 when broken.
+
+**Under `allow`, DDL that moves a masked column briefly releases it.** An
+`ALTER TABLE ... DROP COLUMN x; ADD COLUMN x` gives `x` a new attnum while the
+table OID is unchanged. The proxy's snapshot, resolved to the old attnum, then
+misses on the new one — and under `allow` a miss releases. So a column the
+operator *explicitly* masked is served in the clear until the catalog
+re-resolves.
+
+Measured on a live proxy: before the fix below, every query leaked for the full
+refresh interval (30s by default), because a known table OID nudged no refresh.
+The fix nudges a refresh on any lookup miss, not only unknown relations, which
+bounds the window to `catalog_refresh_min_seconds` (5s by default). The residual
+is inherent to an asynchronous catalog under `allow`: a genuinely new column is
+released there by design, and a reshaped one is indistinguishable from a new one
+until the refresh lands. **Default-deny is not affected** — a miss masks, with
+no dependence on refresh timing, and
+`a_reshaped_masked_column_stays_masked_under_default_deny` pins that. Mask
+anything sensitive rather than leaving it to `allow`.
+
+## Point it at a read-only upstream
+
+The single highest-value deployment choice, and the one that makes most of the
+write-side hardening moot: **give pgmask a connection that cannot write in the
+first place** — a physical read replica / hot standby, or a role with `SELECT`
+and nothing else.
+
+pgmask refuses writes by inspecting SQL: it parses each statement and rejects
+DML, DDL, `DO`, `CALL`, and untrusted functions. That is a real layer, but it
+is a parser-based denylist, and `is_write_statement` returns false for anything
+`pg_query` cannot parse — a statement Postgres executes but the bundled parser
+does not recognise would be forwarded to a read-write backend.
+
+A read-only upstream removes that whole question. Verified against a live
+backend: connect through pgmask as a `SELECT`-only role and the escape that
+defeats a per-session read-only GUC —
+`SET default_transaction_read_only = off; INSERT ...` — is refused by privilege
+alone, 0 rows written, before pgmask's parser or any backend flag is consulted.
+A hot standby is stronger still: writes are physically impossible, per session,
+with no GUC to flip.
+
+What this does **not** buy is anything on the masking side. A read-only role
+still reads unmasked rows, so the proxy still has to mask them, and every
+disclosure in this document is about that path. A read-only upstream closes the
+write surface completely and the read surface not at all.
+
+So the order of guards, strongest first:
+
+1. **A read-only role or replica upstream.** The database refuses writes. Use
+   this if you can; it is free and unbypassable.
+2. **pgmask's write refusal.** Defense in depth for when (1) is not available —
+   e.g. pgmask in front of a writable primary with a privileged role, which is
+   exactly the risky case. Parser-based, so treat it as a strong filter rather
+   than a guarantee.
+3. Setting `default_transaction_read_only` on the backend session is **not** a
+   guarantee: it is a per-session GUC the client can turn off
+   (`SET default_transaction_read_only = off`, `BEGIN READ WRITE`). It is worth
+   having as a default, but it does not replace (1).
 
 ## If you read one thing before deploying this
 
