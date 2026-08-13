@@ -223,6 +223,21 @@ async fn multi_statement_simple_query_stays_masked() -> Result<()> {
     // Several result sets from one Query message, each with its own
     // RowDescription. A plan bound to the request rather than the description
     // would mask the second set with the first set's plan.
+    //
+    // This assertion used to be `assert_no_canary` alone, which a *refusal*
+    // satisfies as readily as correct masking — an error message carries no
+    // canary. And a refusal is exactly what happens: pgmask cannot pair the
+    // Nth RowDescription with the Nth statement (see
+    // analysis::provenance_is_trustworthy, which returns false for anything but
+    // a single statement), so it treats every field as opaque and fails closed.
+    // The old test passed whether the value was masked, nulled, or the whole
+    // query rejected — so it could not have caught a mispairing that served the
+    // second set in the clear.
+    //
+    // Pinned to the real behaviour: fail-closed, and specifically NOT the leak
+    // the comment above describes. If multi-statement ever starts being served,
+    // the refusal assertion fires and someone must re-check that each set is
+    // masked by its own plan before relaxing it.
     client
         .simple_query(
             "SELECT city FROM canary.subjects; \
@@ -230,7 +245,19 @@ async fn multi_statement_simple_query_stays_masked() -> Result<()> {
              SELECT note FROM canary.subjects",
         )
         .await?;
+    let text = client.received_text();
     assert_no_canary(&client, "multi-statement simple query");
+    assert!(
+        text.contains("pgmask:"),
+        "multi-statement is fail-closed today; a served result set here is a \
+         mispairing that must be proven masked, not assumed:\n{text}"
+    );
+    // And the leak direction, named explicitly: the released `city` in the
+    // first set must not become the plan that serves `email` in the second.
+    assert!(
+        !text.contains("@"),
+        "no address slot may carry a value:\n{text}"
+    );
     Ok(())
 }
 

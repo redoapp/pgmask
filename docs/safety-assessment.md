@@ -65,6 +65,18 @@ proxy-to-database connection reads every masked column unmasked, and no rule in
 short — a unix socket, a sidecar, a private subnet — and treat "pgmask is in
 front of it" as saying nothing about network position.
 
+**Multi-statement simple queries are refused, not masked.** A single `Query`
+message carrying more than one statement — `SET search_path = x; SELECT ...`,
+the pattern a lot of ORMs open a connection with — fails closed with "output
+column has no column provenance". pgmask cannot reliably pair the Nth
+RowDescription with the Nth statement (`analysis::provenance_is_trustworthy`
+returns false for anything but a single parsed statement), so it treats every
+field as opaque rather than risk serving the second result set under the first
+statement's plan. Verified fail-closed in both postures: `reject` refuses,
+`mask` nulls, neither serves the value. It is a real compatibility limitation
+and not a leak — but send one statement per `Query`, or use the extended
+protocol, if a client depends on the combined form.
+
 **Who the client is.** pgmask does not authenticate anybody. It forwards the
 authentication exchange to Postgres and watches for `AuthenticationOk`, and the
 principal it resolves masking policy from is the `user` in the startup packet.
@@ -479,6 +491,7 @@ This is the finding that should shape how much weight a green run carries.
 | four `sleep 4`s | called a proxy that was still resolving its catalog "did not come up" |
 | `classify --check` again | told operators unruled columns were "not an exposure" **without reading the setting that decides it** — while holding the parsed catalog |
 | two of the three tests written for that fix | one matched a phrase that wraps across a newline, one asserted an exit code that was non-zero in both postures; both passed whatever the code did |
+| `multi_statement_simple_query_stays_masked` | named for masking, asserted only canary-absence — which a fail-closed *refusal* satisfies as readily, so it could not tell "each set masked by its own plan" from "whole query rejected" |
 | the local gate itself | one machine, one timing profile: a concurrent-DDL race that fails reliably on a Linux runner never reproduced here in seventy releases |
 
 Every one produced a confident answer about something it was not measuring.

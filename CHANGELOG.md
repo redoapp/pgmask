@@ -56,6 +56,34 @@ Four regression tests, each failing without the fix — including one that pins
 the fail-closed path the fix must not open: executing a portal that was never
 bound still has no plan.
 
+### And a multi-statement test that could not see a leak
+
+A third adversarial pass. Still no way to read a masked value — role
+relaxations do not escalate through `SET ROLE` or `SET SESSION AUTHORIZATION`
+(keyed on the startup user, which those do not change), portal suspension and
+resume mask every page, describing one portal while executing another uses the
+executed portal's plan, and rebinding a portal name is refused.
+
+But `multi_statement_simple_query_stays_masked` was another vacuous test. It
+sent three result sets in one `Query` and asserted only that no canary crossed
+— which a *refusal* satisfies exactly as well as correct masking, because an
+error carries no canary. And a refusal is what happens: pgmask cannot pair the
+Nth RowDescription with the Nth statement, so
+`analysis::provenance_is_trustworthy` returns false for any multi-statement
+parse and every field is treated as opaque. The test passed whether each set
+was masked by its own plan, nulled, or the whole query rejected — so it could
+not have caught the very mispairing its comment describes, a second set served
+under the first statement's plaintext plan.
+
+Rewritten to pin the real behaviour: fail-closed, and specifically not that
+leak. Poisoned by pointing it at a served single statement, which now fails
+with "a served result set here is a mispairing that must be proven masked."
+
+The behaviour itself — every multi-statement simple query refused, including
+`SET search_path = x; SELECT ...` — is now documented as the compatibility
+limitation it is, verified fail-closed in both the `reject` and `mask`
+postures.
+
 ### And `--check` called plaintext a coverage gap
 
 A second adversarial pass, this time against objects an attacker would find in
