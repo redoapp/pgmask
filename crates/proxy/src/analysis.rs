@@ -1796,6 +1796,9 @@ fn masked_column_ref_counts(
                 for entry in &join.using_clause {
                     tally_masked_string_node(entry, masked, &mut counts);
                 }
+                if let Some(quals) = join.quals.as_ref() {
+                    tally_masked_column_refs_in(quals, masked, &mut counts);
+                }
             }
             NodeRef::CommonTableExpr(cte) => {
                 for entry in &cte.aliascolnames {
@@ -1859,11 +1862,59 @@ fn tally_select_stmt_masked(
     for list in &select.values_lists {
         tally_masked_column_refs_in(list, masked, counts);
     }
+    // JOIN … ON quals live under from_clause, not WHERE.
+    for from in &select.from_clause {
+        tally_from_item_masked(from, masked, counts);
+    }
     if let Some(left) = select.larg.as_ref() {
         tally_select_stmt_masked(left, masked, counts);
     }
     if let Some(right) = select.rarg.as_ref() {
         tally_select_stmt_masked(right, masked, counts);
+    }
+}
+
+fn tally_from_item_masked(
+    node: &pg_query::protobuf::Node,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    match node.node.as_ref() {
+        Some(NodeEnum::JoinExpr(join)) => {
+            for entry in &join.using_clause {
+                tally_masked_string_node(entry, masked, counts);
+            }
+            if let Some(quals) = join.quals.as_ref() {
+                tally_masked_column_refs_in(quals, masked, counts);
+            }
+            if let Some(left) = join.larg.as_ref() {
+                tally_from_item_masked(left, masked, counts);
+            }
+            if let Some(right) = join.rarg.as_ref() {
+                tally_from_item_masked(right, masked, counts);
+            }
+        }
+        Some(NodeEnum::RangeSubselect(sub)) => {
+            if let Some(alias) = sub.alias.as_ref() {
+                for entry in &alias.colnames {
+                    tally_masked_string_node(entry, masked, counts);
+                }
+            }
+            if let Some(query) = sub.subquery.as_ref() {
+                tally_masked_column_refs_in(query, masked, counts);
+            }
+        }
+        Some(NodeEnum::RangeFunction(func)) => {
+            if let Some(alias) = func.alias.as_ref() {
+                for entry in &alias.colnames {
+                    tally_masked_string_node(entry, masked, counts);
+                }
+            }
+            for call in &func.functions {
+                tally_masked_column_refs_in(call, masked, counts);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2060,6 +2111,137 @@ fn tally_masked_column_refs_in(
         }
         Some(NodeEnum::SelectStmt(select)) => {
             tally_select_stmt_masked(select, masked, counts);
+        }
+        Some(NodeEnum::BooleanTest(b)) => {
+            if let Some(arg) = b.arg.as_ref() {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::XmlSerialize(x)) => {
+            if let Some(expr) = x.expr.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonObjectConstructor(j)) => {
+            for expr in &j.exprs {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonArrayConstructor(j)) => {
+            for expr in &j.exprs {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonConstructorExpr(j)) => {
+            for arg in &j.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+            if let Some(func) = j.func.as_ref() {
+                tally_masked_column_refs_in(func, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonKeyValue(kv)) => {
+            if let Some(key) = kv.key.as_ref() {
+                tally_masked_column_refs_in(key, masked, counts);
+            }
+            if let Some(value) = kv.value.as_ref() {
+                if let Some(raw) = value.raw_expr.as_ref() {
+                    tally_masked_column_refs_in(raw, masked, counts);
+                }
+                if let Some(formatted) = value.formatted_expr.as_ref() {
+                    tally_masked_column_refs_in(formatted, masked, counts);
+                }
+            }
+        }
+        Some(NodeEnum::JsonValueExpr(v)) => {
+            if let Some(raw) = v.raw_expr.as_ref() {
+                tally_masked_column_refs_in(raw, masked, counts);
+            }
+            if let Some(formatted) = v.formatted_expr.as_ref() {
+                tally_masked_column_refs_in(formatted, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonArrayAgg(agg)) => {
+            if let Some(arg) = agg.arg.as_ref() {
+                if let Some(raw) = arg.raw_expr.as_ref() {
+                    tally_masked_column_refs_in(raw, masked, counts);
+                }
+            }
+            if let Some(ctor) = agg.constructor.as_ref() {
+                if let Some(filter) = ctor.agg_filter.as_ref() {
+                    tally_masked_column_refs_in(filter, masked, counts);
+                }
+                for order in &ctor.agg_order {
+                    if let Some(NodeEnum::SortBy(s)) = order.node.as_ref() {
+                        if let Some(expr) = s.node.as_ref() {
+                            tally_masked_column_refs_in(expr, masked, counts);
+                        }
+                    }
+                }
+            }
+        }
+        Some(NodeEnum::JsonObjectAgg(agg)) => {
+            if let Some(arg) = agg.arg.as_ref() {
+                if let Some(key) = arg.key.as_ref() {
+                    tally_masked_column_refs_in(key, masked, counts);
+                }
+                if let Some(value) = arg.value.as_ref() {
+                    if let Some(raw) = value.raw_expr.as_ref() {
+                        tally_masked_column_refs_in(raw, masked, counts);
+                    }
+                }
+            }
+            if let Some(ctor) = agg.constructor.as_ref() {
+                if let Some(filter) = ctor.agg_filter.as_ref() {
+                    tally_masked_column_refs_in(filter, masked, counts);
+                }
+                for order in &ctor.agg_order {
+                    if let Some(NodeEnum::SortBy(s)) = order.node.as_ref() {
+                        if let Some(expr) = s.node.as_ref() {
+                            tally_masked_column_refs_in(expr, masked, counts);
+                        }
+                    }
+                }
+            }
+        }
+        Some(NodeEnum::JsonIsPredicate(p)) => {
+            if let Some(expr) = p.expr.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonArrayQueryConstructor(j)) => {
+            if let Some(query) = j.query.as_ref() {
+                tally_masked_column_refs_in(query, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonParseExpr(j)) => {
+            if let Some(expr) = j.expr.as_ref() {
+                if let Some(raw) = expr.raw_expr.as_ref() {
+                    tally_masked_column_refs_in(raw, masked, counts);
+                }
+            }
+        }
+        Some(NodeEnum::JsonScalarExpr(j)) => {
+            if let Some(expr) = j.expr.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonSerializeExpr(j)) => {
+            if let Some(expr) = j.expr.as_ref() {
+                if let Some(raw) = expr.raw_expr.as_ref() {
+                    tally_masked_column_refs_in(raw, masked, counts);
+                }
+            }
+        }
+        Some(NodeEnum::NullIfExpr(n)) => {
+            for arg in &n.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::ScalarArrayOpExpr(s)) => {
+            for arg in &s.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
         }
         _ => {}
     }
@@ -4422,6 +4604,33 @@ mod referenced_identifier_probe {
         ));
         assert!(masked_exceeds_outer_projection(
             r#"SELECT count(*) FROM demo.customers WHERE xmlforest(u&"email") IS NOT NULL"#,
+            &masked
+        ));
+        // JOIN … ON, BooleanTest, JSON constructors, xmlserialize — previously live OPEN.
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers a
+               JOIN (VALUES (1)) v(x) ON a.u&"email" = 'user1@example.com'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE (u&"email" = 'user1@example.com') IS TRUE"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE JSON_OBJECT('e': u&"email")->>'e' = 'user1@example.com'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE JSON_ARRAY(u&"email")->>0 = 'user1@example.com'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE xmlserialize(CONTENT xmlforest(u&"email" AS e) AS text)
+                     LIKE '%user1@example.com%'"#,
             &masked
         ));
         assert!(!hostile_join_or_rename_masked(

@@ -141,7 +141,9 @@ unicode-escaped identifiers (`u&"email"`) and `ORDER BY email = '…'` membershi
 oracles (only simple `ORDER BY email` stays accepted). As of 0.1.88, also
 NATURAL JOIN / `FROM t AS x(c1,c2,…)` renames / unicode `USING` &
 `PARTITION BY`. As of 0.1.89, also `ARRAY`/`CASE`/`LIMIT`/`(t).col`/
-`xmlforest` containers around unicode-escaped masked names. Residual
+`xmlforest` containers around unicode-escaped masked names. As of 0.1.91, also
+`JOIN … ON`, `BooleanTest` (`IS TRUE`), JSON constructors (`JSON_OBJECT` /
+`JSON_ARRAY`), and `xmlserialize` around those names. Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and
 cleartext sort order among masked projections).

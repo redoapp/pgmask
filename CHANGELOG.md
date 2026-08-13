@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.91 — hostile SQL gate: JOIN ON, BooleanTest, JSON, xmlserialize
+
+Four live membership oracles under `posture = "hostile"` that returned
+exact-match counts on unicode-escaped masked columns:
+
+- `JOIN … ON u&"email" = '…'` — `JoinExpr.quals` was never walked
+- `(u&"email" = '…') IS TRUE` — `BooleanTest` skipped in the tallier
+- `JSON_OBJECT('e': u&"email")` / `JSON_ARRAY(u&"email")` — JSON constructor nodes
+- `xmlserialize(CONTENT xmlforest(u&"email" AS e) AS text) LIKE …`
+
+Fixed by walking `from_clause` / join quals and extending
+`tally_masked_column_refs_in` for BooleanTest, XmlSerialize, NullIfExpr,
+ScalarArrayOpExpr, and the JSON constructor / aggregate / predicate family.
+
 ## 0.1.90 — adversarial hardening of the masking path (six findings)
 
 Found by attacking a running proxy with a raw wire client, in an adversarial
