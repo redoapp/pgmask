@@ -158,7 +158,10 @@ of those same SELECTs is allowed; `EXPLAIN` of a predicate oracle is not.
 leaky too (`pg_stat_monitor` and the next extension were metadata-only);
 core counter / progress views stay allowed. `pg_show_plans` /
 `pg_query_state` and fork `*_stat_activity` / `*_stat_statements` views
-in `pg_catalog` are the same dump without that prefix. Residual
+in `pg_catalog` are the same dump without that prefix. Citus
+`citus_lock_waits` / `citus_stat_tenants` / `pg_dist_*` (authinfo,
+background-task SQL, shard range keys) were still metadata-only.
+Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and
 cleartext sort order among masked projections).

@@ -126,6 +126,20 @@ fn catalogs_that_carry_user_data_are_not_released() {
         "SELECT query FROM pg_catalog.citus_stat_activity",
         "SELECT * FROM citus_stat_activity",
         "SELECT query FROM pg_catalog.citus_stat_statements",
+        // Citus dumps that are not `*_stat_activity` / `*_stat_statements`.
+        "SELECT * FROM pg_catalog.citus_lock_waits",
+        "SELECT blocked_statement FROM citus_lock_waits",
+        r#"SELECT * FROM u&"citus_lock_waits""#,
+        "EXPLAIN SELECT * FROM pg_catalog.citus_lock_waits",
+        "SELECT tenant_attribute FROM pg_catalog.citus_stat_tenants",
+        "SELECT * FROM citus_stat_tenants",
+        "SELECT authinfo FROM pg_catalog.pg_dist_authinfo",
+        "SELECT * FROM pg_dist_authinfo",
+        r#"SELECT * FROM u&"pg_dist_authinfo""#,
+        "SELECT poolinfo FROM pg_dist_poolinfo",
+        "SELECT command FROM pg_dist_background_task",
+        "SELECT shardminvalue FROM pg_dist_shard",
+        "EXPLAIN SELECT authinfo FROM pg_dist_authinfo",
     ] {
         assert!(
             !reads_only_server_metadata(sql),

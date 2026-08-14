@@ -120,6 +120,9 @@ exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
   `pg_stat_*` prefix; forks that put the same dump in `pg_catalog` as
   `citus_stat_activity` / `citus_stat_statements` are refused on
   substring. `pg_wait_sampling*` and `pg_buffercache` stay allowed.
+  Citus `citus_lock_waits` / `citus_stat_tenants` / `pg_dist_*`
+  (authinfo, poolinfo, background-task SQL, shard range keys) are the
+  same class without those substrings.
 - `pg_largeobject` — blob contents
 - `pg_authid`, `pg_shadow`, `pg_user_mapping(s)`, `pg_subscription` — password
   hashes and connection strings

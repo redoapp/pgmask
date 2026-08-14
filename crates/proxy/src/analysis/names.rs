@@ -392,12 +392,24 @@ pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bo
     // `citus_stat_statements`); substring, not a prefix, so those still
     // fail closed. `pg_stat_statements_info` is a counter view on the
     // allowlist and must stay off this rule.
+    //
+    // Citus ships the rest of the dump without those substrings, still
+    // in `pg_catalog` (system OIDs, metadata-only). `citus_lock_waits`
+    // is blocked SQL with literals. `citus_stat_tenants.tenant_attribute`
+    // is the live distribution-column value. `pg_dist_*` is catalog-shaped
+    // (`pg_` prefix): `pg_dist_authinfo.authinfo` is plaintext passwords,
+    // `pg_dist_poolinfo` is libpq params, `pg_dist_background_task.command`
+    // is SQL, `pg_dist_shard.shardminvalue` is range-partition keys.
+    // `\d` of a heap does not read these; fail closed on the prefixes.
     if pg_stat_relation_is_leaky(&relation)
         || relation.starts_with("pg_qualstats")
         || relation.starts_with("pg_store_plans")
         || relation.starts_with("pg_show_plans")
         || relation.starts_with("pg_query_state")
+        || relation.starts_with("pg_dist_")
+        || relation.starts_with("citus_stat_")
         || relation.contains("stat_activity")
+        || relation.contains("lock_waits")
         || (relation.contains("stat_statements")
             && !METADATA_SAFE_PG_STAT.contains(&relation.as_str()))
     {

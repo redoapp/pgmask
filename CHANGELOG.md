@@ -23,7 +23,11 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   the dump in `pg_catalog` under another name (`citus_stat_activity`,
   `edb_stat_activity`, `citus_stat_statements`) fail closed on substring.
   `pg_wait_sampling*` (queryid + wait counts) and `pg_buffercache` (block
-  IDs, not tuple bytes) stay allowed.
+  IDs, not tuple bytes) stay allowed. Citus still dumps in `pg_catalog`
+  without those names: `citus_lock_waits` (blocked SQL), `citus_stat_tenants`
+  (live distribution-column values), and `pg_dist_*` (`authinfo` passwords,
+  `poolinfo`, background-task SQL, range-partition keys). Those prefixes
+  are leaky; `\d` of a heap does not read them.
 - SQL `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` / `CLOSE`
   are now refused on **every posture** (`sql_prepare_cursor`). They are a
   second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.
