@@ -795,6 +795,65 @@ fn pure_scalars_do_not_cover_a_summary() {
     );
 }
 
+// --- summary resolution backstop -------------------------------------
+
+/// The `lineage = "refuse"` backstop hands back the FROM relations and each
+/// field's bare aggregate argument, so the session can attribute the column
+/// to the catalog and mask it. Only the simplest shape resolves: an
+/// aggregate over one unadorned column. Anything else is `None`, kept below
+/// the bar that lets the caller release.
+#[test]
+fn summary_resolution_names_the_aggregate_argument() {
+    let inspection = StatementInspection::new(
+        "SELECT bucketname, sum(salary) FROM canary.no_unique GROUP BY bucketname",
+    );
+    let (relations, columns) = inspection.summary_resolution(2).expect("trusted select");
+    assert_eq!(
+        relations,
+        vec![("canary".to_string(), "no_unique".to_string())]
+    );
+    // `bucketname` is a plain column, not an aggregate; `sum(salary)` is.
+    assert_eq!(columns, vec![None, Some("salary".to_string())]);
+}
+
+#[test]
+fn summary_resolution_peels_a_cast_off_the_aggregate() {
+    let inspection = StatementInspection::new("SELECT cast(sum(salary) AS bigint) FROM demo.t");
+    let (_relations, columns) = inspection.summary_resolution(1).expect("trusted select");
+    assert_eq!(columns, vec![Some("salary".to_string())]);
+}
+
+#[test]
+fn summary_resolution_refuses_shapes_lineage_owns() {
+    // JOINs, stars, multiple statements and non-selects collapse the whole
+    // resolution to `None`, and the session keeps its opaque posture.
+    let collapsing: &[(&str, usize)] = &[
+        ("SELECT sum(salary) FROM demo.t JOIN demo.u ON true", 1),
+        ("SELECT * FROM demo.t", 1),
+        ("SELECT sum(salary) FROM demo.t; SELECT 1", 1),
+    ];
+    for (sql, n) in collapsing {
+        assert!(
+            StatementInspection::new(sql)
+                .summary_resolution(*n)
+                .is_none(),
+            "must collapse: {sql}"
+        );
+    }
+    // An aggregate argument analysis cannot attribute — an expression or a
+    // qualified name — stays per-field `None`, which the session resolves
+    // to the opaque posture rather than a guess.
+    let unattributable: &[&str] = &[
+        "SELECT sum(salary + 1) FROM demo.t",
+        "SELECT sum(t.salary) FROM demo.t",
+    ];
+    for sql in unattributable {
+        let (relations, columns) = StatementInspection::new(sql).summary_resolution(1).unwrap();
+        assert!(!relations.is_empty(), "the FROM is still readable: {sql}");
+        assert_eq!(columns, vec![None], "no attribution: {sql}");
+    }
+}
+
 /// The reason PURE_SCALARS is an allowlist. A user-defined function taking a
 /// harmless argument can return anything at all, so "all arguments are
 /// releasable" says nothing about an arbitrary callee.

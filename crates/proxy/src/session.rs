@@ -77,6 +77,42 @@ pub struct Policy {
     max_notices_per_exchange: Option<u32>,
 }
 
+/// Everything `Policy::plan_for` needs to classify one result set, grouped so
+/// the decision hub stays under the clippy argument budget.
+pub(crate) struct FieldAnalysis<'a> {
+    /// Per-field analysis verdict (`Summary`, `Releasable`, `Unknown`, …).
+    pub safety: &'a [Safety],
+    /// Per-field lineage verdict, when lineage ran (`Release`/`Blocked`/…).
+    pub lineage: &'a [Verdict],
+    /// Per-field reducing-aggregate fallback attribution, masked sources only.
+    pub summary: &'a [Option<MaskSpec>],
+    /// Whether the engine's column provenance is believed (set-op distrust).
+    pub trust_provenance: bool,
+}
+
+impl FieldAnalysis<'_> {
+    /// The reducing-aggregate fallback attribution for `index`, or `None` when
+    /// it does not apply.
+    ///
+    /// Gated on the field actually being `Safety::Summary`, not merely being an
+    /// aggregate-shaped expression: `max(x)` returns a stored value and must
+    /// keep falling through to the opaque posture, and it is refused there. Only
+    /// the reducing purity-allowlist (which `classify` maps to `Summary`)
+    /// reaches a mask here. And only a real mask is returned — the whole
+    /// backstop runs on name-based attribution, and a name-based guess never
+    /// releases, so a released column stays with the opaque posture too.
+    pub(crate) fn summary_for(&self, index: usize) -> Option<MaskSpec> {
+        if self.safety.get(index) != Some(&Safety::Summary) {
+            return None;
+        }
+        self.summary
+            .get(index)
+            .and_then(Option::as_ref)
+            .filter(|spec| !spec.is_passthrough())
+            .cloned()
+    }
+}
+
 impl Policy {
     pub fn from_config(config: &Config, catalog: Arc<Catalog>) -> Result<Self> {
         // `Config` is public because the classifier and test adapters build it
@@ -188,19 +224,17 @@ impl Policy {
         snapshot: &Snapshot,
         fields: &[protocol::FieldDescription],
         roles: &HashSet<String>,
-        safety: &[Safety],
-        lineage: &[Verdict],
-        trust_provenance: bool,
+        analysis: &FieldAnalysis,
     ) -> Result<Plan, Rejection> {
         let mut plan = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
-            let provably_safe = safety.get(index).copied() == Some(Safety::Releasable);
+            let provably_safe = analysis.safety.get(index).copied() == Some(Safety::Releasable);
             // A set operation can put values from several columns into one
             // output field, and CockroachDB reports the first branch's OID for
             // the whole thing. Believing it applies one column's mask to
             // another column's values, which is how a released `city` let a
             // masked `email` through in the clear. Treat the field as opaque.
-            let spec = if !field.has_provenance() || !trust_provenance {
+            let spec = if !field.has_provenance() || !analysis.trust_provenance {
                 // An expression we positively identified as carrying no column
                 // value — `SELECT 1`, `now()`, `count(*)`. Passing it through is
                 // the point of the analysis; see analysis/ for why the rule is
@@ -208,13 +242,13 @@ impl Policy {
                 if provably_safe {
                     self.metrics.record_rescued();
                     MaskSpec::new(Mask::None)
-                } else if lineage.get(index) == Some(&Verdict::Release) {
+                } else if analysis.lineage.get(index) == Some(&Verdict::Release) {
                     // Every base column this derives from is explicitly
                     // released, so it cannot be carrying a masked value.
                     self.metrics.record_rescued();
                     MaskSpec::new(Mask::None)
                 } else if let Some(spec) =
-                    self.summary_spec(snapshot, roles, safety, lineage, index)
+                    self.summary_spec(snapshot, roles, analysis.safety, analysis.lineage, index)
                 {
                     // A reducing aggregate is handled like any other
                     // unprovenanced field *except* when lineage grounds it in a
@@ -225,13 +259,22 @@ impl Policy {
                     // WHERE unique = 1` without a cardinality analysis the
                     // proxy cannot perform.
                     spec
+                } else if let Some(spec) = analysis.summary_for(index) {
+                    // Lineage off (the default) or unresolved for this field.
+                    // A reducing aggregate over one bare column can still be
+                    // attributed from the statement and the catalog, so it is
+                    // masked with that column's own mask instead of refused —
+                    // the 0.1.92 contract under the config that ships on by
+                    // default. `summary_for` gates on `Safety::Summary`, so
+                    // value-returning aggregates (`max(x)`) keep the refusal.
+                    spec
                 } else {
                     match self.opaque {
                         Opaque::Reject => {
                             // When lineage worked out *why*, say so. "derives
                             // from customer.c_first_name, which is masked" is
                             // the difference between a ticket and a rewrite.
-                            if let Some(Verdict::Blocked(source)) = lineage.get(index) {
+                            if let Some(Verdict::Blocked(source)) = analysis.lineage.get(index) {
                                 return Err(Rejection {
                                     cause: Cause::classify_opaque(&field.name, snapshot),
                                     message: format!(
@@ -334,6 +377,64 @@ fn roles_by_principal(roles: &[crate::catalog::Role]) -> HashMap<String, HashSet
         }
     }
     out
+}
+
+/// Attribute a reducing aggregate's single bare column to exactly one FROM
+/// relation and return that column's mask — masked sources only.
+///
+/// This is the catalog half of the `lineage = "refuse"` backstop in
+/// [`Policy::plan_for`]: the statement half (`analysis::summary_resolution`)
+/// hands back the FROM relations and the aggregate argument's column name, and
+/// this function decides which relation owns the name and what that column is
+/// masked with.
+///
+/// Returns `None` when no relation owns the column, when more than one does, when
+/// the catalog has never heard of a relation or a column, or when the column is
+/// *released*. A released column still falls through to the opaque posture
+/// rather than passing through: the whole backstop runs on name-based
+/// attribution, and a name-based guess never releases.
+///
+/// A wrong attribution is therefore an over-mask — or a refusal — never a
+/// passthrough, which is the property that makes this safe to run alongside
+/// lineage.
+fn resolve_summary_source(
+    snapshot: &Snapshot,
+    relations: &[(String, String)],
+    column: Option<&str>,
+    roles: &HashSet<String>,
+) -> Option<MaskSpec> {
+    let column = column?;
+    let mut owners = 0usize;
+    let mut owner: Option<&(String, String)> = None;
+    for relation in relations {
+        let qualified = qualify_relation(relation);
+        // A relation the catalog has never heard of means ownership cannot be
+        // ruled out, so nothing is attributed.
+        let columns = snapshot.relation_columns(&qualified)?;
+        if columns.iter().any(|c| c.as_str() == column) {
+            owners = owners.saturating_add(1);
+            owner = Some(relation);
+        }
+    }
+    if owners != 1 {
+        return None;
+    }
+    let qualified = qualify_relation(owner?);
+    let spec = snapshot
+        .lookup_by_name(&qualified, column)?
+        .for_roles(roles)
+        .clone();
+    (!spec.is_passthrough()).then_some(spec)
+}
+
+/// `(schema, relname)` -> `schema.relname`, defaulting the schema to `public`
+/// exactly as the lineage catalog does.
+fn qualify_relation((schema, relname): &(String, String)) -> String {
+    if schema.is_empty() {
+        format!("public.{relname}")
+    } else {
+        format!("{schema}.{relname}")
+    }
 }
 
 /// Bytes cleared for the client.
@@ -1265,6 +1366,30 @@ impl Session {
             _ => Vec::new(),
         };
 
+        // The reducing-aggregate backstop, independent of lineage. `Summary` is
+        // reached without the catalog and lineage is off by default, so without
+        // this every reducing aggregate would be refused under the default
+        // config instead of masked. It attributes each summary's single bare
+        // column to exactly one FROM relation and keeps its mask — masked
+        // sources only, never a passthrough.
+        let summary_fallback = inspection
+            .as_ref()
+            .and_then(|inspection| inspection.summary_resolution(fields.len()))
+            .map(|(relations, columns)| {
+                columns
+                    .iter()
+                    .map(|column| {
+                        resolve_summary_source(
+                            &snapshot,
+                            &relations,
+                            column.as_deref(),
+                            &self.roles,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![None; fields.len()]);
+
         let planned = if system_catalog {
             Ok(Arc::new(
                 fields
@@ -1281,9 +1406,12 @@ impl Session {
                 &snapshot,
                 &fields,
                 &self.roles,
-                &safety,
-                &lineage_verdicts,
-                trust_provenance,
+                &FieldAnalysis {
+                    safety: &safety,
+                    lineage: &lineage_verdicts,
+                    summary: &summary_fallback,
+                    trust_provenance,
+                },
             )
         };
         let plan = match planned {
@@ -1821,9 +1949,12 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("lower", 0, 0, 25)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .expect_err("must reject");
         assert!(err.message.contains("no column provenance"));
@@ -1837,9 +1968,12 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("lower", 0, 0, 25)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .ok()
             .expect("must allow");
@@ -1854,9 +1988,12 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("email", 16391, 2, 25)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .ok()
             .unwrap();
@@ -1871,9 +2008,12 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("email", 16391, 2, 25)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .ok()
             .unwrap();
@@ -1893,9 +2033,12 @@ mask = "none"
                 &snapshot,
                 &[field("sum", 0, 0, 20)],
                 &HashSet::new(),
-                &[Safety::Summary],
-                &[Verdict::Release],
-                true,
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[Verdict::Release],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .ok()
             .unwrap();
@@ -1922,9 +2065,12 @@ mask = "none"
                 // an unprovenanced `sum` of type int8.
                 &[field("sum", 0, 0, 20)],
                 &HashSet::new(),
-                &[Safety::Summary],
-                &[Verdict::Blocked("demo.t.salary".into())],
-                true,
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[Verdict::Blocked("demo.t.salary".into())],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .ok()
             .unwrap();
@@ -1942,9 +2088,12 @@ mask = "none"
                 &snapshot,
                 &[field("sum", 0, 0, 20)],
                 &HashSet::new(),
-                &[Safety::Summary],
-                &[Verdict::Blocked("demo.t.salary".into())],
-                true,
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[Verdict::Blocked("demo.t.salary".into())],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .ok()
             .unwrap();
@@ -1957,9 +2106,12 @@ mask = "none"
                 &snapshot,
                 &[field("sum", 0, 0, 20)],
                 &HashSet::new(),
-                &[Safety::Summary],
-                &[Verdict::Unresolved],
-                true,
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[Verdict::Unresolved],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .expect_err("an unbounded summary must not pass through");
         assert!(
@@ -1998,9 +2150,12 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("id", 16391, 1, 23)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .expect_err("must reject");
         assert!(
@@ -2012,6 +2167,79 @@ mask = "none"
             err.hint.as_deref().unwrap_or("").contains("null"),
             "the hint should say what to do instead"
         );
+    }
+
+    /// The `lineage = "refuse"` default still masks a reducing aggregate when
+    /// the backstop attributes its bare column to a masked catalog column —
+    /// the 0.1.92 contract under the config that ships on by default.
+    #[test]
+    fn a_summary_over_a_masked_column_is_masked_without_lineage() {
+        let p = policy(Unclassified::Mask, Opaque::Reject);
+        let snapshot = p.catalog.snapshot();
+        let plan = p
+            .plan_for(
+                &snapshot,
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[],
+                    summary: &[Some(MaskSpec::new(Mask::NumericBucket))],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .expect("the fallback must mask, not refuse");
+        assert_eq!(
+            plan[0].spec.kind,
+            Mask::NumericBucket,
+            "same as the lineage-resolved summary"
+        );
+    }
+
+    /// Without an attribution (or when the attributed source is released —
+    /// never guessed through) the summary keeps the opaque posture. `refuse`
+    /// rejects, `mask` nulls.
+    #[test]
+    fn an_unattributed_summary_stays_opaque_without_lineage() {
+        let p = policy(Unclassified::Mask, Opaque::Reject);
+        let err = p
+            .plan_for(
+                &p.catalog.snapshot(),
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[],
+                    summary: &[None],
+                    trust_provenance: true,
+                },
+            )
+            .expect_err("without an attribution the opaque posture governs");
+        assert!(
+            err.message.contains("no column provenance"),
+            "got: {}",
+            err.message
+        );
+
+        let p2 = policy(Unclassified::Mask, Opaque::Mask);
+        let plan = p2
+            .plan_for(
+                &p2.catalog.snapshot(),
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[],
+                    summary: &[Some(MaskSpec::new(Mask::None))],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .expect("mask posture must not reject");
+        // The fallback must never build a passthrough plan; a released-source
+        // entry is filtered out and the opaque (null) posture applies.
+        assert_eq!(plan[0].spec.kind, Mask::Null);
     }
 
     #[test]

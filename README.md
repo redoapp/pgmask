@@ -610,8 +610,10 @@ analytical ones, and which you have decides whether Phase 6 is optional.
 - **Summaries over classified columns are masked, not exact** — `count`, `count(*)`.
   ranking windows and `date_trunc` are released. Reducing aggregates — `sum`,
   `avg`, `stddev`, a variance, a regression slope — resolve their source through
-  lineage: over a *released* column the exact summary is served; over a *masked*
-  column the summary is masked with that column's own mask. A sum of a
+  lineage, or straight from the statement and catalog when it is off (the
+  default) and the aggregate reduces one bare column: over a *released* column
+  the exact summary is served; over a *masked* column the summary is masked with
+  that column's own mask. A sum of a
   bucketed column is a bucket, so a group of one row never yields that row's
   value: `sum(annual_salary) WHERE id = 1` returns the bucket floor, not the
   salary. `summaries = "refuse"` reverts it. The bar is still "you cannot read

@@ -537,7 +537,10 @@ aggregates are unaffected. The classification is now finer than the two-valued
 never degrades into its input).
 
 The effort fell on the *shape*, not the numbers: one new verdict, propagated
-through lineage so only a masked source changes the outcome, which removed the
+through lineage so only a masked source changes the outcome — and, when lineage
+is off (the default) and the aggregate reduces a single bare column over plain
+named FROM ranges, resolved from the statement and the catalog so the default
+configuration masks instead of refusing — which removed the
 `grouping_may_reference`/`aggregate_argument_is_grouped` walkers (every
 reducing aggregate is masked now, so the grouped/ungrouped distinction they
 drew lost its point) — a net deletion.

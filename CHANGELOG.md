@@ -124,14 +124,23 @@ cannot be refused the way `GROUP BY id` could. The unique-key `GROUP BY` guard
 (the 0.1.16 disclosure) already refused the decidable subset.
 
 Closed by giving the precision up instead of the summary. A reducing aggregate
-now resolves its source through lineage (`Safety::Summary`): over a *released*
-column the exact summary is served; over a *masked* column the output is masked
-with that column's own mask, so a sum over a bucketed column is a bucket
+now resolves its source (`Safety::Summary`): over a *released* column the exact
+summary is served; over a *masked* column the output is masked with that
+column's own mask, so a sum over a bucketed column is a bucket
 whatever the predicate collapses it to —
 
     SELECT sum(annual_salary) FROM people               -- was 54000250710
                                                         -- now 54000250000
     SELECT sum(annual_salary) FROM people WHERE id = 1  -- now 900000000
+
+Source resolution normally goes through lineage, but lineage is off by default
+(`lineage = "refuse"`), and the "masked anyway" contract is the point of the
+verdict. For the shape every disclosure used — the aggregate reduces a single
+bare column over plain named FROM ranges — the session attributes the column
+from the statement and the catalog directly, so the default configuration masks
+instead of refusing. Expression arguments, joins and subqueries still fall to
+the opaque posture; value-returning aggregates (`min`, `max`) never reach this
+path.
 
 `count`, `count(*)`, `regr_count` and the boolean aggregates stay passthrough:
 a tally or a predicate never degrades into a member of the set it consumes.

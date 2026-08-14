@@ -4,8 +4,8 @@ use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{SelectStmt, SetOperation};
 
 use super::names::{
-    function_name, CONTEXT_FUNCTIONS, NON_VALUE_REDUCING_AGGREGATES, PURE_SCALARS,
-    RANKING_WINDOWS, REDUCING_AGGREGATES, SIZE_FUNCTIONS,
+    function_name, CONTEXT_FUNCTIONS, NON_VALUE_REDUCING_AGGREGATES, PURE_SCALARS, RANKING_WINDOWS,
+    REDUCING_AGGREGATES, SIZE_FUNCTIONS,
 };
 use super::StatementInspection;
 
@@ -226,7 +226,7 @@ pub(crate) fn unwrap_star_over_subquery(select: &SelectStmt) -> Option<&SelectSt
 /// A set operation has no single target list. `SELECT *` expands one entry into
 /// many fields — which the length check below catches, since the expansion makes
 /// the counts disagree.
-fn positions_are_trustworthy(select: &SelectStmt, field_count: usize) -> bool {
+pub(crate) fn positions_are_trustworthy(select: &SelectStmt, field_count: usize) -> bool {
     select.op == SetOperation::SetopNone as i32
         && select.larg.is_none()
         && select.rarg.is_none()
@@ -269,6 +269,58 @@ fn target_is_star(node: &pg_query::protobuf::Node) -> bool {
         .last()
         .and_then(|f| f.node.as_ref())
         .is_some_and(|f| matches!(f, NodeEnum::AStar(_)))
+}
+
+/// The name a reducing aggregate's target reduces, when `expr` is that
+/// aggregate over a single unadorned column.
+///
+/// [`classify`] reaches `Safety::Summary` for a `FuncCall` that is a reducing
+/// aggregate with no `OVER` clause, and for a cast chain around one — the
+/// aggregate's own `FILTER`/`DISTINCT` stay on the `FuncCall`. So the shapes
+/// here mirror exactly what a `Summary` field can be: the aggregate call,
+/// optionally wrapped in casts. An argument that is an expression, a qualified
+/// name, or a whole row is lineage's job — the session refuses rather than
+/// guess, and the caller applies the same "masked only, never passthrough" bar.
+pub(crate) fn summary_argument_name(expr: &NodeEnum, depth: usize) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    match expr {
+        NodeEnum::TypeCast(cast) => cast
+            .arg
+            .as_ref()
+            .and_then(|a| a.node.as_ref())
+            .and_then(|a| summary_argument_name(a, depth.saturating_add(1))),
+        NodeEnum::CollateClause(collate) => collate
+            .arg
+            .as_ref()
+            .and_then(|a| a.node.as_ref())
+            .and_then(|a| summary_argument_name(a, depth.saturating_add(1))),
+        NodeEnum::FuncCall(call) => {
+            // Peel casts off the argument, mirroring the outer wrapper walk.
+            let mut arg = call.args.first()?;
+            let arg = loop {
+                match arg.node.as_ref()? {
+                    NodeEnum::TypeCast(cast) => arg = cast.arg.as_ref()?,
+                    NodeEnum::CollateClause(collate) => arg = collate.arg.as_ref()?,
+                    inner => break inner,
+                }
+            };
+            let NodeEnum::ColumnRef(column_ref) = arg else {
+                return None;
+            };
+            // Exactly one, unqualified: `sum(salary)`. `sum(t.salary)` and
+            // whole-row refs are left to lineage.
+            let [only] = column_ref.fields.as_slice() else {
+                return None;
+            };
+            let NodeEnum::String(name) = only.node.as_ref()? else {
+                return None;
+            };
+            Some(name.sval.to_ascii_lowercase())
+        }
+        _ => None,
+    }
 }
 
 /// The allowlist proper.
@@ -470,7 +522,6 @@ fn classify(expr: &NodeEnum, allow: Relaxations) -> Safety {
         _ => Safety::Unknown,
     }
 }
-
 
 /// The column names one `GROUP BY` item can distinguish rows by.
 ///

@@ -118,7 +118,10 @@ use hostile::{
     hostile_join_or_rename_masked_inspected, hostile_uses_whole_row_inspected,
     masked_exceeds_outer_projection_inspected,
 };
-use safety::{analyze_inspected, group_item_columns, unwrap_star_over_subquery};
+use safety::{
+    analyze_inspected, group_item_columns, positions_are_trustworthy, summary_argument_name,
+    unwrap_star_over_subquery,
+};
 
 /// One parsed and lazily scanned view of a statement for a release decision.
 ///
@@ -234,6 +237,78 @@ impl<'sql> StatementInspection<'sql> {
         analyze_inspected(self, field_count, allow)
     }
 
+    /// Resolution material for a reducing aggregate over a single bare column.
+    ///
+    /// [`Safety::Summary`] is reached without the catalog, because analysis does
+    /// not resolve names — that is lineage's job. But lineage is off by default
+    /// (`lineage = "refuse"`), and a reducing aggregate over a masked column
+    /// must be masked even then; that is the whole point of the verdict. Today
+    /// it is not: with lineage off every reducing aggregate is *refused*, not
+    /// masked, which breaks the 0.1.92 contract for the one configuration that
+    /// ships on by default.
+    ///
+    /// The backstop below needs no `sqllineage`: an aggregate over one bare
+    /// column is attributable from the statement and the catalog alone. It
+    /// returns, for the one trusted select, the plain-named FROM relations
+    /// `(schema, relname)` and, aligned to `field_count`, the bare column each
+    /// field reduces when the field is exactly such an aggregate
+    /// (`cast(sum(x) AS bigint)` is; an expression argument is lineage's
+    /// territory).
+    ///
+    /// Any parse doubt — a set operation, a star, a FROM entry that is not a
+    /// plain named range — collapses the whole thing to `None`, and the caller
+    /// keeps its normal opaque posture.
+    ///
+    /// This can only ever move a value *towards* masking: the caller resolves a
+    /// returned column name against the catalog and uses only a *masked* column,
+    /// so a wrong attribution is an over-mask (or a refusal), never a
+    /// passthrough.
+    pub fn summary_resolution(&self, field_count: usize) -> Option<SummaryResolution> {
+        let parsed = self.parsed()?;
+        if parsed.protobuf.stmts.len() != 1 {
+            return None;
+        }
+        let NodeEnum::SelectStmt(select) = parsed
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|s| s.stmt.as_ref())
+            .and_then(|s| s.node.as_ref())?
+        else {
+            return None;
+        };
+        // Same unwrap as `analyze_inspected`: `SELECT * FROM (subquery)`.
+        let mut select: &SelectStmt = select;
+        while let Some(inner) = unwrap_star_over_subquery(select) {
+            select = inner;
+        }
+        if !positions_are_trustworthy(select, field_count) {
+            return None;
+        }
+        let mut relations = Vec::with_capacity(select.from_clause.len());
+        for entry in &select.from_clause {
+            let NodeEnum::RangeVar(range) = entry.node.as_ref()? else {
+                // A subquery, join, function or lateral in FROM is lineage's
+                // territory; this backstop only handles plain named ranges.
+                return None;
+            };
+            relations.push((range.schemaname.clone(), range.relname.clone()));
+        }
+        let columns = select
+            .target_list
+            .iter()
+            .map(|entry| match entry.node.as_ref() {
+                Some(NodeEnum::ResTarget(target)) => target
+                    .val
+                    .as_ref()
+                    .and_then(|v| v.node.as_ref())
+                    .and_then(|expr| summary_argument_name(expr, 0)),
+                _ => None,
+            })
+            .collect();
+        Some((relations, columns))
+    }
+
     pub fn reads_only_server_metadata(&self) -> bool {
         reads_only_server_metadata_inspected(self)
     }
@@ -287,6 +362,12 @@ impl<'sql> StatementInspection<'sql> {
             .as_ref()
     }
 }
+
+/// What [`StatementInspection::summary_resolution`] returns: the plain-named
+/// FROM relations `(schema, relname)` and, aligned to the result-set fields, the
+/// bare column each field's aggregate reduces — `None` when the field is not
+/// that shape.
+pub type SummaryResolution = (Vec<(String, String)>, Vec<Option<String>>);
 
 /// Whether `pg_query` can parse the statement at all.
 ///
