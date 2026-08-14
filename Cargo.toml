@@ -48,7 +48,7 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
-toml = "0.8"
+toml = "1.1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-postgres-rustls = "0.13"
 webpki-roots = "1"
