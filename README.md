@@ -270,6 +270,7 @@ changes, CI checks, and monitoring.
 Run the release gate:
 
 ```bash
+cargo install --locked cargo-deny cargo-machete
 ./scripts/test-all.sh
 ```
 

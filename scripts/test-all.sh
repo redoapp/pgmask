@@ -80,6 +80,13 @@ fi
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
+for tool in cargo-deny cargo-machete; do
+  command -v "$tool" >/dev/null || {
+    echo "FAIL: $tool is required (cargo install --locked $tool)"
+    exit 3
+  }
+done
+
 pass=0
 fail=0
 declare -a RESULTS=()
@@ -111,17 +118,27 @@ run() { # name command...
 }
 
 echo "=== static ==="
-cargo fmt --check >/dev/null 2>&1; record "cargo fmt --check" "$?"
-n=$(cargo clippy --workspace --all-targets -q 2>&1 | grep -cE '^(warning|error)')
+cargo fmt --all --check >/dev/null 2>&1; record "cargo fmt --check" "$?"
+n=$(cargo clippy --workspace --all-targets --all-features --locked -q 2>&1 | grep -cE '^(warning|error)')
 [[ "$n" == "0" ]]; record "clippy (0 findings)" "$?" "$n findings"
-cargo audit >/dev/null 2>&1; record "cargo audit" "$?"
+cargo deny --all-features --locked check --hide-inclusion-graph >/dev/null 2>&1
+deny_status=$?
+cargo deny --manifest-path fuzz/Cargo.toml --all-features --locked check --hide-inclusion-graph >/dev/null 2>&1
+fuzz_deny_status=$?
+cargo machete >/dev/null 2>&1
+machete_status=$?
+dependency_status=0
+[ "$deny_status" = 0 ] || dependency_status=$deny_status
+[ "$fuzz_deny_status" = 0 ] || dependency_status=$fuzz_deny_status
+[ "$machete_status" = 0 ] || dependency_status=$machete_status
+record "dependency policy" "$dependency_status"
 
 # Rustdoc, warnings fatal. Not redundant with clippy: a doc link to an item that
 # does not exist compiles, lints clean, and is only ever read by someone trying
 # to follow it. `[`referenced_relations`]` sat in `analysis` pointing at a
 # function that was never written, and four usage lines rendered `<seed>` as an
 # unclosed HTML tag. Nothing in this gate looked.
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps >/dev/null 2>&1
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked >/dev/null 2>&1
 record "rustdoc (warnings fatal)" "$?"
 
 ./scripts/check-repo-invariants.sh >/dev/null 2>&1
@@ -162,9 +179,9 @@ echo "=== rust tests ==="
 # said `ok cargo test 489 tests`. The count was real; the verdict was not. Same
 # shape as three other status losses in a day: a pipeline or a substitution
 # quietly reporting the wrong command's exit code.
-workspace_out=$(PGMASK_ALLOW_SKIP=1 cargo test --workspace --no-fail-fast -q -- --nocapture 2>&1)
+workspace_out=$(PGMASK_ALLOW_SKIP=1 cargo test --workspace --locked --no-fail-fast -q -- --nocapture 2>&1)
 workspace_status=$?
-fuzzing_out=$(PGMASK_ALLOW_SKIP=1 cargo test -p pgmask --lib --features fuzzing --no-fail-fast -q -- --nocapture 2>&1)
+fuzzing_out=$(PGMASK_ALLOW_SKIP=1 cargo test -p pgmask --lib --features fuzzing --locked --no-fail-fast -q -- --nocapture 2>&1)
 fuzzing_status=$?
 out="$workspace_out
 $fuzzing_out"
@@ -190,7 +207,7 @@ record "cargo test" "$status" "$total tests ($skip_note)"
 [[ "$status" == "0" ]] || printf '%s\n' "$out" | grep -E 'FAILED|panicked' | head -8
 
 echo "=== end to end ==="
-cargo build --release -q || { echo "release build failed"; exit 1; }
+cargo build --release --locked -q || { echo "release build failed"; exit 1; }
 run "adversarial (real Postgres)" ./scripts/test-integration.sh
 run "demo (verify.sh)"        env KEEP=0 ./examples/demo/verify.sh
 # Asserts the limits, not the defence: each route it lists is one a client can

@@ -8,7 +8,6 @@
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
-/fuzz/Cargo.lock
 
 # cargo-mutants scratch: a run's survivors are a finding to act on, not an
 # artefact to keep.
