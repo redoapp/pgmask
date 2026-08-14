@@ -161,6 +161,8 @@ core counter / progress views stay allowed. `pg_show_plans` /
 in `pg_catalog` are the same dump without that prefix. Citus
 `citus_lock_waits` / `citus_stat_tenants` / `pg_dist_*` (authinfo,
 background-task SQL, shard range keys) were still metadata-only.
+Catalog-shaped RangeVars are now an allowlist of core heaps/views;
+an unnamed `pg_catalog` / `information_schema` relation is leaky.
 Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and

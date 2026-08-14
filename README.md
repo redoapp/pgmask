@@ -642,9 +642,9 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   does not close predicate oracles; use hostile for containment. Pair with
   `rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
 - **Leaky catalogs refused.** `pg_stats`, `pg_authid`, `pg_stat_activity`,
-  `pg_cursors`, `pg_stat_wal_receiver`, unknown `pg_stat_*` extension views,
-  `pg_show_plans` / `pg_query_state`, fork `*_stat_activity` views,
-  Citus `citus_lock_waits` / `pg_dist_*`, and similar are refused at the
+  `pg_cursors`, `pg_stat_wal_receiver`, unknown `pg_catalog` /
+  `information_schema` relations (allowlist of core heaps/views and
+  SQL-standard name/grant views), and similar are refused at the
   frontend on every posture (`leaky_catalog`).
 - **Non-text types accept only `mask = "null"`.** Text-family types are
   byte-identical in text and binary formats so they mask correctly either way;

@@ -122,7 +122,10 @@ exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
   substring. `pg_wait_sampling*` and `pg_buffercache` stay allowed.
   Citus `citus_lock_waits` / `citus_stat_tenants` / `pg_dist_*`
   (authinfo, poolinfo, background-task SQL, shard range keys) are the
-  same class without those substrings.
+  same class without those substrings. Catalog-shaped names are now an
+  allowlist of core heaps/views and SQL-standard information_schema
+  name/grant views; an unnamed `pg_catalog` / `information_schema`
+  relation is leaky.
 - `pg_largeobject` — blob contents
 - `pg_authid`, `pg_shadow`, `pg_user_mapping(s)`, `pg_subscription` — password
   hashes and connection strings

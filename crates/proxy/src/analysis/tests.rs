@@ -41,6 +41,12 @@ fn metadata_only_catalog_queries_are_released() {
         "SELECT * FROM information_schema.foreign_tables",
         "SELECT * FROM information_schema.foreign_data_wrappers",
         "SELECT column_name FROM information_schema.columns",
+        "SELECT * FROM information_schema.sql_features",
+        "SELECT * FROM pg_catalog.pg_database",
+        "SELECT * FROM pg_catalog.pg_am",
+        "SELECT * FROM pg_catalog.pg_auth_members",
+        "SELECT * FROM pg_catalog.pg_publication",
+        "SELECT * FROM pg_catalog.pg_policies",
         "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_statistic_ext e \
          ON e.stxrelid = c.oid",
         "SELECT n_live_tup FROM pg_catalog.pg_stat_user_tables",
@@ -140,6 +146,12 @@ fn catalogs_that_carry_user_data_are_not_released() {
         "SELECT command FROM pg_dist_background_task",
         "SELECT shardminvalue FROM pg_dist_shard",
         "EXPLAIN SELECT authinfo FROM pg_dist_authinfo",
+        // Invert: an unnamed pg_catalog / information_schema relation is leaky.
+        "SELECT * FROM pg_catalog.hypopg_list_indexes",
+        "SELECT * FROM pg_catalog.unknown_extension_dump",
+        r#"SELECT * FROM pg_catalog.u&"hypopg_list_indexes""#,
+        "SELECT * FROM information_schema.not_a_real_view",
+        "EXPLAIN SELECT * FROM pg_catalog.hypopg_list_indexes",
     ] {
         assert!(
             !reads_only_server_metadata(sql),

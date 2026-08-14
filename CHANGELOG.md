@@ -27,7 +27,15 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   without those names: `citus_lock_waits` (blocked SQL), `citus_stat_tenants`
   (live distribution-column values), and `pg_dist_*` (`authinfo` passwords,
   `poolinfo`, background-task SQL, range-partition keys). Those prefixes
-  are leaky; `\d` of a heap does not read them.
+  are leaky; `\d` of a heap does not read them. The denylist polarity is
+  now inverted for every catalog-shaped RangeVar: only core `pg_catalog`
+  heaps/views (plus `pg_stat_progress_*` / `pg_statio_*` /
+  `pg_wait_sampling*` / counter `pg_stat_*`) and the SQL-standard
+  information_schema name/grant views keep the fast path.
+  `pg_catalog.hypopg_list_indexes` and `information_schema.not_a_real_view`
+  are leaky; `\d` still reads `pg_class` / `pg_attribute` /
+  `information_schema.tables`. Unqualified fork names without a `pg_`
+  prefix (`citus_lock_waits`) stay on the substring rules.
 - SQL `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` / `CLOSE`
   are now refused on **every posture** (`sql_prepare_cursor`). They are a
   second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.
