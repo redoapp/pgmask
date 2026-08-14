@@ -1807,9 +1807,7 @@ fn masked_column_ref_counts(
                 }
             }
             NodeRef::CommonTableExpr(cte) => {
-                for entry in &cte.aliascolnames {
-                    tally_masked_string_node(entry, masked, &mut counts);
-                }
+                tally_common_table_expr(cte, masked, &mut counts);
             }
             NodeRef::Alias(alias) => {
                 for entry in &alias.colnames {
@@ -1891,6 +1889,14 @@ fn tally_select_stmt_masked(
     if let Some(right) = select.rarg.as_ref() {
         tally_select_stmt_masked(right, masked, counts);
     }
+    // PREPARE/DECLARE bodies are invisible to `nodes()`, so SEARCH/CYCLE and
+    // CTE-body predicates only exist if we walk `with_clause` here. Inner
+    // `SelectStmt`s may also be visited via `nodes()`; extra counts fail closed.
+    if let Some(with) = select.with_clause.as_ref() {
+        for cte in &with.ctes {
+            tally_masked_column_refs_in(cte, masked, counts);
+        }
+    }
 }
 
 fn tally_from_item_masked(
@@ -1940,6 +1946,9 @@ fn tally_from_item_masked(
             if let Some(row) = tf.rowexpr.as_ref() {
                 tally_masked_column_refs_in(row, masked, counts);
             }
+            for ns in &tf.namespaces {
+                tally_masked_column_refs_in(ns, masked, counts);
+            }
             for col in &tf.columns {
                 tally_masked_column_refs_in(col, masked, counts);
             }
@@ -1982,6 +1991,53 @@ fn tally_masked_in_window_def(
     }
     if let Some(end) = window.end_offset.as_ref() {
         tally_masked_column_refs_in(end, masked, counts);
+    }
+}
+
+fn tally_common_table_expr(
+    cte: &pg_query::protobuf::CommonTableExpr,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    for entry in &cte.aliascolnames {
+        tally_masked_string_node(entry, masked, counts);
+    }
+    if let Some(search) = cte.search_clause.as_ref() {
+        tally_cte_search_clause(search, masked, counts);
+    }
+    if let Some(cycle) = cte.cycle_clause.as_ref() {
+        tally_cte_cycle_clause(cycle, masked, counts);
+    }
+    if let Some(q) = cte.ctequery.as_ref() {
+        tally_masked_column_refs_in(q, masked, counts);
+    }
+}
+
+fn tally_cte_search_clause(
+    search: &pg_query::protobuf::CteSearchClause,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    for col in &search.search_col_list {
+        tally_masked_string_node(col, masked, counts);
+        tally_masked_column_refs_in(col, masked, counts);
+    }
+}
+
+fn tally_cte_cycle_clause(
+    cycle: &pg_query::protobuf::CteCycleClause,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    for col in &cycle.cycle_col_list {
+        tally_masked_string_node(col, masked, counts);
+        tally_masked_column_refs_in(col, masked, counts);
+    }
+    if let Some(n) = cycle.cycle_mark_value.as_ref() {
+        tally_masked_column_refs_in(n, masked, counts);
+    }
+    if let Some(n) = cycle.cycle_mark_default.as_ref() {
+        tally_masked_column_refs_in(n, masked, counts);
     }
 }
 
@@ -2340,9 +2396,13 @@ fn tally_masked_column_refs_in(
             tally_from_item_masked(node, masked, counts);
         }
         Some(NodeEnum::CommonTableExpr(cte)) => {
-            for entry in &cte.aliascolnames {
-                tally_masked_string_node(entry, masked, counts);
-            }
+            tally_common_table_expr(cte, masked, counts);
+        }
+        Some(NodeEnum::CtesearchClause(search)) => {
+            tally_cte_search_clause(search, masked, counts);
+        }
+        Some(NodeEnum::CtecycleClause(cycle)) => {
+            tally_cte_cycle_clause(cycle, masked, counts);
         }
         Some(NodeEnum::PrepareStmt(p)) => {
             if let Some(query) = p.query.as_ref() {
@@ -2437,6 +2497,14 @@ fn tally_masked_column_refs_in(
                 .chain(tf.colvalexprs.iter())
                 .chain(tf.passingvalexprs.iter())
             {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::RangeTableFuncCol(c)) => {
+            if let Some(expr) = c.colexpr.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+            if let Some(expr) = c.coldefexpr.as_ref() {
                 tally_masked_column_refs_in(expr, masked, counts);
             }
         }
@@ -2815,6 +2883,39 @@ fn subtree_has_whole_row(
 
 /// Child nodes `pg_query::nodes()` does not reliably visit. Hostile whole-row
 /// detection walks these instead of extending a second incomplete match.
+fn visit_json_value_expr_children(
+    expr: Option<&pg_query::protobuf::JsonValueExpr>,
+    visit: &mut dyn FnMut(&pg_query::protobuf::Node),
+) {
+    let Some(expr) = expr else {
+        return;
+    };
+    if let Some(raw) = expr.raw_expr.as_ref() {
+        visit(raw);
+    }
+    if let Some(formatted) = expr.formatted_expr.as_ref() {
+        visit(formatted);
+    }
+}
+
+fn visit_json_agg_constructor_children(
+    ctor: Option<&pg_query::protobuf::JsonAggConstructor>,
+    visit: &mut dyn FnMut(&pg_query::protobuf::Node),
+) {
+    let Some(ctor) = ctor else {
+        return;
+    };
+    if let Some(filter) = ctor.agg_filter.as_ref() {
+        visit(filter);
+    }
+    for order in &ctor.agg_order {
+        visit(order);
+    }
+    if let Some(over) = ctor.over.as_ref() {
+        for_each_window_def_child(over, visit);
+    }
+}
+
 fn for_each_child_node(
     node: &pg_query::protobuf::Node,
     visit: &mut dyn FnMut(&pg_query::protobuf::Node),
@@ -3059,6 +3160,9 @@ fn for_each_child_node(
             if let Some(row) = tf.rowexpr.as_ref() {
                 visit(row);
             }
+            for ns in &tf.namespaces {
+                visit(ns);
+            }
             for col in &tf.columns {
                 visit(col);
             }
@@ -3066,6 +3170,38 @@ fn for_each_child_node(
         Some(NodeEnum::CommonTableExpr(cte)) => {
             if let Some(q) = cte.ctequery.as_ref() {
                 visit(q);
+            }
+            if let Some(search) = cte.search_clause.as_ref() {
+                for col in &search.search_col_list {
+                    visit(col);
+                }
+            }
+            if let Some(cycle) = cte.cycle_clause.as_ref() {
+                for col in &cycle.cycle_col_list {
+                    visit(col);
+                }
+                if let Some(v) = cycle.cycle_mark_value.as_ref() {
+                    visit(v);
+                }
+                if let Some(d) = cycle.cycle_mark_default.as_ref() {
+                    visit(d);
+                }
+            }
+        }
+        Some(NodeEnum::CtesearchClause(search)) => {
+            for col in &search.search_col_list {
+                visit(col);
+            }
+        }
+        Some(NodeEnum::CtecycleClause(cycle)) => {
+            for col in &cycle.cycle_col_list {
+                visit(col);
+            }
+            if let Some(v) = cycle.cycle_mark_value.as_ref() {
+                visit(v);
+            }
+            if let Some(d) = cycle.cycle_mark_default.as_ref() {
+                visit(d);
             }
         }
         Some(NodeEnum::PrepareStmt(p)) => {
@@ -3099,6 +3235,9 @@ fn for_each_child_node(
             }
             if let Some(func) = j.func.as_ref() {
                 visit(func);
+            }
+            if let Some(coercion) = j.coercion.as_ref() {
+                visit(coercion);
             }
         }
         Some(NodeEnum::JsonKeyValue(kv)) => {
@@ -3168,6 +3307,11 @@ fn for_each_child_node(
             for col in &j.columns {
                 visit(col);
             }
+            if let Some(b) = j.on_error.as_ref() {
+                if let Some(e) = b.expr.as_ref() {
+                    visit(e);
+                }
+            }
         }
         Some(NodeEnum::JsonTableColumn(c)) => {
             if let Some(path) = c.pathspec.as_ref() {
@@ -3187,6 +3331,99 @@ fn for_each_child_node(
                 if let Some(e) = b.expr.as_ref() {
                     visit(e);
                 }
+            }
+        }
+        Some(NodeEnum::JsonArgument(a)) => {
+            visit_json_value_expr_children(a.val.as_deref(), visit);
+        }
+        Some(NodeEnum::JsonBehavior(b)) => {
+            if let Some(e) = b.expr.as_ref() {
+                visit(e);
+            }
+        }
+        Some(NodeEnum::JsonArrayAgg(j)) => {
+            visit_json_value_expr_children(j.arg.as_deref(), visit);
+            visit_json_agg_constructor_children(j.constructor.as_deref(), visit);
+        }
+        Some(NodeEnum::JsonObjectAgg(j)) => {
+            if let Some(arg) = j.arg.as_ref() {
+                if let Some(key) = arg.key.as_ref() {
+                    visit(key);
+                }
+                visit_json_value_expr_children(arg.value.as_deref(), visit);
+            }
+            visit_json_agg_constructor_children(j.constructor.as_deref(), visit);
+        }
+        Some(NodeEnum::JsonSerializeExpr(j)) => {
+            visit_json_value_expr_children(j.expr.as_deref(), visit);
+        }
+        Some(NodeEnum::JsonParseExpr(j)) => {
+            visit_json_value_expr_children(j.expr.as_deref(), visit);
+        }
+        Some(NodeEnum::JsonScalarExpr(j)) => {
+            if let Some(expr) = j.expr.as_ref() {
+                visit(expr);
+            }
+        }
+        Some(NodeEnum::JsonIsPredicate(j)) => {
+            if let Some(expr) = j.expr.as_ref() {
+                visit(expr);
+            }
+        }
+        Some(NodeEnum::JsonArrayQueryConstructor(j)) => {
+            if let Some(q) = j.query.as_ref() {
+                visit(q);
+            }
+        }
+        Some(NodeEnum::JsonAggConstructor(c)) => {
+            visit_json_agg_constructor_children(Some(c), visit);
+        }
+        Some(NodeEnum::TableFunc(tf)) => {
+            if let Some(doc) = tf.docexpr.as_ref() {
+                visit(doc);
+            }
+            if let Some(row) = tf.rowexpr.as_ref() {
+                visit(row);
+            }
+            for expr in tf
+                .colexprs
+                .iter()
+                .chain(tf.coldefexprs.iter())
+                .chain(tf.colvalexprs.iter())
+                .chain(tf.passingvalexprs.iter())
+            {
+                visit(expr);
+            }
+        }
+        Some(NodeEnum::RangeTableFuncCol(c)) => {
+            if let Some(expr) = c.colexpr.as_ref() {
+                visit(expr);
+            }
+            if let Some(expr) = c.coldefexpr.as_ref() {
+                visit(expr);
+            }
+        }
+        Some(NodeEnum::CoerceViaIo(c)) => {
+            if let Some(arg) = c.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::ConvertRowtypeExpr(c)) => {
+            if let Some(arg) = c.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::RelabelType(r)) => {
+            if let Some(arg) = r.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::ArrayCoerceExpr(a)) => {
+            if let Some(arg) = a.arg.as_ref() {
+                visit(arg);
+            }
+            if let Some(elem) = a.elemexpr.as_ref() {
+                visit(elem);
             }
         }
         Some(NodeEnum::GroupingSet(set)) => {
@@ -5258,6 +5495,38 @@ mod referenced_identifier_probe {
         ));
         assert!(masked_exceeds_outer_projection(
             r#"DECLARE c CURSOR FOR SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"WITH RECURSIVE r AS (SELECT * FROM demo.customers)
+               SEARCH DEPTH FIRST BY u&"email" SET ord SELECT count(*) FROM r"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"WITH RECURSIVE r AS (SELECT * FROM demo.customers)
+               CYCLE u&"email" SET is_cycle USING path SELECT count(*) FROM r"#,
+            &masked
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT json_arrayagg(t) FROM demo.customers t",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT json_objectagg('k': t) FROM demo.customers t",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM demo.customers t WHERE JSON_SERIALIZE(t) LIKE '%x%'",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM demo.customers t WHERE t IS JSON",
+            &relations
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers,
+               XMLTABLE('/e' PASSING '<e>x</e>'
+                 COLUMNS x text PATH '.' DEFAULT u&"email")"#,
             &masked
         ));
         assert!(hostile_uses_whole_row(

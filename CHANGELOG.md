@@ -1,6 +1,39 @@
 # Changelog
 
-## 0.1.92 — hostile SQL gate: agg ORDER BY, window frames, JSON_TABLE, PREPARE
+## 0.1.92 — hostile SQL gate: agg ORDER BY, JSON_TABLE, PREPARE, SEARCH/CYCLE, JSON agg
+
+Live membership / cleartext-row oracles under `posture = "hostile"` that
+`pg_query::nodes()` never visits. Unicode-escaped masked names
+(`u&"email"`) are invisible to the lexer, so a missed node was an allow:
+
+- `string_agg(city, ',' ORDER BY u&"email" = 'x')` / `WITHIN GROUP (ORDER BY …)`
+  — `FuncCall.agg_order` was never walked
+- `ROWS BETWEEN (SELECT … WHERE u&"email" = 'x') PRECEDING AND CURRENT ROW`
+  — `WindowDef.start_offset` / `end_offset` skipped
+- `JSON_VALUE` / `JSON_QUERY` / `JSON_EXISTS` / `JSON_TABLE` around those names
+- `PREPARE q AS SELECT count(*) WHERE u&"email" = 'x'` then `EXECUTE q` —
+  `nodes()` does not enter `PrepareStmt` / `DeclareCursorStmt` query bodies
+- Whole-row `t::text` inside `ARRAY[]`, `JSON_OBJECT`/`JSON_ARRAY`,
+  `xmlserialize`, `LIMIT (SELECT … t2::text …)`, aggregate `ORDER BY t::text`,
+  and window `PARTITION BY` / `ORDER BY t::text` — binders inside `LIMIT` were
+  also invisible to `nodes()`, so the inner alias was never a row variable
+- `WITH RECURSIVE r AS (SELECT * FROM …) SEARCH DEPTH FIRST BY u&"email"` —
+  `CommonTableExpr.search_clause` / `cycle_clause` were never walked, and
+  `SELECT *` names no column for the projection tally to notice
+- `json_arrayagg(t)` / `json_objectagg('k': t)` / `JSON_SERIALIZE(t)` /
+  `t IS JSON` — JSON aggregate / serialize / IS JSON nodes were tallied for
+  unicode names but skipped by the whole-row child walk
+- `XMLTABLE (… COLUMNS … DEFAULT u&"email")` — `RangeTableFuncCol.coldefexpr`
+
+Unparseable SQL with a unicode-escaped masked name failed *open*: the lexer
+sees no `email` token, the tree walk returns nothing, and the gate treated
+"no counts" as safe. It now refuses when the statement does not parse.
+
+Fixed by walking those node kinds in the projection tally, collecting row
+binders and whole-row refs from the statement root (not `nodes()`), and
+failing closed on a parse error whenever the catalog has masked names.
+
+## 0.1.91 — hostile SQL gate: JOIN ON, BooleanTest, JSON, xmlserialize
 
 Twenty-three live membership / cleartext-row oracles under `posture = "hostile"`
 that `pg_query::nodes()` never visits. Unicode-escaped masked names
