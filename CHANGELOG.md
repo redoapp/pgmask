@@ -48,8 +48,13 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   (`information_schema.user_mapping_options` /
   `foreign_server_options` / `foreign_data_wrapper_options`) were
   metadata-only because they live in `information_schema` and never name
-  `pg_user_mapping`. `information_schema.user_mappings` (no option
-  values) and `information_schema.tables` stay allowed.
+  `pg_user_mapping`. The other two PUBLIC option views
+  (`column_options` / `foreign_table_options`) and the internal
+  `_pg_user_mappings` / `_pg_foreign_*` base views (raw `umoptions` /
+  `srvoptions` / `fdwoptions` / `ftoptions` / `attfdwoptions`) were the
+  same hole. `information_schema.user_mappings` / `foreign_servers` /
+  `foreign_tables` / `foreign_data_wrappers` (names, no option values)
+  and `information_schema.tables` stay allowed.
 - Hostile / read-only / write gates share one descent (`walk_tree` /
   `for_each_child_node`) and one cached parse (`StatementInspection`) instead
   of a parallel `tally_*` match plus `pg_query::nodes()`. The parser is still

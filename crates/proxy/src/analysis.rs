@@ -1420,10 +1420,22 @@ const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     // SQL-standard wrappers of the same option catalogs. `FROM
     // information_schema.user_mapping_options` is metadata-only (schema
     // allowlist) and never names `pg_user_mapping`, so the pg_ catalog
-    // denylist does not see it.
+    // denylist does not see it. The previous pass caught three of the
+    // five PUBLIC option views; `column_options` / `foreign_table_options`
+    // (attfdwoptions / ftoptions) are the same class. Internal
+    // `_pg_*` base views carry the raw option arrays those wrappers
+    // explode — GRANT is not PUBLIC, but a superuser (or
+    // `SET search_path TO information_schema`) still reads them.
     "user_mapping_options",
     "foreign_server_options",
     "foreign_data_wrapper_options",
+    "column_options",
+    "foreign_table_options",
+    "_pg_user_mappings",
+    "_pg_foreign_servers",
+    "_pg_foreign_data_wrappers",
+    "_pg_foreign_tables",
+    "_pg_foreign_table_columns",
     // Host configuration and file contents.
     "pg_file_settings",
     "pg_hba_file_rules",
@@ -1444,6 +1456,15 @@ fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bool {
     // Unqualified `pg_toast_*` is catalog-shaped (`pg_` prefix) and would
     // otherwise look metadata-only.
     if schema == "pg_toast" || relation.starts_with("pg_toast_") {
+        return true;
+    }
+    // information_schema implements SQL/MED option views on `_pg_*`
+    // base views. New ones keep that prefix; a name list alone misses
+    // the next wrapper. Unqualified `_pg_*` still needs the name list
+    // (a CTE can be called `_pg_foo`; only the schema-qualified form
+    // is prefix-matched). `_pg_*` *functions* (`_pg_truetypid`) are
+    // FuncCalls, not RangeVars, and stay catalog-safe helpers.
+    if schema == "information_schema" && relation.starts_with("_pg_") {
         return true;
     }
     LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str())
@@ -3913,6 +3934,10 @@ mod tests {
             "SELECT table_name FROM information_schema.tables",
             "SELECT rolname FROM pg_roles",
             "SELECT * FROM information_schema.user_mappings",
+            "SELECT * FROM information_schema.foreign_servers",
+            "SELECT * FROM information_schema.foreign_tables",
+            "SELECT * FROM information_schema.foreign_data_wrappers",
+            "SELECT column_name FROM information_schema.columns",
             "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_statistic_ext e \
              ON e.stxrelid = c.oid",
         ] {
@@ -3954,6 +3979,18 @@ mod tests {
             "SELECT * FROM information_schema.foreign_data_wrapper_options",
             r#"SELECT * FROM information_schema.u&"user_mapping_options""#,
             "SELECT option_value FROM user_mapping_options",
+            "SELECT option_value FROM information_schema.column_options",
+            "SELECT * FROM information_schema.foreign_table_options",
+            r#"SELECT * FROM information_schema.u&"column_options""#,
+            "SELECT option_value FROM column_options",
+            "SELECT umoptions FROM information_schema._pg_user_mappings",
+            "SELECT srvoptions FROM information_schema._pg_foreign_servers",
+            "SELECT fdwoptions FROM information_schema._pg_foreign_data_wrappers",
+            "SELECT ftoptions FROM information_schema._pg_foreign_tables",
+            "SELECT attfdwoptions FROM information_schema._pg_foreign_table_columns",
+            "SELECT umoptions FROM _pg_user_mappings",
+            r#"SELECT * FROM information_schema.u&"_pg_user_mappings""#,
+            "EXPLAIN SELECT * FROM information_schema.column_options",
         ] {
             assert!(
                 !reads_only_server_metadata(sql),

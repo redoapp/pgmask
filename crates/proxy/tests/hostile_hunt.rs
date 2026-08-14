@@ -95,6 +95,12 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT id FROM demo.customers ORDER BY email COLLATE "C""#,
         r#"SELECT id FROM demo.customers ORDER BY email USING >"#,
         r#"SELECT id FROM demo.customers ORDER BY email USING OPERATOR(pg_catalog.<)"#,
+        "SELECT * FROM information_schema.user_mappings",
+        "SELECT * FROM information_schema.foreign_servers",
+        "SELECT * FROM information_schema.foreign_tables",
+        "SELECT * FROM information_schema.foreign_data_wrappers",
+        "SELECT table_name FROM information_schema.tables",
+        "SELECT rolname FROM pg_roles",
     ];
     let mut bad = Vec::new();
     for sql in must_allow {
@@ -346,6 +352,18 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT * FROM information_schema.u&"user_mapping_options""#,
         r#"SELECT option_value FROM user_mapping_options"#,
         r#"EXPLAIN SELECT * FROM information_schema.user_mapping_options"#,
+        r#"SELECT option_value FROM information_schema.column_options"#,
+        r#"SELECT * FROM information_schema.foreign_table_options"#,
+        r#"SELECT * FROM information_schema.u&"column_options""#,
+        r#"SELECT option_value FROM column_options"#,
+        r#"SELECT umoptions FROM information_schema._pg_user_mappings"#,
+        r#"SELECT srvoptions FROM information_schema._pg_foreign_servers"#,
+        r#"SELECT fdwoptions FROM information_schema._pg_foreign_data_wrappers"#,
+        r#"SELECT ftoptions FROM information_schema._pg_foreign_tables"#,
+        r#"SELECT attfdwoptions FROM information_schema._pg_foreign_table_columns"#,
+        r#"SELECT umoptions FROM _pg_user_mappings"#,
+        r#"SELECT * FROM information_schema.u&"_pg_user_mappings""#,
+        r#"EXPLAIN SELECT * FROM information_schema.column_options"#,
         // Extra unicode frames that should already refuse
         r#"SELECT count(*) FROM demo.customers GROUP BY ROLLUP (u&"email")"#,
         r#"SELECT count(*) FROM demo.customers GROUP BY CUBE (u&"email")"#,
@@ -363,6 +381,21 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT id FROM demo.customers ORDER BY length(u&"email")"#,
         r#"SELECT count(*) FROM demo.customers WHERE u&"email" || '' = 'x'"#,
         r#"SELECT count(*) FROM demo.customers WHERE CASE WHEN u&"email" = 'x' THEN 1 ELSE 0 END = 1"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS JSON ARRAY"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS JSON OBJECT"#,
+        r#"SELECT count(*) FROM demo.customers WHERE normalize(u&"email") = 'x'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE starts_with(u&"email", 'x')"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" LIKE 'x%' ESCAPE '\'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" BETWEEN SYMMETRIC 'a' AND 'z'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE xmlexists('//x' PASSING BY REF u&"email")"#,
+        r#"SELECT pg_read_binary_file('postgresql.conf') FROM pg_catalog.pg_class"#,
+        r#"SELECT lo_from_bytea(0, 'x') FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_buffercache_pages() FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_stat_statements_reset() FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_log_backend_memory_contexts(pg_backend_pid()) FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_copy_logical_replication_slot('a','b') FROM pg_catalog.pg_class"#,
+        r#"SELECT * FROM information_schema.u&"foreign_table_options""#,
+        r#"SELECT * FROM information_schema.u&"_pg_foreign_servers""#,
     ];
 
     for sql in oracles {
