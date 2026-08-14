@@ -151,7 +151,10 @@ refs inside `json_arrayagg` / `json_objectagg` / `JSON_SERIALIZE` / `IS JSON`,
 and join/rename via `PREPARE` or `(SELECT *) AS t(c1,c2,…)` / CTE column lists.
 SQL `PREPARE`/`EXECUTE`/`DEALLOCATE` and `DECLARE`/`FETCH`/`CLOSE` are now
 refused on every posture (`sql_prepare_cursor`); ordinary `SELECT` (including
-`SELECT … FETCH FIRST n ROWS`) and protocol Parse/Bind stay allowed. Residual
+`SELECT … FETCH FIRST n ROWS`) and protocol Parse/Bind stay allowed. `EXPLAIN`
+of those same SELECTs is allowed; `EXPLAIN` of a predicate oracle is not.
+`pg_cursors` and `pg_stat_wal_receiver` join the leaky-catalog refuse list
+(session SQL text / replication conninfo). Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and
 cleartext sort order among masked projections).

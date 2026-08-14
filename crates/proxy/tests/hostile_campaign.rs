@@ -116,6 +116,11 @@ fn run_pass() -> Vec<(String, &'static str)> {
         "SELECT city FROM demo.customers WHERE city = 'Denver'",
         "SELECT count(*) FROM demo.customers WHERE city = 'Denver'",
         "SELECT email FROM demo.customers FETCH FIRST 10 ROWS ONLY",
+        "SELECT * FROM demo.customers",
+        "TABLE demo.customers",
+        "EXPLAIN SELECT email FROM demo.customers",
+        "EXPLAIN SELECT id FROM demo.customers ORDER BY email",
+        "EXPLAIN SELECT email FROM demo.customers FETCH FIRST 10 ROWS ONLY",
     ] {
         check(sql, must_allow_projection(sql));
     }
@@ -321,6 +326,10 @@ fn run_pass() -> Vec<(String, &'static str)> {
            WHERE JSON_OBJECT(KEY u&"email" VALUE city) IS NOT NULL"#,
         r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS JSON OBJECT"#,
         r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS JSON ARRAY"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS JSON WITH UNIQUE KEYS"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS JSON WITHOUT UNIQUE KEYS"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS JSON SCALAR"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS JSON VALUE"#,
         r#"SELECT count(*) FROM demo.customers
            CROSS JOIN LATERAL (SELECT 1 WHERE u&"email" = 'x') s"#,
         r#"SELECT count(*) FROM demo.customers
@@ -464,6 +473,9 @@ fn run_pass() -> Vec<(String, &'static str)> {
     let join_rename: &[&str] = &[
         "SELECT count(*) FROM demo.customers AS t(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) WHERE c2 = 'x'",
         "SELECT count(*) FROM demo.customers a NATURAL JOIN demo.customers b",
+        "SELECT count(*) FROM demo.customers a NATURAL LEFT JOIN demo.customers b",
+        "SELECT count(*) FROM demo.customers a NATURAL RIGHT JOIN demo.customers b",
+        "SELECT count(*) FROM demo.customers a NATURAL FULL JOIN demo.customers b",
         r#"SELECT count(*) FROM demo.customers NATURAL JOIN (VALUES ('x')) v(u&"email")"#,
         "SELECT count(*) FROM customers AS t(c1,c2,c3,c4,c5) WHERE c2 = 'x'",
         "SELECT count(*) FROM (SELECT * FROM demo.customers) AS t(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) WHERE c2 = 'x'",

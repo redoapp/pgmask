@@ -11,7 +11,11 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.
   Analysts keep ordinary `SELECT` (including `SELECT … FETCH FIRST n ROWS`,
   a limit clause) and the extended protocol. Walkers on PREPARE/DECLARE
-  bodies remain as defense in depth.
+  bodies remain as defense in depth. `EXPLAIN SELECT email FROM t` is the
+  same residual as the inner SELECT; `EXPLAIN` of a predicate oracle is not.
+- `pg_cursors` (session cursor SQL text) and `pg_stat_wal_receiver` (conninfo)
+  are refused as leaky catalogs, same class as `pg_prepared_statements` /
+  `pg_subscription`.
 - `string_agg(city, ',' ORDER BY u&"email" = 'x')` / `WITHIN GROUP (ORDER BY …)`
   — `FuncCall.agg_order` was never walked
 - `ROWS BETWEEN (SELECT … WHERE u&"email" = 'x') PRECEDING AND CURRENT ROW`

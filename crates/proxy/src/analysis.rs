@@ -1337,10 +1337,15 @@ const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     "pg_stats",
     "pg_stats_ext",
     "pg_stats_ext_exprs",
-    // Other sessions' SQL text, literals included.
+    // Other sessions' SQL text, literals included. Session-local
+    // `pg_cursors.statement` / `pg_prepared_statements` carry the same
+    // class of text (DECLARE / PREPARE bodies with literals).
     "pg_stat_activity",
     "pg_stat_statements",
     "pg_prepared_statements",
+    "pg_cursors",
+    // Replication conninfo can embed passwords.
+    "pg_stat_wal_receiver",
     // Large object contents.
     "pg_largeobject",
     // Password hashes and connection strings.
@@ -3980,6 +3985,26 @@ const TEXT_FUNCTIONS: &[&str] = &[
     "decode",
 ];
 
+fn select_stmt_for_outer_projection(
+    stmt: &pg_query::protobuf::Node,
+) -> Option<&pg_query::protobuf::SelectStmt> {
+    match stmt.node.as_ref()? {
+        NodeEnum::SelectStmt(select) => Some(select),
+        // Analysts EXPLAIN ordinary SELECT. Peel the wrapper so
+        // `EXPLAIN SELECT email FROM t` keeps the same residual as the
+        // inner statement; `EXPLAIN SELECT count(*) WHERE email = 'x'`
+        // still exceeds outer projection and is refused.
+        NodeEnum::ExplainStmt(explain) => {
+            let query = explain.query.as_ref()?;
+            match query.node.as_ref()? {
+                NodeEnum::SelectStmt(select) => Some(select),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn outer_bare_projection_counts(sql: &str) -> Option<std::collections::HashMap<String, usize>> {
     use std::collections::HashMap;
     let parsed = pg_query::parse(sql).ok()?;
@@ -3987,10 +4012,7 @@ fn outer_bare_projection_counts(sql: &str) -> Option<std::collections::HashMap<S
         return None;
     }
     let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?;
-    let NodeEnum::SelectStmt(select) = stmt.node.as_ref()? else {
-        // Non-SELECT with a masked name: refuse.
-        return None;
-    };
+    let select = select_stmt_for_outer_projection(stmt)?;
     // Set operations erase which branch a name came from; hostile refuses them
     // when a masked name is present (caller already saw one).
     if select.op() != SetOperation::SetopNone {
@@ -4084,6 +4106,11 @@ mod tests {
             "SELECT data FROM pg_catalog.pg_largeobject",
             "SELECT umoptions FROM pg_catalog.pg_user_mappings",
             "SELECT subconninfo FROM pg_catalog.pg_subscription",
+            "SELECT statement FROM pg_catalog.pg_cursors",
+            "SELECT statement FROM pg_cursors",
+            r#"SELECT statement FROM u&"pg_cursors""#,
+            "SELECT conninfo FROM pg_catalog.pg_stat_wal_receiver",
+            "EXPLAIN SELECT most_common_vals FROM pg_catalog.pg_stats",
         ] {
             assert!(
                 !reads_only_server_metadata(sql),
@@ -5448,6 +5475,19 @@ mod referenced_identifier_probe {
         ));
         assert!(!masked_exceeds_outer_projection(
             "SELECT email AS e FROM demo.customers ORDER BY e",
+            &masked
+        ));
+        // EXPLAIN of an allowed SELECT is the same residual (analyst debugging).
+        assert!(!masked_exceeds_outer_projection(
+            "EXPLAIN SELECT email, id FROM demo.customers WHERE id = 1",
+            &masked
+        ));
+        assert!(!masked_exceeds_outer_projection(
+            "EXPLAIN SELECT id FROM demo.customers ORDER BY email",
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            "EXPLAIN SELECT count(*) FROM demo.customers WHERE email = 'x'",
             &masked
         ));
         // ORDER BY with a predicate is a membership oracle — not credited.

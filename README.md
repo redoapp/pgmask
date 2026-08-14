@@ -641,8 +641,9 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   `ORDER BY` of masked values is accepted (cells stay masked). Default posture
   does not close predicate oracles; use hostile for containment. Pair with
   `rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
-- **Leaky catalogs refused.** `pg_stats`, `pg_authid`, `pg_stat_activity`, and
-  similar are refused at the frontend on every posture (`leaky_catalog`).
+- **Leaky catalogs refused.** `pg_stats`, `pg_authid`, `pg_stat_activity`,
+  `pg_cursors`, `pg_stat_wal_receiver`, and similar are refused at the frontend
+  on every posture (`leaky_catalog`).
 - **Non-text types accept only `mask = "null"`.** Text-family types are
   byte-identical in text and binary formats so they mask correctly either way;
   anything else is refused rather than guessed at.
