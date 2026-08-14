@@ -690,10 +690,13 @@ impl Snapshot {
 
     /// Whether grouping by these columns makes every group a single row.
     ///
-    /// `sum(salary)` is released because a summary is not a salary — but
-    /// `GROUP BY id` on a unique key gives one row per group, so every
-    /// "summary" is exactly the value it summarised. Measured on the demo
-    /// fixture, `SELECT id, sum(annual_salary) … GROUP BY id` returned every
+    /// A reducing aggregate over a masked column is internally masked with that
+    /// column's own mask before it is served (see `Safety::Summary`), so on its
+    /// own a one-row group cannot degrade a summary into the exact value. The
+    /// guard is still applied as belt and braces: `GROUP BY id` on a unique key
+    /// gives one row per group, so every "summary" is exactly the value it
+    /// summarised. Measured on the demo fixture, before the summary-masking
+    /// change, `SELECT id, sum(annual_salary) … GROUP BY id` returned every
     /// salary in the table, byte-identical to reading it directly, in one
     /// query. The group-of-one trade was written down as an incidental edge
     /// case; grouping by a key makes it the bulk interface.

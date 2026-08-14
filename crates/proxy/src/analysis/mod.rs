@@ -28,7 +28,7 @@
 //! one who is. Governing the filter side is the only sound answer and it is a
 //! different product — it would refuse `WHERE email = …` outright.
 //!
-//! The one route that was closed is the one that is decidable from the
+//! The one route that stays closed is the one that is decidable from the
 //! statement and the catalog alone: [`StatementInspection::group_by_columns`]
 //! reads the grouping, and if it covers a declared unique key — or cannot be
 //! read at all — the session withholds the aggregate relaxation, so a reducing
@@ -40,14 +40,23 @@
 //! lexical backstop in the session rather than to a refusal, because refusing
 //! outright took time-bucketed aggregation with it: `date_trunc` over a coarse
 //! literal unit is released on purpose, so `SELECT date_trunc('month', ts),
-//! sum(amount) … GROUP BY 1` worked before the guard and not after. The `WHERE id = 1` form of the attack survives and
-//! cannot be closed here: whether a predicate matches one row is a property of
-//! the data, not of the statement. What the guard buys is the difference
-//! between one query for the whole table and one query per row.
+//! sum(amount) … GROUP BY 1` worked before the guard and not after.
+//!
+//! Reducing aggregates *not* ruled out by that key test are released from the
+//! syntactic layer into [`Safety::Summary`], and the session resolves the
+//! source through one syntax-and-catalog path: a sum over an explicitly
+//! qualified unmasked column is served exactly, and a sum over a masked column
+//! is masked with that column's own mask. That is
+//! what closes the `WHERE id = 1` form of the attack, which cannot be decided
+//! from the statement and the catalog — whether a predicate matches one row is
+//! a property of the data — by giving up the *precision* rather than the
+//! summary: `sum(annual_salary)` collapses to the bucket floor, never the
+//! exact salary, whatever the predicate.
 //!
 //! That relaxation is what makes this tractable without a lineage engine. If the
 //! outermost node of a target expression is a reducing aggregate, it cannot
-//! return a stored value *whatever is inside it*, so there is nothing to resolve.
+//! return a stored value *whatever is inside it* once the *output* is masked,
+//! so the source only has to be named, never reconstructed.
 //!
 //! # Why an allowlist of shapes, and not "does it reference a column?"
 //!
@@ -98,9 +107,6 @@ pub use hostile::{
 };
 pub use safety::{analyze, Relaxations, Safety};
 
-#[cfg(test)]
-pub(crate) use safety::{aggregate_argument_is_grouped, grouping_may_reference};
-
 use catalogs::{
     every_relation_is_qualified_inspected, provenance_is_trustworthy_inspected,
     reads_only_server_metadata_inspected, touches_leaky_system_catalog_inspected,
@@ -113,7 +119,10 @@ use hostile::{
     hostile_join_or_rename_masked_inspected, hostile_uses_whole_row_inspected,
     masked_exceeds_outer_projection_inspected,
 };
-use safety::{analyze_inspected, group_item_columns, unwrap_star_over_subquery};
+use safety::{
+    analyze_inspected, group_item_columns, positions_are_trustworthy, summary_argument_name,
+    unwrap_star_over_subquery,
+};
 
 /// One parsed and lazily scanned view of a statement for a release decision.
 ///
@@ -229,6 +238,78 @@ impl<'sql> StatementInspection<'sql> {
         analyze_inspected(self, field_count, allow)
     }
 
+    /// Resolution material for a reducing aggregate over a single bare column.
+    ///
+    /// [`Safety::Summary`] is reached without the catalog, because analysis does
+    /// not resolve names. Mask selection deliberately does not come from a
+    /// blocked lineage verdict: that verdict can describe several inputs or a
+    /// transformed input, and one source's mask is not a policy for the result.
+    ///
+    /// The resolver below needs no `sqllineage`: an aggregate over one bare
+    /// column is attributable from the statement and the catalog alone. It
+    /// returns, for the one trusted select, the explicitly schema-qualified
+    /// FROM relations `(schema, relname)` and, aligned to `field_count`, the bare
+    /// column each field reduces when the field is exactly such an aggregate
+    /// (`cast(sum(x) AS bigint)` is; an expression or multi-argument aggregate
+    /// keeps the opaque posture).
+    ///
+    /// Any parse doubt — a set operation, a star, an unqualified relation (which
+    /// needs the session's `search_path`), or a FROM entry that is not a plain
+    /// named range — collapses the whole thing to `None`, and the caller keeps
+    /// its normal opaque posture.
+    pub fn summary_resolution(&self, field_count: usize) -> Option<SummaryResolution> {
+        let parsed = self.parsed()?;
+        if parsed.protobuf.stmts.len() != 1 {
+            return None;
+        }
+        let NodeEnum::SelectStmt(select) = parsed
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|s| s.stmt.as_ref())
+            .and_then(|s| s.node.as_ref())?
+        else {
+            return None;
+        };
+        // Same unwrap as `analyze_inspected`: `SELECT * FROM (subquery)`.
+        let mut select: &SelectStmt = select;
+        while let Some(inner) = unwrap_star_over_subquery(select) {
+            select = inner;
+        }
+        if !positions_are_trustworthy(select, field_count) {
+            return None;
+        }
+        let mut relations = Vec::with_capacity(select.from_clause.len());
+        for entry in &select.from_clause {
+            let NodeEnum::RangeVar(range) = entry.node.as_ref()? else {
+                // A subquery, join, function or lateral in FROM is lineage's
+                // territory; this backstop only handles plain named ranges.
+                return None;
+            };
+            // The proxy does not track `search_path`. Treating an unqualified
+            // `payroll` as `public.payroll` can apply that relation's weaker
+            // mask to a value actually read from `private.payroll`.
+            if range.schemaname.is_empty() {
+                return None;
+            }
+            relations.push((range.schemaname.clone(), range.relname.clone()));
+        }
+        let fields = select
+            .target_list
+            .iter()
+            .map(|entry| match entry.node.as_ref() {
+                Some(NodeEnum::ResTarget(target)) => target
+                    .val
+                    .as_ref()
+                    .and_then(|v| v.node.as_ref())
+                    .and_then(|expr| summary_argument_name(expr, 0))
+                    .map_or(SummaryArgument::Unattributable, SummaryArgument::BareColumn),
+                _ => SummaryArgument::Unattributable,
+            })
+            .collect();
+        Some(SummaryResolution { relations, fields })
+    }
+
     pub fn reads_only_server_metadata(&self) -> bool {
         reads_only_server_metadata_inspected(self)
     }
@@ -281,6 +362,34 @@ impl<'sql> StatementInspection<'sql> {
             .get_or_init(|| pg_query::parse(self.sql).ok())
             .as_ref()
     }
+}
+
+/// Syntax-level attribution for reducing aggregates in one result set.
+///
+/// This is deliberately not an anonymous pair of parallel vectors: callers
+/// must name whether they are asking about FROM relations or result fields,
+/// and each field says explicitly whether its argument can be attributed.
+pub struct SummaryResolution {
+    relations: Vec<(String, String)>,
+    fields: Vec<SummaryArgument>,
+}
+
+impl SummaryResolution {
+    pub fn relations(&self) -> &[(String, String)] {
+        &self.relations
+    }
+
+    pub fn fields(&self) -> &[SummaryArgument] {
+        &self.fields
+    }
+}
+
+/// The only aggregate argument shape whose catalog policy can safely govern a
+/// reducing result. Everything else retains the opaque posture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryArgument {
+    BareColumn(String),
+    Unattributable,
 }
 
 /// Whether `pg_query` can parse the statement at all.

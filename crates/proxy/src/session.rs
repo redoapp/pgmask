@@ -77,6 +77,53 @@ pub struct Policy {
     max_notices_per_exchange: Option<u32>,
 }
 
+/// Everything `Policy::plan_for` needs to classify one result set, grouped so
+/// the decision hub stays under the clippy argument budget.
+pub(crate) struct FieldAnalysis<'a> {
+    /// Per-field analysis verdict (`Summary`, `Releasable`, `Unknown`, …).
+    pub safety: &'a [Safety],
+    /// Per-field lineage verdict, when lineage ran (`Release`/`Blocked`/…).
+    pub lineage: &'a [Verdict],
+    /// Per-field reducing-aggregate policy after syntax and catalog resolution.
+    pub summary: &'a [SummaryPolicy],
+    /// Whether the engine's column provenance is believed (set-op distrust).
+    pub trust_provenance: bool,
+}
+
+/// The complete policy state for one potential reducing-aggregate field.
+///
+/// Keeping `Released` distinct from `Masked` prevents a missing attribution
+/// (`Opaque`) from being represented as a permissive `None` mask. Keeping
+/// `NotApplicable` distinct from `Opaque` makes the safety gate explicit too.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SummaryPolicy {
+    NotApplicable,
+    Opaque,
+    Released,
+    Masked(MaskSpec),
+}
+
+impl FieldAnalysis<'_> {
+    /// The reducing-aggregate policy for `index`.
+    ///
+    /// Gated on the field actually being `Safety::Summary`, not merely being an
+    /// aggregate-shaped expression: `max(x)` returns a stored value and must
+    /// keep falling through to the opaque posture, and it is refused there. Only
+    /// the reducing purity-allowlist (which `classify` maps to `Summary`)
+    /// reaches a policy here. The source can be masked or explicitly released:
+    /// schema qualification removes the `search_path` guess that made
+    /// passthrough unsafe in the earlier fallback.
+    pub(crate) fn summary_policy_for(&self, index: usize) -> SummaryPolicy {
+        if self.safety.get(index) != Some(&Safety::Summary) {
+            return SummaryPolicy::NotApplicable;
+        }
+        self.summary
+            .get(index)
+            .cloned()
+            .unwrap_or(SummaryPolicy::Opaque)
+    }
+}
+
 impl Policy {
     pub fn from_config(config: &Config, catalog: Arc<Catalog>) -> Result<Self> {
         // `Config` is public because the classifier and test adapters build it
@@ -158,19 +205,17 @@ impl Policy {
         snapshot: &Snapshot,
         fields: &[protocol::FieldDescription],
         roles: &HashSet<String>,
-        safety: &[Safety],
-        lineage: &[Verdict],
-        trust_provenance: bool,
+        analysis: &FieldAnalysis,
     ) -> Result<Plan, Rejection> {
         let mut plan = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
-            let provably_safe = safety.get(index).copied() == Some(Safety::Releasable);
+            let provably_safe = analysis.safety.get(index).copied() == Some(Safety::Releasable);
             // A set operation can put values from several columns into one
             // output field, and CockroachDB reports the first branch's OID for
             // the whole thing. Believing it applies one column's mask to
             // another column's values, which is how a released `city` let a
             // masked `email` through in the clear. Treat the field as opaque.
-            let spec = if !field.has_provenance() || !trust_provenance {
+            let spec = if !field.has_provenance() || !analysis.trust_provenance {
                 // An expression we positively identified as carrying no column
                 // value — `SELECT 1`, `now()`, `count(*)`. Passing it through is
                 // the point of the analysis; see analysis/ for why the rule is
@@ -178,49 +223,65 @@ impl Policy {
                 if provably_safe {
                     self.metrics.record_rescued();
                     MaskSpec::new(Mask::None)
-                } else if lineage.get(index) == Some(&Verdict::Release) {
+                } else if analysis.lineage.get(index) == Some(&Verdict::Release) {
                     // Every base column this derives from is explicitly
                     // released, so it cannot be carrying a masked value.
                     self.metrics.record_rescued();
                     MaskSpec::new(Mask::None)
                 } else {
-                    match self.opaque {
-                        Opaque::Reject => {
-                            // When lineage worked out *why*, say so. "derives
-                            // from customer.c_first_name, which is masked" is
-                            // the difference between a ticket and a rewrite.
-                            if let Some(Verdict::Blocked(source)) = lineage.get(index) {
+                    match analysis.summary_policy_for(index) {
+                        // One shared summary-policy path, independent of
+                        // whether optional lineage ran. Only an aggregate over
+                        // exactly one syntax-verified bare column on qualified
+                        // FROM ranges reaches either resolved state.
+                        SummaryPolicy::Released => {
+                            self.metrics.record_rescued();
+                            MaskSpec::new(Mask::None)
+                        }
+                        SummaryPolicy::Masked(spec) => spec,
+                        // Expressions and multi-argument regressions remain
+                        // opaque because applying one source's mask after a
+                        // transformation is not equivalent to masking it.
+                        SummaryPolicy::NotApplicable | SummaryPolicy::Opaque => match self.opaque {
+                            Opaque::Reject => {
+                                // When lineage worked out *why*, say so.
+                                // "derives from customer.c_first_name, which is
+                                // masked" is the difference between a ticket
+                                // and a rewrite.
+                                if let Some(Verdict::Blocked(source)) = analysis.lineage.get(index)
+                                {
+                                    return Err(Rejection {
+                                        cause: Cause::classify_opaque(&field.name, snapshot),
+                                        message: format!(
+                                            "pgmask: output column \"{}\" derives from {source}, \
+                                             which is masked",
+                                            field.name
+                                        ),
+                                        hint: Some(
+                                            "An expression over a masked column cannot be masked \
+                                             after the fact. Select a column that is released, or \
+                                             aggregate in a way that cannot return a stored value."
+                                                .into(),
+                                        ),
+                                    });
+                                }
                                 return Err(Rejection {
                                     cause: Cause::classify_opaque(&field.name, snapshot),
                                     message: format!(
-                                        "pgmask: output column \"{}\" derives from {source}, \
-                                         which is masked",
+                                        "pgmask: output column \"{}\" has no column provenance, so it \
+                                         cannot be classified",
                                         field.name
                                     ),
                                     hint: Some(
-                                        "An expression over a masked column cannot be masked \
-                                         after the fact. Select a column that is released, or \
-                                         aggregate in a way that cannot return a stored value."
+                                        "Select the underlying column directly. Expressions, set \
+                                         operations (UNION/INTERSECT/EXCEPT), recursive CTEs and \
+                                         SETOF-returning functions all erase provenance."
                                             .into(),
                                     ),
                                 });
                             }
-                            return Err(Rejection {
-                                cause: Cause::classify_opaque(&field.name, snapshot),
-                                message: format!(
-                                    "pgmask: output column \"{}\" has no column provenance, so it \
-                                 cannot be classified",
-                                    field.name
-                                ),
-                                hint: Some(
-                                    "Select the underlying column directly. Expressions, set \
-                                 operations (UNION/INTERSECT/EXCEPT), recursive CTEs and \
-                                 SETOF-returning functions all erase provenance."
-                                        .into(),
-                                ),
-                            });
-                        }
-                        Opaque::Mask => MaskSpec::new(Mask::Null),
+                            Opaque::Mask => MaskSpec::new(Mask::Null),
+                        },
                     }
                 }
             } else {
@@ -292,6 +353,97 @@ fn roles_by_principal(roles: &[crate::catalog::Role]) -> HashMap<String, HashSet
         }
     }
     out
+}
+
+/// Resolve every result field to one explicit reducing-aggregate policy state.
+///
+/// This is the seam between syntax analysis and catalog policy. It owns the
+/// positional alignment and the safety gate, so callers cannot accidentally
+/// treat a non-summary expression or a missing attribution as released.
+fn resolve_summary_policies(
+    inspection: Option<&analysis::StatementInspection<'_>>,
+    field_count: usize,
+    safety: &[Safety],
+    snapshot: &Snapshot,
+    roles: &HashSet<String>,
+) -> Vec<SummaryPolicy> {
+    let resolution = inspection.and_then(|value| value.summary_resolution(field_count));
+    (0..field_count)
+        .map(|index| {
+            if safety.get(index) != Some(&Safety::Summary) {
+                return SummaryPolicy::NotApplicable;
+            }
+            let Some(resolution) = resolution.as_ref() else {
+                return SummaryPolicy::Opaque;
+            };
+            let Some(argument) = resolution.fields().get(index) else {
+                return SummaryPolicy::Opaque;
+            };
+            resolve_summary_source(snapshot, resolution.relations(), argument, roles)
+        })
+        .collect()
+}
+
+/// Attribute a reducing aggregate's single bare column to exactly one FROM
+/// relation and return that column's policy.
+///
+/// This is the catalog half of the summary-policy resolution in
+/// [`Policy::plan_for`]: the statement half (`analysis::summary_resolution`)
+/// hands back the FROM relations and the aggregate argument's column name, and
+/// this function decides which relation owns the name and what that column is
+/// masked with.
+///
+/// Returns [`SummaryPolicy::Opaque`] when an argument is not a bare column, a
+/// relation is unqualified, ownership is not unique, or the catalog has never
+/// heard of a relation or column. Explicit schema qualification is
+/// load-bearing: the proxy does not track `search_path`, and a wrong relation
+/// can carry a weaker mask than the relation PostgreSQL actually selected.
+fn resolve_summary_source(
+    snapshot: &Snapshot,
+    relations: &[(String, String)],
+    argument: &analysis::SummaryArgument,
+    roles: &HashSet<String>,
+) -> SummaryPolicy {
+    let analysis::SummaryArgument::BareColumn(column) = argument else {
+        return SummaryPolicy::Opaque;
+    };
+    let mut owners = 0usize;
+    let mut owner: Option<&(String, String)> = None;
+    for relation in relations {
+        let Some(qualified) = qualify_relation(relation) else {
+            return SummaryPolicy::Opaque;
+        };
+        // A relation the catalog has never heard of means ownership cannot be
+        // ruled out, so nothing is attributed.
+        let Some(columns) = snapshot.relation_columns(&qualified) else {
+            return SummaryPolicy::Opaque;
+        };
+        if columns.iter().any(|c| c.as_str() == column) {
+            owners = owners.saturating_add(1);
+            owner = Some(relation);
+        }
+    }
+    if owners != 1 {
+        return SummaryPolicy::Opaque;
+    }
+    let Some(qualified) = owner.and_then(qualify_relation) else {
+        return SummaryPolicy::Opaque;
+    };
+    let Some(classification) = snapshot.lookup_by_name(&qualified, column) else {
+        return SummaryPolicy::Opaque;
+    };
+    let spec = classification.for_roles(roles).clone();
+    if spec.is_passthrough() {
+        SummaryPolicy::Released
+    } else {
+        SummaryPolicy::Masked(spec)
+    }
+}
+
+/// `(schema, relname)` -> `schema.relname`. An absent schema is unresolved,
+/// because PostgreSQL would consult session state this proxy does not track.
+fn qualify_relation((schema, relname): &(String, String)) -> Option<String> {
+    (!schema.is_empty()).then(|| format!("{schema}.{relname}"))
 }
 
 /// Bytes cleared for the client.
@@ -1223,6 +1375,19 @@ impl Session {
             _ => Vec::new(),
         };
 
+        // Summary policy is resolved once, independently of optional lineage.
+        // Only one bare argument column over explicitly schema-qualified ranges
+        // is eligible. That makes the source exact enough to preserve either a
+        // mask or an explicit release; transformed and multi-source aggregates
+        // retain the opaque posture.
+        let summary_policies = resolve_summary_policies(
+            inspection.as_ref(),
+            fields.len(),
+            &safety,
+            &snapshot,
+            &self.roles,
+        );
+
         let planned = if system_catalog {
             Ok(Arc::new(
                 fields
@@ -1239,9 +1404,12 @@ impl Session {
                 &snapshot,
                 &fields,
                 &self.roles,
-                &safety,
-                &lineage_verdicts,
-                trust_provenance,
+                &FieldAnalysis {
+                    safety: &safety,
+                    lineage: &lineage_verdicts,
+                    summary: &summary_policies,
+                    trust_provenance,
+                },
             )
         };
         let plan = match planned {
@@ -1779,9 +1947,12 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("lower", 0, 0, 25)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .expect_err("must reject");
         assert!(err.message.contains("no column provenance"));
@@ -1795,9 +1966,12 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("lower", 0, 0, 25)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .ok()
             .expect("must allow");
@@ -1812,9 +1986,12 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("email", 16391, 2, 25)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .ok()
             .unwrap();
@@ -1829,13 +2006,160 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("email", 16391, 2, 25)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .ok()
             .unwrap();
         assert_eq!(plan[0].spec.kind, Mask::None);
+    }
+
+    /// A reducing aggregate over a *released* column keeps passing through.
+    #[test]
+    fn a_summary_over_a_released_column_stays_exact() {
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_relation_for_test("demo.t", &[("salary", Mask::NumericBucket)]);
+        snapshot.set_role_mask_for_test("demo.t", "salary", "nobody", Mask::Null);
+        let p = policy_with_lineage_allow(Unclassified::Mask, Opaque::Reject);
+
+        let plan = p
+            .plan_for(
+                &snapshot,
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[Verdict::Release],
+                    summary: &[],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .unwrap();
+        // Lineage says the source is released, so the summary is the source's
+        // exact sum — `sum(id)` over an unmasked `id` keeps its precision.
+        assert_eq!(plan[0].spec.kind, Mask::None);
+    }
+
+    /// A reducing aggregate over a *masked* column is masked with that column's
+    /// own mask instead of being refused. That is what closes `sum(x) WHERE
+    /// unique = 1`: whether the predicate collapses the set to one row is a
+    /// property of the data, so the precision is given up rather than the
+    /// summary — a sum over a bucketed column is a bucket, whatever the filter.
+    #[test]
+    fn a_summary_over_a_masked_column_is_masked_with_its_source_mask() {
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_relation_for_test("demo.t", &[("salary", Mask::NumericBucket)]);
+        let p = policy_with_lineage_allow(Unclassified::Mask, Opaque::Reject);
+
+        let plan = p
+            .plan_for(
+                &snapshot,
+                // Aggregate outputs carry no table provenance, so the field is
+                // an unprovenanced `sum` of type int8.
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[Verdict::Blocked("demo.t.salary".into())],
+                    summary: &[SummaryPolicy::Masked(MaskSpec::new(Mask::NumericBucket))],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .unwrap();
+        assert_eq!(
+            plan[0].spec.kind,
+            Mask::NumericBucket,
+            "the aggregate output must take its source column's mask"
+        );
+
+        // The mask posture makes no difference to a summary: it is maskable,
+        // so it is never simply nulled.
+        let p2 = policy_with_lineage_allow(Unclassified::Mask, Opaque::Mask);
+        let plan2 = p2
+            .plan_for(
+                &snapshot,
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[Verdict::Blocked("demo.t.salary".into())],
+                    summary: &[SummaryPolicy::Masked(MaskSpec::new(Mask::NumericBucket))],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .unwrap();
+        assert_eq!(plan2[0].spec.kind, Mask::NumericBucket);
+
+        // An unresolvable summary falls back to the opaque posture instead of
+        // passing through.
+        let err = p
+            .plan_for(
+                &snapshot,
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[Verdict::Unresolved],
+                    summary: &[],
+                    trust_provenance: true,
+                },
+            )
+            .expect_err("an unbounded summary must not pass through");
+        assert!(
+            err.message.contains("no column provenance"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    /// Lineage reports only one blocked source even when an expression derives
+    /// from several columns or transforms one before aggregating it. That is
+    /// enough for a diagnostic, not enough to choose an output mask. Only the
+    /// syntax-checked single-bare-column resolution may make that choice.
+    #[test]
+    fn a_lineage_block_alone_cannot_choose_a_summary_mask() {
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_relation_for_test("demo.t", &[("a", Mask::NumericBucket)]);
+        let p = policy_with_lineage_allow(Unclassified::Mask, Opaque::Reject);
+
+        let err = p
+            .plan_for(
+                &snapshot,
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[Verdict::Blocked("demo.t.a".into())],
+                    summary: &[],
+                    trust_provenance: true,
+                },
+            )
+            .expect_err("lineage alone cannot prove a mask is valid after aggregation");
+        assert!(err.message.contains("derives from demo.t.a"));
+    }
+
+    #[test]
+    fn an_unqualified_summary_relation_cannot_choose_a_catalog_policy() {
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_relation_for_test("public.payroll", &[("salary", Mask::NumericBucket)]);
+
+        assert_eq!(
+            resolve_summary_source(
+                &snapshot,
+                &[(String::new(), "payroll".into())],
+                &analysis::SummaryArgument::BareColumn("salary".into()),
+                &HashSet::new(),
+            ),
+            SummaryPolicy::Opaque,
+            "the backend may resolve payroll through search_path to another schema"
+        );
     }
 
     #[test]
@@ -1867,9 +2191,12 @@ mask = "none"
                 &p.catalog.snapshot(),
                 &[field("id", 16391, 1, 23)],
                 &HashSet::new(),
-                &[],
-                &[],
-                true,
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
             )
             .expect_err("must reject");
         assert!(
@@ -1881,6 +2208,77 @@ mask = "none"
             err.hint.as_deref().unwrap_or("").contains("null"),
             "the hint should say what to do instead"
         );
+    }
+
+    /// The `lineage = "refuse"` default still masks a reducing aggregate when
+    /// the backstop attributes its bare column to a masked catalog column —
+    /// the 0.1.92 contract under the config that ships on by default.
+    #[test]
+    fn a_summary_over_a_masked_column_is_masked_without_lineage() {
+        let p = policy(Unclassified::Mask, Opaque::Reject);
+        let snapshot = p.catalog.snapshot();
+        let plan = p
+            .plan_for(
+                &snapshot,
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[],
+                    summary: &[SummaryPolicy::Masked(MaskSpec::new(Mask::NumericBucket))],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .expect("the fallback must mask, not refuse");
+        assert_eq!(
+            plan[0].spec.kind,
+            Mask::NumericBucket,
+            "same as the lineage-resolved summary"
+        );
+    }
+
+    /// Without an attribution the summary keeps the opaque posture. A released
+    /// attribution is safe to preserve because it was resolved only from an
+    /// explicitly schema-qualified range.
+    #[test]
+    fn an_unattributed_summary_stays_opaque_without_lineage() {
+        let p = policy(Unclassified::Mask, Opaque::Reject);
+        let err = p
+            .plan_for(
+                &p.catalog.snapshot(),
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[],
+                    summary: &[SummaryPolicy::Opaque],
+                    trust_provenance: true,
+                },
+            )
+            .expect_err("without an attribution the opaque posture governs");
+        assert!(
+            err.message.contains("no column provenance"),
+            "got: {}",
+            err.message
+        );
+
+        let p2 = policy(Unclassified::Mask, Opaque::Mask);
+        let plan = p2
+            .plan_for(
+                &p2.catalog.snapshot(),
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[Safety::Summary],
+                    lineage: &[],
+                    summary: &[SummaryPolicy::Released],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .expect("mask posture must not reject");
+        assert_eq!(plan[0].spec.kind, Mask::None);
     }
 
     #[test]
