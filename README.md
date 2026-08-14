@@ -607,11 +607,16 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   correct refusals, but they are also the largest source of friction.
   `SELECT 1`, `now()` and `count(*)` used to be refused too; they are now served
   (see below).
-- **Summaries over classified columns are released** — `sum`, `avg`, `count`,
-  ranking windows, `date_trunc`. The bar is "you cannot read an anonymised
-  value", not "no information flows": a group of one row makes `sum(salary)`
-  that person's salary, which is accepted on the same terms as the predicate
-  oracles below. `summaries = "refuse"` reverts it.
+- **Summaries over classified columns are masked, not exact** — `count`, `count(*)`.
+  ranking windows and `date_trunc` are released. Reducing aggregates — `sum`,
+  `avg`, `stddev`, a variance, a regression slope — resolve their source through
+  lineage: over a *released* column the exact summary is served; over a *masked*
+  column the summary is masked with that column's own mask. A sum of a
+  bucketed column is a bucket, so a group of one row never yields that row's
+  value: `sum(annual_salary) WHERE id = 1` returns the bucket floor, not the
+  salary. `summaries = "refuse"` reverts it. The bar is still "you cannot read
+  an anonymised value", not "no information flows" — a whole-table sum is a
+  masked summary, and when the source column is unmasked it is exact.
 - **Functions that return a stored value are never released** — `min`, `max`,
   `mode`, `percentile_*`, `string_agg`, `array_agg`, `first_value`, `lag`,
   `lead`. `max(email)` is an email address.
@@ -653,17 +658,18 @@ analytical ones, and which you have decides whether Phase 6 is optional.
 - Masking is a disclosure control on the projection. It does not defend against
   predicate oracles, join-key re-identification, small-cell aggregates or
   differencing — recorded as reviewed and accepted in
-  [`docs/handoff.md` §11](docs/handoff.md). The single exception is the
-  statically decidable one: a released reducing aggregate whose `GROUP BY`
-  covers a declared unique key, or whose `GROUP BY` cannot be read at all, is
-  refused. Column references, ordinals and `ROLLUP`/`CUBE`/`GROUPING SETS` are
-  read, and so is an output alias, which denotes whatever its target computes;
-  an expression is not, and falls back to asking whether the statement names
-  every column of some key at all. Separately, a summary of a column the query
-  groups *on* is that column — `sum(x)/count(*)` is `x` within a constant
-  group — so a reducing aggregate whose input the grouping could reach is
-  refused regardless of any key. Ungrouped groupings, non-key
-  groupings and coarse date buckets are served unchanged.
+  [`docs/handoff.md` §11](docs/handoff.md). Two hard edges survive that record:
+  a reducing aggregate whose `GROUP BY` covers a declared unique key, or whose
+  `GROUP BY` cannot be read at all, is refused. Column references, ordinals and
+  `ROLLUP`/`CUBE`/`GROUPING SETS` are read, and so is an output alias, which
+  denotes whatever its target computes; an expression is not, and falls back to
+  asking whether the statement names every column of some key at all. And
+  because a summary of a column the query groups *on* is that column within a
+  constant group, a reducing aggregate is *masked with its source column's mask*
+  rather than passed through — so the `WHERE id = 1` form, which no amount of
+  statement reading can decide, gives up only the precision: a sum over a
+  bucketed column is a bucket whatever the predicate collapses it to. Ungrouped
+  groupings, non-key groupings and coarse date buckets are served unchanged.
 
 **Before deploying this, read [`docs/safety-assessment.md`](docs/safety-assessment.md).**
 It states what is guaranteed, what is explicitly not, the ten disclosures found

@@ -99,6 +99,52 @@ binders and whole-row refs from the statement root (not `nodes()`), walking
 join/rename the same way, and failing closed on a parse error whenever the
 catalog has masked names.
 
+### Reducing aggregates over masked columns are masked, not exact
+
+The last unmasked output found in the field. Everything else on every channel —
+simple and extended protocol, text and binary, error messages, notices — was
+already masked or refused; the one thing that returned data in the clear was a
+reducing aggregate over a masked column, exactly as the module header had
+recorded it as accepted.
+
+`sum`/`avg`/`stddev`/variance/regression aggregates are useful precisely because
+they collapse a set, and a set an attacker collapses to one row collapses to the
+value:
+
+    SELECT sum(annual_salary) FROM people WHERE id = 1        -- exact salary
+    SELECT sum(annual_salary) FROM people WHERE id IN (1, 2)  -- two salaries
+    SELECT sum(annual_salary) FILTER (WHERE id = 1) FROM t
+    SELECT sum(annual_salary) FROM (SELECT … WHERE id = 1) t
+    … and the same through CTEs, in binary results, and over `email`/`birth_date`
+    columns that are column-wise unique but not declared keys.
+
+That last class is what made it undecidable: whether a predicate matches one row
+is a property of the data, not of the statement, and `WHERE birth_date = '…'`
+cannot be refused the way `GROUP BY id` could. The unique-key `GROUP BY` guard
+(the 0.1.16 disclosure) already refused the decidable subset.
+
+Closed by giving the precision up instead of the summary. A reducing aggregate
+now resolves its source through lineage (`Safety::Summary`): over a *released*
+column the exact summary is served; over a *masked* column the output is masked
+with that column's own mask, so a sum over a bucketed column is a bucket
+whatever the predicate collapses it to —
+
+    SELECT sum(annual_salary) FROM people               -- was 54000250710
+                                                        -- now 54000250000
+    SELECT sum(annual_salary) FROM people WHERE id = 1  -- now 900000000
+
+`count`, `count(*)`, `regr_count` and the boolean aggregates stay passthrough:
+a tally or a predicate never degrades into a member of the set it consumes.
+Aggregates that return a stored value (`min`, `max`, `string_agg`, …) were
+already refused and still are. `summaries = "refuse"`, the `lineage`/`opaque`
+postures and the unique-key GROUP BY guard all keep their existing force; the
+change sits entirely inside the summaries relaxation.
+
+Type-incompatible mask applications fail closed: `sum(… )::text` over a
+bucketed column, and `avg` (numeric) in binary results, are refused with a
+`mask_type_mismatch` rather than guessed at — the same rule the projection
+masks have always used.
+
 ## 0.1.91 — hostile SQL gate: JOIN ON, BooleanTest, JSON, xmlserialize
 
 Four live membership oracles under `posture = "hostile"` that returned

@@ -28,13 +28,17 @@ work:
 | `WHERE` on a masked column | confirms a guess exactly |
 | an error as a one-bit channel | `1/(CASE WHEN … THEN 0 ELSE 1 END)` |
 | `ORDER BY` a masked column | ranks rows by it (accepted: cells stay masked) |
-| `sum(x)` filtered to one row | is that row |
+| `sum(x)` filtered to one row | the bucketed floor — capped by the column's mask |
 
-The last one is the boundary: pgmask refuses a summary whose *grouping* makes
-every group one row, because that is decidable from the statement and the
-catalog. It cannot refuse one whose *filter* does, because whether a predicate
-matches one row is a property of the data. What the guard buys is the difference
-between one query for a whole column and one query per row.
+The last one used to read "is that row", and that reading was the remaining
+unmasked-output path. It is closed since v0.1.92: a reducing aggregate over a
+masked column is masked with that column's own mask before it leaves the proxy,
+so a singleton sum is indistinguishable from the column's own masked value. The
+guard still refuses a summary whose *grouping* makes every group one row,
+because that is decidable from the statement and the catalog, and it is kept
+even though the summary would now be served masked — see the 2026-08-14 record
+above. A *filter* that matches one row is a property of the data and cannot be
+refused; masking is what handles it, and it is now handled.
 
 **Anything the operator's catalog does not declare**, unless `unclassified` is
 left at its default of masking. The catalog is the operator's; `classify`
@@ -511,6 +515,49 @@ So adding them was right, and it closes a different gap than the one that let
 disclosure 7 through. What found all nine was reading, and what made reading
 productive was choosing where to read: the paths that reach the client, taken
 one at a time, asking of each what shape of value it can carry.
+
+## What was recorded on 2026-08-14
+
+A reclassification, not a disclosure. The remaining unmasked-output path was a
+documented accepted limitation: a *reducing* aggregate over a masked column was
+served exact whenever its input set collapsed to one row — `sum(salary) WHERE
+id = 1` returned the exact salary, and was written down as a property of the
+data rather than of the statement. Disclosures 1–4, 6 and 9 had refused their
+*grouping* forms; the *filter* forms could not be refused, because whether a
+predicate matches one row is undecidable from the statement.
+
+Closed in v0.1.92 by policy, not by refusing more: a reducing aggregate over a
+masked column is now masked with that column's *own* mask on its way out, so a
+singleton sum is the bucketed floor — byte-identical to what the column itself
+returns — whatever a predicate or `GROUP BY` collapses the set to. A sum over a
+released column is still exact, and `count(*)/count(col)` and the boolean
+aggregates are unaffected. The classification is now finer than the two-valued
+`Releasable`/`Unknown` split: `Safety::Summary` for the reducing-family
+(average, variance, regression), `Releasable` for the tally family (a count
+never degrades into its input).
+
+The effort fell on the *shape*, not the numbers: one new verdict, propagated
+through lineage so only a masked source changes the outcome, which removed the
+`grouping_may_reference`/`aggregate_argument_is_grouped` walkers (every
+reducing aggregate is masked now, so the grouped/ungrouped distinction they
+drew lost its point) — a net deletion.
+
+Two consequences the reader should weigh:
+
+* **The singleton *grouping* guard is now partly redundant.** It still refuses
+  `sum(salary) GROUP BY <unique key>` even though the summary would now be
+  served masked. It stays in place: removing it re-opens the threat model the
+  adversarial suite pins, which cannot be re-run without a live backend, and
+  refusing a query that would serve masked is over-restriction in a safe
+  direction. Recorded here so the redundancy is a decision, not a drift to
+  "simplify later".
+* **An expression *over* a summary is refused, not masked.** `sum(a)/sum(b)`,
+  `round(sum(a), 1)`, `sum(a) OVER (...)`. The bare aggregate is special-cased
+  as maskable; a wrapper is treated like any other opaque expression over a
+  masked column and refused under `opaque = "reject"`. That matches the module's
+  long-standing rule that an expression over a masked column cannot be masked
+  after the fact, and keeps the special case one branch wide instead of a
+  tri-state through every classify arm.
 
 ## The instruments were wrong more often than the code
 

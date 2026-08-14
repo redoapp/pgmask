@@ -148,6 +148,36 @@ impl Policy {
         Arc::clone(&self.metrics)
     }
 
+    /// The mask a reducing aggregate's output should carry, if lineage grounds
+    /// it in a masked column.
+    ///
+    /// Everything else about a summary field is handled like any other
+    /// unprovenanced field — `Release` passes through, `Unresolved` falls to
+    /// the opaque posture. The one thing that differs is what a masked source
+    /// means: instead of refusing, the summary takes that column's *own* mask,
+    /// so `sum(x)` over a bucketed column is a bucket whatever a predicate
+    /// collapses the set to. `None` means "not a summary, or no readable masked
+    /// source" and the caller keeps its normal opaque behaviour.
+    fn summary_spec(
+        &self,
+        snapshot: &Snapshot,
+        roles: &HashSet<String>,
+        safety: &[Safety],
+        lineage: &[Verdict],
+        index: usize,
+    ) -> Option<MaskSpec> {
+        if safety.get(index).copied() != Some(Safety::Summary) {
+            return None;
+        }
+        let Some(Verdict::Blocked(source)) = lineage.get(index) else {
+            return None;
+        };
+        let (relation, column) = source.rsplit_once('.')?;
+        snapshot
+            .lookup_by_name(relation, column)
+            .map(|classification| classification.for_roles(roles).clone())
+    }
+
     /// Decide the plan for a described result set, or refuse it.
     ///
     /// Takes the principal's roles because the same column can resolve to
@@ -183,6 +213,18 @@ impl Policy {
                     // released, so it cannot be carrying a masked value.
                     self.metrics.record_rescued();
                     MaskSpec::new(Mask::None)
+                } else if let Some(spec) =
+                    self.summary_spec(snapshot, roles, safety, lineage, index)
+                {
+                    // A reducing aggregate is handled like any other
+                    // unprovenanced field *except* when lineage grounds it in a
+                    // masked column: there the output is masked with that
+                    // column's own mask instead of being refused. A sum over a
+                    // bucketed column is a bucket, whatever a predicate
+                    // collapses the set to — which is what closes `sum(x)
+                    // WHERE unique = 1` without a cardinality analysis the
+                    // proxy cannot perform.
+                    spec
                 } else {
                     match self.opaque {
                         Opaque::Reject => {
@@ -1836,6 +1878,95 @@ mask = "none"
             .ok()
             .unwrap();
         assert_eq!(plan[0].spec.kind, Mask::None);
+    }
+
+    /// A reducing aggregate over a *released* column keeps passing through.
+    #[test]
+    fn a_summary_over_a_released_column_stays_exact() {
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_relation_for_test("demo.t", &[("salary", Mask::NumericBucket)]);
+        snapshot.set_role_mask_for_test("demo.t", "salary", "nobody", Mask::Null);
+        let p = policy_with_lineage_allow(Unclassified::Mask, Opaque::Reject);
+
+        let plan = p
+            .plan_for(
+                &snapshot,
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &[Safety::Summary],
+                &[Verdict::Release],
+                true,
+            )
+            .ok()
+            .unwrap();
+        // Lineage says the source is released, so the summary is the source's
+        // exact sum — `sum(id)` over an unmasked `id` keeps its precision.
+        assert_eq!(plan[0].spec.kind, Mask::None);
+    }
+
+    /// A reducing aggregate over a *masked* column is masked with that column's
+    /// own mask instead of being refused. That is what closes `sum(x) WHERE
+    /// unique = 1`: whether the predicate collapses the set to one row is a
+    /// property of the data, so the precision is given up rather than the
+    /// summary — a sum over a bucketed column is a bucket, whatever the filter.
+    #[test]
+    fn a_summary_over_a_masked_column_is_masked_with_its_source_mask() {
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_relation_for_test("demo.t", &[("salary", Mask::NumericBucket)]);
+        let p = policy_with_lineage_allow(Unclassified::Mask, Opaque::Reject);
+
+        let plan = p
+            .plan_for(
+                &snapshot,
+                // Aggregate outputs carry no table provenance, so the field is
+                // an unprovenanced `sum` of type int8.
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &[Safety::Summary],
+                &[Verdict::Blocked("demo.t.salary".into())],
+                true,
+            )
+            .ok()
+            .unwrap();
+        assert_eq!(
+            plan[0].spec.kind,
+            Mask::NumericBucket,
+            "the aggregate output must take its source column's mask"
+        );
+
+        // The mask posture makes no difference to a summary: it is maskable,
+        // so it is never simply nulled.
+        let p2 = policy_with_lineage_allow(Unclassified::Mask, Opaque::Mask);
+        let plan2 = p2
+            .plan_for(
+                &snapshot,
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &[Safety::Summary],
+                &[Verdict::Blocked("demo.t.salary".into())],
+                true,
+            )
+            .ok()
+            .unwrap();
+        assert_eq!(plan2[0].spec.kind, Mask::NumericBucket);
+
+        // An unresolvable summary falls back to the opaque posture instead of
+        // passing through.
+        let err = p
+            .plan_for(
+                &snapshot,
+                &[field("sum", 0, 0, 20)],
+                &HashSet::new(),
+                &[Safety::Summary],
+                &[Verdict::Unresolved],
+                true,
+            )
+            .expect_err("an unbounded summary must not pass through");
+        assert!(
+            err.message.contains("no column provenance"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]

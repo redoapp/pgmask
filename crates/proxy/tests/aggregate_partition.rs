@@ -84,19 +84,25 @@ const ALL_AGGREGATES: &[&str] = &[
     "xmlagg",
 ];
 
-/// The complete set released over a classified column. Everything else refuses.
-const RELEASED: &[&str] = &[
+/// The complete set released pass-through over a classified column. These are
+/// exactly the aggregates that can never degrade into a stored value: a count or
+/// a boolean is a tally or a predicate, not a member of the set it consumes.
+/// Everything else either refuses or — for the reducing summaries below —
+/// becomes `Safety::Summary` and is masked with its source column's mask.
+const RELEASED: &[&str] = &["bool_and", "bool_or", "count", "every", "regr_count"];
+
+/// The aggregates that reduce to `Safety::Summary`: useful over a large set,
+/// but the identity of their input when the set collapses to one row. The
+/// session resolves their source through lineage and masks the output with the
+/// source column's mask, so a sum over a bucketed column is a bucket whatever
+/// the predicate collapses it to.
+const SUMMARY: &[&str] = &[
     "avg",
-    "bool_and",
-    "bool_or",
     "corr",
-    "count",
     "covar_pop",
     "covar_samp",
-    "every",
     "regr_avgx",
     "regr_avgy",
-    "regr_count",
     "regr_intercept",
     "regr_r2",
     "regr_slope",
@@ -114,17 +120,28 @@ const RELEASED: &[&str] = &[
 
 #[test]
 fn the_released_set_is_exactly_what_we_intend() {
-    let mut actual: Vec<&str> = Vec::new();
+    let mut released: Vec<&str> = Vec::new();
+    let mut summary: Vec<&str> = Vec::new();
     for name in ALL_AGGREGATES {
         let sql = format!("SELECT {name}(email) FROM t");
-        if analyze(&sql, 1, ALLOW_ALL).first() == Some(&Safety::Releasable) {
-            actual.push(name);
+        match analyze(&sql, 1, ALLOW_ALL).first() {
+            Some(&Safety::Releasable) => released.push(name),
+            Some(&Safety::Summary) => summary.push(name),
+            _ => {}
         }
     }
+    released.sort_unstable();
+    summary.sort_unstable();
     assert_eq!(
-        actual, RELEASED,
+        released, RELEASED,
         "the released aggregate set changed — every entry converts refusals \
          into acceptances, so this needs a human decision, not a test update"
+    );
+    assert_eq!(
+        summary, SUMMARY,
+        "the reducing-summary set changed — these are now masked with their \
+         source column's mask instead of passing through, and every entry \
+         needs a human decision, not a test update"
     );
 }
 

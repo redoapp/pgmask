@@ -385,19 +385,24 @@ fn a_reducing_aggregate_over_a_window_is_not_releasable() {
     }
 }
 
-/// The same names without `OVER` are still summaries, so the fix is a
-/// window check and not a retreat from releasing aggregates.
+/// The same names without `OVER` are still summaries — resolved to a mask
+/// when their source is masked, passed through when it is released. So
+/// `sum`/`avg` stop at `Safety::Summary` and the counts stay `Releasable`.
 #[test]
-fn plain_reducing_aggregates_are_still_releasable() {
-    for sql in [
-        "SELECT sum(salary) FROM t",
-        "SELECT avg(salary) FROM t",
-        "SELECT count(*) FROM t",
-        "SELECT count(salary) FROM t",
-    ] {
-        assert!(
-            is_safe(sql),
-            "a plain summary must still be released: {sql}"
+fn plain_reducing_aggregates_are_still_summaries() {
+    for sql in ["SELECT sum(salary) FROM t", "SELECT avg(salary) FROM t"] {
+        assert_eq!(
+            safety(sql, 1),
+            vec![Safety::Summary],
+            "{sql} is a reducing aggregate and must be masked when its source is masked"
+        );
+    }
+    // A count is a tally, never a value from a row, so it is released.
+    for sql in ["SELECT count(*) FROM t", "SELECT count(salary) FROM t"] {
+        assert_eq!(
+            safety(sql, 1),
+            vec![Safety::Releasable],
+            "{sql} is a row count and stays released"
         );
     }
 }
@@ -563,17 +568,41 @@ fn non_select_statements_are_not_analysed() {
     );
 }
 
-/// The relaxation itself: a summary cannot return a member of the set it
-/// consumed, so what is inside it does not matter.
+/// The relaxation itself, after the WHERE-singleton closure: a reducing
+/// aggregate stops at `Safety::Summary` so the session can mask its output
+/// with the source column's mask — a sum over a bucketed column returns a
+/// bucket, never the exact value, whatever the predicate. Counts stay
+/// `Releasable` because a tally never degrades into its input.
 #[test]
-fn summarising_aggregates_are_releasable() {
+fn summarising_aggregates_split_by_whether_they_can_be_masked() {
     for sql in [
         "SELECT sum(salary) FROM t",
         "SELECT avg(salary) FROM t",
-        "SELECT count(email) FROM t",
-        "SELECT count(DISTINCT email) FROM t",
         "SELECT stddev(salary) FROM t",
         "SELECT sum(CASE WHEN email = 'x' THEN 1 ELSE 0 END) FROM t",
+    ] {
+        assert_eq!(
+            safety(sql, 1),
+            vec![Safety::Summary],
+            "{sql} should be a resolvable summary"
+        );
+    }
+    // A count is a tally, never a member of the set it consumes.
+    for sql in [
+        "SELECT count(email) FROM t",
+        "SELECT count(DISTINCT email) FROM t",
+    ] {
+        assert_eq!(
+            safety(sql, 1),
+            vec![Safety::Releasable],
+            "{sql} should be a released count"
+        );
+    }
+    // Arithmetic over a summary is no longer itself releasable: it stops
+    // at `Unknown` and the session refuses or masks it through the opaque
+    // posture. That is the safe direction — `sum(a)/sum(b)` is one row
+    // from being a ratio of exact values.
+    for sql in [
         // `sum(salary) OVER (PARTITION BY dept)` was here, asserting the
         // behaviour that turned out to be a disclosure: as a window
         // function the caller picks the frame, and a frame of one row makes
@@ -584,8 +613,8 @@ fn summarising_aggregates_are_releasable() {
     ] {
         assert_eq!(
             safety(sql, 1),
-            vec![Safety::Releasable],
-            "{sql} should be releasable"
+            vec![Safety::Unknown],
+            "{sql} wraps a summary and must not be released blind"
         );
     }
 }
@@ -621,7 +650,8 @@ fn functions_that_return_a_stored_value_are_never_released() {
 }
 
 /// Arithmetic is releasable only when every operand is. A summary divided by
-/// a summary is a summary; a column times two is still that column.
+/// a summary is no longer released — it stops at `Unknown` so the opaque
+/// posture refuses or masks it; a column times two is still that column.
 #[test]
 fn arithmetic_is_releasable_only_through_releasable_operands() {
     assert_eq!(safety("SELECT salary * 2 FROM t", 1), vec![Safety::Unknown]);
@@ -632,7 +662,7 @@ fn arithmetic_is_releasable_only_through_releasable_operands() {
     );
     assert_eq!(
         safety("SELECT sum(a) - sum(b) FROM t", 1),
-        vec![Safety::Releasable]
+        vec![Safety::Unknown]
     );
 }
 
@@ -724,7 +754,7 @@ fn a_star_over_a_subquery_is_unwrapped() {
             "SELECT * FROM (SELECT city, sum(salary) FROM t GROUP BY city) q",
             2
         ),
-        vec![Safety::Unknown, Safety::Releasable]
+        vec![Safety::Unknown, Safety::Summary]
     );
     // But not when the correspondence is not ours to claim.
     assert_eq!(
@@ -741,16 +771,20 @@ fn a_star_over_a_subquery_is_unwrapped() {
 }
 
 #[test]
-fn pure_scalars_pass_through_releasability() {
+fn pure_scalars_do_not_cover_a_summary() {
+    // These wrap a reducing aggregate, which now stops at `Safety::Summary`,
+    // so the wrapper stops at `Unknown` and the opaque posture refuses or
+    // masks it — `round(sum(a)/sum(b), 1)` is itself one row away from a
+    // ratio of exact values.
     assert_eq!(
         safety("SELECT round(sum(a) / sum(b), 1) FROM t", 1),
-        vec![Safety::Releasable]
+        vec![Safety::Unknown]
     );
     assert_eq!(
         safety("SELECT abs(sum(salary)) FROM t", 1),
-        vec![Safety::Releasable]
+        vec![Safety::Unknown]
     );
-    // ...but never over a column.
+    // ...and never over a column.
     assert_eq!(
         safety("SELECT round(salary) FROM t", 1),
         vec![Safety::Unknown]

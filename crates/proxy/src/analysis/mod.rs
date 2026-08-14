@@ -28,7 +28,7 @@
 //! one who is. Governing the filter side is the only sound answer and it is a
 //! different product — it would refuse `WHERE email = …` outright.
 //!
-//! The one route that was closed is the one that is decidable from the
+//! The one route that stays closed is the one that is decidable from the
 //! statement and the catalog alone: [`StatementInspection::group_by_columns`]
 //! reads the grouping, and if it covers a declared unique key — or cannot be
 //! read at all — the session withholds the aggregate relaxation, so a reducing
@@ -40,14 +40,22 @@
 //! lexical backstop in the session rather than to a refusal, because refusing
 //! outright took time-bucketed aggregation with it: `date_trunc` over a coarse
 //! literal unit is released on purpose, so `SELECT date_trunc('month', ts),
-//! sum(amount) … GROUP BY 1` worked before the guard and not after. The `WHERE id = 1` form of the attack survives and
-//! cannot be closed here: whether a predicate matches one row is a property of
-//! the data, not of the statement. What the guard buys is the difference
-//! between one query for the whole table and one query per row.
+//! sum(amount) … GROUP BY 1` worked before the guard and not after.
+//!
+//! Reducing aggregates *not* ruled out by that key test are released from the
+//! syntactic layer into [`Safety::Summary`], and the session resolves the
+//! source through lineage: a sum over an unmasked column is served exactly, and
+//! a sum over a masked column is masked with that column's own mask. That is
+//! what closes the `WHERE id = 1` form of the attack, which cannot be decided
+//! from the statement and the catalog — whether a predicate matches one row is
+//! a property of the data — by giving up the *precision* rather than the
+//! summary: `sum(annual_salary)` collapses to the bucket floor, never the
+//! exact salary, whatever the predicate.
 //!
 //! That relaxation is what makes this tractable without a lineage engine. If the
 //! outermost node of a target expression is a reducing aggregate, it cannot
-//! return a stored value *whatever is inside it*, so there is nothing to resolve.
+//! return a stored value *whatever is inside it* once the *output* is masked,
+//! so the source only has to be named, never reconstructed.
 //!
 //! # Why an allowlist of shapes, and not "does it reference a column?"
 //!
@@ -97,9 +105,6 @@ pub use hostile::{
     hostile_join_or_rename_masked, hostile_uses_whole_row, masked_exceeds_outer_projection,
 };
 pub use safety::{analyze, Relaxations, Safety};
-
-#[cfg(test)]
-pub(crate) use safety::{aggregate_argument_is_grouped, grouping_may_reference};
 
 use catalogs::{
     every_relation_is_qualified_inspected, provenance_is_trustworthy_inspected,
