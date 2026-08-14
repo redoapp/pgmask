@@ -6,6 +6,18 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
 `pg_query::nodes()` never visits. Unicode-escaped masked names
 (`u&"email"`) are invisible to the lexer, so a missed node was an allow:
 
+- Unknown `pg_stat_*` relations are leaky. The previous denylist named
+  `pg_stat_activity` / `pg_stat_statements` / `pg_stat_wal_receiver` and
+  treated the rest as metadata-only — the same polarity as target-list
+  `FuncCall`. `SELECT query FROM pg_stat_monitor` (and `pg_qualstats.constvalue`,
+  `pg_store_plans.plan`, the next extension) is other sessions' SQL with
+  literals, including masked ones. Core counter / LSN / progress views
+  (`pg_stat_user_tables`, `pg_stat_replication`, `pg_stat_ssl`,
+  `pg_stat_progress_*`, `pg_stat_statements_info`, …) stay allowed so
+  table-size dashboards and `\d` keep working. `pg_statio_*` is a different
+  prefix (block I/O counts) and is unchanged. `pg_qualstats*` /
+  `pg_store_plans*` join the refuse list by prefix (same class, different
+  naming).
 - SQL `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` / `CLOSE`
   are now refused on **every posture** (`sql_prepare_cursor`). They are a
   second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.

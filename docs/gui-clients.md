@@ -111,7 +111,11 @@ exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
 - `pg_statistic`, `pg_statistic_ext_data`, `pg_stats`, `pg_stats_ext`,
   `pg_stats_ext_exprs` — sampled values
 - `pg_stat_activity`, `pg_stat_statements`, `pg_prepared_statements` — other
-  sessions' SQL text, literals included
+  sessions' SQL text, literals included. Unknown `pg_stat_*` views are
+  refused the same way (the previous name list was an allow for
+  `pg_stat_monitor` / the next extension). Core counter views
+  (`pg_stat_user_tables`, `pg_stat_progress_*`, …) stay allowed.
+  `pg_qualstats*` / `pg_store_plans*` are the same class under other names.
 - `pg_largeobject` — blob contents
 - `pg_authid`, `pg_shadow`, `pg_user_mapping(s)`, `pg_subscription` — password
   hashes and connection strings

@@ -253,6 +253,10 @@ const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     // Other sessions' SQL text, literals included. Session-local
     // `pg_cursors.statement` / `pg_prepared_statements` carry the same
     // class of text (DECLARE / PREPARE bodies with literals).
+    // `pg_stat_*` besides the metadata-safe allowlist is also leaky —
+    // see [`range_var_is_leaky_catalog`]. These two stay named so the
+    // list documents the core views; extensions (`pg_stat_monitor`,
+    // `pg_qualstats`) are caught by the prefix, not by this table.
     "pg_stat_activity",
     "pg_stat_statements",
     "pg_prepared_statements",
@@ -299,6 +303,58 @@ const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     "pg_backend_memory_contexts",
 ];
 
+/// Core `pg_stat_*` views that hold counters, LSNs, or connection *metadata*
+/// — not query text, sampled cell values, or conninfo.
+///
+/// Every other `pg_stat_*` relation is leaky. The previous denylist named
+/// `pg_stat_activity` / `pg_stat_statements` / `pg_stat_wal_receiver` and
+/// treated the rest as metadata-only, which is the same polarity hole as
+/// target-list `FuncCall`: `pg_stat_monitor.query`, `pg_qualstats.constvalue`,
+/// and `pg_store_plans.plan` are other sessions' SQL with literals, and a
+/// name list cannot see the next extension. `\d` does not read these views;
+/// GUIs that show live tuples use `pg_stat_user_tables` / `pg_stat_all_tables`,
+/// which stay allowed. `pg_stat_statements_info` is contrib dealloc counters,
+/// not query text. `pg_stat_progress_*` is a command tag plus counters.
+const METADATA_SAFE_PG_STAT: &[&str] = &[
+    "pg_stat_archiver",
+    "pg_stat_bgwriter",
+    "pg_stat_checkpointer",
+    "pg_stat_database",
+    "pg_stat_database_conflicts",
+    "pg_stat_all_tables",
+    "pg_stat_sys_tables",
+    "pg_stat_user_tables",
+    "pg_stat_xact_all_tables",
+    "pg_stat_xact_sys_tables",
+    "pg_stat_xact_user_tables",
+    "pg_stat_all_indexes",
+    "pg_stat_sys_indexes",
+    "pg_stat_user_indexes",
+    "pg_stat_user_functions",
+    "pg_stat_xact_user_functions",
+    "pg_stat_slru",
+    "pg_stat_replication",
+    "pg_stat_replication_slots",
+    "pg_stat_ssl",
+    "pg_stat_gssapi",
+    "pg_stat_subscription",
+    "pg_stat_subscription_stats",
+    "pg_stat_wal",
+    "pg_stat_io",
+    "pg_stat_recovery_prefetch",
+    "pg_stat_statements_info",
+];
+
+fn pg_stat_relation_is_leaky(relation: &str) -> bool {
+    if !relation.starts_with("pg_stat_") {
+        return false;
+    }
+    if relation.starts_with("pg_stat_progress_") {
+        return false;
+    }
+    !METADATA_SAFE_PG_STAT.contains(&relation)
+}
+
 /// Catalogs whose rows are user data, session SQL, passwords, or toasted
 /// cell bytes. Refused at the frontend on every posture.
 pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bool {
@@ -322,6 +378,18 @@ pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bo
     // `_pg_*` *functions* (`_pg_truetypid`) are FuncCalls, not
     // RangeVars, and stay catalog-safe helpers.
     if relation.starts_with("_pg_") && (schema.is_empty() || schema == "information_schema") {
+        return true;
+    }
+    // `pg_stat_*` is catalog-shaped, so an unnamed extension view was
+    // metadata-only and skipped the untrusted-function gate. Invert:
+    // only the core counter/LSN views above keep the fast path.
+    // `pg_statio_*` is a different prefix (block I/O counts) and stays
+    // off this rule. `pg_qualstats*` / `pg_store_plans*` hold qual
+    // literals and stored plans — same class, different naming.
+    if pg_stat_relation_is_leaky(&relation)
+        || relation.starts_with("pg_qualstats")
+        || relation.starts_with("pg_store_plans")
+    {
         return true;
     }
     LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str())

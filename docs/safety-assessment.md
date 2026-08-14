@@ -154,7 +154,9 @@ refused on every posture (`sql_prepare_cursor`); ordinary `SELECT` (including
 `SELECT … FETCH FIRST n ROWS`) and protocol Parse/Bind stay allowed. `EXPLAIN`
 of those same SELECTs is allowed; `EXPLAIN` of a predicate oracle is not.
 `pg_cursors` and `pg_stat_wal_receiver` join the leaky-catalog refuse list
-(session SQL text / replication conninfo). Residual
+(session SQL text / replication conninfo). Unknown `pg_stat_*` views are
+leaky too (`pg_stat_monitor` and the next extension were metadata-only);
+core counter / progress views stay allowed. Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and
 cleartext sort order among masked projections).
