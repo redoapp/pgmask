@@ -1396,6 +1396,7 @@ const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     // Password hashes and connection strings.
     "pg_authid",
     "pg_shadow",
+    "pg_user",
     "pg_user_mapping",
     "pg_user_mappings",
     "pg_subscription",
@@ -1441,16 +1442,38 @@ const CATALOG_ESCAPE_FUNCTIONS: &[&str] = &[
     "table_to_xml_and_xmlschema",
     "cursor_to_xml",
     "cursor_to_xmlschema",
+    "schema_to_xml",
+    "schema_to_xmlschema",
+    "schema_to_xml_and_xmlschema",
+    "database_to_xml",
+    "database_to_xmlschema",
+    "database_to_xml_and_xmlschema",
     "dblink",
     "dblink_send_query",
     "dblink_get_result",
     "pg_read_file",
     "pg_read_binary_file",
     "pg_ls_dir",
+    "pg_ls_logdir",
+    "pg_ls_waldir",
+    "pg_ls_archive_statusdir",
+    "pg_ls_tmpdir",
+    "pg_ls_logicalmapdir",
+    "pg_ls_logicalsnapdir",
+    "pg_ls_summariesdir",
     "pg_stat_file",
     "lo_get",
     "lo_import",
     "lo_export",
+    // Target-list form: `SELECT f() FROM pg_class` is metadata-only unless
+    // these names disqualify, which then skips the untrusted-function gate.
+    "pg_stat_get_activity",
+    "pg_stat_get_backend_activity",
+    "pg_stat_statements",
+    "pg_logical_slot_get_changes",
+    "pg_logical_slot_peek_changes",
+    "pg_logical_slot_get_binary_changes",
+    "pg_logical_slot_peek_binary_changes",
 ];
 
 /// True when this statement reads only server metadata — a `SHOW`, or a query
@@ -2330,6 +2353,26 @@ fn visit_alias_colnames(
     }
 }
 
+/// `varchar(n)` / `numeric(p,s)` typmods are a_expr lists. A subquery there is
+/// a membership oracle (`CAST(1 AS numeric((SELECT count(*) WHERE email = 'x'), 0))`)
+/// that TypeCast otherwise never enters.
+fn visit_type_name(
+    type_name: Option<&pg_query::protobuf::TypeName>,
+    visit: &mut dyn FnMut(&pg_query::protobuf::Node),
+) {
+    let Some(type_name) = type_name else {
+        return;
+    };
+    for n in type_name
+        .names
+        .iter()
+        .chain(type_name.typmods.iter())
+        .chain(type_name.array_bounds.iter())
+    {
+        visit(n);
+    }
+}
+
 fn visit_json_value_expr_children(
     expr: Option<&pg_query::protobuf::JsonValueExpr>,
     visit: &mut dyn FnMut(&pg_query::protobuf::Node),
@@ -2345,6 +2388,20 @@ fn visit_json_value_expr_children(
     }
 }
 
+fn visit_json_output(
+    output: Option<&pg_query::protobuf::JsonOutput>,
+    visit: &mut dyn FnMut(&pg_query::protobuf::Node),
+) {
+    // `RETURNING numeric((SELECT count(*) WHERE email = 'x'), 0)` is the same
+    // typmod membership oracle as CAST, but JsonOutput is not a TypeCast and
+    // is not a Node, so the walker never reaches those typmods unless we
+    // enter them from every JSON constructor that carries an output type.
+    let Some(output) = output else {
+        return;
+    };
+    visit_type_name(output.type_name.as_ref(), visit);
+}
+
 fn visit_json_agg_constructor_children(
     ctor: Option<&pg_query::protobuf::JsonAggConstructor>,
     visit: &mut dyn FnMut(&pg_query::protobuf::Node),
@@ -2352,6 +2409,7 @@ fn visit_json_agg_constructor_children(
     let Some(ctor) = ctor else {
         return;
     };
+    visit_json_output(ctor.output.as_ref(), visit);
     if let Some(filter) = ctor.agg_filter.as_ref() {
         visit(filter);
     }
@@ -2372,7 +2430,9 @@ fn for_each_child_node(
             if let Some(arg) = cast.arg.as_ref() {
                 visit(arg);
             }
+            visit_type_name(cast.type_name.as_ref(), visit);
         }
+        Some(NodeEnum::TypeName(t)) => visit_type_name(Some(t), visit),
         Some(NodeEnum::CollateClause(c)) => {
             if let Some(arg) = c.arg.as_ref() {
                 visit(arg);
@@ -2487,6 +2547,7 @@ fn for_each_child_node(
             if let Some(expr) = x.expr.as_ref() {
                 visit(expr);
             }
+            visit_type_name(x.type_name.as_ref(), visit);
         }
         Some(NodeEnum::NamedArgExpr(named)) => {
             if let Some(arg) = named.arg.as_ref() {
@@ -2501,6 +2562,9 @@ fn for_each_child_node(
         Some(NodeEnum::ResTarget(target)) => {
             if let Some(val) = target.val.as_ref() {
                 visit(val);
+            }
+            for part in &target.indirection {
+                visit(part);
             }
         }
         Some(NodeEnum::List(list)) => {
@@ -2582,6 +2646,7 @@ fn for_each_child_node(
                 visit(entry);
             }
             visit_alias_colnames(join.alias.as_ref(), visit);
+            visit_alias_colnames(join.join_using_alias.as_ref(), visit);
         }
         Some(NodeEnum::RangeVar(v)) => visit_alias_colnames(v.alias.as_ref(), visit),
         Some(NodeEnum::RangeSubselect(sub)) => {
@@ -2603,8 +2668,8 @@ fn for_each_child_node(
             if let Some(rel) = sample.relation.as_ref() {
                 visit(rel);
             }
-            for arg in &sample.args {
-                visit(arg);
+            for n in sample.method.iter().chain(sample.args.iter()) {
+                visit(n);
             }
             if let Some(rep) = sample.repeatable.as_ref() {
                 visit(rep);
@@ -2669,6 +2734,53 @@ fn for_each_child_node(
             if let Some(q) = p.query.as_ref() {
                 visit(q);
             }
+            for t in &p.argtypes {
+                visit(t);
+            }
+        }
+        Some(NodeEnum::ExecuteStmt(e)) => {
+            for p in &e.params {
+                visit(p);
+            }
+        }
+        Some(NodeEnum::VariableSetStmt(s)) => {
+            for arg in &s.args {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::DefElem(d)) => {
+            if let Some(arg) = d.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::CopyStmt(c)) => {
+            if let Some(q) = c.query.as_ref() {
+                visit(q);
+            }
+            for n in c.attlist.iter().chain(c.options.iter()) {
+                visit(n);
+            }
+            if let Some(w) = c.where_clause.as_ref() {
+                visit(w);
+            }
+        }
+        Some(NodeEnum::SetOperationStmt(s)) => {
+            if let Some(l) = s.larg.as_ref() {
+                visit(l);
+            }
+            if let Some(r) = s.rarg.as_ref() {
+                visit(r);
+            }
+        }
+        Some(NodeEnum::LockingClause(l)) => {
+            for rel in &l.locked_rels {
+                visit(rel);
+            }
+        }
+        Some(NodeEnum::Alias(a)) => {
+            for col in &a.colnames {
+                visit(col);
+            }
         }
         Some(NodeEnum::DeclareCursorStmt(d)) => {
             if let Some(q) = d.query.as_ref() {
@@ -2679,16 +2791,21 @@ fn for_each_child_node(
             if let Some(q) = e.query.as_ref() {
                 visit(q);
             }
+            for opt in &e.options {
+                visit(opt);
+            }
         }
         Some(NodeEnum::JsonObjectConstructor(j)) => {
             for expr in &j.exprs {
                 visit(expr);
             }
+            visit_json_output(j.output.as_ref(), visit);
         }
         Some(NodeEnum::JsonArrayConstructor(j)) => {
             for expr in &j.exprs {
                 visit(expr);
             }
+            visit_json_output(j.output.as_ref(), visit);
         }
         Some(NodeEnum::JsonConstructorExpr(j)) => {
             for arg in &j.args {
@@ -2737,6 +2854,7 @@ fn for_each_child_node(
             for passing in &j.passing {
                 visit(passing);
             }
+            visit_json_output(j.output.as_ref(), visit);
             if let Some(b) = j.on_empty.as_ref() {
                 if let Some(e) = b.expr.as_ref() {
                     visit(e);
@@ -2776,6 +2894,7 @@ fn for_each_child_node(
             visit_alias_colnames(j.alias.as_ref(), visit);
         }
         Some(NodeEnum::JsonTableColumn(c)) => {
+            visit_type_name(c.type_name.as_ref(), visit);
             if let Some(path) = c.pathspec.as_ref() {
                 if let Some(s) = path.string.as_ref() {
                     visit(s);
@@ -2793,6 +2912,11 @@ fn for_each_child_node(
                 if let Some(e) = b.expr.as_ref() {
                     visit(e);
                 }
+            }
+        }
+        Some(NodeEnum::JsonTablePathSpec(p)) => {
+            if let Some(s) = p.string.as_ref() {
+                visit(s);
             }
         }
         Some(NodeEnum::JsonArgument(a)) => {
@@ -2818,14 +2942,17 @@ fn for_each_child_node(
         }
         Some(NodeEnum::JsonSerializeExpr(j)) => {
             visit_json_value_expr_children(j.expr.as_deref(), visit);
+            visit_json_output(j.output.as_ref(), visit);
         }
         Some(NodeEnum::JsonParseExpr(j)) => {
             visit_json_value_expr_children(j.expr.as_deref(), visit);
+            visit_json_output(j.output.as_ref(), visit);
         }
         Some(NodeEnum::JsonScalarExpr(j)) => {
             if let Some(expr) = j.expr.as_ref() {
                 visit(expr);
             }
+            visit_json_output(j.output.as_ref(), visit);
         }
         Some(NodeEnum::JsonIsPredicate(j)) => {
             if let Some(expr) = j.expr.as_ref() {
@@ -2839,8 +2966,8 @@ fn for_each_child_node(
             if let Some(path) = j.path_spec.as_ref() {
                 visit(path);
             }
-            for value in &j.passing_values {
-                visit(value);
+            for n in j.passing_names.iter().chain(j.passing_values.iter()) {
+                visit(n);
             }
             if let Some(b) = j.on_empty.as_ref() {
                 if let Some(e) = b.expr.as_ref() {
@@ -2857,6 +2984,7 @@ fn for_each_child_node(
             if let Some(q) = j.query.as_ref() {
                 visit(q);
             }
+            visit_json_output(j.output.as_ref(), visit);
         }
         Some(NodeEnum::JsonAggConstructor(c)) => {
             visit_json_agg_constructor_children(Some(c), visit);
@@ -2868,9 +2996,18 @@ fn for_each_child_node(
             if let Some(row) = tf.rowexpr.as_ref() {
                 visit(row);
             }
+            if let Some(plan) = tf.plan.as_ref() {
+                visit(plan);
+            }
             for expr in tf
-                .colexprs
+                .ns_uris
                 .iter()
+                .chain(tf.ns_names.iter())
+                .chain(tf.colnames.iter())
+                .chain(tf.coltypes.iter())
+                .chain(tf.coltypmods.iter())
+                .chain(tf.colcollations.iter())
+                .chain(tf.colexprs.iter())
                 .chain(tf.coldefexprs.iter())
                 .chain(tf.colvalexprs.iter())
                 .chain(tf.passingvalexprs.iter())
@@ -2878,7 +3015,27 @@ fn for_each_child_node(
                 visit(expr);
             }
         }
+        Some(NodeEnum::JsonTablePathScan(scan)) => {
+            if let Some(plan) = scan.plan.as_ref() {
+                visit(plan);
+            }
+            if let Some(child) = scan.child.as_ref() {
+                visit(child);
+            }
+        }
+        Some(NodeEnum::JsonTableSiblingJoin(join)) => {
+            if let Some(plan) = join.plan.as_ref() {
+                visit(plan);
+            }
+            if let Some(l) = join.lplan.as_ref() {
+                visit(l);
+            }
+            if let Some(r) = join.rplan.as_ref() {
+                visit(r);
+            }
+        }
         Some(NodeEnum::RangeTableFuncCol(c)) => {
+            visit_type_name(c.type_name.as_ref(), visit);
             if let Some(expr) = c.colexpr.as_ref() {
                 visit(expr);
             }
@@ -2887,11 +3044,25 @@ fn for_each_child_node(
             }
         }
         Some(NodeEnum::ColumnDef(d)) => {
+            visit_type_name(d.type_name.as_ref(), visit);
             if let Some(expr) = d.raw_default.as_ref() {
                 visit(expr);
             }
             if let Some(expr) = d.cooked_default.as_ref() {
                 visit(expr);
+            }
+            if let Some(coll) = d.coll_clause.as_ref() {
+                if let Some(arg) = coll.arg.as_ref() {
+                    visit(arg);
+                }
+            }
+            for c in &d.constraints {
+                visit(c);
+            }
+        }
+        Some(NodeEnum::Constraint(c)) => {
+            if let Some(e) = c.raw_expr.as_ref() {
+                visit(e);
             }
         }
         Some(NodeEnum::CoerceViaIo(c)) => {
@@ -3495,6 +3666,8 @@ mod tests {
             "SELECT statement FROM pg_cursors",
             r#"SELECT statement FROM u&"pg_cursors""#,
             "SELECT conninfo FROM pg_catalog.pg_stat_wal_receiver",
+            "SELECT passwd FROM pg_user",
+            "SELECT * FROM pg_catalog.pg_user",
             "EXPLAIN SELECT most_common_vals FROM pg_catalog.pg_stats",
         ] {
             assert!(
@@ -3564,8 +3737,13 @@ mod tests {
              FROM pg_catalog.pg_class",
             "SELECT table_to_xml('demo.customers'::regclass, false, true, '') \
              FROM pg_catalog.pg_class",
+            "SELECT schema_to_xml('demo', false, true, '') FROM pg_catalog.pg_class",
+            "SELECT database_to_xml(false, true, '') FROM pg_catalog.pg_class",
             "SELECT pg_read_file('/etc/passwd') FROM pg_catalog.pg_class",
             "SELECT dblink('', 'SELECT email FROM demo.customers') FROM pg_catalog.pg_class",
+            "SELECT pg_stat_get_activity(NULL) FROM pg_catalog.pg_class",
+            "SELECT pg_ls_logdir() FROM pg_catalog.pg_class",
+            "SELECT pg_logical_slot_get_changes('s', NULL, NULL) FROM pg_catalog.pg_class",
         ] {
             assert!(
                 !reads_only_server_metadata(sql),
@@ -4858,6 +5036,20 @@ mod referenced_identifier_probe {
         assert!(masked_exceeds_outer_projection(
             "SELECT 1/(CASE WHEN (SELECT email FROM demo.customers WHERE id=1) LIKE 'u%' \
              THEN 0 ELSE 1 END)",
+            &masked
+        ));
+        // TypeName.typmods: CAST numeric(p,s) hid a subquery membership oracle.
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT CAST(1 AS numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+            &masked
+        ));
+        // JSON RETURNING uses JsonOutput.type_name, not TypeCast.
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT JSON_VALUE('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT JSON_QUERY('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
             &masked
         ));
         // Cleartext ORDER BY is accepted — values stay masked on the wire.

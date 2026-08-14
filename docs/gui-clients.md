@@ -130,8 +130,11 @@ it never reaches Postgres — rather than being nulled after the fact.
 `query_to_xml('SELECT email FROM demo.customers', …)` has no `RangeVar` for
 `customers` in the parse tree, so a relation-based rule cannot see it. Without a
 denylist the whole thing is bypassable in one call. `CATALOG_ESCAPE_FUNCTIONS`
-covers the `*_to_xml` family, `dblink`, `pg_read_file`, `pg_ls_dir`,
-`pg_stat_file` and the large-object accessors.
+covers the `*_to_xml` family (including `schema_to_xml` / `database_to_xml`),
+`dblink`, `pg_read_file`, `pg_ls_dir` and the other `pg_ls_*` directory
+listings, `pg_stat_file`, large-object accessors, and target-list dumps such
+as `pg_stat_get_activity()` / logical-slot peek that otherwise look like a
+catalog query when joined to `pg_class`.
 
 ## What it does not change
 

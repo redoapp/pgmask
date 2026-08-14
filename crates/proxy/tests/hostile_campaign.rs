@@ -373,6 +373,12 @@ fn run_pass() -> Vec<(String, &'static str)> {
            JSON_TABLE('{}', '$' COLUMNS (e text PATH '$.e' DEFAULT u&"email" ON EMPTY)) jt"#,
         r#"SELECT jt.* FROM demo.customers,
            JSON_TABLE('{}', '$' COLUMNS (NESTED PATH '$.e' COLUMNS (x text PATH '$' DEFAULT u&"email" ON EMPTY))) jt"#,
+        r#"SELECT CAST(1 AS numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+        r#"SELECT count(*) FROM demo.customers WHERE CAST(1 AS numeric((SELECT count(*) FROM demo.customers t2 WHERE t2.u&"email" = 'x'), 0)) = 1"#,
+        r#"SELECT JSON_VALUE('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+        r#"SELECT JSON_QUERY('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+        r#"SELECT count(*) FROM demo.customers WHERE JSON_VALUE('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers t2 WHERE t2.u&"email" = 'x'), 0)) IS NOT NULL"#,
+        r#"EXPLAIN SELECT JSON_VALUE('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
     ];
     for sql in unicode {
         check(sql, must_refuse_projection(sql));

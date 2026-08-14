@@ -86,6 +86,14 @@ fn hunt_finds_no_new_oracles() {
         "EXPLAIN SELECT email FROM demo.customers",
         "EXPLAIN SELECT id FROM demo.customers ORDER BY email",
         "SHOW search_path",
+        "SELECT DISTINCT email FROM demo.customers",
+        "SELECT id FROM demo.customers ORDER BY email NULLS FIRST",
+        "SELECT id FROM demo.customers ORDER BY email DESC",
+        "TABLE ONLY demo.customers",
+        "SELECT t.email FROM demo.customers t",
+        r#"SELECT id, count(*) OVER w FROM demo.customers WINDOW w AS (ORDER BY email)"#,
+        r#"SELECT id FROM demo.customers ORDER BY email COLLATE "C""#,
+        r#"SELECT id FROM demo.customers ORDER BY email USING >"#,
     ];
     let mut bad = Vec::new();
     for sql in must_allow {
@@ -268,6 +276,8 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT * FROM pg_stat_statements()"#,
         r#"SELECT statement FROM pg_cursors"#,
         r#"SELECT * FROM pg_prepared_statements"#,
+        r#"SELECT passwd FROM pg_user"#,
+        r#"SELECT * FROM pg_user"#,
         r#"SELECT data FROM pg_largeobject"#,
         r#"SELECT stavalues1 FROM pg_statistic"#,
         r#"WITH s AS (SELECT * FROM pg_stats) SELECT * FROM s"#,
@@ -284,6 +294,17 @@ fn hunt_finds_no_new_oracles() {
         r#"COPY demo.customers TO STDOUT"#,
         r#"LISTEN x"#,
         r#"LOAD 'auto_explain'"#,
+        r#"SELECT CAST(1 AS numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+        r#"SELECT count(*) FROM demo.customers WHERE CAST(1 AS numeric((SELECT count(*) FROM demo.customers t2 WHERE t2.u&"email" = 'x'), 0)) IS NOT NULL"#,
+        r#"SELECT JSON_VALUE('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+        r#"SELECT JSON_QUERY('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+        r#"SELECT count(*) FROM demo.customers WHERE JSON_VALUE('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers t2 WHERE t2.u&"email" = 'x'), 0)) IS NOT NULL"#,
+        r#"EXPLAIN SELECT JSON_VALUE('1', '$' RETURNING numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+        r#"SELECT database_to_xml(true, true, '') FROM pg_catalog.pg_class"#,
+        r#"SELECT schema_to_xml('demo', true, true, '') FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_stat_get_activity(NULL) FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_ls_logdir() FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_logical_slot_get_changes('s', NULL, NULL) FROM pg_catalog.pg_class"#,
     ];
 
     for sql in oracles {

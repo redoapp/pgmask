@@ -15,7 +15,20 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   same residual as the inner SELECT; `EXPLAIN` of a predicate oracle is not.
 - `pg_cursors` (session cursor SQL text) and `pg_stat_wal_receiver` (conninfo)
   are refused as leaky catalogs, same class as `pg_prepared_statements` /
-  `pg_subscription`.
+  `pg_subscription`. `pg_user` (passwd) joins `pg_shadow` / `pg_authid`.
+- `CAST(1 AS numeric((SELECT count(*) WHERE u&"email" = 'x'), 0))` — TypeCast
+  never entered `TypeName.typmods`, a subquery membership oracle. The shared
+  walk now visits typmods (and ColumnDef / XMLSERIALIZE / JSON_TABLE column
+  types), plus other previously skipped children (`JoinExpr.join_using_alias`,
+  `ResTarget.indirection`, `VariableSetStmt.args`, `ExplainStmt.options`,
+  `PrepareStmt.argtypes`, `ExecuteStmt.params`, `CopyStmt` query/WHERE).
+  `JSON_VALUE` / `JSON_QUERY` `RETURNING numeric((SELECT …), 0)` is the same
+  oracle on `JsonOutput.type_name`, which is not a TypeCast and not a Node.
+- `SELECT database_to_xml(…) FROM pg_class` (and `schema_to_xml`,
+  `pg_stat_get_activity()`, `pg_ls_logdir()`, logical-slot peek/get) looked
+  like a metadata-only catalog query, which skips the untrusted-function
+  gate. The escape list now covers the rest of the `*_to_xml` family and
+  those target-list dumps.
 - Hostile / read-only / write gates share one descent (`walk_tree` /
   `for_each_child_node`) and one cached parse (`StatementInspection`) instead
   of a parallel `tally_*` match plus `pg_query::nodes()`. The parser is still
