@@ -114,6 +114,18 @@ fn catalogs_that_carry_user_data_are_not_released() {
         "SELECT * FROM pg_qualstats_pretty",
         "SELECT * FROM pg_store_plans_info",
         "EXPLAIN SELECT query FROM pg_stat_monitor",
+        // Catalog-shaped, not `pg_stat_*`: other backends' SQL + plans.
+        "SELECT * FROM pg_show_plans",
+        "SELECT query FROM pg_catalog.pg_show_plans",
+        r#"SELECT * FROM u&"pg_show_plans""#,
+        "EXPLAIN SELECT * FROM pg_show_plans",
+        "SELECT * FROM pg_query_state",
+        "SELECT * FROM pg_catalog.pg_query_state",
+        r#"SELECT * FROM u&"pg_query_state""#,
+        // Forks install the same dump in pg_catalog under another name.
+        "SELECT query FROM pg_catalog.citus_stat_activity",
+        "SELECT * FROM citus_stat_activity",
+        "SELECT query FROM pg_catalog.citus_stat_statements",
     ] {
         assert!(
             !reads_only_server_metadata(sql),
@@ -960,6 +972,10 @@ fn walk_visits_every_column_ref_func_call_and_range_var() {
         r#"SELECT current_setting('search_path') FROM pg_catalog.pg_class"#,
         r#"SHOW search_path"#,
         r#"SELECT * FROM generate_series(1,3) g, pg_catalog.pg_class c"#,
+        r#"SELECT u&"email" INTO tmp FROM demo.customers"#,
+        r#"COPY demo.customers (u&"email") TO STDOUT"#,
+        r#"COPY (SELECT u&"email" FROM demo.customers) TO STDOUT"#,
+        r#"CALL dump(u&"email")"#,
     ];
 
     let mut holes = Vec::new();

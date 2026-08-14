@@ -116,6 +116,10 @@ exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
   `pg_stat_monitor` / the next extension). Core counter views
   (`pg_stat_user_tables`, `pg_stat_progress_*`, …) stay allowed.
   `pg_qualstats*` / `pg_store_plans*` are the same class under other names.
+  `pg_show_plans*` / `pg_query_state*` dump running SQL without the
+  `pg_stat_*` prefix; forks that put the same dump in `pg_catalog` as
+  `citus_stat_activity` / `citus_stat_statements` are refused on
+  substring. `pg_wait_sampling*` and `pg_buffercache` stay allowed.
 - `pg_largeobject` — blob contents
 - `pg_authid`, `pg_shadow`, `pg_user_mapping(s)`, `pg_subscription` — password
   hashes and connection strings

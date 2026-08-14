@@ -17,7 +17,13 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   table-size dashboards and `\d` keep working. `pg_statio_*` is a different
   prefix (block I/O counts) and is unchanged. `pg_qualstats*` /
   `pg_store_plans*` join the refuse list by prefix (same class, different
-  naming).
+  naming). Same class again, still not `pg_stat_*`: `pg_show_plans*`
+  (running query text + plans) and `pg_query_state*` (other backends'
+  current SQL) were catalog-shaped and metadata-only. Forks that install
+  the dump in `pg_catalog` under another name (`citus_stat_activity`,
+  `edb_stat_activity`, `citus_stat_statements`) fail closed on substring.
+  `pg_wait_sampling*` (queryid + wait counts) and `pg_buffercache` (block
+  IDs, not tuple bytes) stay allowed.
 - SQL `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` / `CLOSE`
   are now refused on **every posture** (`sql_prepare_cursor`). They are a
   second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.

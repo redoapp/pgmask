@@ -156,7 +156,9 @@ of those same SELECTs is allowed; `EXPLAIN` of a predicate oracle is not.
 `pg_cursors` and `pg_stat_wal_receiver` join the leaky-catalog refuse list
 (session SQL text / replication conninfo). Unknown `pg_stat_*` views are
 leaky too (`pg_stat_monitor` and the next extension were metadata-only);
-core counter / progress views stay allowed. Residual
+core counter / progress views stay allowed. `pg_show_plans` /
+`pg_query_state` and fork `*_stat_activity` / `*_stat_statements` views
+in `pg_catalog` are the same dump without that prefix. Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and
 cleartext sort order among masked projections).

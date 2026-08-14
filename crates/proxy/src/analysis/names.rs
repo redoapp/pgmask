@@ -384,11 +384,22 @@ pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bo
     // metadata-only and skipped the untrusted-function gate. Invert:
     // only the core counter/LSN views above keep the fast path.
     // `pg_statio_*` is a different prefix (block I/O counts) and stays
-    // off this rule. `pg_qualstats*` / `pg_store_plans*` hold qual
-    // literals and stored plans — same class, different naming.
+    // off this rule. Same class, different naming: `pg_qualstats*` /
+    // `pg_store_plans*` (qual literals / stored plans), `pg_show_plans*`
+    // (running query text + plans), `pg_query_state*` (other backends'
+    // current SQL). Forks install the same dump under other names in
+    // `pg_catalog` (`citus_stat_activity`, `edb_stat_activity`,
+    // `citus_stat_statements`); substring, not a prefix, so those still
+    // fail closed. `pg_stat_statements_info` is a counter view on the
+    // allowlist and must stay off this rule.
     if pg_stat_relation_is_leaky(&relation)
         || relation.starts_with("pg_qualstats")
         || relation.starts_with("pg_store_plans")
+        || relation.starts_with("pg_show_plans")
+        || relation.starts_with("pg_query_state")
+        || relation.contains("stat_activity")
+        || (relation.contains("stat_statements")
+            && !METADATA_SAFE_PG_STAT.contains(&relation.as_str()))
     {
         return true;
     }
