@@ -1,5 +1,10 @@
 # Safety assessment
 
+> [!NOTE]
+> This is a chronological audit record. Use the concise
+> [security model](security.md) for current deployment guidance. Version counts,
+> test counts, and open questions below describe the date of each entry.
+
 Written 2026-08-10, after a day that found six disclosures in code which had
 been passing a thirteen-suite release gate. Updated 2026-08-11; the gate is
 nineteen suites now, which changes nothing about the argument below — the

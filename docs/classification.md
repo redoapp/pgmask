@@ -1,5 +1,9 @@
 # Phase 1: writing down what is sensitive
 
+> [!NOTE]
+> This records the classifier's original evaluation. See
+> [policy ownership](responsibilities.md) for the current catalog workflow.
+
 Everything else in pgmask enforces a list. This is about producing the list.
 
 The enforcement machinery was always the easy half. Provenance comes free from

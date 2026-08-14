@@ -1,156 +1,127 @@
-# Running it: config, migrations, and deploys
+# Operations
 
-pgmask sits in front of a database that will keep changing under it. This is
-what happens when it does.
+This guide covers schema changes, policy deployment, restarts, and monitoring.
+Read the [security model](security.md) before production deployment.
 
-## The property that makes this tractable
+## Deployment checklist
 
-**There is no unsafe deploy ordering.** Config and migration can land in either
-order, and both windows are degraded rather than exposed:
+- Block direct user access to PostgreSQL.
+- Use a `SELECT`-only database role or a read replica.
+- Require client TLS and protect the backend hop.
+- Keep `unclassified = "mask"` with `unclassified_mask = "null"`.
+- Run `classify --check` against the migrated schema.
+- Alert on coverage warnings and rejection metrics.
 
-| you deploy | what happens in between |
+## Schema and policy order
+
+Schema and policy changes can deploy in either order under default-deny:
+
+| Order | Temporary behavior |
 |---|---|
-| migration first, config second | the new column is unclassified, so default-deny masks it. Someone sees a blank column. |
-| config first, migration second | the rule resolves to nothing and is logged as unresolved. It starts working when the column appears. |
+| Schema first | New columns are unclassified and return `NULL`. |
+| Policy first | New rules remain unresolved until the columns exist. |
 
-That is worth knowing before you design a release process around it: you do not
-need a lockstep deploy, and there is no window where the wrong ordering leaks
-something. You only need to close the gap before people complain about blanks.
+Both orders reduce utility rather than expose an unclassified value. This does
+not make an incorrect `mask = "none"` safe.
 
-## What each kind of migration does
+Common schema changes behave as follows:
 
-| migration | runtime behaviour | caught by `classify --check`? |
+| Change | Runtime behavior | `classify --check` |
 |---|---|---|
-| add a column | masked by default-deny | yes — reported as having no rule |
-| rename a column | old rule matches nothing, new name masked | yes — both halves, as uncovered *and* as a stale rule |
-| drop a column | rule matches nothing | yes — stale rule |
-| drop and recreate a table | new OID; refreshed within `catalog_refresh_seconds`, masked meanwhile | n/a — resolves itself |
-| **change a column's type** | **the proxy refuses every result set containing it** | **yes** |
+| Add a column | Default mask until classified | Reports a missing rule |
+| Rename a column | New name is masked; old rule is unresolved | Reports both |
+| Drop a column | Rule becomes unresolved | Reports a stale rule |
+| Recreate a relation | OIDs refresh; unknown OIDs use default policy | No policy change required |
+| Change a column type | Incompatible masks reject the result set | Reports the mismatch |
 
-That last row is the one that bites. A `date-year` mask on a column that became
-`text` is not a coverage gap that quietly hides data — it is an outage, and
-without the check it surfaces as the first user's query failing:
+## CI check
 
-```
-ERROR:  pgmask: mask DateYear on demo.customers.birth_date cannot be applied to type OID 25
-```
-
-`classify --check` validates every rule's mask against the column's current
-type, so a type-changing migration fails the build instead:
-
-```
-1 rule(s) name a mask the column's current type cannot take. This is
-not a coverage gap — the proxy refuses these result sets at runtime:
-  demo.customers.birth_date  mask `date-year` vs text
-```
-
-## The pipeline to build
-
-Run this in CI against a schema-equivalent database — the one your migrations
-have already been applied to:
+Run the drift check after migrations against a schema-equivalent database:
 
 ```bash
-DSN=postgres://… classify --check --catalog catalog.toml --schema public
+DSN=postgres://... classify --check \
+  --catalog catalog.toml \
+  --schema public
 ```
 
-Non-zero on any of: a column with no rule, a rule matching nothing, or a rule
-whose mask no longer fits. Wire it after your migration step and before deploy,
-and every one of the rows above becomes a build failure rather than a discovery.
+The command exits nonzero when:
 
-To see what a new column *should* be classified as, run the proposing mode
-against the same database and read the diff:
+- A database column has no catalog rule.
+- A catalog rule matches no column.
+- A mask does not support the current column type.
+- The selected schema has no columns.
+
+To inspect new columns, generate a draft and review the diff:
 
 ```bash
-DSN=postgres://… classify --schema public --sample 200 > proposed.toml
+DSN=postgres://... classify \
+  --schema public \
+  --sample 200 > catalog-draft.toml
 ```
 
-## Rolling the proxy
+The classifier is a starting point, not an approval step. See
+[policy ownership](responsibilities.md).
 
-`SIGTERM` stops it accepting new connections and exits. In-flight sessions are
-not drained — each holds its own backend connection, and waiting for the longest
-query would stall a deploy — so run more than one instance behind whatever
-routes to it if you care about not dropping sessions.
+## Catalog refresh and reload
 
-**Changing the catalog file requires a restart.** The refresher re-resolves
-names to OIDs on `catalog_refresh_seconds`, which handles DDL, but it does not
-re-read the file. Adding a rule for a new column is a deploy, not a reload.
-That is a real limitation; a `SIGHUP` reload is the obvious fix and is not built.
+pgmask resolves relation and column names to PostgreSQL OIDs at startup. It
+re-resolves them every `catalog_refresh_seconds` and may refresh sooner after an
+unknown OID, limited by `catalog_refresh_min_seconds`.
 
-## What to watch
+If a refresh fails, pgmask keeps the previous snapshot. If a rule stops
+resolving, pgmask logs a coverage warning and applies the unclassified policy.
 
-The proxy already tells you when coverage changes, at `warn`:
+The policy file is not reloaded. Restart pgmask after changing it.
 
-```
-catalog: coverage lost for demo.customers.email (was oid.attnum 16385.2) —
-the relation or column no longer exists; those values are now unclassified
-```
+## Rolling restart
 
-Alert on that line. It is the runtime signal that a migration moved something
-out from under a rule, and it is deliberately a warning rather than a refusal
-because the values are still masked — you have lost coverage, not containment.
+`SIGTERM` stops new connections and closes existing sessions without draining.
+Run multiple instances behind a TCP load balancer if sessions must survive a
+rolling deployment.
 
-From `/metrics`, the useful signals are `pgmask_rejections_total` by cause — a
-spike in `mask_type_mismatch` is a type-changing migration that got past CI —
-and `pgmask_values_masked_total` going to zero, which means either nobody is
-querying or a catalog stopped resolving.
+Use a health check that opens a PostgreSQL connection through pgmask. A process
+check alone does not verify backend connectivity or catalog loading.
 
-There is no gauge for "rules currently unresolved". There should be; it is not
-built.
+## Logs
 
-## Catalog hygiene
+pgmask writes structured logs to stderr. `PGMASK_LOG` controls filtering and
+falls back to `RUST_LOG`; the default is `info`.
 
-Treat the catalog as production configuration, in the same repository and review
-process as the migrations it tracks. Two things follow from that:
+Each connection has a span containing the peer and session outcome. Do not log
+catalog secrets or query values around pgmask. pgmask's own tests assert that
+masked values and the pseudonym key do not appear in its logs or metrics.
 
-- **Review a `mask = "none"` the way you would review a permission grant.** It
-  is the only setting here that can expose something; everything else fails
-  towards hiding.
-- **Keep it complete rather than minimal.** Under default-deny, a column absent
-  from the catalog comes back blank, so "only list the sensitive ones" produces
-  a database where most columns are empty. `classify` emits an entry for every
-  column for this reason.
+Alert on:
 
-## Build-time checks
+- `coverage lost` warnings.
+- Repeated catalog refresh failures.
+- Plaintext client sessions when TLS is expected.
+- Spikes in rejected result sets or mask type mismatches.
+- Rate-limit and notice-flood events.
 
-These are configured in the workspace, so `cargo build` and `cargo clippy`
-enforce them without anyone remembering to pass a flag.
+## Metrics
 
-```toml
-[profile.release]
-overflow-checks = true      # release arithmetic panics instead of wrapping
+Set `metrics_listen` to expose Prometheus text at `/metrics`. No metrics port is
+opened by default.
 
-[workspace.lints.rust]
-unsafe_code = "forbid"
+Useful metrics include:
 
-[workspace.lints.clippy]
-unwrap_used = "deny"        # zero in the library and binaries
-panic = "deny"              # zero in the library and binaries
-indexing_slicing = "warn"
-arithmetic_side_effects = "warn"
-```
+- `pgmask_rejections_total{cause="..."}`
+- `pgmask_values_masked_total`
+- `pgmask_fields_masked_total`
+- `pgmask_fields_rescued_total`
+- `pgmask_sessions_total`
 
-`overflow-checks` in release is the one that is easy to skip and shouldn't be.
-This binary does date and bucket arithmetic on attacker-influenced bytes, and
-fuzzing already found an overflow in `floor_to` at `i64::MIN` — caught only
-because the *debug* build panics. Without this the release build would have
-wrapped silently and masked the wrong value. A panic kills one session; a
-wrapped integer is a wrong answer nobody notices.
+Interpret a zero masking rate with traffic as a policy or routing warning. A
+zero rate without traffic is normal.
 
-Test code carries an `#![allow(...)]` for these: an assertion is a deliberate
-panic, and denying `unwrap` in tests buys nothing.
+## Release verification
 
-### Supply chain
+Run the full repository gate before release:
 
 ```bash
-cargo audit      # advisories against Cargo.lock
-cargo machete    # unused dependencies
+./scripts/test-all.sh
 ```
 
-`.cargo/audit.toml` holds the ignore list. There is exactly one entry, and the
-rule for adding another is that it must be justified by evidence rather than by
-convenience — the current one records that `rkyv` reaches the lockfile as an
-unactivated optional feature of `rust_decimal`, verified by `cargo tree -i`
-returning nothing and a full release build producing zero rkyv artifacts.
-
-`cargo machete` reports `iban_validate` as unused. That is a false positive: the
-crate's library name is `iban`, and it is used as `parse::<iban::Iban>()`.
+A skipped suite fails the gate. Focused real-database and engine checks are
+listed in the [README](../README.md#test-and-benchmark).

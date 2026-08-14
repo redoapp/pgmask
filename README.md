@@ -1,740 +1,308 @@
 # pgmask
 
-A fail-closed column masking proxy for Postgres. Point your connection string at
-pgmask instead of the database; it rewrites sensitive column values in result sets
-according to a policy catalog, and refuses anything it cannot classify.
+pgmask is a fail-closed column-masking proxy for PostgreSQL. Point a PostgreSQL
+client at pgmask instead of the database. pgmask masks classified columns,
+masks unclassified columns by default, and rejects result fields it cannot
+classify safely.
 
-**What it does and does not do.** It guarantees a masked value does not appear
-in a result set. It does *not* stop a determined client reconstructing one by
-inference: the filter side is ungoverned, so `count(*)` with a `LIKE` predicate
-recovers a full address in about 300 queries. The one route that returned every
-value at once — `sum(x) GROUP BY <unique key>`, where each group is a single row
-and the summary is that row — is refused as of v0.1.16; the same shape through a
-`WHERE` clause is not, because whether a predicate matches one row is a property
-of the data rather than of the statement. `./scripts/test-inference.sh`
-enumerates what remains, measured against the demo fixture. Treat this as a
-control against incidental exposure — an analyst who is not attacking you — not
-as containment for one who is.
+> [!IMPORTANT]
+> pgmask prevents masked values from appearing directly in query results. The
+> default posture does not stop a determined client from inferring values with
+> filters, ordering, or repeated queries. Use `posture = "hostile"` for an
+> adversarial client, and read the [security model](docs/security.md) before
+> deployment.
 
+Current version: **v0.1.92**. Licensed under the [MIT License](LICENSE).
+
+## What pgmask provides
+
+- Column policies resolved from PostgreSQL table OIDs and column numbers.
+- Default-deny handling for columns missing from the catalog.
+- Deterministic pseudonyms, redaction, partial masks, date truncation, numeric
+  buckets, IP prefixes, and type-correct `NULL` values.
+- Per-principal policies based on the username PostgreSQL authenticated.
+- Read-only SQL enforcement and fail-closed handling of unsupported query
+  shapes and protocol messages.
+- Optional lineage for expressions and optional metadata access for GUI clients.
+- Structured logs, Prometheus metrics, catalog refresh, and a catalog drift
+  check for CI.
+
+pgmask is tested against PostgreSQL 13–17 and CockroachDB 25.4. See the
+[engine notes](docs/engines.md) for compatibility details.
+
+## Quick start
+
+Requirements: Rust, Podman, and `psql`.
+
+Run the complete demo:
+
+```bash
+./examples/demo/verify.sh
 ```
-$ psql -p 55432 -c 'SELECT id, email, name, phone, city, internal_note FROM demo.customers ORDER BY id LIMIT 2'
- id |       email       |    name    |  phone   |  city  | internal_note
-----+-------------------+------------+----------+--------+---------------
-  1 | user1@example.com | Customer 1 | 555-0101 | Denver | note 1
-  2 | user2@example.com | Customer 2 | 555-0102 | Austin | note 2
 
-$ psql -p 6432 -c 'SELECT id, email, name, phone, city, internal_note FROM demo.customers ORDER BY id LIMIT 2'
- id |               email               | name |  phone   |  city  | internal_note
-----+-----------------------------------+------+----------+--------+---------------
-  1 | c22b1ef44518c300@8dedb655.invalid | ***  | ****0101 | Denver |
-  2 | c8080392aa49c538@8dedb655.invalid | ***  | ****0102 | Austin |
+Or start it manually:
 
-$ psql -p 6432 -c 'SELECT lower(email) FROM demo.customers'
-ERROR:  pgmask: output column "lower" has no column provenance, so it cannot be classified
-HINT:  Select the underlying column directly. Expressions, set operations
-       (UNION/INTERSECT/EXCEPT), recursive CTEs and SETOF-returning functions
-       all erase provenance.
+```bash
+podman run -d --name pgmask-demo \
+  -e POSTGRES_PASSWORD=demo \
+  -e POSTGRES_DB=demo \
+  -p 55432:5432 \
+  docker.io/library/postgres:17
+
+PGPASSWORD=demo psql -h localhost -p 55432 -U postgres -d demo \
+  -f examples/demo/schema.sql
+
+cargo run --release -p pgmask -- examples/demo/catalog.toml
 ```
 
-The address is pseudonymised on both sides of the `@`: the local part alone is
-not the identifying half of a work address, and the domain names an employer.
-Both map deterministically, so the same person is the same pseudonym everywhere
-and "group by employer" still works without naming one.
+In another terminal, connect through pgmask:
 
-**v0.1.92**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
-done, and [LICENSE](LICENSE).
+```bash
+PGPASSWORD=demo psql -h localhost -p 6432 -U postgres -d demo
+```
 
-## Where this stands
+Direct column reads are masked according to the catalog. Unsafe expressions
+fail closed:
 
-| | |
-|---|---|
-| Phase 0 — provenance spike | done, **GO** ([results](docs/phase0-results.md)) |
-| MVP — masking, fail-closed | done ([goal](docs/mvp.md)) |
-| Phase 4 — security boundary | done ([what it found](docs/phase4.md)) |
-| Catalog freshness + rejection metrics | done |
-| Per-principal policy, semantic types, type-aware masks | done |
-| Validated against a real database | done ([Neon run](examples/neon/README.md)) |
-| Phase 1 — catalog discovery (`crates/classify`) | done ([what it found](docs/classification.md)) |
-| GUI clients — Harlequin, Beekeeper's stack, psql `\d` | done, opt-in ([how](docs/gui-clients.md)) |
-| `classify --check` — CI gate on catalog drift | done ([who owns what](docs/responsibilities.md)) |
-| Phase 6 — lineage (`lineage = "allow"`) | done, opt-in; TPC-DS refusals 55% → 26% ([measured](docs/lineage-estimate.md)) |
-| CockroachDB v25.4 | supported, fuzzed on both protocols; closed three disclosures ([why](docs/engines.md)) |
-| Diagnostic channels — `RAISE`, `CONTEXT`, `SQLSTATE`, `ParameterStatus` | closed on both engines, 2026-08-11 ([what they were](docs/safety-assessment.md)) |
+```sql
+SELECT id, email, phone FROM demo.customers LIMIT 2;
 
-`./scripts/test-all.sh` runs 21 suites and reports one line each, with a
-skipped suite counted as a failure: 505 cargo tests, 40 adversarial and
-resilience tests against a real Postgres, 98 demo assertions, an 18-check
-`classify` round trip, 18 TLS, 120 across Postgres 13–17, 43 against CockroachDB,
-an 86-shape canary sweep over both engines, a generated-SQL campaign on Postgres
-and a 7,200-shape campaign on CockroachDB, both of which must report zero leaks.
-The adversarial cargo suite drives a raw wire client and asserts no sentinel byte
-ever crosses the boundary.
-
-Three of those suites exist because something got through the other seventeen.
-The counts here are from a run with nothing else on the machine: the gate now
-refuses to start when another session's proxy or container is live, because
-several of them are timing-sensitive enough to report false failures under load.
-
-### Who owns what
-
-**The catalog belongs to whoever deploys this, not to pgmask.** They know which
-of their columns are sensitive; we do not, and a proxy that shipped opinions
-about someone else's schema would be wrong more often than useful.
-
-What pgmask owes them instead:
-
-- **A safe default.** An unclassified column is masked, so a catalog that is
-  incomplete costs utility, never exposure.
-- **Tools to build and keep the catalog.** `classify` reads a live schema and
-  proposes one, naming what it cannot decide rather than guessing — on TPC-DS it
-  surfaced 46 sensitive columns a hand-written catalog had missed, including
-  every special-category demographic column.
-- **Loud misconfiguration.** Unknown config keys are refused, degenerate mask
-  parameters are refused, and a classification that stops resolving logs a
-  warning rather than silently ceasing to mask.
-
-**What to do next.** `./scripts/test-fuzz.sh` is the standing answer to having
-no second reviewer: each seed contributes a sqlsmith corpus and a `shapegen`
-corpus, replayed across 4 policy combinations, with **no masked value reaching
-the client in any of them**. (Executions are 4x the corpus — the same SQL runs
-under each policy.)
-
-Count *executed*, not generated. Roughly a third of what sqlsmith emits runs at
-all: measured on this fixture, 123 of 400 statements execute and the other 277
-are `anymultirange is not a multirange type`, `cannot determine element type of
-"anyarray"`, `operator does not exist: point = point` and kin — the type
-resolver, not the masker. `shapegen` executes 400 of 400 on Postgres and 391 of
-400 on CockroachDB, the nine being `pg_size_pretty` and `round(int4)`, which
-that engine does not have. Adding it to the main
-replay took the served fraction from 12% to 35% of statements and the masked
-values actually reached from 26 thousand to 21 million. The generated total is
-the less interesting number and this file used to quote only that. One of the four configurations masks *nothing*, where the proxy must
-be a byte-exact mirror of the database — that asks "did it corrupt anything it
-should not have touched", which a leak oracle is structurally blind to. It
-refuses to pass on a technicality: a poison run with masking removed must trip
-the oracle first, a run that never reached masked data exits VACUOUS, the
-harness refusal count is cross-checked against the proxy's own metrics, and the
-fixture is verified unchanged. Beyond that: more fixture shapes,
-and someone other than Claude reading `analysis/` and `lineage.rs`.
-
-`scripts/test-fuzz.sh` also runs 12 binary-result-format checks, 21,600
-per-principal assertions across 24 concurrent sessions of three principals, and
-60 reads taken while a view is dropped and recreated underneath the catalog. Everything else
-that drives the proxy end to end speaks the simple query protocol, which is
-text-only — the first suite to ask for binary found two bugs, one of which broke
-every driver that prefers it.
-
-Coverage was last measured at **79%** overall at v0.1.0 and is not re-measured
-per release, so treat it as indicative rather than current — several suites and
-a good deal of code have landed since. Measure it by sourcing
-`cargo llvm-cov show-env --export-prefix` before running the suites. What is
-worth measuring is coverage *of the generated corpus alone*: "the fuzzer found
-nothing" and "the fuzzer never executed that code" look identical from outside,
-and that distinction has cost this project a real disclosure. Phase 6 lineage is done — measured at converting about a third
-of refusals, see [docs/lineage-estimate.md](docs/lineage-estimate.md). The
-limits below are real and unchanged.
+SELECT lower(email) FROM demo.customers;
+-- ERROR: pgmask: output column "lower" has no column provenance
+```
 
 ## How it works
 
-Postgres's `RowDescription` carries, per output field, the table OID and column
-attnum it came from — and `0` for both when the field is a computed expression.
-That is engine-authoritative provenance, free, with no SQL parsing.
+PostgreSQL sends a `RowDescription` before each result set. Each field includes
+the source table OID and column number, or zero when the field is computed.
+pgmask binds a masking plan to that description and applies it to every
+following row.
 
-The governing rule: **bind the masking plan to the `RowDescription`, never to the
-statement.** Every row-producing path in the protocol emits one first, so
-extended-protocol portals, multi-statement queries, and re-executed prepared
-statements are all covered without special handling. SQL `PREPARE` / `DECLARE` /
-`FETCH` / `CLOSE` are refused as a statement class — use ordinary `SELECT`, or
-Parse/Bind/Execute. Exactly two paths emit rows
-*without* one — `COPY ... TO STDOUT` and the legacy `FunctionCall` message — and
-both are refused. A `DataRow` arriving with no active plan is never forwarded.
+The main rule is: **bind policy to the result description, never only to SQL
+text**. Prepared statements, portals, and repeated executions therefore use the
+policy attached to their own result fields.
 
-We decode only four message types and forward everything else byte-for-byte.
-Bytes we never interpret are bytes we cannot misinterpret. That is also why the
-framing is hand-written rather than taken from `pgwire` or `postgres-protocol`:
-both model the protocol as a closed enum, so an unrecognised tag is an error
-rather than something to pass along, and neither can emit the modified backend
-messages a masking proxy exists to produce. `pgwire` is a dev-dependency
-instead — `tests/differential.rs` makes it a second opinion on the
-`RowDescription` fields that decide masking.
+SQL analysis handles cases where provenance alone is incomplete. For example,
+pgmask distrusts provenance for set operations and known opaque views. Anything
+that cannot be proved safe follows the configured opaque policy.
 
-Fields with no provenance are refused — except for a short allowlist of
-expression shapes positively known to carry no column value (`SELECT 1`,
-`now()`, `count(*)`). That rule is an allowlist rather than a search for column
-references because it converts refusals into acceptances, so unsoundness there
-means a leak; see [`crates/proxy/src/analysis/`](crates/proxy/src/analysis/).
-It cut the false-rejection rate on a real workload from 23% to 6%.
+See the [build handoff](docs/handoff.md) for the design history and the
+[safety assessment](docs/safety-assessment.md) for the detailed audit record.
 
-**Provenance is necessary but not sufficient.** Where one output field draws
-from several source columns, the reported OID names at most one of them.
-Postgres declines to answer in that case and reports zero; CockroachDB answers
-with the first branch, which leaked a masked column through a `UNION` until
-v0.1.1. The proxy now distrusts provenance for any statement containing a set
-operation, on every engine, and handles those fields as computed ones. See
-[docs/engines.md](docs/engines.md).
+## Deploy safely
 
-## Try it
+The deployment is part of the security boundary:
 
-```bash
-./scripts/test-all.sh            # everything; a skipped suite counts as a failure
-./examples/demo/verify.sh        # acceptance criteria against a real Postgres
-./scripts/test-fuzz.sh           # 24k generated statements x 4 policies, asserts nothing leaks
-./scripts/test-integration.sh    # canary + adversarial + resilience, 31 tests
-./scripts/test-tls.sh            # TLS on both legs via a real psql, 7 assertions
-./scripts/test-versions.sh       # 23 assertions x Postgres 13,14,15,16,17
-./scripts/test-cockroach.sh      # 34 assertions against CockroachDB v25.4
-./scripts/test-shapes.sh         # 43 query shapes, canary sweep, both engines
-./scripts/test-fuzz-cockroach.sh # generated shapes, both protocols, CockroachDB
-./scripts/test-differential.sh   # same corpus through both engines, compared
-cargo llvm-cov --release --summary-only   # coverage, after running the above
-cargo audit && cargo machete              # advisories and unused deps
-```
+1. Block users from connecting directly to PostgreSQL.
+2. Give pgmask a database role with `SELECT` and no write privileges. Prefer a
+   read replica when possible.
+3. Require client TLS with `tls_cert` and `tls_key`.
+4. Protect the backend hop. Use `verify-full` when authentication permits it.
+   Client TLS and backend TLS cannot both use SCRAM channel binding through a
+   TLS-terminating proxy; that deployment requires a protected plaintext
+   backend hop or a different authentication method.
+5. Use real PostgreSQL authentication. Do not use `trust` with per-principal
+   mask relaxations.
+6. Keep `unclassified = "mask"` and run `classify --check` in CI.
+7. Treat every `mask = "none"` rule as an access grant.
 
-Everything above generates SQL. One suite generates **message orderings**
-instead, and it is separate because libFuzzer needs a nightly toolchain:
-
-```bash
-rustup toolchain install nightly && cargo install cargo-fuzz
-./scripts/test-plan-state-fuzz.sh        # coverage-guided protocol interleavings
-```
-
-It drives `PlanState` — Parse, Bind, Describe, Execute, Sync, Close, simple
-Query, and the backend replies that acknowledge or reject them — through
-`arbitrary`-generated sequences, and asserts that the proxy still knows which
-SQL and which plan belong to which result set. It exists because a disclosure
-lived in an interleaving no generated *statement* could reach: `described_sql`
-fell back to an earlier simple query's text when a Describe was outstanding
-whose SQL had never been recorded, so `SELECT 1, 2` — two literals, nothing to
-mask — became the identity under which another statement's fields were
-released. The target rediscovers that in two messages and under ten seconds
-when the fallback is reintroduced, which is the poison control the script runs
-before it will trust a clean sweep.
-
-Nightly is not on the release gate. What is: the minimized sequences are
-checked in as ordinary unit tests in `crates/proxy/src/plan_state_fuzz.rs`, so
-`./scripts/test-all.sh` carries them without a nightly toolchain. `fuzz/` is
-its own workspace and is listed under `exclude` in the root manifest, so
-`libfuzzer-sys` and its C++ runtime never enter the dependency graph that
-`cargo build` or `cargo audit` reads.
-
-Or by hand:
-
-```bash
-podman run -d --name pgmask-demo -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=demo \
-  -p 55432:5432 docker.io/library/postgres:17
-psql -h localhost -p 55432 -U postgres -d demo -f examples/demo/schema.sql
-cargo run --release -p pgmask -- examples/demo/catalog.toml
-psql -h localhost -p 6432 -U postgres -d demo
-```
-
-Benchmarks:
-
-```bash
-DIRECT_URL=postgres://postgres:demo@localhost:55432/demo \
-PROXY_URL=postgres://postgres:demo@localhost:6432/demo \
-  cargo run -p bench --bin bench --release -- 10000 300
-```
-
-## Deploying it: the part that is not code
-
-**A proxy is only a control if the database is not reachable around it.** Every
-guarantee below assumes the backend's port is closed to the people the masking
-is for. If an analyst can put the real host in their connection string, they get
-unmasked data and pgmask never sees the query. Nothing in this process can
-detect or prevent that, and no amount of hardening here changes it.
-
-So the deployment is the boundary, not the binary:
-
-- The Postgres port reachable **only** from the proxy — security group, network
-  policy, `pg_hba.conf`, or all three.
-- The proxy's own credentials to the backend distinct from anyone else's, so
-  revoking human direct access does not revoke the proxy's.
-- `tls_cert`/`tls_key` set. pgmask warns loudly without them, because a masking
-  proxy reachable in plaintext is a boundary anyone on the path can read around.
-
-Treat the catalog file as production configuration. A column dropped from it
-stops being masked at the next refresh, and the log line saying so is a `warn`
-that nobody reads if nothing is watching `pgmask_rejections_total` and the
-coverage warnings.
-
-## Operating it
-
-Config, migrations and deploy ordering: [docs/operations.md](docs/operations.md).
-The short version — there is no unsafe deploy ordering, config and migration can
-land in either order, and `classify --check` turns every kind of schema drift
-into a build failure including a column type change, which is the one that
-otherwise surfaces as a production outage.
-
-
-Logs are `tracing`, structured, on stderr, filtered by `PGMASK_LOG` (falling
-back to `RUST_LOG`, defaulting to `info`). Each connection gets a span, so every
-line it emits carries its peer:
-
-```
-INFO pgmask listening listen=127.0.0.1:6432 backend=127.0.0.1:55432 classified_columns=20 …
-WARN no tls_cert/tls_key — clients connect in plaintext, and a masking proxy reachable in plaintext is not a security boundary
-INFO session{peer=127.0.0.1:53295}: session closed user=postgres authenticated=true roles=0 masked_fields=10 rejected_result_sets=0
-```
-
-With `metrics_listen` set, `/metrics` serves Prometheus text. Rejection *causes*
-are a label rather than a metric each, so adding a cause needs no exporter
-change:
-
-```
-pgmask_rejections_total{cause="opaque_aggregate"} 1
-pgmask_rejections_total{cause="opaque_function"} 1
-pgmask_values_masked_total 10
-pgmask_fields_rescued_total 2
-pgmask_sessions_total 3
-```
-
-`pgmask_fields_masked_total` counts *columns carrying a mask* per result set;
-`pgmask_values_masked_total` counts values actually rewritten. Two assertions in
-`verify.sh` check that no metric or log line ever contains a column value or the
-pseudonym key.
+See [Security](docs/security.md), [Operations](docs/operations.md), and
+[Policy ownership](docs/responsibilities.md).
 
 ## Configuration
 
+The complete example is [examples/demo/catalog.toml](examples/demo/catalog.toml).
+
 ```toml
-listen  = "127.0.0.1:6432"
+listen = "127.0.0.1:6432"
 backend = "127.0.0.1:55432"
-catalog_dsn   = "postgres://..."   # resolves names to OIDs, at boot and refresh
-pseudonym_key = "..."              # rotating invalidates every pseudonym issued
+catalog_dsn = "postgres://postgres:password@127.0.0.1:55432/app"
+pseudonym_key = "replace-with-at-least-16-random-bytes"
 
-unclassified      = "mask"   # mask | allow    — default-deny
+# Safe defaults.
+unclassified = "mask"
 unclassified_mask = "null"
-opaque            = "reject" # reject | mask   — fields with no provenance
-lineage           = "refuse" # refuse | allow  — trace expressions to base columns
-summaries         = "allow"  # allow | refuse  — aggregates over masked columns
-posture           = "default" # default | hostile — see below
+opaque = "reject"
+lineage = "refuse"
+summaries = "allow"
+posture = "default"
+system_catalogs = "refuse"
 
-# Optional blunt instrument against notice-oracle campaigns (and any other
-# high-volume authenticated traffic). 0 disables. Burst defaults to the
-# per-minute budget when omitted / zero.
-# rate_limit_per_minute = 60
-# rate_limit_burst      = 10
-# Cap NoticeResponse messages (NOTICE/INFO/WARNING) per ReadyForQuery exchange.
-# Stops a single DO from encoding a value as hundreds of notices. 0 disables.
-# max_notices_per_exchange = 32
+# Client and backend transport.
+tls_cert = "/run/secrets/pgmask.crt"
+tls_key = "/run/secrets/pgmask.key"
+# Client TLS plus SCRAM requires a protected plaintext backend hop.
+backend_tls = "disable"
+# Use verify-full when backend authentication does not offer SCRAM-PLUS.
+# backend_tls = "verify-full"
+# backend_ca = "/run/secrets/backend-ca.pem"
 
-tls_cert    = "/path/proxy.crt"   # omit both to serve plaintext
-tls_key     = "/path/proxy.key"
-backend_tls = "disable"           # disable | require | verify-full
-backend_ca  = "/path/ca.pem"      # only for verify-full; public roots otherwise
+catalog_refresh_seconds = 30
+catalog_refresh_min_seconds = 5
+metrics_listen = "127.0.0.1:9464"
 
-catalog_refresh_seconds     = 30  # OIDs are not stable across DDL
-catalog_refresh_min_seconds = 5   # floor on miss-triggered refreshes
-metrics_interval_seconds    = 60  # summary log line; 0 disables
-metrics_listen = "127.0.0.1:9464"  # Prometheus /metrics; omit to open no port
-
-# Who is who. Members are usernames Postgres verified, never merely claimed.
 [[role]]
-name    = "support"
+name = "support"
 members = ["support_sam"]
 
-# Describe a kind of data once, reference it from every column that holds it.
 [[semantic_type]]
-name    = "email"
-mask    = "pseudonym"
-keep    = 3
+name = "email"
+mask = "pseudonym"
 by_role = { support = "inner" }
+keep = 3
 
 [[column]]
-relation = "demo.customers"
-column   = "email"
-type     = "email"          # or an inline `mask =`, which overrides the type
+relation = "app.customers"
+column = "email"
+type = "email"
+
+[[column]]
+relation = "app.customers"
+column = "id"
+mask = "none"
 ```
 
-**`posture = "hostile"`** is the containment profile: it forces `summaries =
-"refuse"` and refuses any statement where a masked column appears outside a bare
-outermost SELECT list — including unclassified columns (default-deny nulls them
-in the projection; hostile also blocks predicate oracles on them). That closes
-the measured *value* inference routes (`WHERE`/`LIKE`, single-row aggregates,
-error-channel `CASE`) while still serving `SELECT email, id FROM t WHERE id = 1`
-(masked) and cleartext **ordering** of masked values (`ORDER BY email`). Default
-posture is unchanged.
-On every posture, pgmask is **read-only**: only an allowlist of read/session
-statements reach Postgres (`SELECT` without row locks, `EXPLAIN`, `SET`/`SHOW`,
-transactions). SQL `PREPARE`/`EXECUTE`/`DEALLOCATE` and `DECLARE`/`FETCH`/`CLOSE`
-are refused (`sql_prepare_cursor`); `SELECT … FETCH FIRST n ROWS` is a limit
-clause and stays allowed. Drivers should use the extended protocol
-Parse/Bind/Execute. DML, DDL (including `CREATE VIEW`),
-`LOAD`, `DO`, `CALL`, and similar are refused first. Pair with
-`rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
+Unknown configuration keys, invalid mask parameters, duplicate column rules,
+and unresolved configured columns are startup errors.
 
-**`backend_tls = "verify-full"`** authenticates the database certificate
-(optional `backend_ca` for private CAs). `require` still means encryption
-without verification.
+### Policy controls
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `unclassified` | `mask` | Mask columns missing from the catalog. `allow` is an incremental-rollout escape hatch. |
+| `opaque` | `reject` | Reject computed or otherwise unclassified result fields. `mask` replaces them with `NULL`. |
+| `lineage` | `refuse` | When enabled, release an expression only if all resolved source columns are explicitly released. |
+| `summaries` | `allow` | Allow supported reducing aggregates, while applying the source column's policy when required. |
+| `posture` | `default` | `hostile` refuses masked-column use outside a bare projection and forces summaries off. |
+| `system_catalogs` | `refuse` | `allow` enables approved metadata queries needed by GUI clients and `psql` `\d`. |
+
+`lineage = "allow"` improves compatibility but is less conservative: an
+incomplete lineage result could release data. It is off by default.
+
+`system_catalogs = "allow"` is required for most GUI clients. pgmask still
+rejects catalog relations that may contain user values or SQL text. See
+[GUI clients](docs/gui-clients.md).
 
 ### Masks
 
-| Mask | Effect | Applies to |
+| Mask | Result | Supported values |
 |---|---|---|
-| `none` | passthrough — an explicit decision | any |
-| `null` | type-correct NULL | **any type, any format** |
-| `redact` | constant `***` | text |
-| `partial` | keep the last `keep` chars — `****0101` | text |
-| `inner` | keep `keep` at each end — `12**56` | text |
-| `outer` | keep the middle — `**34**` | text |
-| `range` | mask `[start, end)` | text |
-| `hash` | HMAC-SHA256, hex | text |
-| `pseudonym` | keyed, deterministic, shape-preserving | text, uuid |
-| `date-year` | truncate to 1 January | date, timestamp, timestamptz |
-| `date-month` | truncate to the 1st | date, timestamp, timestamptz |
-| `numeric-bucket` | floor to a multiple of `bucket` | int2/4/8, float4/8, numeric (text) |
-| `ip-prefix` | keep the network — `203.0.113.0` | text, inet/cidr (text) |
-| `scrub` | replace identifiers inside free text — `called <EMAIL>` | text |
+| `none` | Pass through unchanged | Any |
+| `null` | Type-correct `NULL` | Any |
+| `redact` | Constant `***` | Text |
+| `partial`, `inner`, `outer`, `range` | Keep selected characters | Text |
+| `hash` | Deterministic HMAC digest | Text |
+| `pseudonym` | Deterministic, shape-preserving pseudonym | Text, UUID |
+| `date-year`, `date-month` | Truncated date or timestamp | Date and timestamp types |
+| `numeric-bucket` | Floor to a configured bucket | Integers, floats, and text-format `numeric` |
+| `ip-prefix` | Remove the host portion | Text and text-format `inet` or `cidr` |
+| `scrub` | Replace recognized identifiers in free text | Text |
 
-### `scrub` is the one mask that reveals
+`scrub` reveals all text it does not recognize. It does not reliably identify
+names, street addresses, or obfuscated identifiers. Use it only when readable
+free text is required and partial disclosure is acceptable.
 
-Every other mask hides by default, so a gap costs utility. `scrub` shows the
-value minus what it recognised, so **a gap is a disclosure**. It replaces
-structured identifiers — address, phone, card, IBAN, UK NHS number, NINO, SSN,
-UK postcode, IP, MAC, crypto address, URL, uuid — and it does not catch a
-person's name, a street address, or `alice [at] acme [dot] com`.
+Pseudonyms preserve equality. This keeps joins useful, but also exposes
+frequency and repeated identity. Semantic types act as pseudonym domains:
+columns in the same domain remain linkable; columns in different domains do
+not.
 
-Where a checksum exists it is applied, because in a mask that *reveals* a false
-positive rewrites readable text into a placeholder that was never there. Luhn
-for cards, mod-97 for IBANs (via `iban_validate`, which carries the per-country
-length table), mod-11 for NHS numbers. The entity set follows
-[Presidio](https://github.com/microsoft/presidio)'s predefined recognizers,
-which is MIT licensed and validates the same fields for the same reason. On realistic support notes that is roughly half of
-what a human would call sensitive; the misses are pinned as assertions in
-`mask.rs` so the limit stays documented rather than assumed.
+## Query behavior
 
-Use it when someone has to read the note and you accept that. It costs about
-1 microsecond per value, and it is ranked as barely-more-restrictive-than-`none`
-so a role holding both `scrub` and `redact` still gets `redact`.
+- Plain classified columns use their catalog policy.
+- Unclassified columns use `unclassified_mask`, which defaults to `NULL`.
+- Safe scalar values such as literals, `now()`, and `count(*)` pass through.
+- Expressions over masked columns, value-returning aggregates such as `max`,
+  set operations, recursive common table expressions, and set-returning
+  functions are rejected unless a conservative rule proves them safe.
+- Supported one-column reductions such as `sum`, `avg`, variance, and boolean
+  reductions inherit the source policy only for a bare column over explicitly
+  schema-qualified named relations. Other shapes remain opaque unless lineage
+  proves all inputs are released.
+- Views need their own catalog entries because PostgreSQL reports the view's OID.
+- SQL `COPY`, writes, row locks, procedural statements, SQL cursors, and SQL
+  prepared-statement commands are rejected. Drivers may use the PostgreSQL
+  extended protocol normally.
 
-Type and format compatibility is checked once when the result set is described,
-so a misconfiguration refuses cleanly instead of dying halfway through a stream.
+Some rejection decisions happen after PostgreSQL executes a query but before
+pgmask forwards the result. Use database permissions and a read-only upstream
+to control side effects and resource use.
 
-Dates and timestamps are decoded and re-encoded through `postgres-types`'
-`FromSql`/`ToSql` with jiff's civil types, and `numeric` through `rust_decimal`,
-rather than through epoch arithmetic and `f64` of our own. Three defects came
-out of the hand-rolled version — an overflow at the microsecond extremes, a
-narrowing cast that moved a date instead of coarsening it, and a dropped `BC`
-era — and the library's types are range-checked, so an unrepresentable value now
-fails to decode rather than wrapping.
-Negative numbers floor *downward* (`-37` with bucket 10 → `-40`), because
-rounding toward zero would reveal more than the bucket size promises.
+## Catalog workflow
 
-`pseudonym` is deterministic, fixed-width (64 bits), and pseudonymises an
-email's **domain** as well as its local part — for business data the domain
-names the company, and with one contact there it names the person. Domains map
-deterministically, so colleagues still group together without the employer being
-named; `keep_domain = true` opts back in.
-
-Determinism is also an equality-and-frequency oracle: an analyst can count
-distinct subjects, join them across tables, and spot the outlier. Usually the
-point, but choose it deliberately.
-
-Parameters that would leave a value unchanged are refused at startup —
-`numeric-bucket` with `bucket = 1` and `range` with `end <= start` both used to
-pass the value through while looking configured.
-
-### Semantic types and pseudonym domains
-
-A semantic type names a kind of data once and supplies its mask, parameters and
-per-role overrides. It also becomes the default **pseudonym domain**, which
-decides what stays linkable: two columns of the same type pseudonymise
-identically so joins keep working, while an `account_id` that happens to equal a
-`phone` will not, so the two columns cannot be linked by comparing masked values.
-
-### Per-principal policy
-
-`by_role` on a column or a semantic type gives the same column different
-treatment for different people — support sees a partial email, everyone else a
-pseudonym. Roles come from the username **Postgres verified**, never one the
-client claimed, and a session that has not authenticated holds no roles at all.
-
-When a principal holds several roles with different masks, **the most
-restrictive wins**. Adding a role must never widen access.
-
-**These are not the database's roles.** A `[[role]]` maps the *startup
-principal* — the username in the connection packet, once Postgres has verified
-it — to pgmask role names, and that is resolved once at authentication and never
-revisited. `SET ROLE`, `SET SESSION AUTHORIZATION` and `RESET ROLE` change what
-the database will let a session read; they change nothing about which mask
-pgmask applies.
-
-That is the safe direction — a client cannot reach another role's looser mask by
-switching into it — but it is not what the name suggests, so: if you want a
-person to see less, map their *login* to a role here. Granting them a Postgres
-role has no effect on masking.
-
-The catalog is keyed on `(OID, attnum)`, never on output column name, which any
-query can rename. Views need their own entries: Phase 0 found that Postgres
-reports the *view's* OID, not the base table's.
-
-If a configured column does not exist, the proxy refuses to start. A half-loaded
-catalog is a catalog with unknown coverage. Unknown config keys are also a
-startup failure: TOML puts any key written after a `[[column]]` block *inside*
-that block, so a misplaced `tls_cert` would otherwise silently leave you running
-in plaintext.
-
-### Catalog drift
-
-pg_class OIDs are **not stable across DDL**. `CREATE OR REPLACE VIEW` keeps a
-relation's OID; `DROP VIEW; CREATE VIEW` — what a lot of migration tooling emits
-— does not. A catalog pinned at boot silently stops classifying those columns:
-under default-deny they turn to NULL, and under `unclassified = "allow"` they
-stop being masked at all.
-
-So the catalog re-resolves on a timer, and sooner when the hot path sees a
-relation OID it does not recognise (rate-limited by
-`catalog_refresh_min_seconds`). Every difference is logged:
-
-```
-catalog: demo.customer_directory.email moved (oid.attnum 16393.2 -> 16397.2)
-         — relation recreated, classification restored
-catalog: COVERAGE LOST for demo.customers.ssn (was oid.attnum 16385.7)
-         — the relation or column no longer exists; those values are now unclassified
-```
-
-If a refresh fails, the previous snapshot is kept rather than cleared — clearing
-would be fail-closed in the narrow sense and would mask every column in the
-database the moment Postgres blinked. Failures are logged and counted.
-
-**The snapshot's unique keys fail open, unlike everything else in it.** An
-unknown column is masked, because unclassified means deny; but a relation whose
-unique keys are not yet in the snapshot simply has none, and the singleton-group
-guard has nothing to fire on. A table created after the last refresh therefore
-serves `sum(x) GROUP BY <its key>` until the next one, up to
-`catalog_refresh_seconds`. Found by a test that created its fixture after
-starting the proxy: the cases that ran before the refresh were served and the
-ones after were refused, splitting exactly on the boundary. The window is
-bounded by the refresh interval and needs DDL inside it, so it is recorded
-rather than closed — closing it means refusing aggregates over every relation
-the snapshot does not know, which includes every temp table.
-
-### Rejection metrics
-
-Every refusal is bucketed by cause, because the numbers decide whether the
-Phase 6 parser is worth building:
-
-```
-pgmask metrics: result_sets_masked=2 fields_masked=3 rejections=3 \
-  opaque_named_like_column=1 opaque_anonymous=1 opaque_function=1 \
-  set_op_like_share=33%
-```
-
-`tableID = 0` says "not a stored column" and nothing else, so the cause cannot be
-recovered exactly without parsing. But Postgres names output columns predictably,
-and the name buckets them well enough to steer a decision: `?column?` is a
-literal or operator, `count`/`string_agg` an aggregate, `lower` a function — and
-an opaque field named exactly like a column we classify is very likely a set
-operation, recursive CTE or `SETOF` function, because all three preserve the
-source name while losing provenance.
-
-**`set_op_like_share` is the number to watch.** If a week of real traffic puts it
-low, the parser is not worth a quarter. If it is high, build the two-rule version
-in `docs/handoff.md` rather than a general lineage engine.
-
-This inference is deliberately confined to counters. Matching on a column name
-would be unsound for enforcement — any query can alias anything to anything — so
-nothing here changes what gets masked.
-
-### TLS, and one constraint worth knowing
-
-Postgres negotiates TLS with an `SSLRequest` packet rather than ALPN or a
-separate port; pgmask handles that on both legs.
-
-**A configured certificate is a required certificate.** Because Postgres has no
-ALPN and no TLS port, a client that never sends `SSLRequest` — `sslmode=disable`
-— gets a plaintext session. Until v0.1.69 it got a working one, against a proxy
-whose startup log said `tls=true`, because that line reported the configuration
-rather than the connection. So setting `tls_cert` now also requires TLS: a
-plaintext client is refused with an error telling it what to do, and the refusal
-is counted as `plaintext_refused`.
-
-Set `require_client_tls = false` to allow plaintext deliberately. Those sessions
-are counted as `plaintext_session` and the startup log warns, because the
-dangerous configuration is not "no certificate" — that is a choice an operator
-made — but a certificate any client may decline, which looks like protection in
-both the config file and the log. Setting `require_client_tls = true` without a
-certificate is refused at load rather than silently refusing every connection.
-
-**Use `backend_tls = "disable"` if your clients authenticate with SCRAM.**
-`SCRAM-SHA-256-PLUS` binds authentication to the TLS certificate of the endpoint
-the client is talking to, and pgmask terminates TLS and re-originates — so the
-client binds to our certificate and the backend checks its own. That is channel
-binding working as designed; catching an endpoint that re-originates TLS is
-exactly its purpose. Stripping the mechanism does not help either, because SCRAM
-detects the downgrade.
-
-Postgres only advertises `-PLUS` on a TLS connection of its own, so a plaintext
-backend leg means plain `SCRAM-SHA-256`, clients authenticate normally, and the
-client-to-pgmask hop is still encrypted. Put pgmask next to the database and
-secure that hop by placement. The unworkable combination is detected and
-explained rather than failing opaquely. Full reasoning in
-[`docs/phase4.md`](docs/phase4.md).
-
-## Performance
-
-0.22–0.29 µs per masked row across three runs; interactive latency overhead
-within noise; bulk scans ~2.4× slower than direct. The first working version was
-3.98 µs/row, and the fix that mattered was not algorithmic — it was coalescing
-writes into one buffer, replacing a `write` syscall per row. Methodology and the
-full optimisation trail in [`docs/benchmarks.md`](docs/benchmarks.md).
-
-## Against a real database
-
-`examples/neon/` runs pgmask read-only in front of a live Neon branch of a real
-internal-tools database (~380k rows) under three policies. It found four bugs —
-hardcoded TLS SNI, a `NoTls` catalog connection, `channel_binding=require` in the
-provider's own DSN, and libpq refusing `-PLUS` over a plaintext link — and it
-refuted the assumption behind our Phase 6 plan: set operations are 7% of
-rejections, expressions and aggregates are 80%. Write-up in
-[`examples/neon/README.md`](examples/neon/README.md).
-
-## Measured against real workloads
-
-| corpus | refused | note |
-|---|---|---|
-| 31 hand-written queries, real Neon branch | 32% | [write-up](examples/neon/README.md) |
-| **TPC-DS, 99 queries** | **55%** (was 90%) | [write-up](examples/tpcds/README.md) |
-
-`crates/corpus` measures this against any directory of SQL, using `Parse` +
-`Describe` so it needs **no data** — only the DDL. The gap between the two rows
-is the point: pgmask is usable today for row-level lookup workloads and not for
-analytical ones, and which you have decides whether Phase 6 is optional.
-
-## Known limits
-
-- **Expressions over a column are rejected** — `lower(email)`, `email || ''`,
-  `coalesce(domain, …)`, `to_json(row)`. Each emits the real value, so these are
-  correct refusals, but they are also the largest source of friction.
-  `SELECT 1`, `now()` and `count(*)` used to be refused too; they are now served
-  (see below).
-- **Summaries over classified columns are masked, not exact** — counts
-  (`count`, `count(*)`, `regr_count`), ranking windows and `date_trunc` are
-  released. A one-argument reduction — `sum`, `avg`, `stddev`, a variance, or a
-  boolean reduction — inherits its source policy only when it reduces one bare
-  column over explicitly schema-qualified named ranges. Over a *released*
-  column the exact summary is served; over a *masked* column the summary is
-  masked with that column's own mask. Unqualified ranges, transformed arguments,
-  joins, subqueries and multi-argument regressions retain the opaque posture;
-  optional lineage may still prove that all of their inputs are explicitly
-  released. A sum of a bucketed column is a bucket, so a group of one row never
-  yields that row's value: `sum(annual_salary) WHERE id = 1` returns the bucket
-  floor, not the salary. `summaries = "refuse"` reverts it. The bar is still
-  "you cannot read an anonymised value", not "no information flows" — a
-  whole-table sum is a masked summary, and when the source column is unmasked it
-  is exact.
-- **Functions that return a stored value are never released** — `min`, `max`,
-  `mode`, `percentile_*`, `string_agg`, `array_agg`, `first_value`, `lag`,
-  `lead`. `max(email)` is an email address.
-- **Set operations, recursive CTEs and `SETOF` functions are rejected** — Phase 0
-  measured that they erase provenance. Expected to be the main source of
-  rejections in practice; instrument by cause before deciding on Phase 6.
-- **Rejection happens after execution.** The backend already ran the query; the
-  data never reaches the client, but the work was done, and inside an explicit
-  transaction the client and server disagree about whether the statement
-  succeeded.
-- **SCRAM channel binding is unsupported**, unavoidably — see above.
-- **Backend TLS:** `disable` (plaintext), `require` (encrypt, no cert check),
-  or `verify-full` (encrypt and verify, optional `backend_ca` for private CAs).
-- **Read-only.** Fail-closed allowlist: DML, DDL (including `CREATE VIEW`),
-  `LOAD`, `COPY`, `DO`, `CALL`, `FOR UPDATE`, and other mutating SQL are refused
-  on every posture (`write_refused`). The proxy is for SELECT.
-- **Trusted functions only.** Schema-qualified calls outside `pg_catalog`, and
-  unqualified names not on the built-in allowlist, are refused before execution
-  (`untrusted_function`) — closes timing/side-effect oracles via preinstalled
-  PL/pgSQL. Pair with a SELECT-only DB role that also revokes `EXECUTE` on
-  non-essential functions.
-- **`posture = "hostile"`** refuses summaries over masked columns and any use of
-  a masked (or unclassified) column outside a bare SELECT list — checked
-  **before** Postgres runs the statement (`hostile_masked_use`). Also refuses
-  whole-row casts/refs, NATURAL JOIN / column-alias renames that hide masked
-  columns, and unicode-escaped names in `USING` / `PARTITION BY`. Cleartext
-  `ORDER BY` of masked values is accepted (cells stay masked). Default posture
-  does not close predicate oracles; use hostile for containment. Pair with
-  `rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
-- **Leaky catalogs refused.** `pg_stats`, `pg_authid`, `pg_stat_activity`,
-  `pg_cursors`, `pg_stat_wal_receiver`, unknown `pg_catalog` /
-  `information_schema` relations (vanilla Postgres 18 surface classified
-  once: every official heap/view is Safe XOR Leaky; unknown names leaky), and similar are refused at the
-  frontend on every posture (`leaky_catalog`).
-- **Non-text types accept only `mask = "null"`.** Text-family types are
-  byte-identical in text and binary formats so they mask correctly either way;
-  anything else is refused rather than guessed at.
-- **One catalog with per-principal role overrides.** A principal may receive a
-  stricter mask through any matching role; overlapping roles resolve to the
-  most restrictive mask deterministically.
-- Masking is a disclosure control on the projection. It does not defend against
-  predicate oracles, join-key re-identification, small-cell aggregates or
-  differencing — recorded as reviewed and accepted in
-  [`docs/handoff.md` §11](docs/handoff.md). Two hard edges survive that record:
-  a reducing aggregate whose `GROUP BY` covers a declared unique key, or whose
-  `GROUP BY` cannot be read at all, is refused. Column references, ordinals and
-  `ROLLUP`/`CUBE`/`GROUPING SETS` are read, and so is an output alias, which
-  denotes whatever its target computes; an expression is not, and falls back to
-  asking whether the statement names every column of some key at all. And
-  because a summary of a column the query groups *on* is that column within a
-  constant group, an attributable one-column reduction is *masked with its
-  source column's mask* rather than passed through — so the `WHERE id = 1` form,
-  which no amount of statement reading can decide, gives up only the precision:
-  a sum over a bucketed column is a bucket whatever the predicate collapses it
-  to. Ungrouped
-  groupings, non-key groupings and coarse date buckets are served unchanged.
-
-**Before deploying this, read [`docs/safety-assessment.md`](docs/safety-assessment.md).**
-It states what is guaranteed, what is explicitly not, the ten disclosures found
-across two days — six in the release rules, three more in the diagnostic and
-`ParameterStatus` channels — and why the instruments were wrong more often than
-the code was.
-
-## Layout
-
-```
-docs/handoff.md            the build plan — read this first
-docs/mvp.md                MVP goal, acceptance criteria, scope boundaries
-docs/benchmarks.md         performance methodology and results
-docs/phase0-results.md     generated provenance spike output
-
-crates/proxy/protocol.rs   wire framing and the message types we decode
-crates/proxy/plan_state.rs statement/portal/Describe plan lifecycle
-crates/proxy/session.rs    the per-connection state machine, and Vetted
-crates/proxy/catalog.rs    config and (OID, attnum) resolution
-crates/proxy/mask.rs       masking algorithms, semantic-type domains
-crates/proxy/metrics.rs    rejection causes and counters
-crates/proxy/rate_limit.rs per-principal statement rate limits
-crates/proxy/tls.rs        TLS on both legs
-crates/proxy/tests/        canary, adversarial and resilience suites
-crates/proxy/plan_state.rs         extended-query lifecycle: which plan, which rows
-crates/proxy/plan_state_fuzz.rs    its invariants, and the protocol fuzz oracle
-fuzz/                      libFuzzer targets; own workspace, nightly only
-crates/spike/              Phase 0 provenance spike
-crates/bench/              latency and throughput harness
-examples/demo/             schema, catalog, and the acceptance script
-scripts/                   integration and TLS test drivers
-```
-
-## How the guarantee is enforced
-
-`Batch::client` — the only route to the client socket — accepts a `Vetted`, and
-its four constructors are the complete list of ways bytes can get there. Adding a
-"just forward it" path is a compile error rather than a code-review question.
-
-The backend direction has **no catch-all**: control messages are allowlisted and
-anything unrecognised is refused, because a message we cannot classify may carry
-row data. That arm exists because the canary test caught `CopyData` escaping
-through a `_ =>` that looked harmless.
-
-## Phase 0
-
-The design rests on provenance surviving real queries, so that was measured
-before anything was built. 37 query shapes on PG 17.10: 22 full provenance, 3
-partial, 12 opaque. It survives subqueries (flattened and not), CTEs including
-`MATERIALIZED`, views, matviews, partitioned parents, `LATERAL`, cursors, temp
-tables and no-op casts. Results in
-[`docs/phase0-results.md`](docs/phase0-results.md), analysis in
-[`docs/handoff.md` §4](docs/handoff.md).
-
-Rerun against the target major version before trusting it there — provenance is a
-planner property, not a documented guarantee.
+Generate a draft from a schema-equivalent database:
 
 ```bash
-DATABASE_URL=postgres://... cargo run -p spike -- --md docs/phase0-results.md
+DSN=postgres://... cargo run --release -p classify -- \
+  --schema public --sample 200 > catalog-draft.toml
 ```
+
+Review every proposed rule. The classifier never treats an apparently ordinary
+column as proof that it is safe.
+
+Check the reviewed catalog in CI:
+
+```bash
+DSN=postgres://... classify --check \
+  --catalog catalog.toml --schema public
+```
+
+The check fails for missing rules, stale rules, an empty schema, and masks that
+do not support the current column type. See [Policy ownership](docs/responsibilities.md).
+
+## Operations
+
+- Catalog names are re-resolved periodically because PostgreSQL OIDs can change
+  after DDL.
+- The catalog file itself is read only at startup. Restart pgmask after editing
+  policy.
+- `SIGTERM` stops new connections and closes existing sessions without draining.
+- Logs are written to stderr. `PGMASK_LOG` controls the filter and falls back to
+  `RUST_LOG`.
+- `metrics_listen` exposes Prometheus metrics at `/metrics`. Alert on catalog
+  coverage warnings and rejection spikes.
+
+See the [operations guide](docs/operations.md) for deployment order, schema
+changes, CI checks, and monitoring.
+
+## Test and benchmark
+
+Run the release gate:
+
+```bash
+./scripts/test-all.sh
+```
+
+Useful focused suites:
+
+```bash
+./scripts/test-integration.sh       # real PostgreSQL adversarial tests
+./scripts/test-cockroach.sh         # CockroachDB compatibility
+./scripts/test-fuzz.sh              # generated SQL and policy combinations
+./scripts/test-plan-state-fuzz.sh   # protocol-state fuzzing; requires nightly
+./scripts/test-inference.sh         # measures known inference routes
+```
+
+Performance methodology and current results are in [Benchmarks](docs/benchmarks.md).
+
+## Documentation
+
+Start with the [documentation index](docs/README.md).
+
+- [Security model](docs/security.md)
+- [Operations](docs/operations.md)
+- [Policy ownership and catalog workflow](docs/responsibilities.md)
+- [GUI clients](docs/gui-clients.md)
+- [PostgreSQL and CockroachDB](docs/engines.md)
+- [Detailed safety assessment](docs/safety-assessment.md): the chronological
+  record of ten disclosures and remaining verification gaps.
+- [Changelog](CHANGELOG.md)
+
+Historical phase reports and design records are listed separately in the
+documentation index.
+
+## Get help
+
+Open a GitHub issue with the pgmask version, database engine and version,
+relevant configuration with secrets removed, the rejected SQL shape, and the
+full pgmask error.
