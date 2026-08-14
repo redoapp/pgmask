@@ -643,8 +643,8 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   `rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
 - **Leaky catalogs refused.** `pg_stats`, `pg_authid`, `pg_stat_activity`,
   `pg_cursors`, `pg_stat_wal_receiver`, unknown `pg_catalog` /
-  `information_schema` relations (allowlist of core heaps/views and
-  SQL-standard name/grant views), and similar are refused at the
+  `information_schema` relations (vanilla Postgres 18 surface classified
+  once: every official heap/view is Safe XOR Leaky; unknown names leaky), and similar are refused at the
   frontend on every posture (`leaky_catalog`).
 - **Non-text types accept only `mask = "null"`.** Text-family types are
   byte-identical in text and binary formats so they mask correctly either way;

@@ -124,7 +124,8 @@ exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
   (authinfo, poolinfo, background-task SQL, shard range keys) are the
   same class without those substrings. Catalog-shaped names are now an
   allowlist of core heaps/views and SQL-standard information_schema
-  name/grant views; an unnamed `pg_catalog` / `information_schema`
+  name/grant views — every official Postgres 18 relation classified
+  once, Safe XOR Leaky; an unnamed `pg_catalog` / `information_schema`
   relation is leaky.
 - `pg_largeobject` — blob contents
 - `pg_authid`, `pg_shadow`, `pg_user_mapping(s)`, `pg_subscription` — password

@@ -15,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 use pgmask::analysis::{
     calls_untrusted_function, hostile_join_or_rename_masked, hostile_uses_whole_row,
     is_sql_prepare_or_cursor, is_write_statement, masked_exceeds_outer_projection,
-    reads_only_server_metadata, touches_leaky_system_catalog,
+    reads_only_server_metadata, touches_leaky_system_catalog, VANILLA_INFORMATION_SCHEMA,
+    VANILLA_PG_CATALOG,
 };
 
 fn masked() -> HashSet<String> {
@@ -412,104 +413,42 @@ fn hunt_finds_no_new_oracles() {
     }
 }
 
-/// Second inventory: every information_schema view, core system views,
-/// dump-function shapes, and unicode frames not in the list above.
-/// Known residuals are asserted open; everything else must refuse.
+/// Second inventory: dump-function shapes, unicode frames, and residuals
+/// not covered by the vanilla catalog table. Every official Postgres 18
+/// heap/view/IS relation is classified once in `VANILLA_*` and checked
+/// below; this list is the rest (contrib dumps, forks, helpers, SHOW).
 #[test]
 fn audit_catalog_and_sql_surface() {
     let mut bad = Vec::new();
 
-    let option_views = [
-        "user_mapping_options",
-        "foreign_server_options",
-        "foreign_data_wrapper_options",
-        "column_options",
-        "foreign_table_options",
-        "_pg_user_mappings",
-        "_pg_foreign_servers",
-        "_pg_foreign_data_wrappers",
-        "_pg_foreign_tables",
-        "_pg_foreign_table_columns",
-    ];
-    for name in option_views {
-        for sql in [
-            format!("SELECT * FROM information_schema.{name}"),
-            format!("SELECT * FROM {name}"),
-        ] {
-            if !touches_leaky_system_catalog(&sql) {
-                bad.push(format!("option view not leaky: {sql}"));
+    for (name, safe) in VANILLA_INFORMATION_SCHEMA {
+        let sql = format!("SELECT * FROM information_schema.{name}");
+        if *safe {
+            if any_frontend_refuse(&sql) {
+                bad.push(format!("over-refused IS view: {sql}"));
+            }
+            if !reads_only_server_metadata(&sql) {
+                bad.push(format!("IS view not metadata-only: {sql}"));
+            }
+        } else if !any_frontend_refuse(&sql) {
+            bad.push(format!("OPEN IS view: {sql}"));
+        }
+        if !*safe {
+            let unqualified = format!("SELECT * FROM {name}");
+            if !touches_leaky_system_catalog(&unqualified) {
+                bad.push(format!("option view not leaky unqualified: {unqualified}"));
             }
         }
     }
 
-    // Name-only / schema IS views. Must stay metadata-only so GUIs work.
-    for name in [
-        "administrable_role_authorizations",
-        "applicable_roles",
-        "attributes",
-        "character_sets",
-        "check_constraint_routine_usage",
-        "check_constraints",
-        "collation_character_set_applicability",
-        "collations",
-        "column_column_usage",
-        "column_domain_usage",
-        "column_privileges",
-        "column_udt_usage",
-        "columns",
-        "constraint_column_usage",
-        "constraint_table_usage",
-        "data_type_privileges",
-        "domain_constraints",
-        "domain_udt_usage",
-        "domains",
-        "element_types",
-        "enabled_roles",
-        "foreign_data_wrappers",
-        "foreign_servers",
-        "foreign_tables",
-        "information_schema_catalog_name",
-        "key_column_usage",
-        "parameters",
-        "referential_constraints",
-        "role_column_grants",
-        "role_routine_grants",
-        "role_table_grants",
-        "role_udt_grants",
-        "role_usage_grants",
-        "routine_column_usage",
-        "routine_privileges",
-        "routine_routine_usage",
-        "routine_sequence_usage",
-        "routine_table_usage",
-        "routines",
-        "schemata",
-        "sequences",
-        "sql_features",
-        "sql_implementation_info",
-        "sql_parts",
-        "sql_sizing",
-        "table_constraints",
-        "table_privileges",
-        "tables",
-        "transforms",
-        "triggered_update_columns",
-        "triggers",
-        "udt_privileges",
-        "usage_privileges",
-        "user_defined_types",
-        "user_mappings",
-        "view_column_usage",
-        "view_routine_usage",
-        "view_table_usage",
-        "views",
-    ] {
-        let sql = format!("SELECT * FROM information_schema.{name}");
-        if touches_leaky_system_catalog(&sql) {
-            bad.push(format!("over-refused IS view: {sql}"));
-        }
-        if !reads_only_server_metadata(&sql) {
-            bad.push(format!("IS view not metadata-only: {sql}"));
+    for (name, safe) in VANILLA_PG_CATALOG {
+        let sql = format!("SELECT * FROM pg_catalog.{name}");
+        if *safe {
+            if any_frontend_refuse(&sql) {
+                bad.push(format!("over-refused vanilla pg: {sql}"));
+            }
+        } else if !any_frontend_refuse(&sql) {
+            bad.push(format!("OPEN vanilla pg: {sql}"));
         }
     }
 

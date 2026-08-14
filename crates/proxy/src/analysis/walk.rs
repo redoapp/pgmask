@@ -2,7 +2,10 @@
 //!
 //! `pg_query::nodes()` is generated from a subset of the protobuf schema and
 //! "doesn't iterate over every possible node type" (upstream). Absence proofs
-//! in this crate use this walk instead of that iterator.
+//! in this crate use this walk instead of that iterator. Completeness against
+//! skipped `ColumnRef` / `FuncCall` / `RangeVar` is the Debug-dump unit test,
+//! not an exhaustive `NodeEnum` match — the catalog analogue is the classified
+//! vanilla surface in `catalog_surface.rs`.
 
 use pg_query::protobuf::node::Node as NodeEnum;
 

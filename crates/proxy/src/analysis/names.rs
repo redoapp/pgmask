@@ -5,6 +5,10 @@
 
 use pg_query::protobuf::node::Node as NodeEnum;
 
+use super::catalog_surface::{
+    relation_is_metadata_safe_information_schema, relation_is_metadata_safe_pg,
+};
+
 /// Functions reporting how much storage an object occupies.
 ///
 /// Every GUI client shows table sizes; Beekeeper's stack and Harlequin both
@@ -243,7 +247,13 @@ pub(crate) fn function_name(parts: &[pg_query::protobuf::Node]) -> Option<String
 /// TOAST heaps are not on this name list: they are `pg_toast.pg_toast_<oid>`
 /// and the oid is not known statically. [`range_var_is_leaky_catalog`] matches
 /// the schema / `pg_toast_` prefix instead.
-const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
+///
+/// Vanilla Postgres 18 names are classified in
+/// [`super::catalog_surface`]. This list is the unqualified fallback
+/// (`user_mapping_options` with empty schema) plus contrib dumps that are
+/// not vanilla (`pg_stat_statements`). A name classified metadata-safe
+/// there must not appear here — CI checks the overlap.
+pub(crate) const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     // Sampled values from user tables.
     "pg_statistic",
     "pg_statistic_ext_data",
@@ -303,231 +313,15 @@ const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     "pg_backend_memory_contexts",
 ];
 
-/// Core `pg_stat_*` views that hold counters, LSNs, or connection *metadata*
-/// — not query text, sampled cell values, or conninfo.
-///
-/// Every other `pg_stat_*` relation is leaky. The previous denylist named
-/// `pg_stat_activity` / `pg_stat_statements` / `pg_stat_wal_receiver` and
-/// treated the rest as metadata-only, which is the same polarity hole as
-/// target-list `FuncCall`: `pg_stat_monitor.query`, `pg_qualstats.constvalue`,
-/// and `pg_store_plans.plan` are other sessions' SQL with literals, and a
-/// name list cannot see the next extension. `\d` does not read these views;
-/// GUIs that show live tuples use `pg_stat_user_tables` / `pg_stat_all_tables`,
-/// which stay allowed. `pg_stat_statements_info` is contrib dealloc counters,
-/// not query text. `pg_stat_progress_*` is a command tag plus counters.
-const METADATA_SAFE_PG_STAT: &[&str] = &[
-    "pg_stat_archiver",
-    "pg_stat_bgwriter",
-    "pg_stat_checkpointer",
-    "pg_stat_database",
-    "pg_stat_database_conflicts",
-    "pg_stat_all_tables",
-    "pg_stat_sys_tables",
-    "pg_stat_user_tables",
-    "pg_stat_xact_all_tables",
-    "pg_stat_xact_sys_tables",
-    "pg_stat_xact_user_tables",
-    "pg_stat_all_indexes",
-    "pg_stat_sys_indexes",
-    "pg_stat_user_indexes",
-    "pg_stat_user_functions",
-    "pg_stat_xact_user_functions",
-    "pg_stat_slru",
-    "pg_stat_replication",
-    "pg_stat_replication_slots",
-    "pg_stat_ssl",
-    "pg_stat_gssapi",
-    "pg_stat_subscription",
-    "pg_stat_subscription_stats",
-    "pg_stat_wal",
-    "pg_stat_io",
-    "pg_stat_recovery_prefetch",
-    "pg_stat_statements_info",
-];
-
-/// Core `pg_catalog` heaps and views that are schema metadata, counters,
-/// or connection *metadata* — not sampled cell values, other sessions' SQL,
-/// passwords, or toasted bytes.
-///
-/// Catalog-shaped RangeVars (`pg_catalog.*`, unqualified `pg_*`) that are
-/// not on this list (and not a prefix below) are leaky. The previous
-/// denylist named `pg_stats` / `pg_stat_activity` / … and treated every
-/// other `pg_catalog` relation as metadata-only, which is the same
-/// polarity as target-list `FuncCall`: `hypopg_list_indexes`,
-/// `citus_lock_waits`, `pg_dist_authinfo`, and the next extension install
-/// into `pg_catalog` with system OIDs. `\d` and GUI browsers read the
-/// names here; they do not read extension dump views.
-///
-/// Prefixes handled in [`relation_is_metadata_safe_pg`]:
-/// `pg_stat_progress_*`, `pg_statio_*`, `pg_wait_sampling*`. Counter
-/// `pg_stat_*` views live in [`METADATA_SAFE_PG_STAT`].
-const METADATA_SAFE_PG_CATALOG: &[&str] = &[
-    // Heaps (PostgreSQL 18 catalogs-overview), minus the leaky ones in
-    // [`LEAKY_SYSTEM_CATALOGS`].
-    "pg_aggregate",
-    "pg_am",
-    "pg_amop",
-    "pg_amproc",
-    "pg_attrdef",
-    "pg_attribute",
-    "pg_auth_members",
-    "pg_cast",
-    "pg_class",
-    "pg_collation",
-    "pg_constraint",
-    "pg_conversion",
-    "pg_database",
-    "pg_db_role_setting",
-    "pg_default_acl",
-    "pg_depend",
-    "pg_description",
-    "pg_enum",
-    "pg_event_trigger",
-    "pg_extension",
-    "pg_foreign_table",
-    "pg_index",
-    "pg_inherits",
-    "pg_init_privs",
-    "pg_language",
-    "pg_largeobject_metadata",
-    "pg_namespace",
-    "pg_opclass",
-    "pg_operator",
-    "pg_opfamily",
-    "pg_parameter_acl",
-    "pg_partitioned_table",
-    "pg_policy",
-    "pg_proc",
-    "pg_publication",
-    "pg_publication_namespace",
-    "pg_publication_rel",
-    "pg_range",
-    "pg_replication_origin",
-    "pg_rewrite",
-    "pg_seclabel",
-    "pg_sequence",
-    "pg_shdepend",
-    "pg_shdescription",
-    "pg_shseclabel",
-    "pg_statistic_ext",
-    "pg_subscription_rel",
-    "pg_tablespace",
-    "pg_transform",
-    "pg_trigger",
-    "pg_ts_config",
-    "pg_ts_config_map",
-    "pg_ts_dict",
-    "pg_ts_parser",
-    "pg_ts_template",
-    "pg_type",
-    // Views (PostgreSQL 18 views-overview), minus dump / secret views.
-    "pg_aios",
-    "pg_available_extensions",
-    "pg_available_extension_versions",
-    "pg_config",
-    "pg_group",
-    "pg_indexes",
-    "pg_locks",
-    "pg_matviews",
-    "pg_policies",
-    "pg_prepared_xacts",
-    "pg_publication_tables",
-    "pg_replication_origin_status",
-    "pg_replication_slots",
-    "pg_roles",
-    "pg_rules",
-    "pg_seclabels",
-    "pg_sequences",
-    "pg_settings",
-    "pg_shmem_allocations",
-    "pg_shmem_allocations_numa",
-    "pg_tables",
-    "pg_timezone_abbrevs",
-    "pg_timezone_names",
-    "pg_views",
-    "pg_wait_events",
-    // Contrib residual: block IDs, not tuple bytes.
-    "pg_buffercache",
-];
-
-/// SQL-standard information_schema views that are names / grants / types,
-/// not FDW option values. Option views and `_pg_*` internals stay leaky.
-/// Every other `information_schema.*` RangeVar is leaky — the previous
-/// schema allowlist was an allow for the next wrapper.
-const METADATA_SAFE_INFORMATION_SCHEMA: &[&str] = &[
-    "administrable_role_authorizations",
-    "applicable_roles",
-    "attributes",
-    "character_sets",
-    "check_constraint_routine_usage",
-    "check_constraints",
-    "collation_character_set_applicability",
-    "collations",
-    "column_column_usage",
-    "column_domain_usage",
-    "column_privileges",
-    "column_udt_usage",
-    "columns",
-    "constraint_column_usage",
-    "constraint_table_usage",
-    "data_type_privileges",
-    "domain_constraints",
-    "domain_udt_usage",
-    "domains",
-    "element_types",
-    "enabled_roles",
-    "foreign_data_wrappers",
-    "foreign_servers",
-    "foreign_tables",
-    "information_schema_catalog_name",
-    "key_column_usage",
-    "parameters",
-    "referential_constraints",
-    "role_column_grants",
-    "role_routine_grants",
-    "role_table_grants",
-    "role_udt_grants",
-    "role_usage_grants",
-    "routine_column_usage",
-    "routine_privileges",
-    "routine_routine_usage",
-    "routine_sequence_usage",
-    "routine_table_usage",
-    "routines",
-    "schemata",
-    "sequences",
-    "sql_features",
-    "sql_implementation_info",
-    "sql_parts",
-    "sql_sizing",
-    "table_constraints",
-    "table_privileges",
-    "tables",
-    "transforms",
-    "triggered_update_columns",
-    "triggers",
-    "udt_privileges",
-    "usage_privileges",
-    "user_defined_types",
-    "user_mappings",
-    "view_column_usage",
-    "view_routine_usage",
-    "view_table_usage",
-    "views",
-];
-
-fn relation_is_metadata_safe_pg(relation: &str) -> bool {
-    if relation.starts_with("pg_stat_progress_")
-        || relation.starts_with("pg_statio_")
-        || relation.starts_with("pg_wait_sampling")
-    {
-        return true;
-    }
-    METADATA_SAFE_PG_CATALOG.contains(&relation) || METADATA_SAFE_PG_STAT.contains(&relation)
-}
-
 /// Catalogs whose rows are user data, session SQL, passwords, or toasted
 /// cell bytes. Refused at the frontend on every posture.
+///
+/// Catalog-shaped names (`pg_catalog.*`, unqualified `pg_*`,
+/// `information_schema.*`) are classified in [`super::catalog_surface`]:
+/// every official Postgres 18 heap/view is metadata-safe XOR leaky, and an
+/// unnamed one is leaky. Prefixes (`pg_stat_progress_*` / `pg_statio_*` /
+/// `pg_wait_sampling*`) and contrib exceptions (`pg_buffercache`,
+/// `pg_stat_statements_info`) live there too.
 pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bool {
     let schema = v.schemaname.to_ascii_lowercase();
     let relation = v.relname.to_ascii_lowercase();
@@ -568,7 +362,7 @@ pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bo
     // `information_schema.not_yet_invented_options`, and the next
     // extension were metadata-only because the schema matched.
     if schema == "information_schema" {
-        return !METADATA_SAFE_INFORMATION_SCHEMA.contains(&relation.as_str());
+        return !relation_is_metadata_safe_information_schema(&relation);
     }
     if schema == "pg_catalog" || (schema.is_empty() && relation.starts_with("pg_")) {
         return !relation_is_metadata_safe_pg(&relation);

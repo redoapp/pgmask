@@ -35,7 +35,15 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   `pg_catalog.hypopg_list_indexes` and `information_schema.not_a_real_view`
   are leaky; `\d` still reads `pg_class` / `pg_attribute` /
   `information_schema.tables`. Unqualified fork names without a `pg_`
-  prefix (`citus_lock_waits`) stay on the substring rules.
+  prefix (`citus_lock_waits`) stay on the substring rules. The vanilla
+  PostgreSQL 18 surface is classified once (`catalog_surface.rs`): every
+  official heap, system view, monitoring-stats view, and
+  `information_schema` relation is metadata-safe XOR leaky. CI fails on
+  duplicates, unsorted names, overlap with the leaky fallback, or a
+  `SELECT * FROM pg_catalog.{name}` that disagrees with the table.
+  Unknown catalog-shaped names stay leaky. Contrib exceptions
+  (`pg_buffercache`, `pg_stat_statements_info`, `pg_wait_sampling*`)
+  stay named separately.
 - SQL `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` / `CLOSE`
   are now refused on **every posture** (`sql_prepare_cursor`). They are a
   second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.
