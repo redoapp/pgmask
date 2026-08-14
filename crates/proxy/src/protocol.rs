@@ -26,6 +26,8 @@ pub const B_NOTICE_RESPONSE: u8 = b'N';
 pub const B_PARAMETER_STATUS: u8 = b'S';
 pub const B_NOTIFICATION_RESPONSE: u8 = b'A';
 pub const B_READY_FOR_QUERY: u8 = b'Z';
+pub const B_COMMAND_COMPLETE: u8 = b'C';
+pub const B_EMPTY_QUERY_RESPONSE: u8 = b'I';
 pub const B_PARSE_COMPLETE: u8 = b'1';
 pub const B_BIND_COMPLETE: u8 = b'2';
 pub const B_COPY_DATA: u8 = b'd';
@@ -41,8 +43,6 @@ pub const BACKEND_CONTROL_TAGS: &[u8] = &[
     b'R', // Authentication*
     b'K', // BackendKeyData
     b'Z', // ReadyForQuery
-    b'C', // CommandComplete
-    b'I', // EmptyQueryResponse
     b'1', // ParseComplete
     b'2', // BindComplete
     b'3', // CloseComplete

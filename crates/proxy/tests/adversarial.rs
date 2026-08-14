@@ -70,6 +70,7 @@ async fn copy_to_stdout_cannot_leak() -> Result<()> {
         let proxy = start_proxy(DB, default_rules()).await?;
         let mut client = RawClient::connect(proxy.addr, DB).await?;
         client.simple_query(sql).await?;
+        assert_refused(&client, sql); // COPY is refused by the read-only allowlist
         assert_no_canary(&client, sql);
     }
     Ok(())
@@ -110,6 +111,9 @@ async fn execute_without_describe_cannot_leak() -> Result<()> {
     client.send(execute_msg("p1", 0)).await?;
     client.send(sync_msg()).await?;
     client.read_until_ready_or_eof().await?;
+    // No Describe means no plan; the rows arrive with no described result set
+    // and are refused rather than served.
+    assert_refused(&client, "Execute without Describe");
     assert_no_canary(&client, "Execute without Describe");
     Ok(())
 }
@@ -139,6 +143,8 @@ async fn rebinding_a_different_statement_cannot_reuse_a_stale_plan() -> Result<(
     client.send(execute_msg("p1", 0)).await?;
     client.send(sync_msg()).await?;
     client.read_until_ready_or_eof().await?;
+    // The rebound portal has no described result set, so it is refused.
+    assert_refused(&client, "re-Bind with a stale plan");
     assert_no_canary(&client, "re-Bind with a stale plan");
     Ok(())
 }
@@ -155,14 +161,17 @@ async fn suspended_and_resumed_portals_stay_masked() -> Result<()> {
         .await?;
     client.send(describe_statement("s1")).await?;
     client.send(bind_msg("p1", "s1")).await?;
-    // One row at a time: the second Execute resumes a suspended portal and
-    // arrives with no fresh RowDescription.
+    // One row at a time, with NO Sync between the two Executes: a Sync closes
+    // the portal, so the earlier version of this test made the second Execute
+    // fail on a non-existent portal and never actually resumed anything — the
+    // canary check passed on that error. Both Executes then one Sync keeps the
+    // portal suspended and resumed, and the second page arrives with no fresh
+    // RowDescription — the path that must still be masked.
+    client.send(execute_msg("p1", 1)).await?;
     client.send(execute_msg("p1", 1)).await?;
     client.send(sync_msg()).await?;
-    client.read_until_ready().await?;
-    client.send(execute_msg("p1", 1)).await?;
-    client.send(sync_msg()).await?;
-    client.read_until_ready_or_eof().await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_served(&msgs, "both pages of the resumed portal");
     assert_no_canary(&client, "resumed portal");
     Ok(())
 }
@@ -191,7 +200,8 @@ async fn pipelined_interleaved_portals_stay_masked() -> Result<()> {
         buf.extend_from_slice(&msg.encode());
     }
     client.send_raw(&buf).await?;
-    client.read_until_ready_or_eof().await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_served(&msgs, "pipelined interleaved portals");
     assert_no_canary(&client, "pipelined interleaved portals");
     Ok(())
 }
@@ -208,8 +218,9 @@ async fn cursors_stay_masked() -> Result<()> {
     client
         .simple_query("DECLARE c CURSOR FOR SELECT email, name, note FROM canary.subjects")
         .await?;
-    client.simple_query("FETCH ALL FROM c").await?;
+    let fetched = client.simple_query("FETCH ALL FROM c").await?;
     client.simple_query("COMMIT").await?;
+    assert_exercised(&fetched, &client, "cursor FETCH");
     assert_no_canary(&client, "cursor FETCH");
     Ok(())
 }
@@ -270,6 +281,9 @@ async fn setof_returning_functions_stay_masked() -> Result<()> {
     client
         .simple_query("SELECT * FROM canary.all_subjects()")
         .await?;
+    // A user-defined SETOF function is not on the trusted allowlist, so it is
+    // refused before it runs — which is why nothing leaks.
+    assert_refused(&client, "SETOF function all_subjects()");
     client.simple_query("SELECT * FROM canary.emails()").await?;
     assert_no_canary(&client, "SETOF function");
     Ok(())
@@ -286,6 +300,9 @@ async fn temp_tables_are_default_denied() -> Result<()> {
     client
         .simple_query("CREATE TEMP TABLE stash AS SELECT email, name FROM canary.subjects")
         .await?;
+    // The read-only allowlist refuses the CREATE, so the laundering table is
+    // never even made.
+    assert_refused(&client, "CREATE TEMP TABLE");
     client.simple_query("SELECT * FROM stash").await?;
     assert_no_canary(&client, "temp table laundering");
     Ok(())
@@ -315,6 +332,7 @@ async fn expressions_and_set_operations_cannot_leak() -> Result<()> {
         "SELECT array_agg(email) FROM canary.subjects",
     ] {
         client.simple_query(sql).await?;
+        assert_refused(&client, sql); // every one is an expression/set-op: opaque, refused
         assert_no_canary(&client, sql);
     }
     Ok(())
@@ -331,9 +349,10 @@ async fn search_path_changes_cannot_launder() -> Result<()> {
     // Reaching the same relation by an unqualified name must classify the same,
     // because the catalog is keyed on OID rather than on anything textual.
     client.simple_query("SET search_path TO canary").await?;
-    client
+    let msgs = client
         .simple_query("SELECT email, name FROM subjects")
         .await?;
+    assert_served(&msgs, "unqualified name after SET search_path");
     assert_no_canary(&client, "unqualified name after SET search_path");
     Ok(())
 }
@@ -344,9 +363,10 @@ async fn views_are_masked_through_their_own_oid() -> Result<()> {
     load_schema(DB).await?;
     let proxy = start_proxy(DB, default_rules()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
-    client
+    let msgs = client
         .simple_query("SELECT * FROM canary.subject_view")
         .await?;
+    assert_served(&msgs, "view");
     assert_no_canary(&client, "view");
     Ok(())
 }
@@ -437,12 +457,18 @@ async fn no_canary_escapes_across_every_path() -> Result<()> {
         "SELECT note FROM canary.subjects",
     ] {
         // Some of these hang the connection up by design; reconnect and continue.
-        if client.simple_query(sql).await.is_err() {
-            assert_no_canary(&client, sql);
-            client = RawClient::connect(proxy.addr, DB).await?;
-            continue;
+        match client.simple_query(sql).await {
+            Ok(msgs) => {
+                assert_exercised(&msgs, &client, sql);
+                assert_no_canary(&client, sql);
+            }
+            Err(_) => {
+                // Errored or hung up: the refusal is what closed the path.
+                assert_refused(&client, sql);
+                assert_no_canary(&client, sql);
+                client = RawClient::connect(proxy.addr, DB).await?;
+            }
         }
-        assert_no_canary(&client, sql);
     }
 
     assert_no_canary(&client, "full sweep");
@@ -490,12 +516,18 @@ async fn relations_that_are_not_plain_tables_stay_masked() -> Result<()> {
         "SELECT email_copy FROM canary.derived",
         "SELECT email, email_copy FROM canary.derived",
     ] {
-        if client.simple_query(sql).await.is_err() {
-            assert_no_canary(&client, sql);
-            client = RawClient::connect(proxy.addr, DB).await?;
-            continue;
+        match client.simple_query(sql).await {
+            Ok(msgs) => {
+                assert_exercised(&msgs, &client, sql);
+                assert_no_canary(&client, sql);
+            }
+            Err(_) => {
+                // Errored or hung up: the refusal is what closed the path.
+                assert_refused(&client, sql);
+                assert_no_canary(&client, sql);
+                client = RawClient::connect(proxy.addr, DB).await?;
+            }
         }
-        assert_no_canary(&client, sql);
     }
 
     assert_no_canary(&client, "non-plain-table sweep");
@@ -631,6 +663,15 @@ async fn an_error_message_chosen_by_sql_cannot_carry_a_value() -> Result<()> {
             !reply.contains("CANAR"),
             "a prefix of the canary crossed the boundary via {sql}:\n{reply}"
         );
+        // Every one of these is a DO block or an INSERT that constructs the
+        // leaking error, and the read-only allowlist refuses them before the
+        // backend runs them. Pin that refusal, or a value that stopped being
+        // refused-and-started-carrying would pass the prefix check on a reply
+        // that never contained the error at all.
+        assert!(
+            reply.contains("pgmask:"),
+            "the leaking statement must be refused, not silently accepted:\n{reply}"
+        );
         assert_no_canary(&client, sql);
         if failed {
             client = RawClient::connect(proxy.addr, DB).await?;
@@ -707,6 +748,7 @@ async fn a_notice_cannot_smuggle_a_value_through_its_sqlstate() -> Result<()> {
             !reply.contains("CANAR"),
             "{level} carried five characters of the value:\n{reply}"
         );
+        assert_refused(&client, &sql); // the DO block is refused by the read-only allowlist
         assert_no_canary(&client, &sql);
         client = RawClient::connect(proxy.addr, DB).await?;
     }
@@ -945,12 +987,18 @@ async fn an_empty_catalog_masks_everything_and_still_refuses() -> Result<()> {
         "SELECT city, count(*) FROM canary.subjects GROUP BY city",
         "SELECT lower(email) FROM canary.subjects",
     ] {
-        if client.simple_query(sql).await.is_err() {
-            assert_no_canary(&client, sql);
-            client = RawClient::connect(proxy.addr, DB).await?;
-            continue;
+        match client.simple_query(sql).await {
+            Ok(msgs) => {
+                assert_exercised(&msgs, &client, sql);
+                assert_no_canary(&client, sql);
+            }
+            Err(_) => {
+                // Errored or hung up: the refusal is what closed the path.
+                assert_refused(&client, sql);
+                assert_no_canary(&client, sql);
+                client = RawClient::connect(proxy.addr, DB).await?;
+            }
         }
-        assert_no_canary(&client, sql);
     }
     Ok(())
 }
@@ -1045,7 +1093,8 @@ async fn the_rescue_path_cannot_be_tricked() -> Result<()> {
         "SELECT 1, email FROM canary.subjects",
         "SELECT 1 UNION ALL SELECT 1",
     ] {
-        client.simple_query(sql).await?;
+        let msgs = client.simple_query(sql).await?;
+        assert_exercised(&msgs, &client, sql); // rescued-and-served or refused, never silent
         assert_no_canary(&client, sql);
     }
     Ok(())
@@ -1064,7 +1113,8 @@ async fn a_star_expansion_cannot_shift_a_literal_onto_a_column() -> Result<()> {
         "SELECT 1, * FROM canary.subjects",
         "SELECT s.*, count(*) OVER () FROM canary.subjects s",
     ] {
-        client.simple_query(sql).await?;
+        let msgs = client.simple_query(sql).await?;
+        assert_exercised(&msgs, &client, sql); // served-masked or refused, never silent
         assert_no_canary(&client, sql);
     }
     Ok(())
@@ -1164,9 +1214,10 @@ async fn a_reshaped_masked_column_stays_masked_under_default_deny() -> Result<()
     let proxy = start_proxy_with(DB, rules, Unclassified::Mask, Opaque::Reject).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
 
-    client
+    let before = client
         .simple_query("SELECT secret FROM canary.reshape")
         .await?;
+    assert_served(&before, "reshape: before ALTER"); // masked (NULL), but served
     assert_no_canary(&client, "reshape: before ALTER");
 
     // Move the attnum out from under the snapshot.
@@ -1181,9 +1232,13 @@ async fn a_reshaped_masked_column_stays_masked_under_default_deny() -> Result<()
     // The snapshot still points at the old attnum; the new one is a lookup
     // miss. Default-deny must mask it, with no dependence on refresh timing.
     let mut after = RawClient::connect(proxy.addr, DB).await?;
-    after
+    let msgs = after
         .simple_query("SELECT secret FROM canary.reshape")
         .await?;
+    // Default-deny masks the reshaped column to NULL and still serves the row —
+    // the guarantee is that the value never appears, not that the query is
+    // refused.
+    assert_served(&msgs, "reshape: immediately after ALTER");
     assert_no_canary(&after, "reshape: immediately after ALTER");
 
     exec_direct(DB, "DROP TABLE IF EXISTS canary.reshape").await?;
