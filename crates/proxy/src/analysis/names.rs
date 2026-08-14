@@ -1,14 +1,9 @@
-//! Function and catalog name lists the rest of analysis consults.
+//! Function name lists the rest of analysis consults.
 //!
 //! Allowlists, not denylists: a name we fail to recognise is refused, never
 //! released. Adding a name is a deliberate, reviewable act.
 
 use pg_query::protobuf::node::Node as NodeEnum;
-
-use super::catalog_surface::{
-    relation_is_classified_leaky, relation_is_metadata_safe_information_schema,
-    relation_is_metadata_safe_pg,
-};
 
 /// Functions reporting how much storage an object occupies.
 ///
@@ -231,76 +226,6 @@ pub(crate) fn function_name(parts: &[pg_query::protobuf::Node]) -> Option<String
         NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
         _ => None,
     }
-}
-
-/// Catalogs whose rows are user data, session SQL, passwords, or toasted
-/// cell bytes. Refused at the frontend on every posture.
-///
-/// Classification lives in [`super::catalog_surface`]: every official
-/// Postgres 18 heap/view is metadata-safe XOR leaky. A classified-leaky
-/// name is leaky in any schema. Catalog-shaped unknown names are leaky.
-/// Named contrib exceptions (`pg_buffercache`, `pg_stat_statements_info`,
-/// `pg_wait_sampling_{profile,history,current}`) stay allowed. The rules
-/// outside that table are TOAST, future `_pg_*` wrappers, and unqualified
-/// fork dumps that are not catalog-shaped.
-pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bool {
-    let schema = v.schemaname.to_ascii_lowercase();
-    let relation = v.relname.to_ascii_lowercase();
-    // TOAST heaps are the toasted bytes of user columns, masked ones
-    // included. `reltoastrelid` from `pg_class` plus `SET search_path TO
-    // pg_toast` makes `SELECT count(*) FROM pg_toast_NNNN WHERE chunk_data
-    // LIKE '%x%'` a membership oracle. `chunk_data` is not in the snapshot
-    // (the loader skips `pg_toast`), so the hostile name set never sees it.
-    // Unqualified `pg_toast_*` is catalog-shaped (`pg_` prefix) and would
-    // otherwise look metadata-only.
-    if schema == "pg_toast" || relation.starts_with("pg_toast_") {
-        return true;
-    }
-    // information_schema implements SQL/MED option views on `_pg_*`
-    // base views. New ones keep that prefix; a name list alone misses
-    // the next wrapper. Unqualified `_pg_*` is the same views after
-    // `SET search_path TO information_schema` (RangeVar.schemaname is
-    // empty). A CTE named `_pg_foo` would also match — fail closed.
-    // `_pg_*` *functions* (`_pg_truetypid`) are FuncCalls, not
-    // RangeVars, and stay catalog-safe helpers.
-    if relation.starts_with("_pg_") && (schema.is_empty() || schema == "information_schema") {
-        return true;
-    }
-    // Fork dumps whose *unqualified* names are not catalog-shaped
-    // (`citus_lock_waits` has no `pg_` prefix). Invert never sees them.
-    // Qualified `pg_catalog.citus_lock_waits` is unknown and leaky anyway.
-    // `pg_stat_statements_info` is a counter view and must stay off
-    // the `stat_statements` substring.
-    if is_non_catalog_shaped_fork_dump(&relation) {
-        return true;
-    }
-    // Classified leaky in any schema: `public.pg_stats` and unqualified
-    // `user_mapping_options` wrap the same secrets the table already named.
-    if relation_is_classified_leaky(&relation) {
-        return true;
-    }
-    // Invert: a catalog-shaped name not classified metadata-safe is leaky.
-    // `pg_catalog.hypopg_list_indexes`, `pg_dist_authinfo`,
-    // `information_schema.not_yet_invented_options`, and the next
-    // extension were metadata-only because the schema matched.
-    if schema == "information_schema" {
-        return !relation_is_metadata_safe_information_schema(&relation);
-    }
-    if schema == "pg_catalog" || (schema.is_empty() && relation.starts_with("pg_")) {
-        return !relation_is_metadata_safe_pg(&relation);
-    }
-    false
-}
-
-/// Unqualified fork dumps invert cannot see (`citus_lock_waits` has no `pg_`
-/// prefix). Substring, not a name list: the next `edb_stat_activity` must
-/// fail closed. Catalog-shaped forks (`pg_dist_*`) are unknown and leaky
-/// via invert instead.
-fn is_non_catalog_shaped_fork_dump(relation: &str) -> bool {
-    relation.starts_with("citus_stat_")
-        || relation.contains("stat_activity")
-        || relation.contains("lock_waits")
-        || (relation.contains("stat_statements") && !relation_is_metadata_safe_pg(relation))
 }
 
 /// Functions that reach data the parse tree never names.

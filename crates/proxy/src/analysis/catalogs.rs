@@ -19,9 +19,10 @@
 
 use pg_query::protobuf::node::Node as NodeEnum;
 
+use super::catalog_surface::range_var_is_leaky_catalog;
 use super::names::{
-    func_call_name_parts, is_trusted_function_name, range_var_is_leaky_catalog,
-    CATALOG_ESCAPE_FUNCTIONS, CATALOG_HELPER_FUNCTIONS, GENERATORS_IN_FROM,
+    func_call_name_parts, is_trusted_function_name, CATALOG_ESCAPE_FUNCTIONS,
+    CATALOG_HELPER_FUNCTIONS, GENERATORS_IN_FROM,
 };
 use super::walk::{tree_any, walk_parsed};
 use super::StatementInspection;

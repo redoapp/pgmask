@@ -4,7 +4,7 @@
 //! ([views-overview][2]), monitoring-stats view ([monitoring-stats][3]), and
 //! `information_schema` relation (`information_schema.sql`) is either
 //! metadata-safe or leaky. There is no third bucket. Unknown catalog-shaped
-//! names stay leaky via the invert in [`super::names::range_var_is_leaky_catalog`].
+//! names stay leaky via the invert in [`range_var_is_leaky_catalog`].
 //!
 //! Contrib exceptions (`pg_buffercache`, `pg_stat_statements_info`,
 //! `pg_wait_sampling_{profile,history,current}`) are named separately.
@@ -301,7 +301,7 @@ pub(crate) fn relation_is_metadata_safe_pg(relation: &str) -> bool {
 ///
 /// Applied in any schema: `public.pg_stats` and unqualified
 /// `user_mapping_options` (after `SET search_path`) wrap the same secrets.
-pub(crate) fn relation_is_classified_leaky(relation: &str) -> bool {
+fn relation_is_classified_leaky(relation: &str) -> bool {
     matches!(vanilla_pg_classification(relation), Some(false))
         || matches!(
             vanilla_information_schema_classification(relation),
@@ -312,10 +312,79 @@ pub(crate) fn relation_is_classified_leaky(relation: &str) -> bool {
 /// Whether an `information_schema` relation is metadata-safe.
 ///
 /// Unknown views are leaky. `_pg_*` internals are classified leaky in the
-/// table; the prefix rule in [`super::names::range_var_is_leaky_catalog`]
-/// still catches a future wrapper the table has not named.
+/// table; the prefix rule in [`range_var_is_leaky_catalog`] still catches a
+/// future wrapper the table has not named.
 pub(crate) fn relation_is_metadata_safe_information_schema(relation: &str) -> bool {
     vanilla_information_schema_classification(relation).unwrap_or(false)
+}
+
+/// Catalogs whose rows are user data, session SQL, passwords, or toasted
+/// cell bytes. Refused at the frontend on every posture.
+///
+/// A classified-leaky name is leaky in any schema. Catalog-shaped unknown
+/// names are leaky. Named contrib exceptions stay allowed. The rules
+/// outside the tables are TOAST oids, future `_pg_*` wrappers, and
+/// unqualified fork dumps that are not catalog-shaped.
+pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bool {
+    let schema = v.schemaname.to_ascii_lowercase();
+    let relation = v.relname.to_ascii_lowercase();
+    // TOAST heaps are the toasted bytes of user columns, masked ones
+    // included. `reltoastrelid` from `pg_class` plus `SET search_path TO
+    // pg_toast` makes `SELECT count(*) FROM pg_toast_NNNN WHERE chunk_data
+    // LIKE '%x%'` a membership oracle. `chunk_data` is not in the snapshot
+    // (the loader skips `pg_toast`), so the hostile name set never sees it.
+    // Unqualified `pg_toast_*` is catalog-shaped (`pg_` prefix) and would
+    // otherwise look metadata-only.
+    if schema == "pg_toast" || relation.starts_with("pg_toast_") {
+        return true;
+    }
+    // information_schema implements SQL/MED option views on `_pg_*`
+    // base views. New ones keep that prefix; a name list alone misses
+    // the next wrapper. Unqualified `_pg_*` is the same views after
+    // `SET search_path TO information_schema` (RangeVar.schemaname is
+    // empty). A CTE named `_pg_foo` would also match — fail closed.
+    // `_pg_*` *functions* (`_pg_truetypid`) are FuncCalls, not
+    // RangeVars, and stay catalog-safe helpers.
+    if relation.starts_with("_pg_") && (schema.is_empty() || schema == "information_schema") {
+        return true;
+    }
+    // Fork dumps whose *unqualified* names are not catalog-shaped
+    // (`citus_lock_waits` has no `pg_` prefix). Invert never sees them.
+    // Catalog-shaped names (`pg_stat_activity`, `pg_stat_statements_info`)
+    // go through classification / invert instead of these substrings.
+    if is_non_catalog_shaped_fork_dump(&relation) {
+        return true;
+    }
+    // Classified leaky in any schema: `public.pg_stats` and unqualified
+    // `user_mapping_options` wrap the same secrets the table already named.
+    if relation_is_classified_leaky(&relation) {
+        return true;
+    }
+    // Invert: a catalog-shaped name not classified metadata-safe is leaky.
+    // `pg_catalog.hypopg_list_indexes`, `pg_dist_authinfo`,
+    // `information_schema.not_yet_invented_options`, and the next
+    // extension were metadata-only because the schema matched.
+    if schema == "information_schema" {
+        return !relation_is_metadata_safe_information_schema(&relation);
+    }
+    if schema == "pg_catalog" || (schema.is_empty() && relation.starts_with("pg_")) {
+        return !relation_is_metadata_safe_pg(&relation);
+    }
+    false
+}
+
+/// Unqualified fork dumps invert cannot see (`citus_lock_waits` has no `pg_`
+/// prefix). Substring, not a name list: the next `edb_stat_activity` must
+/// fail closed. `pg_*` names are skipped so `pg_stat_statements_info` is
+/// not a special case on the `stat_statements` substring.
+fn is_non_catalog_shaped_fork_dump(relation: &str) -> bool {
+    if relation.starts_with("pg_") {
+        return false;
+    }
+    relation.starts_with("citus_stat_")
+        || relation.contains("stat_activity")
+        || relation.contains("lock_waits")
+        || relation.contains("stat_statements")
 }
 
 #[cfg(test)]
@@ -467,6 +536,26 @@ mod tests {
         ));
         // Unqualified name/grant views are not leaky: they might be user tables.
         assert!(!touches_leaky_system_catalog("SELECT * FROM tables"));
+    }
+
+    #[test]
+    fn fork_substrings_skip_catalog_shaped_names() {
+        assert!(!is_non_catalog_shaped_fork_dump("pg_stat_statements_info"));
+        assert!(!is_non_catalog_shaped_fork_dump("pg_stat_activity"));
+        assert!(is_non_catalog_shaped_fork_dump("citus_stat_activity"));
+        assert!(is_non_catalog_shaped_fork_dump("edb_stat_activity"));
+        assert!(is_non_catalog_shaped_fork_dump("citus_lock_waits"));
+        assert!(is_non_catalog_shaped_fork_dump("citus_stat_statements"));
+        assert!(is_non_catalog_shaped_fork_dump("citus_stat_tenants"));
+        assert!(!touches_leaky_system_catalog(
+            "SELECT * FROM pg_catalog.pg_stat_statements_info"
+        ));
+        assert!(touches_leaky_system_catalog(
+            "SELECT * FROM pg_catalog.pg_stat_activity"
+        ));
+        assert!(touches_leaky_system_catalog(
+            "SELECT * FROM citus_stat_statements"
+        ));
     }
 
     #[test]

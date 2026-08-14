@@ -48,7 +48,9 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   catalog-shaped names stay leaky. Named contrib exceptions
   (`pg_buffercache`, `pg_stat_statements_info`,
   `pg_wait_sampling_{profile,history,current}`) stay off the vanilla
-  table.
+  table. The leaky-catalog gate lives in that file. Fork substrings skip
+  `pg_*` names, so `pg_stat_statements_info` is not a special case on
+  `stat_statements`.
 - SQL `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` / `CLOSE`
   are now refused on **every posture** (`sql_prepare_cursor`). They are a
   second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.
