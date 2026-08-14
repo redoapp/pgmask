@@ -115,7 +115,7 @@ refuses to pass on a technicality: a poison run with masking removed must trip
 the oracle first, a run that never reached masked data exits VACUOUS, the
 harness refusal count is cross-checked against the proxy's own metrics, and the
 fixture is verified unchanged. Beyond that: more fixture shapes,
-and someone other than Claude reading `analysis.rs` and `lineage.rs`.
+and someone other than Claude reading `analysis/` and `lineage.rs`.
 
 `scripts/test-fuzz.sh` also runs 12 binary-result-format checks, 21,600
 per-principal assertions across 24 concurrent sessions of three principals, and
@@ -162,7 +162,7 @@ Fields with no provenance are refused — except for a short allowlist of
 expression shapes positively known to carry no column value (`SELECT 1`,
 `now()`, `count(*)`). That rule is an allowlist rather than a search for column
 references because it converts refusals into acceptances, so unsoundness there
-means a leak; see [`crates/proxy/src/analysis.rs`](crates/proxy/src/analysis.rs).
+means a leak; see [`crates/proxy/src/analysis/`](crates/proxy/src/analysis/).
 It cut the false-rejection rate on a real workload from 23% to 6%.
 
 **Provenance is necessary but not sufficient.** Where one output field draws

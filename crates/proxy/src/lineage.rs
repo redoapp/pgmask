@@ -11,7 +11,7 @@
 //! # This inverts the safety property, so read the guards
 //!
 //! Everywhere else in pgmask, missing something costs utility. The allowlist in
-//! `analysis.rs` is sound by construction: a shape we fail to recognise is a
+//! `analysis` is sound by construction: a shape we fail to recognise is a
 //! shape we refuse.
 //!
 //! Here it is the other way round. A source column we fail to notice is a
@@ -38,7 +38,7 @@
 //!    or "did not look inside", and the type cannot distinguish them: `count(*)`
 //!    and a string literal sit in the same bucket as a `CASE` over scalar
 //!    subqueries whose sources were missed. Costs nothing to refuse, because
-//!    `analysis.rs` already releases `count(*)` and literals by shape.
+//!    `analysis` already releases `count(*)` and literals by shape.
 //! 3. A mapping count that does not match the field count is unresolved. We
 //!    address fields by position, and a mismatch means the positions are not
 //!    ours to claim.
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn an_empty_source_list_is_unresolved_not_safe() {
         // `count(*)` genuinely has no sources; a CASE over scalar subqueries
-        // whose sources were missed looks identical. analysis.rs releases the
+        // whose sources were missed looks identical. analysis releases the
         // first by shape, so refusing both here costs nothing.
         assert_eq!(one("SELECT count(*) FROM demo.orders"), Verdict::Unresolved);
         assert_eq!(one("SELECT 'literal'"), Verdict::Unresolved);

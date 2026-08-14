@@ -79,7 +79,7 @@ not how anyone writes SQL. Two consequences:
 
 1. The "expressions 47% / aggregates 33%" split from the Neon run is skewed the
    same way and should be treated as indicative, not measured.
-2. The fix is available and cheap: bucket causes with `analysis.rs`, which reads
+2. The fix is available and cheap: bucket causes with `analysis`, which reads
    the expression shape from the parse tree and does not care what the field was
    aliased to. The heuristic was the right call when there was no parser; there
    is one now.

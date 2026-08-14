@@ -86,6 +86,9 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
 - `(SELECT * FROM customers) AS t(c1,c2,…)` and `WITH q(c1,c2,…) AS (SELECT *)`
   — column-list aliases on subqueries and CTEs hid `email` behind `c2`
 - `json_arrayagg(city) OVER (PARTITION BY u&"email")` — `JsonAggConstructor.over`
+- `analysis.rs` is now `crates/proxy/src/analysis/` (`walk`, `names`, `safety`,
+  `catalogs`, `hostile`, `frontend`). Public `crate::analysis::*` paths are
+  unchanged.
 
 Unparseable SQL with a unicode-escaped masked name failed *open*: the lexer
 sees no `email` token, the tree walk returns nothing, and the gate treated

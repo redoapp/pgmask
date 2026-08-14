@@ -61,7 +61,7 @@ something reassuring.
 
 Neither setting authenticates the database. An attacker who can intercept the
 proxy-to-database connection reads every masked column unmasked, and no rule in
-`analysis.rs` has anything to say about it. Put the proxy where that hop is
+`analysis` has anything to say about it. Put the proxy where that hop is
 short — a unix socket, a sidecar, a private subnet — and treat "pgmask is in
 front of it" as saying nothing about network position.
 
@@ -655,7 +655,7 @@ arrived the next morning, in the one module the preceding sweep never opened,
 and the sweep missed it because it asked what values could reach the client and
 never asked what carried them. Each sweep has found the previous sweep's frame.
 
-A human adversary should start with `crates/proxy/src/analysis.rs`, and should
+A human adversary should start with `crates/proxy/src/analysis/`, and should
 distrust the comments. They are unusually detailed and load-bearing, which makes
 them read as specifications; two of today's disclosures were sitting behind a
 comment that asserted the case could not happen.

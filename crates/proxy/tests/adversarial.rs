@@ -1044,7 +1044,7 @@ async fn an_error_still_carries_its_sqlstate() -> Result<()> {
 
 // --- The rescue path --------------------------------------------------------
 //
-// analysis.rs turns refusals into passthroughs for expressions positively
+// analysis turns refusals into passthroughs for expressions positively
 // identified as carrying no column value. That direction is the dangerous one:
 // a wrong rule here is a leak, not a false pass. These tests exist to make sure
 // nothing can ride through it.

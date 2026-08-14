@@ -138,7 +138,7 @@ check "1. psql connects and queries through the proxy" \
 
 # 1b — a constant has no provenance, but it is positively identifiable as
 # carrying no column value, so it is served rather than refused. This used to
-# fail and break SELECT 1 health checks; see crates/proxy/src/analysis.rs.
+# fail and break SELECT 1 health checks; see crates/proxy/src/analysis/.
 check "1b. literal-only SELECT is served (health checks work)" \
   "1" "$(proxied 'SELECT 1;')"
 check "1c. count(*) is served" \

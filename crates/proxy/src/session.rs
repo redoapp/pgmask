@@ -173,7 +173,7 @@ impl Policy {
             let spec = if !field.has_provenance() || !trust_provenance {
                 // An expression we positively identified as carrying no column
                 // value — `SELECT 1`, `now()`, `count(*)`. Passing it through is
-                // the point of the analysis; see analysis.rs for why the rule is
+                // the point of the analysis; see analysis/ for why the rule is
                 // an allowlist of shapes rather than a search for column refs.
                 if provably_safe {
                     self.metrics.record_rescued();
@@ -1133,7 +1133,7 @@ impl Session {
         // sort order of masked values is accepted). Whole-row casts/refs
         // (`t::text`) are refused — they embed cleartext without naming
         // columns. Closes WHERE/LIKE, single-row aggregates and the
-        // error-channel CASE — see analysis.rs.
+        // error-channel CASE — see analysis/.
         if self.policy.posture == Posture::Hostile {
             let masked = snapshot.masked_bare_names_for_roles(&self.roles);
             let relations = snapshot.relation_columns_map();

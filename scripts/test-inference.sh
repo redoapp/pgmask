@@ -282,7 +282,7 @@ printf '%d still recoverable, %d governed, %d unexpected\n' "$recoverable" "$gov
 [[ "$fail" -eq 0 ]] || {
   echo
   echo "Something that used to be recoverable no longer is. That is good news,"
-  echo "but the threat model in analysis.rs and README.md describes the old"
+  echo "but the threat model in analysis/ and README.md describes the old"
   echo "behaviour — update them, then update this suite."
   exit 1
 }
