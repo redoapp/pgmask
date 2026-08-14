@@ -2,7 +2,10 @@
 //!
 //! `pg_query::nodes()` is generated from a subset of the protobuf schema and
 //! "doesn't iterate over every possible node type" (upstream). Absence proofs
-//! in this crate use this walk instead of that iterator.
+//! in this crate use this walk instead of that iterator. Completeness against
+//! skipped `ColumnRef` / `FuncCall` / `RangeVar` is the Debug-dump unit test,
+//! not an exhaustive `NodeEnum` match — the catalog analogue is the classified
+//! vanilla surface in `catalog_surface.rs`.
 
 use pg_query::protobuf::node::Node as NodeEnum;
 
@@ -82,6 +85,34 @@ fn visit_json_agg_constructor_children(
     }
     if let Some(over) = ctor.over.as_ref() {
         for_each_window_def_child(over, visit);
+    }
+}
+
+/// `RangeVar` is a protobuf message, not always a `Node`. COPY / SELECT INTO
+/// store it that way; wrapping lets the shared walk see the relation the
+/// same way a FROM-clause RangeVar is seen.
+fn visit_range_var(
+    rel: &pg_query::protobuf::RangeVar,
+    visit: &mut dyn FnMut(&pg_query::protobuf::Node),
+) {
+    let wrap = pg_query::protobuf::Node {
+        node: Some(NodeEnum::RangeVar(rel.clone())),
+    };
+    visit(&wrap);
+}
+
+fn visit_into_clause(
+    into: &pg_query::protobuf::IntoClause,
+    visit: &mut dyn FnMut(&pg_query::protobuf::Node),
+) {
+    if let Some(rel) = into.rel.as_ref() {
+        visit_range_var(rel, visit);
+    }
+    for n in into.col_names.iter().chain(into.options.iter()) {
+        visit(n);
+    }
+    if let Some(q) = into.view_query.as_ref() {
+        visit(q);
     }
 }
 
@@ -203,7 +234,12 @@ fn for_each_child_node(
             }
         }
         Some(NodeEnum::XmlExpr(xml)) => {
-            for arg in xml.args.iter().chain(xml.named_args.iter()) {
+            for arg in xml
+                .args
+                .iter()
+                .chain(xml.named_args.iter())
+                .chain(xml.arg_names.iter())
+            {
                 visit(arg);
             }
         }
@@ -282,6 +318,9 @@ fn for_each_child_node(
                 for cte in &with.ctes {
                     visit(cte);
                 }
+            }
+            if let Some(into) = select.into_clause.as_ref() {
+                visit_into_clause(into, visit);
             }
             if let Some(left) = select.larg.as_ref() {
                 let wrap = pg_query::protobuf::Node {
@@ -418,6 +457,9 @@ fn for_each_child_node(
             }
         }
         Some(NodeEnum::CopyStmt(c)) => {
+            if let Some(rel) = c.relation.as_ref() {
+                visit_range_var(rel, visit);
+            }
             if let Some(q) = c.query.as_ref() {
                 visit(q);
             }
@@ -723,10 +765,60 @@ fn for_each_child_node(
             for c in &d.constraints {
                 visit(c);
             }
+            for opt in &d.fdwoptions {
+                visit(opt);
+            }
         }
         Some(NodeEnum::Constraint(c)) => {
             if let Some(e) = c.raw_expr.as_ref() {
                 visit(e);
+            }
+            for n in c.keys.iter().chain(c.exclusions.iter()) {
+                visit(n);
+            }
+        }
+        Some(NodeEnum::CollateExpr(c)) => {
+            if let Some(arg) = c.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::CoerceToDomain(c)) => {
+            if let Some(arg) = c.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::WindowFuncRunCondition(c)) => {
+            if let Some(arg) = c.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::WithClause(w)) => {
+            for cte in &w.ctes {
+                visit(cte);
+            }
+        }
+        Some(NodeEnum::JsonOutput(j)) => visit_json_output(Some(j), visit),
+        Some(NodeEnum::IntoClause(into)) => visit_into_clause(into, visit),
+        Some(NodeEnum::CallStmt(c)) => {
+            if let Some(call) = c.funccall.as_ref() {
+                let wrap = pg_query::protobuf::Node {
+                    node: Some(NodeEnum::FuncCall(call.clone())),
+                };
+                visit(&wrap);
+            }
+            if let Some(expr) = c.funcexpr.as_ref() {
+                let wrap = pg_query::protobuf::Node {
+                    node: Some(NodeEnum::FuncExpr(expr.clone())),
+                };
+                visit(&wrap);
+            }
+            for arg in &c.outargs {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::FuncExpr(f)) => {
+            for arg in &f.args {
+                visit(arg);
             }
         }
         Some(NodeEnum::CoerceViaIo(c)) => {

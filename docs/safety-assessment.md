@@ -158,7 +158,19 @@ refused on every posture (`sql_prepare_cursor`); ordinary `SELECT` (including
 `SELECT … FETCH FIRST n ROWS`) and protocol Parse/Bind stay allowed. `EXPLAIN`
 of those same SELECTs is allowed; `EXPLAIN` of a predicate oracle is not.
 `pg_cursors` and `pg_stat_wal_receiver` join the leaky-catalog refuse list
-(session SQL text / replication conninfo). Residual
+(session SQL text / replication conninfo). Unknown `pg_stat_*` views are
+leaky too (`pg_stat_monitor` and the next extension were metadata-only);
+core counter / progress views stay allowed. `pg_show_plans` /
+`pg_query_state` and fork `*_stat_activity` / `*_stat_statements` views
+in `pg_catalog` are the same dump without that prefix. Citus
+`citus_lock_waits` / `citus_stat_tenants` / `pg_dist_*` (authinfo,
+background-task SQL, shard range keys) were still metadata-only.
+Catalog-shaped RangeVars are classified once against the vanilla
+PostgreSQL 18 surface (every official heap/view/IS relation is
+metadata-safe XOR leaky); classified-leaky names are leaky in any
+schema, and an unnamed `pg_catalog` / `information_schema` relation is
+leaky.
+Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and
 cleartext sort order among masked projections).

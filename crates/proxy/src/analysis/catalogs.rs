@@ -19,9 +19,10 @@
 
 use pg_query::protobuf::node::Node as NodeEnum;
 
+use super::catalog_surface::range_var_is_leaky_catalog;
 use super::names::{
-    func_call_name_parts, is_trusted_function_name, range_var_is_leaky_catalog,
-    CATALOG_ESCAPE_FUNCTIONS, CATALOG_HELPER_FUNCTIONS, GENERATORS_IN_FROM,
+    func_call_name_parts, is_trusted_function_name, CATALOG_ESCAPE_FUNCTIONS,
+    CATALOG_HELPER_FUNCTIONS, GENERATORS_IN_FROM,
 };
 use super::walk::{tree_any, walk_parsed};
 use super::StatementInspection;
@@ -136,11 +137,10 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
             }
             // A set-returning function in `FROM`.
             //
-            // `LEAKY_SYSTEM_CATALOGS` denies `pg_stat_activity` and
-            // `pg_stat_statements` — "other sessions' SQL text, literals
-            // included". Those are *views*, and the SRFs behind them produce
-            // identical rows while appearing as a `RangeFunction` that neither
-            // the RangeVar arm nor the escape list matches:
+            // Classified-leaky catalogs (`pg_stat_activity`, `pg_stat_statements`)
+            // are views. The SRFs behind them produce identical rows while
+            // appearing as a `RangeFunction` that neither the RangeVar arm nor
+            // the escape list matches:
             //
             //   SELECT a.query FROM pg_stat_get_activity(NULL) a, pg_class c
             //

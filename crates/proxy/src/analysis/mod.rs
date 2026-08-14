@@ -88,6 +88,7 @@ use std::sync::OnceLock;
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::SelectStmt;
 
+mod catalog_surface;
 mod catalogs;
 mod frontend;
 mod hostile;
@@ -95,6 +96,7 @@ mod names;
 mod safety;
 mod walk;
 
+pub use catalog_surface::{VANILLA_INFORMATION_SCHEMA, VANILLA_PG_CATALOG};
 pub use catalogs::{
     every_relation_is_qualified, provenance_is_trustworthy, reads_only_server_metadata,
     touches_leaky_system_catalog,

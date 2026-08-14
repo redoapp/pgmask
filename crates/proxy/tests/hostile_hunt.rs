@@ -15,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 use pgmask::analysis::{
     calls_untrusted_function, hostile_join_or_rename_masked, hostile_uses_whole_row,
     is_sql_prepare_or_cursor, is_write_statement, masked_exceeds_outer_projection,
-    reads_only_server_metadata, touches_leaky_system_catalog,
+    reads_only_server_metadata, touches_leaky_system_catalog, VANILLA_INFORMATION_SCHEMA,
+    VANILLA_PG_CATALOG,
 };
 
 fn masked() -> HashSet<String> {
@@ -412,80 +413,42 @@ fn hunt_finds_no_new_oracles() {
     }
 }
 
-/// Second inventory: every information_schema view, core system views,
-/// dump-function shapes, and unicode frames not in the list above.
-/// Known residuals are asserted open; everything else must refuse.
+/// Second inventory: dump-function shapes, unicode frames, and residuals
+/// not covered by the vanilla catalog table. Every official Postgres 18
+/// heap/view/IS relation is classified once in `VANILLA_*` and checked
+/// below; this list is the rest (contrib dumps, forks, helpers, SHOW).
 #[test]
 fn audit_catalog_and_sql_surface() {
     let mut bad = Vec::new();
 
-    let option_views = [
-        "user_mapping_options",
-        "foreign_server_options",
-        "foreign_data_wrapper_options",
-        "column_options",
-        "foreign_table_options",
-        "_pg_user_mappings",
-        "_pg_foreign_servers",
-        "_pg_foreign_data_wrappers",
-        "_pg_foreign_tables",
-        "_pg_foreign_table_columns",
-    ];
-    for name in option_views {
-        for sql in [
-            format!("SELECT * FROM information_schema.{name}"),
-            format!("SELECT * FROM {name}"),
-        ] {
-            if !touches_leaky_system_catalog(&sql) {
-                bad.push(format!("option view not leaky: {sql}"));
+    for (name, safe) in VANILLA_INFORMATION_SCHEMA {
+        let sql = format!("SELECT * FROM information_schema.{name}");
+        if *safe {
+            if any_frontend_refuse(&sql) {
+                bad.push(format!("over-refused IS view: {sql}"));
+            }
+            if !reads_only_server_metadata(&sql) {
+                bad.push(format!("IS view not metadata-only: {sql}"));
+            }
+        } else if !any_frontend_refuse(&sql) {
+            bad.push(format!("OPEN IS view: {sql}"));
+        }
+        if !*safe {
+            let unqualified = format!("SELECT * FROM {name}");
+            if !touches_leaky_system_catalog(&unqualified) {
+                bad.push(format!("option view not leaky unqualified: {unqualified}"));
             }
         }
     }
 
-    // Name-only / schema IS views. Must stay metadata-only so GUIs work.
-    for name in [
-        "tables",
-        "columns",
-        "views",
-        "routines",
-        "schemata",
-        "sequences",
-        "user_mappings",
-        "foreign_servers",
-        "foreign_tables",
-        "foreign_data_wrappers",
-        "parameters",
-        "triggers",
-        "check_constraints",
-        "table_constraints",
-        "key_column_usage",
-        "applicable_roles",
-        "enabled_roles",
-        "character_sets",
-        "collations",
-        "domains",
-        "user_defined_types",
-        "attributes",
-        "element_types",
-        "data_type_privileges",
-        "role_table_grants",
-        "role_column_grants",
-        "role_routine_grants",
-        "role_udt_grants",
-        "role_usage_grants",
-        "usage_privileges",
-        "udt_privileges",
-        "table_privileges",
-        "column_privileges",
-        "routine_privileges",
-        "information_schema_catalog_name",
-    ] {
-        let sql = format!("SELECT * FROM information_schema.{name}");
-        if touches_leaky_system_catalog(&sql) {
-            bad.push(format!("over-refused IS view: {sql}"));
-        }
-        if !reads_only_server_metadata(&sql) {
-            bad.push(format!("IS view not metadata-only: {sql}"));
+    for (name, safe) in VANILLA_PG_CATALOG {
+        let sql = format!("SELECT * FROM pg_catalog.{name}");
+        if *safe {
+            if any_frontend_refuse(&sql) {
+                bad.push(format!("over-refused vanilla pg: {sql}"));
+            }
+        } else if !any_frontend_refuse(&sql) {
+            bad.push(format!("OPEN vanilla pg: {sql}"));
         }
     }
 
@@ -501,6 +464,41 @@ fn audit_catalog_and_sql_surface() {
         "SELECT * FROM pg_catalog.pg_prepared_statements",
         "SELECT * FROM pg_catalog.pg_cursors",
         "SELECT * FROM pg_catalog.pg_stat_wal_receiver",
+        "SELECT * FROM pg_catalog.pg_stat_monitor",
+        "SELECT query FROM pg_stat_monitor",
+        r#"SELECT * FROM u&"pg_stat_monitor""#,
+        "SELECT constvalue FROM pg_qualstats",
+        "SELECT plan FROM pg_store_plans",
+        "SELECT * FROM pg_stat_kcache",
+        "SELECT * FROM pg_stat_unknown_dump",
+        "SELECT * FROM pg_show_plans",
+        "SELECT query FROM pg_catalog.pg_show_plans",
+        r#"SELECT * FROM u&"pg_show_plans""#,
+        "EXPLAIN SELECT * FROM pg_show_plans",
+        "SELECT * FROM pg_query_state",
+        r#"SELECT * FROM u&"pg_query_state""#,
+        "SELECT query FROM pg_catalog.citus_stat_activity",
+        "SELECT * FROM citus_stat_activity",
+        "SELECT query FROM pg_catalog.citus_stat_statements",
+        "SELECT * FROM pg_catalog.citus_lock_waits",
+        "SELECT blocked_statement FROM citus_lock_waits",
+        r#"SELECT * FROM u&"citus_lock_waits""#,
+        "EXPLAIN SELECT * FROM pg_catalog.citus_lock_waits",
+        "SELECT tenant_attribute FROM pg_catalog.citus_stat_tenants",
+        "SELECT authinfo FROM pg_catalog.pg_dist_authinfo",
+        "SELECT * FROM pg_dist_authinfo",
+        r#"SELECT * FROM u&"pg_dist_authinfo""#,
+        "SELECT poolinfo FROM pg_dist_poolinfo",
+        "SELECT command FROM pg_dist_background_task",
+        "SELECT shardminvalue FROM pg_dist_shard",
+        "SELECT * FROM pg_catalog.hypopg_list_indexes",
+        "SELECT * FROM public.pg_stats",
+        "SELECT * FROM pg_stat_progress_future",
+        "SELECT * FROM pg_wait_sampling_dump",
+        "SELECT * FROM pg_catalog.unknown_extension_dump",
+        r#"SELECT * FROM pg_catalog.u&"hypopg_list_indexes""#,
+        "SELECT * FROM information_schema.not_a_real_view",
+        "EXPLAIN SELECT * FROM pg_catalog.hypopg_list_indexes",
         "SELECT * FROM pg_catalog.pg_largeobject",
         "SELECT * FROM pg_catalog.pg_user_mapping",
         "SELECT * FROM pg_catalog.pg_user_mappings",
@@ -566,10 +564,15 @@ fn audit_catalog_and_sql_surface() {
         "SELECT * FROM pg_catalog.pg_settings",
         "SELECT * FROM pg_catalog.pg_db_role_setting",
         "SELECT * FROM pg_catalog.pg_stat_user_tables",
+        "SELECT * FROM pg_catalog.pg_stat_all_tables",
         "SELECT * FROM pg_catalog.pg_stat_replication",
         "SELECT * FROM pg_catalog.pg_stat_ssl",
+        "SELECT * FROM pg_catalog.pg_stat_gssapi",
         "SELECT * FROM pg_catalog.pg_stat_subscription",
+        "SELECT * FROM pg_catalog.pg_stat_subscription_stats",
         "SELECT * FROM pg_catalog.pg_stat_statements_info",
+        "SELECT * FROM pg_catalog.pg_stat_progress_copy",
+        "SELECT * FROM pg_catalog.pg_stat_progress_vacuum",
         "SELECT * FROM pg_catalog.pg_locks",
         "SELECT * FROM pg_catalog.pg_views",
         "SELECT * FROM pg_catalog.pg_indexes",
@@ -593,6 +596,18 @@ fn audit_catalog_and_sql_surface() {
         "SELECT * FROM pg_catalog.pg_stat_wal",
         "SELECT * FROM pg_catalog.pg_wait_events",
         "SELECT * FROM pg_catalog.pg_aios",
+        "SELECT * FROM pg_catalog.pg_buffercache",
+        "SELECT * FROM pg_catalog.pg_statio_user_tables",
+        "SELECT * FROM pg_catalog.pg_wait_sampling_profile",
+        "SELECT * FROM pg_catalog.pg_wait_sampling_history",
+        "SELECT * FROM pg_catalog.pg_wait_sampling_current",
+        "SELECT * FROM pg_catalog.pg_database",
+        "SELECT * FROM pg_catalog.pg_am",
+        "SELECT * FROM pg_catalog.pg_auth_members",
+        "SELECT * FROM pg_catalog.pg_publication",
+        "SELECT * FROM pg_catalog.pg_policies",
+        "SELECT * FROM pg_catalog.pg_shmem_allocations_numa",
+        "SELECT * FROM information_schema.sql_features",
         "SHOW all",
         "SHOW primary_conninfo",
         "SET ROLE analyst",
@@ -876,6 +891,43 @@ fn audit_catalog_and_sql_surface() {
         r#"SELECT count(*) FROM demo.customers WHERE u&"email" OPERATOR(pg_catalog.~*) 'x'"#,
         r#"SELECT count(*) FROM demo.customers WHERE u&"email" OPERATOR(pg_catalog.!~) 'x'"#,
         r#"SELECT count(*) FROM demo.customers WHERE u&"email" OPERATOR(pg_catalog.!~*) 'x'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" AT LOCAL IS NOT NULL"#,
+        r#"SELECT * FROM ts_stat('SELECT u&"email" FROM demo.customers')"#,
+        r#"SELECT ts_stat('SELECT to_tsvector(u&"email") FROM demo.customers') FROM pg_catalog.pg_class"#,
+        r#"SELECT * FROM pg_stat_monitor"#,
+        r#"SELECT query FROM pg_catalog.pg_stat_monitor"#,
+        r#"SELECT constvalue FROM pg_qualstats"#,
+        r#"SELECT plan FROM pg_store_plans"#,
+        r#"SELECT * FROM pg_stat_unknown_dump"#,
+        r#"SELECT * FROM pg_show_plans"#,
+        r#"SELECT query FROM pg_catalog.pg_show_plans"#,
+        r#"SELECT * FROM u&"pg_show_plans""#,
+        r#"EXPLAIN SELECT * FROM pg_show_plans"#,
+        r#"SELECT * FROM pg_query_state"#,
+        r#"SELECT * FROM pg_catalog.pg_query_state"#,
+        r#"SELECT * FROM u&"pg_query_state""#,
+        r#"SELECT query FROM pg_catalog.citus_stat_activity"#,
+        r#"SELECT * FROM citus_stat_activity"#,
+        r#"SELECT query FROM edb_stat_activity"#,
+        r#"SELECT query FROM pg_catalog.citus_stat_statements"#,
+        r#"SELECT * FROM pg_catalog.citus_lock_waits"#,
+        r#"SELECT blocked_statement FROM citus_lock_waits"#,
+        r#"SELECT * FROM u&"citus_lock_waits""#,
+        r#"EXPLAIN SELECT * FROM pg_catalog.citus_lock_waits"#,
+        r#"SELECT tenant_attribute FROM pg_catalog.citus_stat_tenants"#,
+        r#"SELECT * FROM citus_stat_tenants"#,
+        r#"SELECT authinfo FROM pg_catalog.pg_dist_authinfo"#,
+        r#"SELECT * FROM pg_dist_authinfo"#,
+        r#"SELECT * FROM u&"pg_dist_authinfo""#,
+        r#"SELECT poolinfo FROM pg_dist_poolinfo"#,
+        r#"SELECT command FROM pg_dist_background_task"#,
+        r#"SELECT shardminvalue FROM pg_catalog.pg_dist_shard"#,
+        r#"EXPLAIN SELECT authinfo FROM pg_dist_authinfo"#,
+        r#"SELECT * FROM pg_catalog.hypopg_list_indexes"#,
+        r#"SELECT * FROM pg_catalog.unknown_extension_dump"#,
+        r#"SELECT * FROM pg_catalog.u&"hypopg_list_indexes""#,
+        r#"SELECT * FROM information_schema.not_a_real_view"#,
+        r#"EXPLAIN SELECT * FROM pg_catalog.hypopg_list_indexes"#,
     ];
 
     for sql in extra_oracles {

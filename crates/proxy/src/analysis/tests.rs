@@ -41,8 +41,18 @@ fn metadata_only_catalog_queries_are_released() {
         "SELECT * FROM information_schema.foreign_tables",
         "SELECT * FROM information_schema.foreign_data_wrappers",
         "SELECT column_name FROM information_schema.columns",
+        "SELECT * FROM information_schema.sql_features",
+        "SELECT * FROM pg_catalog.pg_database",
+        "SELECT * FROM pg_catalog.pg_am",
+        "SELECT * FROM pg_catalog.pg_auth_members",
+        "SELECT * FROM pg_catalog.pg_publication",
+        "SELECT * FROM pg_catalog.pg_policies",
         "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_statistic_ext e \
          ON e.stxrelid = c.oid",
+        "SELECT n_live_tup FROM pg_catalog.pg_stat_user_tables",
+        "SELECT * FROM pg_catalog.pg_stat_statements_info",
+        "SELECT * FROM pg_catalog.pg_stat_progress_vacuum",
+        "SELECT * FROM pg_catalog.pg_statio_user_tables",
     ] {
         assert!(reads_only_server_metadata(sql), "should be released: {sql}");
     }
@@ -97,6 +107,51 @@ fn catalogs_that_carry_user_data_are_not_released() {
         // Prefix, not the name list: a future `_pg_foreign_*` wrapper.
         "SELECT * FROM information_schema._pg_foreign_future",
         "SELECT * FROM _pg_foreign_future",
+        // `pg_stat_*` denylist polarity: extension views that hold query text
+        // / qual literals were catalog-shaped and not on the name list.
+        "SELECT query FROM pg_stat_monitor",
+        "SELECT * FROM pg_catalog.pg_stat_monitor",
+        r#"SELECT * FROM u&"pg_stat_monitor""#,
+        "SELECT constvalue FROM pg_qualstats",
+        "SELECT plan FROM pg_store_plans",
+        "SELECT * FROM pg_stat_kcache",
+        "SELECT * FROM pg_stat_unknown_dump",
+        "SELECT * FROM pg_qualstats_examples",
+        "SELECT * FROM pg_qualstats_pretty",
+        "SELECT * FROM pg_store_plans_info",
+        "EXPLAIN SELECT query FROM pg_stat_monitor",
+        // Catalog-shaped, not `pg_stat_*`: other backends' SQL + plans.
+        "SELECT * FROM pg_show_plans",
+        "SELECT query FROM pg_catalog.pg_show_plans",
+        r#"SELECT * FROM u&"pg_show_plans""#,
+        "EXPLAIN SELECT * FROM pg_show_plans",
+        "SELECT * FROM pg_query_state",
+        "SELECT * FROM pg_catalog.pg_query_state",
+        r#"SELECT * FROM u&"pg_query_state""#,
+        // Forks install the same dump in pg_catalog under another name.
+        "SELECT query FROM pg_catalog.citus_stat_activity",
+        "SELECT * FROM citus_stat_activity",
+        "SELECT query FROM pg_catalog.citus_stat_statements",
+        // Citus dumps that are not `*_stat_activity` / `*_stat_statements`.
+        "SELECT * FROM pg_catalog.citus_lock_waits",
+        "SELECT blocked_statement FROM citus_lock_waits",
+        r#"SELECT * FROM u&"citus_lock_waits""#,
+        "EXPLAIN SELECT * FROM pg_catalog.citus_lock_waits",
+        "SELECT tenant_attribute FROM pg_catalog.citus_stat_tenants",
+        "SELECT * FROM citus_stat_tenants",
+        "SELECT authinfo FROM pg_catalog.pg_dist_authinfo",
+        "SELECT * FROM pg_dist_authinfo",
+        r#"SELECT * FROM u&"pg_dist_authinfo""#,
+        "SELECT poolinfo FROM pg_dist_poolinfo",
+        "SELECT command FROM pg_dist_background_task",
+        "SELECT shardminvalue FROM pg_dist_shard",
+        "EXPLAIN SELECT authinfo FROM pg_dist_authinfo",
+        // Invert: an unnamed pg_catalog / information_schema relation is leaky.
+        "SELECT * FROM pg_catalog.hypopg_list_indexes",
+        "SELECT * FROM pg_catalog.unknown_extension_dump",
+        r#"SELECT * FROM pg_catalog.u&"hypopg_list_indexes""#,
+        "SELECT * FROM information_schema.not_a_real_view",
+        "EXPLAIN SELECT * FROM pg_catalog.hypopg_list_indexes",
     ] {
         assert!(
             !reads_only_server_metadata(sql),
@@ -978,5 +1033,156 @@ fn date_trunc_is_released_only_at_coarse_literal_precision() {
     assert_eq!(
         safety("SELECT date_trunc(some_unit, birth_date) FROM t", 1),
         vec![Safety::Unknown]
+    );
+}
+
+/// `Debug` of the protobuf is an independent dump of every nested message.
+/// If it contains a `ColumnRef` / `FuncCall` / `RangeVar` that `walk_parsed`
+/// never visits, that node is an allow for unicode-escaped names.
+#[test]
+fn walk_visits_every_column_ref_func_call_and_range_var() {
+    use super::walk::walk_parsed;
+    use pg_query::protobuf::node::Node as NodeEnum;
+
+    let sqls = [
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS NFC NORMALIZED"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS NORMALIZED"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS OF (text, varchar)"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS DOCUMENT"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS JSON WITH UNIQUE KEYS"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" AT TIME ZONE 'UTC' IS NOT NULL"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" AT LOCAL IS NOT NULL"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" COLLATE "C" = 'x'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" OPERATOR(pg_catalog.=) 'x'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" LIKE ALL (ARRAY['x%'])"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" BETWEEN SYMMETRIC 'a' AND 'z'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE XMLEXISTS('//e' PASSING u&"email")"#,
+        r#"SELECT DISTINCT ON (u&"email") id FROM demo.customers"#,
+        r#"SELECT id FROM demo.customers GROUP BY GROUPING SETS ((id), (u&"email"))"#,
+        r#"SELECT id FROM demo.customers GROUP BY CUBE (id, u&"email")"#,
+        r#"SELECT id FROM demo.customers GROUP BY ROLLUP (id, u&"email")"#,
+        r#"SELECT count(*) FILTER (WHERE u&"email" = 'x') FROM demo.customers"#,
+        r#"SELECT string_agg(city, ',' ORDER BY u&"email") FROM demo.customers"#,
+        r#"SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY u&"email") FROM demo.customers"#,
+        r#"SELECT count(*) OVER (PARTITION BY u&"email" ORDER BY id) FROM demo.customers"#,
+        r#"SELECT count(*) OVER (ORDER BY id ROWS BETWEEN (SELECT count(*) FROM demo.customers c2 WHERE c2.u&"email" = 'x') PRECEDING AND CURRENT ROW) FROM demo.customers"#,
+        r#"SELECT count(*) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM demo.customers WHERE u&"email" = 'x'"#,
+        r#"SELECT JSON_VALUE(u&"email", '$.a' RETURNING numeric((SELECT count(*) FROM demo.customers c2 WHERE c2.u&"email" = 'x'), 0)) FROM demo.customers"#,
+        r#"SELECT JSON_QUERY(u&"email", '$.a' PASSING u&"name" AS n NULL ON EMPTY) FROM demo.customers"#,
+        r#"SELECT JSON_EXISTS(u&"email", '$.a' PASSING u&"phone" AS p TRUE ON ERROR) FROM demo.customers"#,
+        r#"SELECT JSON_OBJECT('e': u&"email" RETURNING jsonb) FROM demo.customers"#,
+        r#"SELECT JSON_ARRAY(u&"email" RETURNING numeric((SELECT count(*) FROM demo.customers c2 WHERE c2.u&"email" = 'x'), 0)) FROM demo.customers"#,
+        r#"SELECT json_arrayagg(u&"email" ORDER BY u&"name") FROM demo.customers"#,
+        r#"SELECT json_objectagg(u&"email": city) FROM demo.customers"#,
+        r#"SELECT JSON_SERIALIZE(u&"email" RETURNING text) FROM demo.customers"#,
+        r#"SELECT JSON_PARSE(u&"email") FROM demo.customers"#,
+        r#"SELECT JSON_SCALAR(u&"email") FROM demo.customers"#,
+        r#"SELECT * FROM JSON_TABLE(u&"email", '$' COLUMNS (x text PATH '$' NULL ON EMPTY)) FROM demo.customers"#,
+        r#"SELECT * FROM JSON_TABLE('{}', '$' PASSING u&"email" AS e COLUMNS (x text PATH '$')) AS jt FROM demo.customers"#,
+        r#"SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (NESTED PATH '$' COLUMNS (x text PATH '$'))) AS jt, demo.customers"#,
+        r#"SELECT xmlserialize(content xmlelement(name e, XMLATTRIBUTES(u&"email" AS a), u&"name") AS text) FROM demo.customers"#,
+        r#"SELECT * FROM xmltable('/e' PASSING xmlelement(name e, u&"email") COLUMNS x text PATH '.' DEFAULT u&"name") FROM demo.customers"#,
+        r#"SELECT * FROM ROWS FROM (unnest(ARRAY[(SELECT u&"email" FROM demo.customers LIMIT 1)])) AS t(e text)"#,
+        r#"SELECT * FROM generate_series(1, (SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'))"#,
+        r#"SELECT count(*) FROM demo.customers TABLESAMPLE SYSTEM ((SELECT count(*) FROM demo.customers c2 WHERE c2.u&"email" = 'x')) REPEATABLE ((SELECT count(*) FROM demo.customers c3 WHERE c3.u&"email" = 'y'))"#,
+        r#"SELECT count(*) FROM ONLY demo.customers WHERE u&"email" = 'x'"#,
+        r#"SELECT CAST(1 AS numeric((SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'), 0))"#,
+        r#"SELECT (u&"email")[1:2] FROM demo.customers"#,
+        r#"SELECT (ROW(u&"email")).f1 FROM demo.customers"#,
+        r#"SELECT t.u&"email" FROM demo.customers t"#,
+        r#"WITH q AS (SELECT u&"email" FROM demo.customers) SELECT * FROM q"#,
+        r#"WITH RECURSIVE r AS (SELECT u&"email" AS e FROM demo.customers UNION ALL SELECT e FROM r) SEARCH DEPTH FIRST BY e SET seq SELECT * FROM r"#,
+        r#"WITH RECURSIVE r AS (SELECT u&"email" AS e FROM demo.customers UNION ALL SELECT e FROM r) CYCLE e SET is_cycle USING path SELECT * FROM r"#,
+        r#"SELECT * FROM demo.customers t WHERE EXISTS (SELECT 1 FROM demo.customers t2 WHERE t2.u&"email" = t.u&"email")"#,
+        r#"SELECT * FROM demo.customers t, LATERAL (SELECT 1 FROM demo.customers t2 WHERE t2.u&"email" = t.u&"email") s"#,
+        r#"SELECT count(*) FROM demo.customers t JOIN demo.customers t2 ON t.u&"email" = t2.u&"email""#,
+        r#"SELECT count(*) FROM demo.customers t JOIN demo.customers t2 USING (u&"email")"#,
+        r#"SELECT count(*) FROM demo.customers NATURAL JOIN demo.customers t2"#,
+        r#"SELECT id FROM demo.customers ORDER BY u&"email" USING OPERATOR(pg_catalog.<) NULLS FIRST"#,
+        r#"SELECT id, count(*) OVER w FROM demo.customers WINDOW w AS (PARTITION BY u&"email" ORDER BY id)"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IN (SELECT u&"name" FROM demo.customers)"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" = SOME (VALUES ('x'))"#,
+        r#"SELECT CASE u&"email" WHEN 'x' THEN 1 ELSE 0 END FROM demo.customers"#,
+        r#"SELECT COALESCE(u&"email", u&"name") FROM demo.customers"#,
+        r#"SELECT NULLIF(u&"email", u&"name") FROM demo.customers"#,
+        r#"SELECT GREATEST(u&"email", u&"name") FROM demo.customers"#,
+        r#"SELECT ARRAY[u&"email"] FROM demo.customers"#,
+        r#"SELECT u&"email"::text FROM demo.customers"#,
+        r#"EXPLAIN SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'"#,
+        r#"EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'"#,
+        r#"PREPARE q AS SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'"#,
+        r#"EXECUTE q('x')"#,
+        r#"DECLARE c CURSOR FOR SELECT u&"email" FROM demo.customers"#,
+        r#"COPY (SELECT u&"email" FROM demo.customers) TO STDOUT"#,
+        r#"SELECT u&"email" FROM demo.customers FETCH FIRST (SELECT count(*) FROM demo.customers c2 WHERE c2.u&"email" = 'x') ROWS ONLY"#,
+        r#"SELECT * FROM demo.customers LIMIT (SELECT count(*) FROM demo.customers c2 WHERE c2.u&"email" = 'x') OFFSET (SELECT count(*) FROM demo.customers c3 WHERE c3.u&"phone" = 'y')"#,
+        r#"SELECT u&"email" FROM demo.customers UNION ALL SELECT u&"name" FROM demo.customers"#,
+        r#"(SELECT u&"email" FROM demo.customers) INTERSECT SELECT u&"name" FROM demo.customers"#,
+        r#"VALUES ((SELECT u&"email" FROM demo.customers LIMIT 1))"#,
+        r#"TABLE demo.customers"#,
+        r#"SELECT * FROM pg_catalog.pg_class WHERE relname = (SELECT u&"email" FROM demo.customers LIMIT 1)"#,
+        r#"SELECT format('%s', u&"email") FROM demo.customers"#,
+        r#"SELECT overlay(u&"email" placing 'x' from 1 for 1) FROM demo.customers"#,
+        r#"SELECT substring(u&"email" similar '%#"x#"%' escape '#') FROM demo.customers"#,
+        r#"SELECT xmlelement(NAME foo, XMLNAMESPACES(DEFAULT 'http://x'), u&"email") FROM demo.customers"#,
+        r#"SELECT xmlpi(NAME foo, u&"email") FROM demo.customers"#,
+        r#"SELECT xmlroot(xmlparse(document u&"email"), version '1.0') FROM demo.customers"#,
+        r#"SELECT xmlagg(xmlelement(name e, u&"email") ORDER BY id) FROM demo.customers"#,
+        r#"SELECT lag(u&"email") OVER (ORDER BY id) FROM demo.customers"#,
+        r#"SELECT first_value(u&"email") OVER (ORDER BY id) FROM demo.customers"#,
+        r#"SELECT grouping(u&"email") FROM demo.customers GROUP BY ROLLUP (u&"email")"#,
+        r#"SELECT * FROM demo.customers AS t(c1, c2, c3, c4, c5, c6, c7)"#,
+        r#"WITH q(u&"email") AS (SELECT city FROM demo.customers) SELECT * FROM q"#,
+        r#"SELECT count(*) FROM demo.customers WHERE (u&"email", id) > ('x', 0)"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS NOT DISTINCT FROM u&"name""#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS TRUE"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" IS UNKNOWN"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" NOT IN ('x', 'y')"#,
+        r#"SELECT * FROM unnest((SELECT array_agg(u&"email") FROM demo.customers)) WITH ORDINALITY AS t(e, n)"#,
+        r#"SELECT jsonb_path_query(to_jsonb(t), '$.email') FROM demo.customers t"#,
+        r#"SELECT (xpath('//text()', xmlparse(content u&"email"))) FROM demo.customers"#,
+        r#"SELECT current_setting('search_path') FROM pg_catalog.pg_class"#,
+        r#"SHOW search_path"#,
+        r#"SELECT * FROM generate_series(1,3) g, pg_catalog.pg_class c"#,
+        r#"SELECT u&"email" INTO tmp FROM demo.customers"#,
+        r#"COPY demo.customers (u&"email") TO STDOUT"#,
+        r#"COPY (SELECT u&"email" FROM demo.customers) TO STDOUT"#,
+        r#"CALL dump(u&"email")"#,
+    ];
+
+    let mut holes = Vec::new();
+    for sql in sqls {
+        let Ok(parsed) = pg_query::parse(sql) else {
+            continue;
+        };
+        let dump = format!("{parsed:?}");
+        let mut walk_column_ref = 0usize;
+        let mut walk_func_call = 0usize;
+        let mut walk_range_var = 0usize;
+        walk_parsed(&parsed, &mut |node| match node.node.as_ref() {
+            Some(NodeEnum::ColumnRef(_)) => walk_column_ref += 1,
+            Some(NodeEnum::FuncCall(_)) => walk_func_call += 1,
+            Some(NodeEnum::RangeVar(_)) => walk_range_var += 1,
+            _ => {}
+        });
+        let debug_column_ref = dump.matches("ColumnRef {").count();
+        let debug_func_call = dump.matches("FuncCall {").count();
+        let debug_range_var = dump.matches("RangeVar {").count();
+        if walk_column_ref != debug_column_ref
+            || walk_func_call != debug_func_call
+            || walk_range_var != debug_range_var
+        {
+            holes.push(format!(
+                "walk ColRef={walk_column_ref} FuncCall={walk_func_call} RangeVar={walk_range_var} \
+                 debug ColRef={debug_column_ref} FuncCall={debug_func_call} RangeVar={debug_range_var}\n  {sql}"
+            ));
+        }
+    }
+    assert!(
+        holes.is_empty(),
+        "{} walker hole(s):\n{}",
+        holes.len(),
+        holes.join("\n")
     );
 }

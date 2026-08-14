@@ -1,4 +1,4 @@
-//! Function and catalog name lists the rest of analysis consults.
+//! Function name lists the rest of analysis consults.
 //!
 //! Allowlists, not denylists: a name we fail to recognise is refused, never
 //! released. Adding a name is a deliberate, reviewable act.
@@ -160,8 +160,8 @@ pub(crate) const RANKING_WINDOWS: &[&str] = &[
 /// Set-returning functions allowed in a `FROM` clause of a metadata query.
 ///
 /// An allowlist rather than a denylist, because the denylist here is on
-/// *relations*: `LEAKY_SYSTEM_CATALOGS` denies the `pg_stat_activity` and
-/// `pg_stat_statements` views, and the SRFs behind them —
+/// *relations*: classified-leaky catalogs (`pg_stat_activity`,
+/// `pg_stat_statements`, …) and the SRFs behind them —
 /// `pg_stat_get_activity()`, `pg_stat_statements()` — return identical rows
 /// while appearing as a `RangeFunction` that no relation rule matches. Naming
 /// those two would leave every other data-bearing SRF, `pg_ls_waldir()`
@@ -236,105 +236,6 @@ pub(crate) fn function_name(parts: &[pg_query::protobuf::Node]) -> Option<String
         NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
         _ => None,
     }
-}
-
-/// Catalogs that hold user data, not metadata about it.
-///
-/// Measured, not assumed. On the demo database `pg_stats` returns
-/// `most_common_vals = {shared@example.com}` for a pseudonymised column, and
-/// exact `histogram_bounds` for a date masked to its year and an IP masked to
-/// its /24. Releasing `pg_catalog` wholesale would hand back the values the
-/// proxy exists to hide.
-///
-/// `pg_statistic_ext` is deliberately absent: it records *which* extended
-/// statistics objects exist. The values live in `pg_statistic_ext_data`, and
-/// `\d` reads the former.
-///
-/// TOAST heaps are not on this name list: they are `pg_toast.pg_toast_<oid>`
-/// and the oid is not known statically. [`range_var_is_leaky_catalog`] matches
-/// the schema / `pg_toast_` prefix instead.
-const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
-    // Sampled values from user tables.
-    "pg_statistic",
-    "pg_statistic_ext_data",
-    "pg_stats",
-    "pg_stats_ext",
-    "pg_stats_ext_exprs",
-    // Other sessions' SQL text, literals included. Session-local
-    // `pg_cursors.statement` / `pg_prepared_statements` carry the same
-    // class of text (DECLARE / PREPARE bodies with literals).
-    "pg_stat_activity",
-    "pg_stat_statements",
-    "pg_prepared_statements",
-    "pg_cursors",
-    // Replication conninfo can embed passwords.
-    "pg_stat_wal_receiver",
-    // Large object contents.
-    "pg_largeobject",
-    // Password hashes and connection strings.
-    "pg_authid",
-    "pg_shadow",
-    "pg_user",
-    "pg_user_mapping",
-    "pg_user_mappings",
-    "pg_subscription",
-    // FDW server / wrapper options: the same class as user mappings
-    // (passwords, endpoints). `pg_foreign_table` stays off the list so `\d`
-    // of a foreign table still works; heap `\d` never reads these two.
-    "pg_foreign_server",
-    "pg_foreign_data_wrapper",
-    // SQL-standard wrappers of the same option catalogs. `FROM
-    // information_schema.user_mapping_options` is metadata-only (schema
-    // allowlist) and never names `pg_user_mapping`, so the pg_ catalog
-    // denylist does not see it. The previous pass caught three of the
-    // five PUBLIC option views; `column_options` / `foreign_table_options`
-    // (attfdwoptions / ftoptions) are the same class. Internal
-    // `_pg_*` base views carry the raw option arrays those wrappers
-    // explode — GRANT is not PUBLIC, but a superuser (or
-    // `SET search_path TO information_schema`) still reads them.
-    "user_mapping_options",
-    "foreign_server_options",
-    "foreign_data_wrapper_options",
-    "column_options",
-    "foreign_table_options",
-    "_pg_user_mappings",
-    "_pg_foreign_servers",
-    "_pg_foreign_data_wrappers",
-    "_pg_foreign_tables",
-    "_pg_foreign_table_columns",
-    // Host configuration and file contents.
-    "pg_file_settings",
-    "pg_hba_file_rules",
-    "pg_ident_file_mappings",
-    "pg_backend_memory_contexts",
-];
-
-/// Catalogs whose rows are user data, session SQL, passwords, or toasted
-/// cell bytes. Refused at the frontend on every posture.
-pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bool {
-    let schema = v.schemaname.to_ascii_lowercase();
-    let relation = v.relname.to_ascii_lowercase();
-    // TOAST heaps are the toasted bytes of user columns, masked ones
-    // included. `reltoastrelid` from `pg_class` plus `SET search_path TO
-    // pg_toast` makes `SELECT count(*) FROM pg_toast_NNNN WHERE chunk_data
-    // LIKE '%x%'` a membership oracle. `chunk_data` is not in the snapshot
-    // (the loader skips `pg_toast`), so the hostile name set never sees it.
-    // Unqualified `pg_toast_*` is catalog-shaped (`pg_` prefix) and would
-    // otherwise look metadata-only.
-    if schema == "pg_toast" || relation.starts_with("pg_toast_") {
-        return true;
-    }
-    // information_schema implements SQL/MED option views on `_pg_*`
-    // base views. New ones keep that prefix; a name list alone misses
-    // the next wrapper. Unqualified `_pg_*` is the same views after
-    // `SET search_path TO information_schema` (RangeVar.schemaname is
-    // empty). A CTE named `_pg_foo` would also match — fail closed.
-    // `_pg_*` *functions* (`_pg_truetypid`) are FuncCalls, not
-    // RangeVars, and stay catalog-safe helpers.
-    if relation.starts_with("_pg_") && (schema.is_empty() || schema == "information_schema") {
-        return true;
-    }
-    LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str())
 }
 
 /// Functions that reach data the parse tree never names.
