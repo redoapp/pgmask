@@ -131,10 +131,13 @@ it never reaches Postgres — rather than being nulled after the fact.
 `customers` in the parse tree, so a relation-based rule cannot see it. Without a
 denylist the whole thing is bypassable in one call. `CATALOG_ESCAPE_FUNCTIONS`
 covers the `*_to_xml` family (including `schema_to_xml` / `database_to_xml`),
-`dblink`, `pg_read_file`, `pg_ls_dir` and the other `pg_ls_*` directory
-listings, `pg_stat_file`, large-object accessors, and target-list dumps such
-as `pg_stat_get_activity()` / logical-slot peek that otherwise look like a
-catalog query when joined to `pg_class`.
+`dblink` and the rest of `dblink_*`, `crosstab` / `connectby`, `pg_read_file`,
+`pg_file_read` / `pg_logdir_ls`, `pg_ls_dir` and the other `pg_ls_*` directory
+listings, `pg_stat_file`, large-object accessors (`lo_get` / `loread` / `lo_open`),
+and target-list dumps such as `pg_stat_get_activity()` / `pg_stat_get_wal_receiver()`
+/ logical-slot peek / `pg_walinspect` that otherwise look like a catalog query
+when joined to `pg_class`. `format_type`, `pg_get_userbyid`, `pg_get_indexdef`
+and other catalog-browser helpers stay off this list.
 
 ## What it does not change
 

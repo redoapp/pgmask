@@ -94,6 +94,7 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT id, count(*) OVER w FROM demo.customers WINDOW w AS (ORDER BY email)"#,
         r#"SELECT id FROM demo.customers ORDER BY email COLLATE "C""#,
         r#"SELECT id FROM demo.customers ORDER BY email USING >"#,
+        r#"SELECT id FROM demo.customers ORDER BY email USING OPERATOR(pg_catalog.<)"#,
     ];
     let mut bad = Vec::new();
     for sql in must_allow {
@@ -305,6 +306,18 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT pg_stat_get_activity(NULL) FROM pg_catalog.pg_class"#,
         r#"SELECT pg_ls_logdir() FROM pg_catalog.pg_class"#,
         r#"SELECT pg_logical_slot_get_changes('s', NULL, NULL) FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_stat_get_wal_receiver() FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_stat_get_wal_receiver() FROM pg_catalog.pg_database"#,
+        r#"SELECT crosstab('SELECT email FROM demo.customers') FROM pg_catalog.pg_class"#,
+        r#"SELECT connectby('demo.customers','id','id','id','1',0) FROM pg_catalog.pg_class"#,
+        r#"SELECT dblink_exec('dbname=x', 'SELECT 1') FROM pg_catalog.pg_class"#,
+        r#"SELECT dblink_connect('dbname=x') FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_file_read('postgresql.conf', 0, 100) FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_logdir_ls() FROM pg_catalog.pg_class"#,
+        r#"SELECT loread(1, 100) FROM pg_catalog.pg_class"#,
+        r#"SELECT lo_open(1, 262144) FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_get_wal_records_info('0/0', '0/0') FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_get_wal_block_info('0/0', '0/0') FROM pg_catalog.pg_class"#,
     ];
 
     for sql in oracles {

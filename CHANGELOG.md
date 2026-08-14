@@ -28,7 +28,10 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   `pg_stat_get_activity()`, `pg_ls_logdir()`, logical-slot peek/get) looked
   like a metadata-only catalog query, which skips the untrusted-function
   gate. The escape list now covers the rest of the `*_to_xml` family and
-  those target-list dumps.
+  those target-list dumps. Same polarity, later pass: `pg_stat_get_wal_receiver()`
+  (conninfo), `crosstab` / `connectby` (SQL-as-string), the rest of `dblink_*`,
+  adminpack `pg_file_read` / `pg_logdir_ls`, `loread` / `lo_open`, and
+  `pg_walinspect` record dumps.
 - Hostile / read-only / write gates share one descent (`walk_tree` /
   `for_each_child_node`) and one cached parse (`StatementInspection`) instead
   of a parallel `tally_*` match plus `pg_query::nodes()`. The parser is still
