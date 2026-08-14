@@ -118,6 +118,11 @@ exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
 - `pg_foreign_server`, `pg_foreign_data_wrapper` — FDW options (endpoints,
   passwords), same class as user mappings. `pg_foreign_table` stays off the
   list so `\d` of a foreign table still works
+- `information_schema.user_mapping_options`, `foreign_server_options`,
+  `foreign_data_wrapper_options` — the SQL-standard wrappers of those
+  option catalogs. They never name `pg_user_mapping`, so a pg_-only
+  denylist misses them. `information_schema.user_mappings` (names, no
+  option values) stays allowed
 - `pg_toast` / `pg_toast_*` — toasted bytes of user columns, including masked
   ones. `reltoastrelid` from `pg_class` plus `SET search_path TO pg_toast`
   makes an unqualified `pg_toast_NNNN` look catalog-shaped

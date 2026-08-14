@@ -340,6 +340,12 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT srvoptions FROM pg_catalog.pg_foreign_server"#,
         r#"SELECT fdwoptions FROM pg_foreign_data_wrapper"#,
         r#"SELECT * FROM u&"pg_foreign_server""#,
+        r#"SELECT option_value FROM information_schema.user_mapping_options"#,
+        r#"SELECT * FROM information_schema.foreign_server_options"#,
+        r#"SELECT * FROM information_schema.foreign_data_wrapper_options"#,
+        r#"SELECT * FROM information_schema.u&"user_mapping_options""#,
+        r#"SELECT option_value FROM user_mapping_options"#,
+        r#"EXPLAIN SELECT * FROM information_schema.user_mapping_options"#,
         // Extra unicode frames that should already refuse
         r#"SELECT count(*) FROM demo.customers GROUP BY ROLLUP (u&"email")"#,
         r#"SELECT count(*) FROM demo.customers GROUP BY CUBE (u&"email")"#,

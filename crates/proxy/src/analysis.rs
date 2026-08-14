@@ -1417,6 +1417,13 @@ const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     // of a foreign table still works; heap `\d` never reads these two.
     "pg_foreign_server",
     "pg_foreign_data_wrapper",
+    // SQL-standard wrappers of the same option catalogs. `FROM
+    // information_schema.user_mapping_options` is metadata-only (schema
+    // allowlist) and never names `pg_user_mapping`, so the pg_ catalog
+    // denylist does not see it.
+    "user_mapping_options",
+    "foreign_server_options",
+    "foreign_data_wrapper_options",
     // Host configuration and file contents.
     "pg_file_settings",
     "pg_hba_file_rules",
@@ -3905,6 +3912,7 @@ mod tests {
             "SELECT * FROM generate_series(1, 3) g, pg_catalog.pg_class c",
             "SELECT table_name FROM information_schema.tables",
             "SELECT rolname FROM pg_roles",
+            "SELECT * FROM information_schema.user_mappings",
             "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_statistic_ext e \
              ON e.stxrelid = c.oid",
         ] {
@@ -3941,6 +3949,11 @@ mod tests {
             "SELECT fdwoptions FROM pg_foreign_data_wrapper",
             r#"SELECT srvoptions FROM u&"pg_foreign_server""#,
             "EXPLAIN SELECT chunk_data FROM pg_toast.pg_toast_12345",
+            "SELECT option_value FROM information_schema.user_mapping_options",
+            "SELECT * FROM information_schema.foreign_server_options",
+            "SELECT * FROM information_schema.foreign_data_wrapper_options",
+            r#"SELECT * FROM information_schema.u&"user_mapping_options""#,
+            "SELECT option_value FROM user_mapping_options",
         ] {
             assert!(
                 !reads_only_server_metadata(sql),

@@ -44,6 +44,12 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   `pg_foreign_data_wrapper` options join user mappings (connection secrets).
   `pg_foreign_table` stays off the list so `\d` of a foreign table still
   works. `pg_roles` is still allowed (`\du`).
+  SQL-standard wrappers of the same option catalogs
+  (`information_schema.user_mapping_options` /
+  `foreign_server_options` / `foreign_data_wrapper_options`) were
+  metadata-only because they live in `information_schema` and never name
+  `pg_user_mapping`. `information_schema.user_mappings` (no option
+  values) and `information_schema.tables` stay allowed.
 - Hostile / read-only / write gates share one descent (`walk_tree` /
   `for_each_child_node`) and one cached parse (`StatementInspection`) instead
   of a parallel `tally_*` match plus `pg_query::nodes()`. The parser is still
