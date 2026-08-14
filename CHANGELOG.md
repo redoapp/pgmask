@@ -36,6 +36,14 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   an allow for every unnamed one (`get_raw_page`, `pg_sleep`, `set_config`,
   `pg_file_write`). The escape list remains defense in depth. `format_type` /
   `pg_get_viewdef` stay helpers, not dumps.
+- TOAST heaps (`pg_toast.pg_toast_<oid>` / unqualified `pg_toast_*` after
+  `SET search_path TO pg_toast`) hold toasted bytes of user columns. They
+  were catalog-shaped (`pg_` prefix) and not on the leaky-name list, so
+  `SELECT count(*) FROM pg_toast_NNNN WHERE chunk_data LIKE '%x%'` was a
+  membership oracle the snapshot never names. `pg_foreign_server` /
+  `pg_foreign_data_wrapper` options join user mappings (connection secrets).
+  `pg_foreign_table` stays off the list so `\d` of a foreign table still
+  works. `pg_roles` is still allowed (`\du`).
 - Hostile / read-only / write gates share one descent (`walk_tree` /
   `for_each_child_node`) and one cached parse (`StatementInspection`) instead
   of a parallel `tally_*` match plus `pg_query::nodes()`. The parser is still

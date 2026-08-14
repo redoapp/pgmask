@@ -115,6 +115,12 @@ exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
 - `pg_largeobject` — blob contents
 - `pg_authid`, `pg_shadow`, `pg_user_mapping(s)`, `pg_subscription` — password
   hashes and connection strings
+- `pg_foreign_server`, `pg_foreign_data_wrapper` — FDW options (endpoints,
+  passwords), same class as user mappings. `pg_foreign_table` stays off the
+  list so `\d` of a foreign table still works
+- `pg_toast` / `pg_toast_*` — toasted bytes of user columns, including masked
+  ones. `reltoastrelid` from `pg_class` plus `SET search_path TO pg_toast`
+  makes an unqualified `pg_toast_NNNN` look catalog-shaped
 - `pg_file_settings`, `pg_hba_file_rules`, `pg_ident_file_mappings`,
   `pg_backend_memory_contexts` — host configuration
 

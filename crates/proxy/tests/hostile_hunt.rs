@@ -329,6 +329,34 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT pg_file_write('x', 'y', false) FROM pg_catalog.pg_class"#,
         r#"SELECT pg_terminate_backend(pg_backend_pid()) FROM pg_catalog.pg_class"#,
         r#"SELECT not_a_catalog_fn() FROM pg_catalog.pg_class"#,
+        // TOAST heaps are the toasted bytes of user columns. Unqualified
+        // pg_toast_* is catalog-shaped and skipped the leaky-name list.
+        r#"SELECT chunk_data FROM pg_toast.pg_toast_12345"#,
+        r#"SELECT count(*) FROM pg_toast.pg_toast_12345 WHERE chunk_data LIKE '%@%'"#,
+        r#"SELECT * FROM pg_toast_12345"#,
+        r#"SELECT * FROM pg_toast.pg_toast_12345_index"#,
+        r#"SELECT * FROM u&"pg_toast".u&"pg_toast_12345""#,
+        r#"EXPLAIN SELECT chunk_data FROM pg_toast.pg_toast_12345"#,
+        r#"SELECT srvoptions FROM pg_catalog.pg_foreign_server"#,
+        r#"SELECT fdwoptions FROM pg_foreign_data_wrapper"#,
+        r#"SELECT * FROM u&"pg_foreign_server""#,
+        // Extra unicode frames that should already refuse
+        r#"SELECT count(*) FROM demo.customers GROUP BY ROLLUP (u&"email")"#,
+        r#"SELECT count(*) FROM demo.customers GROUP BY CUBE (u&"email")"#,
+        r#"SELECT count(*) FROM demo.customers GROUP BY GROUPING SETS ((u&"email"))"#,
+        r#"SELECT DISTINCT ON (u&"email") id FROM demo.customers"#,
+        r#"SELECT count(*) FROM demo.customers WHERE (u&"email", city) = ('x', 'y')"#,
+        r#"SELECT count(*) FROM demo.customers WHERE COALESCE(u&"email", 'x') = 'x'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE NULLIF(u&"email", 'x') IS NULL"#,
+        r#"SELECT count(*) FROM demo.customers WHERE GREATEST(u&"email", 'a') = 'x'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" SIMILAR TO 'x%'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" NOT SIMILAR TO 'x%'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" OPERATOR(pg_catalog.~) 'x'"#,
+        r#"SELECT count(*) FROM ONLY demo.customers WHERE u&"email" = 'x'"#,
+        r#"SELECT count(*) FROM demo.customers HAVING bool_or(u&"email" = 'x')"#,
+        r#"SELECT id FROM demo.customers ORDER BY length(u&"email")"#,
+        r#"SELECT count(*) FROM demo.customers WHERE u&"email" || '' = 'x'"#,
+        r#"SELECT count(*) FROM demo.customers WHERE CASE WHEN u&"email" = 'x' THEN 1 ELSE 0 END = 1"#,
     ];
 
     for sql in oracles {

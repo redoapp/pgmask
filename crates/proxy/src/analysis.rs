@@ -1383,6 +1383,10 @@ fn function_name(parts: &[pg_query::protobuf::Node]) -> Option<String> {
 /// `pg_statistic_ext` is deliberately absent: it records *which* extended
 /// statistics objects exist. The values live in `pg_statistic_ext_data`, and
 /// `\d` reads the former.
+///
+/// TOAST heaps are not on this name list: they are `pg_toast.pg_toast_<oid>`
+/// and the oid is not known statically. [`range_var_is_leaky_catalog`] matches
+/// the schema / `pg_toast_` prefix instead.
 const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     // Sampled values from user tables.
     "pg_statistic",
@@ -1408,12 +1412,35 @@ const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
     "pg_user_mapping",
     "pg_user_mappings",
     "pg_subscription",
+    // FDW server / wrapper options: the same class as user mappings
+    // (passwords, endpoints). `pg_foreign_table` stays off the list so `\d`
+    // of a foreign table still works; heap `\d` never reads these two.
+    "pg_foreign_server",
+    "pg_foreign_data_wrapper",
     // Host configuration and file contents.
     "pg_file_settings",
     "pg_hba_file_rules",
     "pg_ident_file_mappings",
     "pg_backend_memory_contexts",
 ];
+
+/// Catalogs whose rows are user data, session SQL, passwords, or toasted
+/// cell bytes. Refused at the frontend on every posture.
+fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bool {
+    let schema = v.schemaname.to_ascii_lowercase();
+    let relation = v.relname.to_ascii_lowercase();
+    // TOAST heaps are the toasted bytes of user columns, masked ones
+    // included. `reltoastrelid` from `pg_class` plus `SET search_path TO
+    // pg_toast` makes `SELECT count(*) FROM pg_toast_NNNN WHERE chunk_data
+    // LIKE '%x%'` a membership oracle. `chunk_data` is not in the snapshot
+    // (the loader skips `pg_toast`), so the hostile name set never sees it.
+    // Unqualified `pg_toast_*` is catalog-shaped (`pg_` prefix) and would
+    // otherwise look metadata-only.
+    if schema == "pg_toast" || relation.starts_with("pg_toast_") {
+        return true;
+    }
+    LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str())
+}
 
 /// True when the statement names a catalog that holds sampled user data,
 /// other sessions' SQL, passwords, or similar — values default-deny nulling
@@ -1430,8 +1457,7 @@ fn touches_leaky_system_catalog_inspected(inspection: &StatementInspection<'_>) 
     tree_any(parsed, |node| {
         matches!(
             node.node.as_ref(),
-            Some(NodeEnum::RangeVar(v))
-                if LEAKY_SYSTEM_CATALOGS.contains(&v.relname.to_ascii_lowercase().as_str())
+            Some(NodeEnum::RangeVar(v)) if range_var_is_leaky_catalog(v)
         )
     })
 }
@@ -1769,7 +1795,7 @@ fn reads_only_server_metadata_inspected(inspection: &StatementInspection<'_>) ->
                     disqualified = true;
                     return;
                 }
-                if LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str()) {
+                if range_var_is_leaky_catalog(v) {
                     disqualified = true;
                     return;
                 }
@@ -3878,6 +3904,7 @@ mod tests {
             "SELECT pg_catalog.pg_get_indexdef(i.indexrelid) FROM pg_catalog.pg_index i",
             "SELECT * FROM generate_series(1, 3) g, pg_catalog.pg_class c",
             "SELECT table_name FROM information_schema.tables",
+            "SELECT rolname FROM pg_roles",
             "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_statistic_ext e \
              ON e.stxrelid = c.oid",
         ] {
@@ -3906,6 +3933,14 @@ mod tests {
             "SELECT passwd FROM pg_user",
             "SELECT * FROM pg_catalog.pg_user",
             "EXPLAIN SELECT most_common_vals FROM pg_catalog.pg_stats",
+            "SELECT chunk_data FROM pg_toast.pg_toast_12345",
+            "SELECT count(*) FROM pg_toast.pg_toast_12345 WHERE chunk_data LIKE '%@%'",
+            "SELECT * FROM pg_toast_12345",
+            r#"SELECT * FROM u&"pg_toast".u&"pg_toast_12345""#,
+            "SELECT srvoptions FROM pg_catalog.pg_foreign_server",
+            "SELECT fdwoptions FROM pg_foreign_data_wrapper",
+            r#"SELECT srvoptions FROM u&"pg_foreign_server""#,
+            "EXPLAIN SELECT chunk_data FROM pg_toast.pg_toast_12345",
         ] {
             assert!(
                 !reads_only_server_metadata(sql),
