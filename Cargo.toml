@@ -43,7 +43,7 @@ publish = false
 [workspace.dependencies]
 anyhow = "1"
 bytes = "1"
-hmac = "0.12"
+hmac = "0.13"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
