@@ -530,8 +530,10 @@ decision stays visible and nobody later mistakes the proxy for anonymization.
 - **Small-cell aggregates.** `GROUP BY city HAVING count(*) = 1`. Note the degenerate
   case is *not* on this list: a summary of a column the query groups on is that column
   exactly, needs no small cell and no unique key. Since 0.1.19 the grouping guard
-  refused it; since 0.1.92 a reducing aggregate over a masked column is masked anyway,
-  so even a one-row group serves only the bucketed floor.
+  refused it; since 0.1.92 a one-argument reduction over an explicitly
+  schema-qualified masked column is masked anyway, so even a one-row group
+  serves only the bucketed floor. Boolean reductions follow the same rule:
+  over one row they are the input value, not a harmless tally.
 - **Differencing.** Two permitted aggregate queries whose difference isolates one row.
 
 One case was reclassified from accepted to closed. `SELECT sum(salary) FROM t GROUP BY
@@ -550,9 +552,11 @@ unchanged, so ordinary analytics is unaffected. Since v0.1.92 the filter-side
 twin — `WHERE id = 1` reaching the same value — is closed too, by masking
 rather than by the guard. Whether a predicate is singleton is a fact about the
 data, so it cannot be refused with the grouping guard's certainty; but a
-reducing aggregate over a masked column now leaves the proxy already masked, so
-the singleton sum is the bucketed floor, byte-identical to the column's own
-masked value.
+an attributable one-column reduction over a masked column now leaves the proxy
+already masked, so the singleton sum is the bucketed floor, byte-identical to
+the column's own masked value. Attribution requires an explicit schema because
+the proxy does not track `search_path`; transformed and multi-source summaries
+remain opaque rather than borrowing one input's possibly weaker mask.
 
 The guard reads the catalog, so it inherits the catalog's staleness — and in the
 opposite direction to everything else. An unclassified column is masked; a relation

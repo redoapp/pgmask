@@ -530,30 +530,31 @@ Closed in v0.1.92 by policy, not by refusing more: a reducing aggregate over a
 masked column is now masked with that column's *own* mask on its way out, so a
 singleton sum is the bucketed floor — byte-identical to what the column itself
 returns — whatever a predicate or `GROUP BY` collapses the set to. A sum over a
-released column is still exact, and `count(*)/count(col)` and the boolean
-aggregates are unaffected. The classification is now finer than the two-valued
-`Releasable`/`Unknown` split: `Safety::Summary` for the reducing-family
-(average, variance, regression), `Releasable` for the tally family (a count
-never degrades into its input).
+released column is still exact, and `count(*)/count(col)` are unaffected.
+Boolean reductions join the masked family because each is the identity over a
+singleton set. The classification is finer than the two-valued
+`Releasable`/`Unknown` split: `Safety::Summary` for the value-reducing family,
+`Releasable` for the tally family (a count never degrades into its input).
 
 The effort fell on the *shape*, not the numbers: one new verdict, propagated
-through lineage so only a masked source changes the outcome — and, when lineage
-is off (the default) and the aggregate reduces a single bare column over plain
-named FROM ranges, resolved from the statement and the catalog so the default
-configuration masks instead of refusing — which removed the
-`grouping_may_reference`/`aggregate_argument_is_grouped` walkers (every
-reducing aggregate is masked now, so the grouped/ungrouped distinction they
-drew lost its point) — a net deletion.
+through one shared source-policy path. An aggregate is maskable only when it
+reduces one bare column over explicitly schema-qualified named FROM ranges;
+unqualified ranges need `search_path`, and transformed or multi-source inputs
+cannot safely inherit one input's mask. Optional lineage may prove full release
+but a blocked lineage source no longer selects a mask. This removed the
+`grouping_may_reference`/`aggregate_argument_is_grouped` walkers (no reducing
+aggregate is directly released now; attributable one-column summaries are
+masked and the rest stay opaque, so the grouped/ungrouped distinction they drew
+lost its point) — a net deletion.
 
 Two consequences the reader should weigh:
 
 * **The singleton *grouping* guard is now partly redundant.** It still refuses
-  `sum(salary) GROUP BY <unique key>` even though the summary would now be
-  served masked. It stays in place: removing it re-opens the threat model the
-  adversarial suite pins, which cannot be re-run without a live backend, and
-  refusing a query that would serve masked is over-restriction in a safe
-  direction. Recorded here so the redundancy is a decision, not a drift to
-  "simplify later".
+  `sum(salary) GROUP BY <unique key>` even when an explicitly qualified summary
+  could be served masked. It stays in place until removing it is separately
+  validated against the DB-backed adversarial suite; refusing a query that
+  would serve masked is over-restriction in a safe direction. Recorded here so
+  the redundancy is a decision, not a drift to "simplify later".
 * **An expression *over* a summary is refused, not masked.** `sum(a)/sum(b)`,
   `round(sum(a), 1)`, `sum(a) OVER (...)`. The bare aggregate is special-cased
   as maskable; a wrapper is treated like any other opaque expression over a
@@ -561,6 +562,10 @@ Two consequences the reader should weigh:
   long-standing rule that an expression over a masked column cannot be masked
   after the fact, and keeps the special case one branch wide instead of a
   tri-state through every classify arm.
+* **An expression *inside* a summary is also refused when it touches a masked
+  source.** `sum(a * 1000)` cannot inherit `a`'s bucket after amplification, and
+  `regr_avgx(y, x)` cannot inherit `y`'s mask when it returns an average of `x`.
+  Only one bare argument column is eligible for summary masking.
 
 ## The instruments were wrong more often than the code
 

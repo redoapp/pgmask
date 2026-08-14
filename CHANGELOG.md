@@ -133,17 +133,20 @@ whatever the predicate collapses it to —
                                                         -- now 54000250000
     SELECT sum(annual_salary) FROM people WHERE id = 1  -- now 900000000
 
-Source resolution normally goes through lineage, but lineage is off by default
-(`lineage = "refuse"`), and the "masked anyway" contract is the point of the
-verdict. For the shape every disclosure used — the aggregate reduces a single
-bare column over plain named FROM ranges — the session attributes the column
-from the statement and the catalog directly, so the default configuration masks
-instead of refusing. Expression arguments, joins and subqueries still fall to
-the opaque posture; value-returning aggregates (`min`, `max`) never reach this
-path.
+Summary masking now has one source-selection path whether lineage is enabled or
+not. For the shape every disclosure used — one bare aggregate argument over
+explicitly schema-qualified named FROM ranges — the session attributes the
+column from the statement and catalog directly. Requiring the schema is
+load-bearing: defaulting an unqualified name to `public` can select a weaker mask
+than the relation PostgreSQL resolves through `search_path`. Expression
+arguments, joins, subqueries, unqualified ranges and multi-argument regressions
+fall to the opaque posture; lineage can still release them only when every
+source is explicitly released. A blocked lineage source is diagnostic and can
+no longer choose an output mask by itself.
 
-`count`, `count(*)`, `regr_count` and the boolean aggregates stay passthrough:
-a tally or a predicate never degrades into a member of the set it consumes.
+`count`, `count(*)` and `regr_count` stay passthrough. Boolean aggregates are
+summaries: over a singleton set `bool_or(x)`, `bool_and(x)` and `every(x)` are
+exactly `x`, so a masked boolean must mask their output too.
 Aggregates that return a stored value (`min`, `max`, `string_agg`, …) were
 already refused and still are. `summaries = "refuse"`, the `lineage`/`opaque`
 postures and the unique-key GROUP BY guard all keep their existing force; the

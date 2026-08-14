@@ -607,18 +607,21 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   correct refusals, but they are also the largest source of friction.
   `SELECT 1`, `now()` and `count(*)` used to be refused too; they are now served
   (see below).
-- **Summaries over classified columns are masked, not exact** — `count`, `count(*)`.
-  ranking windows and `date_trunc` are released. Reducing aggregates — `sum`,
-  `avg`, `stddev`, a variance, a regression slope — resolve their source through
-  lineage, or straight from the statement and catalog when it is off (the
-  default) and the aggregate reduces one bare column: over a *released* column
-  the exact summary is served; over a *masked* column the summary is masked with
-  that column's own mask. A sum of a
-  bucketed column is a bucket, so a group of one row never yields that row's
-  value: `sum(annual_salary) WHERE id = 1` returns the bucket floor, not the
-  salary. `summaries = "refuse"` reverts it. The bar is still "you cannot read
-  an anonymised value", not "no information flows" — a whole-table sum is a
-  masked summary, and when the source column is unmasked it is exact.
+- **Summaries over classified columns are masked, not exact** — counts
+  (`count`, `count(*)`, `regr_count`), ranking windows and `date_trunc` are
+  released. A one-argument reduction — `sum`, `avg`, `stddev`, a variance, or a
+  boolean reduction — inherits its source policy only when it reduces one bare
+  column over explicitly schema-qualified named ranges. Over a *released*
+  column the exact summary is served; over a *masked* column the summary is
+  masked with that column's own mask. Unqualified ranges, transformed arguments,
+  joins, subqueries and multi-argument regressions retain the opaque posture;
+  optional lineage may still prove that all of their inputs are explicitly
+  released. A sum of a bucketed column is a bucket, so a group of one row never
+  yields that row's value: `sum(annual_salary) WHERE id = 1` returns the bucket
+  floor, not the salary. `summaries = "refuse"` reverts it. The bar is still
+  "you cannot read an anonymised value", not "no information flows" — a
+  whole-table sum is a masked summary, and when the source column is unmasked it
+  is exact.
 - **Functions that return a stored value are never released** — `min`, `max`,
   `mode`, `percentile_*`, `string_agg`, `array_agg`, `first_value`, `lag`,
   `lead`. `max(email)` is an email address.
@@ -667,10 +670,11 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   denotes whatever its target computes; an expression is not, and falls back to
   asking whether the statement names every column of some key at all. And
   because a summary of a column the query groups *on* is that column within a
-  constant group, a reducing aggregate is *masked with its source column's mask*
-  rather than passed through — so the `WHERE id = 1` form, which no amount of
-  statement reading can decide, gives up only the precision: a sum over a
-  bucketed column is a bucket whatever the predicate collapses it to. Ungrouped
+  constant group, an attributable one-column reduction is *masked with its
+  source column's mask* rather than passed through — so the `WHERE id = 1` form,
+  which no amount of statement reading can decide, gives up only the precision:
+  a sum over a bucketed column is a bucket whatever the predicate collapses it
+  to. Ungrouped
   groupings, non-key groupings and coarse date buckets are served unchanged.
 
 **Before deploying this, read [`docs/safety-assessment.md`](docs/safety-assessment.md).**

@@ -191,8 +191,10 @@ INSERT INTO canary.uc_unique VALUES (1, 987654321), (2, 123456789);
 -- at. So a key on *any* table makes a grouping by that name refuse everywhere.
 -- Naming this column `label` made the control refuse and would have made the
 -- whole probe read as a fix when it was a blanket.
-CREATE TABLE canary.no_unique (bucketname text, salary int);
-INSERT INTO canary.no_unique VALUES ('a', 987654321), ('a', 123456789);
+CREATE TABLE canary.no_unique (bucketname text, salary int, secret_flag boolean);
+INSERT INTO canary.no_unique VALUES
+  ('a', 987654321, true),
+  ('a', 123456789, false);
 
 -- A generated column: a second copy of a classified value under a name the
 -- operator has to have thought of separately.
@@ -259,6 +261,7 @@ pub fn default_rules() -> Vec<ColumnRule> {
         bucket_rule("canary.uc_unique", "salary", 1000),
         rule("canary.no_unique", "bucketname", Mask::None),
         bucket_rule("canary.no_unique", "salary", 1000),
+        rule("canary.no_unique", "secret_flag", Mask::Null),
         rule("canary.derived", "id", Mask::None),
         rule("canary.derived", "email", Mask::Pseudonym),
         // canary.derived.email_copy is deliberately unclassified: a generated

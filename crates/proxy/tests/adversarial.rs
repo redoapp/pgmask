@@ -1184,6 +1184,21 @@ async fn summaries_are_served_without_leaking() -> Result<()> {
         assert!(msgs.iter().any(|m| m.tag == b'D'), "{sql} should be served");
         assert_no_canary(&client, sql);
     }
+
+    // A boolean reduction is the identity over one row. Before the summary
+    // partition was tightened, this returned `true` through a column whose
+    // direct projection is null-masked.
+    let sql = "SELECT bool_or(secret_flag) FROM canary.no_unique WHERE salary = 987654321";
+    let msgs = client.simple_query(sql).await?;
+    let row = msgs
+        .iter()
+        .find(|m| m.tag == b'D')
+        .expect("the boolean summary should be served and masked");
+    assert_eq!(
+        pgmask::protocol::parse_data_row(&row.body)?,
+        vec![None],
+        "a singleton boolean aggregate must inherit the source's null mask"
+    );
     Ok(())
 }
 

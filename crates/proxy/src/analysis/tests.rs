@@ -407,6 +407,24 @@ fn plain_reducing_aggregates_are_still_summaries() {
     }
 }
 
+/// A boolean reduction is the identity function over a singleton input set.
+/// It therefore needs the same source-bound masking as a numeric summary:
+/// `bool_or(secret_flag) WHERE id = 1` is exactly `secret_flag`.
+#[test]
+fn boolean_reductions_are_summaries_not_tallies() {
+    for sql in [
+        "SELECT bool_and(secret_flag) FROM demo.t",
+        "SELECT bool_or(secret_flag) FROM demo.t",
+        "SELECT every(secret_flag) FROM demo.t",
+    ] {
+        assert_eq!(
+            safety(sql, 1),
+            vec![Safety::Summary],
+            "{sql} returns its input for a singleton set"
+        );
+    }
+}
+
 /// Ranking windows keep working: they emit a position, whatever the frame.
 #[test]
 fn ranking_windows_are_still_releasable() {
@@ -807,20 +825,49 @@ fn summary_resolution_names_the_aggregate_argument() {
     let inspection = StatementInspection::new(
         "SELECT bucketname, sum(salary) FROM canary.no_unique GROUP BY bucketname",
     );
-    let (relations, columns) = inspection.summary_resolution(2).expect("trusted select");
+    let resolution = inspection.summary_resolution(2).expect("trusted select");
     assert_eq!(
-        relations,
+        resolution.relations(),
         vec![("canary".to_string(), "no_unique".to_string())]
     );
     // `bucketname` is a plain column, not an aggregate; `sum(salary)` is.
-    assert_eq!(columns, vec![None, Some("salary".to_string())]);
+    assert_eq!(
+        resolution.fields(),
+        vec![
+            SummaryArgument::Unattributable,
+            SummaryArgument::BareColumn("salary".to_string())
+        ]
+    );
 }
 
 #[test]
 fn summary_resolution_peels_a_cast_off_the_aggregate() {
     let inspection = StatementInspection::new("SELECT cast(sum(salary) AS bigint) FROM demo.t");
-    let (_relations, columns) = inspection.summary_resolution(1).expect("trusted select");
-    assert_eq!(columns, vec![Some("salary".to_string())]);
+    let resolution = inspection.summary_resolution(1).expect("trusted select");
+    assert_eq!(
+        resolution.fields(),
+        vec![SummaryArgument::BareColumn("salary".to_string())]
+    );
+}
+
+#[test]
+fn summary_resolution_requires_explicit_relation_schemas() {
+    let inspection = StatementInspection::new("SELECT sum(salary) FROM payroll");
+    assert!(
+        inspection.summary_resolution(1).is_none(),
+        "an unqualified relation cannot be resolved without the session search_path"
+    );
+}
+
+#[test]
+fn summary_resolution_rejects_multi_argument_aggregates() {
+    let inspection = StatementInspection::new("SELECT regr_avgx(y, x) FROM demo.measurements");
+    let resolution = inspection.summary_resolution(1).expect("trusted select");
+    assert_eq!(
+        resolution.fields(),
+        vec![SummaryArgument::Unattributable],
+        "regr_avgx returns x, so inheriting the first argument y's mask is unsound"
+    );
 }
 
 #[test]
@@ -848,9 +895,16 @@ fn summary_resolution_refuses_shapes_lineage_owns() {
         "SELECT sum(t.salary) FROM demo.t",
     ];
     for sql in unattributable {
-        let (relations, columns) = StatementInspection::new(sql).summary_resolution(1).unwrap();
-        assert!(!relations.is_empty(), "the FROM is still readable: {sql}");
-        assert_eq!(columns, vec![None], "no attribution: {sql}");
+        let resolution = StatementInspection::new(sql).summary_resolution(1).unwrap();
+        assert!(
+            !resolution.relations().is_empty(),
+            "the FROM is still readable: {sql}"
+        );
+        assert_eq!(
+            resolution.fields(),
+            vec![SummaryArgument::Unattributable],
+            "no attribution: {sql}"
+        );
     }
 }
 

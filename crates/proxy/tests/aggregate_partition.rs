@@ -85,22 +85,25 @@ const ALL_AGGREGATES: &[&str] = &[
 ];
 
 /// The complete set released pass-through over a classified column. These are
-/// exactly the aggregates that can never degrade into a stored value: a count or
-/// a boolean is a tally or a predicate, not a member of the set it consumes.
+/// exactly the aggregates that can never degrade into a stored value: a count
+/// is a tally, not a member of the set it consumes.
 /// Everything else either refuses or — for the reducing summaries below —
 /// becomes `Safety::Summary` and is masked with its source column's mask.
-const RELEASED: &[&str] = &["bool_and", "bool_or", "count", "every", "regr_count"];
+const RELEASED: &[&str] = &["count", "regr_count"];
 
 /// The aggregates that reduce to `Safety::Summary`: useful over a large set,
 /// but the identity of their input when the set collapses to one row. The
-/// session resolves their source through lineage and masks the output with the
-/// source column's mask, so a sum over a bucketed column is a bucket whatever
+/// the session resolves one bare source column from explicitly qualified SQL
+/// and applies its policy, so a sum over a bucketed column is a bucket whatever
 /// the predicate collapses it to.
 const SUMMARY: &[&str] = &[
     "avg",
+    "bool_and",
+    "bool_or",
     "corr",
     "covar_pop",
     "covar_samp",
+    "every",
     "regr_avgx",
     "regr_avgy",
     "regr_intercept",

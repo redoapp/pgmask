@@ -18,9 +18,10 @@ pub enum Safety {
     /// A reducing aggregate: `sum(x)`, `avg(x)`, a variance, a regression
     /// slope. It is a summary when the input set is large and the *identity*
     /// function when the set collapses to one row, so it is only as safe as
-    /// what it reduces. The caller resolves the aggregate's source via
-    /// lineage and masks the output with the source column's mask when that
-    /// source is masked; when every source is released it is passed through.
+    /// what it reduces. The caller resolves a single bare source from explicitly
+    /// schema-qualified SQL and applies that column's policy. More complex
+    /// summaries retain the opaque posture; optional lineage may still prove
+    /// that all of their sources are explicitly released.
     Summary,
     /// Everything else. Says nothing about the field; the caller keeps its
     /// existing behaviour.
@@ -297,8 +298,15 @@ pub(crate) fn summary_argument_name(expr: &NodeEnum, depth: usize) -> Option<Str
             .and_then(|a| a.node.as_ref())
             .and_then(|a| summary_argument_name(a, depth.saturating_add(1))),
         NodeEnum::FuncCall(call) => {
+            // Multi-argument regressions do not necessarily return a summary
+            // of their first argument: `regr_avgx(y, x)` returns the average
+            // of `x`. One source mask cannot govern an output derived from
+            // several inputs, so leave every such call opaque.
+            let [arg] = call.args.as_slice() else {
+                return None;
+            };
             // Peel casts off the argument, mirroring the outer wrapper walk.
-            let mut arg = call.args.first()?;
+            let mut arg = arg;
             let arg = loop {
                 match arg.node.as_ref()? {
                     NodeEnum::TypeCast(cast) => arg = cast.arg.as_ref()?,
@@ -402,18 +410,18 @@ fn classify(expr: &NodeEnum, allow: Relaxations) -> Safety {
             // prove-absence reasoning this module refuses to do, so every
             // windowed aggregate is refused.
             if call.over.is_none() && REDUCING_AGGREGATES.contains(&name) {
-                // A count or a boolean returns a tally or a predicate, never a
-                // member of the input set, so it cannot degrade into a value no
-                // matter how small the group is.
+                // A count returns a tally, never a member of the input set, so
+                // it cannot degrade into a value no matter how small the group
+                // is. Boolean reductions are the identity over a singleton set
+                // and therefore fall through to `Summary` below.
                 if NON_VALUE_REDUCING_AGGREGATES.contains(&name) {
                     return Safety::Releasable;
                 }
                 // Everything else — `sum`, `avg`, a variance, a regression
-                // slope — is `Safety::Summary`: the identity of its input when
-                // the set collapses to one row. The session resolves the
-                // source; a masked source means the output is masked with that
-                // column's mask, so a singleton sum collapses to the same
-                // masked value the column itself returns.
+                // slope — is `Safety::Summary`: potentially the identity of an
+                // input when the set collapses. The session applies a source
+                // policy only for one bare argument column; complex summaries
+                // keep the opaque posture.
                 return Safety::Summary;
             }
             // Ranking windows emit a position, not a value — but only when

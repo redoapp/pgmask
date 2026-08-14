@@ -108,14 +108,15 @@ pub(crate) const REDUCING_AGGREGATES: &[&str] = &[
 //   reveals every bit set in any member. They are vanishingly rare over
 //   classified columns, so the utility given up is nil.
 
-/// The reducing aggregates that stay `Releasable` even over a masked column: a
-/// count or a boolean returns a tally or a predicate, never a member of the
-/// input set, so however small the group it cannot degrade into the value
-/// itself. Every other reducing aggregate is `Safety::Summary`. A name in both
-/// lists is not a contradiction — `REDUCING_AGGREGATES` is a purity allowlist,
-/// this is the subdivision the classifier makes *within* it.
-pub(crate) const NON_VALUE_REDUCING_AGGREGATES: &[&str] =
-    &["count", "regr_count", "bool_and", "bool_or", "every"];
+/// The reducing aggregates that stay `Releasable` even over a masked column.
+/// Counts return a tally, never a member of the input set. Boolean reductions
+/// are deliberately absent: over a singleton set `bool_or(x)`, `bool_and(x)`
+/// and `every(x)` are exactly `x`, so they are `Safety::Summary` and inherit
+/// the source column's mask.
+///
+/// A name in both lists is not a contradiction — `REDUCING_AGGREGATES` is a
+/// purity allowlist, this is the subdivision the classifier makes within it.
+pub(crate) const NON_VALUE_REDUCING_AGGREGATES: &[&str] = &["count", "regr_count"];
 
 /// Aggregates and window functions that **return one of the input values**, and
 /// are therefore exactly what this module must keep refusing.

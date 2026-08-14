@@ -44,8 +44,9 @@
 //!
 //! Reducing aggregates *not* ruled out by that key test are released from the
 //! syntactic layer into [`Safety::Summary`], and the session resolves the
-//! source through lineage: a sum over an unmasked column is served exactly, and
-//! a sum over a masked column is masked with that column's own mask. That is
+//! source through one syntax-and-catalog path: a sum over an explicitly
+//! qualified unmasked column is served exactly, and a sum over a masked column
+//! is masked with that column's own mask. That is
 //! what closes the `WHERE id = 1` form of the attack, which cannot be decided
 //! from the statement and the catalog — whether a predicate matches one row is
 //! a property of the data — by giving up the *precision* rather than the
@@ -240,29 +241,22 @@ impl<'sql> StatementInspection<'sql> {
     /// Resolution material for a reducing aggregate over a single bare column.
     ///
     /// [`Safety::Summary`] is reached without the catalog, because analysis does
-    /// not resolve names — that is lineage's job. But lineage is off by default
-    /// (`lineage = "refuse"`), and a reducing aggregate over a masked column
-    /// must be masked even then; that is the whole point of the verdict. Today
-    /// it is not: with lineage off every reducing aggregate is *refused*, not
-    /// masked, which breaks the 0.1.92 contract for the one configuration that
-    /// ships on by default.
+    /// not resolve names. Mask selection deliberately does not come from a
+    /// blocked lineage verdict: that verdict can describe several inputs or a
+    /// transformed input, and one source's mask is not a policy for the result.
     ///
-    /// The backstop below needs no `sqllineage`: an aggregate over one bare
+    /// The resolver below needs no `sqllineage`: an aggregate over one bare
     /// column is attributable from the statement and the catalog alone. It
-    /// returns, for the one trusted select, the plain-named FROM relations
-    /// `(schema, relname)` and, aligned to `field_count`, the bare column each
-    /// field reduces when the field is exactly such an aggregate
-    /// (`cast(sum(x) AS bigint)` is; an expression argument is lineage's
-    /// territory).
+    /// returns, for the one trusted select, the explicitly schema-qualified
+    /// FROM relations `(schema, relname)` and, aligned to `field_count`, the bare
+    /// column each field reduces when the field is exactly such an aggregate
+    /// (`cast(sum(x) AS bigint)` is; an expression or multi-argument aggregate
+    /// keeps the opaque posture).
     ///
-    /// Any parse doubt — a set operation, a star, a FROM entry that is not a
-    /// plain named range — collapses the whole thing to `None`, and the caller
-    /// keeps its normal opaque posture.
-    ///
-    /// This can only ever move a value *towards* masking: the caller resolves a
-    /// returned column name against the catalog and uses only a *masked* column,
-    /// so a wrong attribution is an over-mask (or a refusal), never a
-    /// passthrough.
+    /// Any parse doubt — a set operation, a star, an unqualified relation (which
+    /// needs the session's `search_path`), or a FROM entry that is not a plain
+    /// named range — collapses the whole thing to `None`, and the caller keeps
+    /// its normal opaque posture.
     pub fn summary_resolution(&self, field_count: usize) -> Option<SummaryResolution> {
         let parsed = self.parsed()?;
         if parsed.protobuf.stmts.len() != 1 {
@@ -292,9 +286,15 @@ impl<'sql> StatementInspection<'sql> {
                 // territory; this backstop only handles plain named ranges.
                 return None;
             };
+            // The proxy does not track `search_path`. Treating an unqualified
+            // `payroll` as `public.payroll` can apply that relation's weaker
+            // mask to a value actually read from `private.payroll`.
+            if range.schemaname.is_empty() {
+                return None;
+            }
             relations.push((range.schemaname.clone(), range.relname.clone()));
         }
-        let columns = select
+        let fields = select
             .target_list
             .iter()
             .map(|entry| match entry.node.as_ref() {
@@ -302,11 +302,12 @@ impl<'sql> StatementInspection<'sql> {
                     .val
                     .as_ref()
                     .and_then(|v| v.node.as_ref())
-                    .and_then(|expr| summary_argument_name(expr, 0)),
-                _ => None,
+                    .and_then(|expr| summary_argument_name(expr, 0))
+                    .map_or(SummaryArgument::Unattributable, SummaryArgument::BareColumn),
+                _ => SummaryArgument::Unattributable,
             })
             .collect();
-        Some((relations, columns))
+        Some(SummaryResolution { relations, fields })
     }
 
     pub fn reads_only_server_metadata(&self) -> bool {
@@ -363,11 +364,33 @@ impl<'sql> StatementInspection<'sql> {
     }
 }
 
-/// What [`StatementInspection::summary_resolution`] returns: the plain-named
-/// FROM relations `(schema, relname)` and, aligned to the result-set fields, the
-/// bare column each field's aggregate reduces — `None` when the field is not
-/// that shape.
-pub type SummaryResolution = (Vec<(String, String)>, Vec<Option<String>>);
+/// Syntax-level attribution for reducing aggregates in one result set.
+///
+/// This is deliberately not an anonymous pair of parallel vectors: callers
+/// must name whether they are asking about FROM relations or result fields,
+/// and each field says explicitly whether its argument can be attributed.
+pub struct SummaryResolution {
+    relations: Vec<(String, String)>,
+    fields: Vec<SummaryArgument>,
+}
+
+impl SummaryResolution {
+    pub fn relations(&self) -> &[(String, String)] {
+        &self.relations
+    }
+
+    pub fn fields(&self) -> &[SummaryArgument] {
+        &self.fields
+    }
+}
+
+/// The only aggregate argument shape whose catalog policy can safely govern a
+/// reducing result. Everything else retains the opaque posture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryArgument {
+    BareColumn(String),
+    Unattributable,
+}
 
 /// Whether `pg_query` can parse the statement at all.
 ///
