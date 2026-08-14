@@ -1818,16 +1818,14 @@ fn reads_only_server_metadata_inspected(inspection: &StatementInspection<'_>) ->
                 }
             }
 
-            Some(NodeEnum::FuncCall(call)) => {
-                // Same invert as RangeFunction. `SELECT get_raw_page(...) FROM
-                // pg_class` has a catalog RangeVar and constant args, so a
-                // denylist of dump names is an allow for every unnamed one
-                // (pageinspect, `pg_sleep`, `set_config`, …) and skips
-                // untrusted. Helpers / trusted names / FROM-generators keep
-                // the fast path; the escape list still wins if both match.
-                if !func_call_is_catalog_safe(call) {
-                    disqualified = true;
-                }
+            // Same invert as RangeFunction. `SELECT get_raw_page(...) FROM
+            // pg_class` has a catalog RangeVar and constant args, so a
+            // denylist of dump names is an allow for every unnamed one
+            // (pageinspect, `pg_sleep`, `set_config`, …) and skips
+            // untrusted. Helpers / trusted names / FROM-generators keep
+            // the fast path; the escape list still wins if both match.
+            Some(NodeEnum::FuncCall(call)) if !func_call_is_catalog_safe(call) => {
+                disqualified = true;
             }
             _ => {}
         }
