@@ -352,6 +352,9 @@ fn run_pass() -> Vec<(String, &'static str)> {
         r#"SELECT count(*) FROM demo.customers WHERE JSON_PARSE(to_json(u&"email")) IS NOT NULL"#,
         r#"SELECT json_arrayagg(u&"email" ORDER BY id) FROM demo.customers"#,
         r#"SELECT json_objectagg(u&"email": city) FROM demo.customers"#,
+        r#"SELECT json_arrayagg(city) OVER (PARTITION BY u&"email") FROM demo.customers"#,
+        r#"SELECT json_arrayagg(city) OVER (ORDER BY u&"email" = 'x') FROM demo.customers"#,
+        r#"SELECT json_objectagg(city: id) OVER (PARTITION BY u&"email") FROM demo.customers"#,
         r#"EXPLAIN WITH RECURSIVE r AS (SELECT * FROM demo.customers)
            SEARCH DEPTH FIRST BY u&"email" SET ord SELECT count(*) FROM r"#,
         r#"SELECT count(*) FROM demo.customers,
@@ -462,6 +465,17 @@ fn run_pass() -> Vec<(String, &'static str)> {
         "SELECT count(*) FROM demo.customers a NATURAL JOIN demo.customers b",
         r#"SELECT count(*) FROM demo.customers NATURAL JOIN (VALUES ('x')) v(u&"email")"#,
         "SELECT count(*) FROM customers AS t(c1,c2,c3,c4,c5) WHERE c2 = 'x'",
+        "SELECT count(*) FROM (SELECT * FROM demo.customers) AS t(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) WHERE c2 = 'x'",
+        "WITH q(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) AS (SELECT * FROM demo.customers) SELECT count(*) FROM q WHERE c2 = 'x'",
+        "SELECT count(*) FROM q AS t(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11), demo.customers WHERE false",
+        r#"PREPARE q AS SELECT count(*) FROM demo.customers a NATURAL JOIN demo.customers b"#,
+        r#"PREPARE q AS SELECT count(*) FROM demo.customers AS t(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) WHERE c2 = 'x'"#,
+        r#"DECLARE c CURSOR FOR SELECT count(*) FROM demo.customers a NATURAL JOIN demo.customers b"#,
+        r#"DECLARE c CURSOR FOR SELECT count(*) FROM demo.customers AS t(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) WHERE c2 = 'x'"#,
+        "SELECT count(*) FROM (TABLE demo.customers) AS t(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) WHERE c2 = 'x'",
+        r#"WITH q AS (SELECT * FROM demo.customers a NATURAL JOIN demo.customers b) SELECT count(*) FROM q"#,
+        r#"PREPARE q AS SELECT count(*) FROM (SELECT * FROM demo.customers) AS t(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) WHERE c2 = 'x'"#,
+        r#"SELECT count(*) FROM demo.customers NATURAL JOIN unnest(ARRAY['x']) AS t(u&"email")"#,
     ];
     for sql in join_rename {
         check(sql, must_refuse_join_rename(sql));
