@@ -16,6 +16,14 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
 - `pg_cursors` (session cursor SQL text) and `pg_stat_wal_receiver` (conninfo)
   are refused as leaky catalogs, same class as `pg_prepared_statements` /
   `pg_subscription`.
+- Hostile / read-only / write gates share one descent (`walk_tree` /
+  `for_each_child_node`) and one cached parse (`StatementInspection`) instead
+  of a parallel `tally_*` match plus `pg_query::nodes()`. The parser is still
+  pg_query; `nodes()` is not a complete visitor (upstream: it skips node
+  types, including LIMIT and window frames), so absence proofs — masked
+  names, writes, leaky catalogs, metadata-only, provenance, qualification —
+  use the local walk. The session frontend gates parse once. `EXPLAIN INSERT`
+  is a write because the inner statement is visible on that walk.
 - `string_agg(city, ',' ORDER BY u&"email" = 'x')` / `WITHIN GROUP (ORDER BY …)`
   — `FuncCall.agg_order` was never walked
 - `ROWS BETWEEN (SELECT … WHERE u&"email" = 'x') PRECEDING AND CURRENT ROW`

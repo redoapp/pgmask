@@ -565,19 +565,20 @@ impl Session {
 
     /// Frontend gates that must run before the statement reaches Postgres.
     fn refuse_frontend_sql(&mut self, sql: &str, out: &mut Batch, with_ready: bool) -> bool {
-        if analysis::is_write_statement(sql) {
+        let inspection = analysis::StatementInspection::new(sql);
+        if inspection.is_write_statement() {
             self.refuse_write(out, with_ready);
             return true;
         }
-        if analysis::is_sql_prepare_or_cursor(sql) {
+        if inspection.is_sql_prepare_or_cursor() {
             self.refuse_sql_prepare_or_cursor(out, with_ready);
             return true;
         }
-        if analysis::calls_untrusted_function(sql) {
+        if inspection.calls_untrusted_function() {
             self.refuse_untrusted_function(out, with_ready);
             return true;
         }
-        if analysis::touches_leaky_system_catalog(sql) {
+        if inspection.touches_leaky_system_catalog() {
             self.refuse_leaky_catalog(out, with_ready);
             return true;
         }
@@ -589,9 +590,9 @@ impl Session {
             let snapshot = self.policy.catalog.snapshot();
             let masked = snapshot.masked_bare_names_for_roles(&self.roles);
             let relations = snapshot.relation_columns_map();
-            if analysis::masked_exceeds_outer_projection(sql, &masked)
-                || analysis::hostile_uses_whole_row(sql, relations)
-                || analysis::hostile_join_or_rename_masked(sql, relations, &masked)
+            if inspection.masked_exceeds_outer_projection(&masked)
+                || inspection.hostile_uses_whole_row(relations)
+                || inspection.hostile_join_or_rename_masked(relations, &masked)
             {
                 self.refuse_hostile_masked_use(out, with_ready);
                 return true;
@@ -1136,10 +1137,11 @@ impl Session {
         if self.policy.posture == Posture::Hostile {
             let masked = snapshot.masked_bare_names_for_roles(&self.roles);
             let relations = snapshot.relation_columns_map();
-            let sql = described_sql.as_deref().unwrap_or("");
-            if analysis::masked_exceeds_outer_projection(sql, &masked)
-                || analysis::hostile_uses_whole_row(sql, relations)
-                || analysis::hostile_join_or_rename_masked(sql, relations, &masked)
+            let empty = analysis::StatementInspection::new("");
+            let hostile = inspection.as_ref().unwrap_or(&empty);
+            if hostile.masked_exceeds_outer_projection(&masked)
+                || hostile.hostile_uses_whole_row(relations)
+                || hostile.hostile_join_or_rename_masked(relations, &masked)
             {
                 self.plans.discard_description();
                 return self.reject(
