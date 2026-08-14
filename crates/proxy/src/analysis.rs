@@ -1740,6 +1740,12 @@ pub fn masked_exceeds_outer_projection(sql: &str, masked: &HashSet<String>) -> b
     if masked.is_empty() {
         return false;
     }
+    // Unicode-escaped names are invisible to the lexer. If we cannot parse,
+    // we cannot count them, and allowing the statement is a leak on any
+    // syntax pg_query lags the engine on (JSON_TABLE, …). Fail closed.
+    if pg_query::parse(sql).is_err() {
+        return true;
+    }
     let Some(idents) = referenced_identifiers(sql) else {
         return true;
     };
@@ -1808,6 +1814,19 @@ fn masked_column_ref_counts(
             NodeRef::Alias(alias) => {
                 for entry in &alias.colnames {
                     tally_masked_string_node(entry, masked, &mut counts);
+                }
+            }
+            // `nodes()` does not descend into PREPARE/DECLARE query bodies, so
+            // `PREPARE q AS SELECT … WHERE u&"email" = 'x'` followed by
+            // `EXECUTE q` would otherwise be a live membership oracle.
+            NodeRef::PrepareStmt(prep) => {
+                if let Some(query) = prep.query.as_ref() {
+                    tally_masked_column_refs_in(query, masked, &mut counts);
+                }
+            }
+            NodeRef::DeclareCursorStmt(decl) => {
+                if let Some(query) = decl.query.as_ref() {
+                    tally_masked_column_refs_in(query, masked, &mut counts);
                 }
             }
             _ => {}
@@ -1914,6 +1933,31 @@ fn tally_from_item_masked(
                 tally_masked_column_refs_in(call, masked, counts);
             }
         }
+        Some(NodeEnum::RangeTableFunc(tf)) => {
+            if let Some(doc) = tf.docexpr.as_ref() {
+                tally_masked_column_refs_in(doc, masked, counts);
+            }
+            if let Some(row) = tf.rowexpr.as_ref() {
+                tally_masked_column_refs_in(row, masked, counts);
+            }
+            for col in &tf.columns {
+                tally_masked_column_refs_in(col, masked, counts);
+            }
+        }
+        Some(NodeEnum::RangeTableSample(sample)) => {
+            if let Some(rel) = sample.relation.as_ref() {
+                tally_from_item_masked(rel, masked, counts);
+            }
+            for arg in &sample.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+            if let Some(rep) = sample.repeatable.as_ref() {
+                tally_masked_column_refs_in(rep, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonTable(_)) | Some(NodeEnum::TableFunc(_)) => {
+            tally_masked_column_refs_in(node, masked, counts);
+        }
         _ => {}
     }
 }
@@ -1932,6 +1976,12 @@ fn tally_masked_in_window_def(
                 tally_masked_column_refs_in(expr, masked, counts);
             }
         }
+    }
+    if let Some(start) = window.start_offset.as_ref() {
+        tally_masked_column_refs_in(start, masked, counts);
+    }
+    if let Some(end) = window.end_offset.as_ref() {
+        tally_masked_column_refs_in(end, masked, counts);
     }
 }
 
@@ -2007,6 +2057,9 @@ fn tally_masked_column_refs_in(
         Some(NodeEnum::FuncCall(call)) => {
             for arg in &call.args {
                 tally_masked_column_refs_in(arg, masked, counts);
+            }
+            for order in &call.agg_order {
+                tally_masked_column_refs_in(order, masked, counts);
             }
             if let Some(filter) = call.agg_filter.as_ref() {
                 tally_masked_column_refs_in(filter, masked, counts);
@@ -2243,7 +2296,180 @@ fn tally_masked_column_refs_in(
                 tally_masked_column_refs_in(arg, masked, counts);
             }
         }
+        Some(NodeEnum::SortBy(s)) => {
+            if let Some(expr) = s.node.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::WindowDef(w)) => {
+            tally_masked_in_window_def(w, masked, counts);
+        }
+        Some(NodeEnum::AIndices(i)) => {
+            if let Some(l) = i.lidx.as_ref() {
+                tally_masked_column_refs_in(l, masked, counts);
+            }
+            if let Some(u) = i.uidx.as_ref() {
+                tally_masked_column_refs_in(u, masked, counts);
+            }
+        }
+        Some(NodeEnum::GroupingFunc(g)) => {
+            for arg in &g.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::RowCompareExpr(r)) => {
+            for arg in r.largs.iter().chain(r.rargs.iter()) {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::DistinctExpr(d)) => {
+            for arg in &d.args {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::FieldSelect(f)) => {
+            if let Some(arg) = f.arg.as_ref() {
+                tally_masked_column_refs_in(arg, masked, counts);
+            }
+        }
+        Some(NodeEnum::JoinExpr(_))
+        | Some(NodeEnum::RangeSubselect(_))
+        | Some(NodeEnum::RangeFunction(_))
+        | Some(NodeEnum::RangeTableSample(_))
+        | Some(NodeEnum::RangeTableFunc(_)) => {
+            tally_from_item_masked(node, masked, counts);
+        }
+        Some(NodeEnum::CommonTableExpr(cte)) => {
+            for entry in &cte.aliascolnames {
+                tally_masked_string_node(entry, masked, counts);
+            }
+        }
+        Some(NodeEnum::PrepareStmt(p)) => {
+            if let Some(query) = p.query.as_ref() {
+                tally_masked_column_refs_in(query, masked, counts);
+            }
+        }
+        Some(NodeEnum::DeclareCursorStmt(d)) => {
+            if let Some(query) = d.query.as_ref() {
+                tally_masked_column_refs_in(query, masked, counts);
+            }
+        }
+        Some(NodeEnum::ExplainStmt(e)) => {
+            if let Some(query) = e.query.as_ref() {
+                tally_masked_column_refs_in(query, masked, counts);
+            }
+        }
+        Some(NodeEnum::JsonFuncExpr(j)) => {
+            tally_json_value_expr(j.context_item.as_deref(), masked, counts);
+            if let Some(path) = j.pathspec.as_ref() {
+                tally_masked_column_refs_in(path, masked, counts);
+            }
+            for passing in &j.passing {
+                tally_masked_column_refs_in(passing, masked, counts);
+            }
+            tally_json_behavior(j.on_empty.as_deref(), masked, counts);
+            tally_json_behavior(j.on_error.as_deref(), masked, counts);
+        }
+        Some(NodeEnum::JsonTable(j)) => {
+            tally_json_value_expr(j.context_item.as_deref(), masked, counts);
+            if let Some(path) = j.pathspec.as_ref() {
+                if let Some(s) = path.string.as_ref() {
+                    tally_masked_column_refs_in(s, masked, counts);
+                }
+            }
+            for passing in &j.passing {
+                tally_masked_column_refs_in(passing, masked, counts);
+            }
+            for col in &j.columns {
+                tally_masked_column_refs_in(col, masked, counts);
+            }
+            tally_json_behavior(j.on_error.as_deref(), masked, counts);
+            if let Some(alias) = j.alias.as_ref() {
+                for entry in &alias.colnames {
+                    tally_masked_string_node(entry, masked, counts);
+                }
+            }
+        }
+        Some(NodeEnum::JsonTableColumn(c)) => {
+            if let Some(path) = c.pathspec.as_ref() {
+                if let Some(s) = path.string.as_ref() {
+                    tally_masked_column_refs_in(s, masked, counts);
+                }
+            }
+            for nested in &c.columns {
+                tally_masked_column_refs_in(nested, masked, counts);
+            }
+            tally_json_behavior(c.on_empty.as_deref(), masked, counts);
+            tally_json_behavior(c.on_error.as_deref(), masked, counts);
+        }
+        Some(NodeEnum::JsonArgument(a)) => {
+            tally_json_value_expr(a.val.as_deref(), masked, counts);
+        }
+        Some(NodeEnum::JsonExpr(j)) => {
+            if let Some(formatted) = j.formatted_expr.as_ref() {
+                tally_masked_column_refs_in(formatted, masked, counts);
+            }
+            if let Some(path) = j.path_spec.as_ref() {
+                tally_masked_column_refs_in(path, masked, counts);
+            }
+            for value in &j.passing_values {
+                tally_masked_column_refs_in(value, masked, counts);
+            }
+            tally_json_behavior(j.on_empty.as_deref(), masked, counts);
+            tally_json_behavior(j.on_error.as_deref(), masked, counts);
+        }
+        Some(NodeEnum::JsonBehavior(b)) => {
+            if let Some(expr) = b.expr.as_ref() {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
+        Some(NodeEnum::TableFunc(tf)) => {
+            if let Some(doc) = tf.docexpr.as_ref() {
+                tally_masked_column_refs_in(doc, masked, counts);
+            }
+            if let Some(row) = tf.rowexpr.as_ref() {
+                tally_masked_column_refs_in(row, masked, counts);
+            }
+            for expr in tf
+                .colexprs
+                .iter()
+                .chain(tf.coldefexprs.iter())
+                .chain(tf.colvalexprs.iter())
+                .chain(tf.passingvalexprs.iter())
+            {
+                tally_masked_column_refs_in(expr, masked, counts);
+            }
+        }
         _ => {}
+    }
+}
+
+fn tally_json_value_expr(
+    expr: Option<&pg_query::protobuf::JsonValueExpr>,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    let Some(expr) = expr else {
+        return;
+    };
+    if let Some(raw) = expr.raw_expr.as_ref() {
+        tally_masked_column_refs_in(raw, masked, counts);
+    }
+    if let Some(formatted) = expr.formatted_expr.as_ref() {
+        tally_masked_column_refs_in(formatted, masked, counts);
+    }
+}
+
+fn tally_json_behavior(
+    behavior: Option<&pg_query::protobuf::JsonBehavior>,
+    masked: &HashSet<String>,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    let Some(behavior) = behavior else {
+        return;
+    };
+    if let Some(expr) = behavior.expr.as_ref() {
+        tally_masked_column_refs_in(expr, masked, counts);
     }
 }
 
@@ -2470,20 +2696,41 @@ pub fn hostile_uses_whole_row(
     sql: &str,
     relation_columns: &std::collections::HashMap<String, Vec<String>>,
 ) -> bool {
-    use pg_query::NodeRef;
-
     let Ok(parsed) = pg_query::parse(sql) else {
         return true;
     };
     let mut row_names = HashSet::new();
     let mut qualified = HashSet::new();
-    for (node, _, _, _) in parsed.protobuf.nodes() {
-        match node {
-            NodeRef::RangeVar(v) => {
-                let rel = v.relname.to_ascii_lowercase();
-                if rel.is_empty() {
-                    continue;
-                }
+    for raw in &parsed.protobuf.stmts {
+        if let Some(stmt) = raw.stmt.as_ref() {
+            collect_row_binders(stmt, relation_columns, &mut row_names, &mut qualified);
+        }
+    }
+    if row_names.is_empty() && qualified.is_empty() {
+        return false;
+    }
+    // Walk each statement from the root. `nodes()` skips LIMIT, window
+    // frames, aggregate ORDER BY, JSON constructors, XML, and PREPARE bodies.
+    for raw in &parsed.protobuf.stmts {
+        if let Some(stmt) = raw.stmt.as_ref() {
+            if subtree_has_whole_row(stmt, &row_names, &qualified) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_row_binders(
+    node: &pg_query::protobuf::Node,
+    relation_columns: &std::collections::HashMap<String, Vec<String>>,
+    row_names: &mut HashSet<String>,
+    qualified: &mut HashSet<String>,
+) {
+    match node.node.as_ref() {
+        Some(NodeEnum::RangeVar(v)) => {
+            let rel = v.relname.to_ascii_lowercase();
+            if !rel.is_empty() {
                 let schema = v.schemaname.to_ascii_lowercase();
                 if !schema.is_empty() {
                     qualified.insert(format!("{schema}.{rel}"));
@@ -2497,83 +2744,54 @@ pub fn hostile_uses_whole_row(
                 if let Some(alias) = v.alias.as_ref() {
                     consider(alias.aliasname.to_ascii_lowercase());
                 }
-                // Table name is always a possible row variable (with or without alias).
                 consider(rel);
             }
-            // `FROM (SELECT …) t` — alias is a row variable; no catalog columns.
-            NodeRef::RangeSubselect(sub) => {
-                if let Some(alias) = sub.alias.as_ref() {
-                    let a = alias.aliasname.to_ascii_lowercase();
-                    if !a.is_empty() {
-                        row_names.insert(a);
-                    }
-                }
-            }
-            NodeRef::RangeFunction(func) => {
-                if let Some(alias) = func.alias.as_ref() {
-                    let a = alias.aliasname.to_ascii_lowercase();
-                    if !a.is_empty() {
-                        row_names.insert(a);
-                    }
-                }
-            }
-            NodeRef::JoinExpr(join) => {
-                if let Some(alias) = join.alias.as_ref() {
-                    let a = alias.aliasname.to_ascii_lowercase();
-                    if !a.is_empty() {
-                        row_names.insert(a);
-                    }
-                }
-            }
-            _ => {}
         }
-    }
-    if row_names.is_empty() && qualified.is_empty() {
-        return false;
-    }
-    for (node, _, _, _) in parsed.protobuf.nodes() {
-        match node {
-            NodeRef::ColumnRef(column) => {
-                if column_ref_is_whole_row(column, &row_names, &qualified) {
-                    return true;
+        Some(NodeEnum::RangeSubselect(sub)) => {
+            if let Some(alias) = sub.alias.as_ref() {
+                let a = alias.aliasname.to_ascii_lowercase();
+                if !a.is_empty() {
+                    row_names.insert(a);
                 }
             }
-            // `protobuf.nodes()` does not descend into aggregate FILTER
-            // clauses (`count(*) FILTER (WHERE t::text …)`), which is how
-            // this oracle survived the first pass.
-            NodeRef::FuncCall(call) => {
-                if let Some(filter) = call.agg_filter.as_ref() {
-                    if subtree_has_whole_row(filter, &row_names, &qualified) {
-                        return true;
-                    }
-                }
-            }
-            NodeRef::Aggref(agg) => {
-                if let Some(filter) = agg.aggfilter.as_ref() {
-                    if subtree_has_whole_row(filter, &row_names, &qualified) {
-                        return true;
-                    }
-                }
-            }
-            NodeRef::WindowFunc(win) => {
-                if let Some(filter) = win.aggfilter.as_ref() {
-                    if subtree_has_whole_row(filter, &row_names, &qualified) {
-                        return true;
-                    }
-                }
-            }
-            // Same gap: COLLATE hides the TypeCast/ColumnRef from `nodes()`.
-            NodeRef::CollateClause(c) => {
-                if let Some(arg) = c.arg.as_ref() {
-                    if subtree_has_whole_row(arg, &row_names, &qualified) {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
         }
+        Some(NodeEnum::RangeFunction(func)) => {
+            if let Some(alias) = func.alias.as_ref() {
+                let a = alias.aliasname.to_ascii_lowercase();
+                if !a.is_empty() {
+                    row_names.insert(a);
+                }
+            }
+        }
+        Some(NodeEnum::JoinExpr(join)) => {
+            if let Some(alias) = join.alias.as_ref() {
+                let a = alias.aliasname.to_ascii_lowercase();
+                if !a.is_empty() {
+                    row_names.insert(a);
+                }
+            }
+        }
+        Some(NodeEnum::JsonTable(jt)) => {
+            if let Some(alias) = jt.alias.as_ref() {
+                let a = alias.aliasname.to_ascii_lowercase();
+                if !a.is_empty() {
+                    row_names.insert(a);
+                }
+            }
+        }
+        Some(NodeEnum::RangeTableFunc(tf)) => {
+            if let Some(alias) = tf.alias.as_ref() {
+                let a = alias.aliasname.to_ascii_lowercase();
+                if !a.is_empty() {
+                    row_names.insert(a);
+                }
+            }
+        }
+        _ => {}
     }
-    false
+    for_each_child_node(node, &mut |child| {
+        collect_row_binders(child, relation_columns, row_names, qualified);
+    });
 }
 
 fn subtree_has_whole_row(
@@ -2581,74 +2799,448 @@ fn subtree_has_whole_row(
     row_names: &HashSet<String>,
     qualified: &HashSet<String>,
 ) -> bool {
-    match node.node.as_ref() {
-        Some(NodeEnum::ColumnRef(column)) => column_ref_is_whole_row(column, row_names, qualified),
-        Some(NodeEnum::TypeCast(cast)) => cast
-            .arg
-            .as_ref()
-            .is_some_and(|a| subtree_has_whole_row(a, row_names, qualified)),
-        Some(NodeEnum::CollateClause(c)) => c
-            .arg
-            .as_ref()
-            .is_some_and(|a| subtree_has_whole_row(a, row_names, qualified)),
-        Some(NodeEnum::AExpr(expr)) => [expr.lexpr.as_ref(), expr.rexpr.as_ref()]
-            .into_iter()
-            .flatten()
-            .any(|side| subtree_has_whole_row(side, row_names, qualified)),
-        Some(NodeEnum::BoolExpr(expr)) => expr
-            .args
-            .iter()
-            .any(|arg| subtree_has_whole_row(arg, row_names, qualified)),
-        Some(NodeEnum::NullTest(n)) => n
-            .arg
-            .as_ref()
-            .is_some_and(|a| subtree_has_whole_row(a, row_names, qualified)),
-        Some(NodeEnum::FuncCall(call)) => {
-            call.args
-                .iter()
-                .any(|arg| subtree_has_whole_row(arg, row_names, qualified))
-                || call
-                    .agg_filter
-                    .as_ref()
-                    .is_some_and(|f| subtree_has_whole_row(f, row_names, qualified))
+    if let Some(NodeEnum::ColumnRef(column)) = node.node.as_ref() {
+        if column_ref_is_whole_row(column, row_names, qualified) {
+            return true;
         }
-        Some(NodeEnum::CoalesceExpr(c)) => c
-            .args
-            .iter()
-            .any(|arg| subtree_has_whole_row(arg, row_names, qualified)),
-        Some(NodeEnum::MinMaxExpr(m)) => m
-            .args
-            .iter()
-            .any(|arg| subtree_has_whole_row(arg, row_names, qualified)),
+    }
+    let mut found = false;
+    for_each_child_node(node, &mut |child| {
+        if !found && subtree_has_whole_row(child, row_names, qualified) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Child nodes `pg_query::nodes()` does not reliably visit. Hostile whole-row
+/// detection walks these instead of extending a second incomplete match.
+fn for_each_child_node(
+    node: &pg_query::protobuf::Node,
+    visit: &mut dyn FnMut(&pg_query::protobuf::Node),
+) {
+    match node.node.as_ref() {
+        Some(NodeEnum::TypeCast(cast)) => {
+            if let Some(arg) = cast.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::CollateClause(c)) => {
+            if let Some(arg) = c.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::AExpr(expr)) => {
+            if let Some(l) = expr.lexpr.as_ref() {
+                visit(l);
+            }
+            if let Some(r) = expr.rexpr.as_ref() {
+                visit(r);
+            }
+        }
+        Some(NodeEnum::BoolExpr(expr)) => {
+            for arg in &expr.args {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::NullTest(n)) => {
+            if let Some(arg) = n.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::BooleanTest(b)) => {
+            if let Some(arg) = b.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::FuncCall(call)) => {
+            for arg in &call.args {
+                visit(arg);
+            }
+            for order in &call.agg_order {
+                visit(order);
+            }
+            if let Some(filter) = call.agg_filter.as_ref() {
+                visit(filter);
+            }
+            if let Some(over) = call.over.as_ref() {
+                for_each_window_def_child(over, visit);
+            }
+        }
+        Some(NodeEnum::CoalesceExpr(c)) => {
+            for arg in &c.args {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::MinMaxExpr(m)) => {
+            for arg in &m.args {
+                visit(arg);
+            }
+        }
         Some(NodeEnum::SubLink(sub)) => {
-            sub.testexpr
-                .as_ref()
-                .is_some_and(|t| subtree_has_whole_row(t, row_names, qualified))
-                || sub
-                    .subselect
-                    .as_ref()
-                    .is_some_and(|s| subtree_has_whole_row(s, row_names, qualified))
+            if let Some(t) = sub.testexpr.as_ref() {
+                visit(t);
+            }
+            if let Some(s) = sub.subselect.as_ref() {
+                visit(s);
+            }
         }
         Some(NodeEnum::CaseExpr(c)) => {
-            c.arg
-                .as_ref()
-                .is_some_and(|a| subtree_has_whole_row(a, row_names, qualified))
-                || c.args
-                    .iter()
-                    .any(|arm| subtree_has_whole_row(arm, row_names, qualified))
-                || c.defresult
-                    .as_ref()
-                    .is_some_and(|d| subtree_has_whole_row(d, row_names, qualified))
+            if let Some(a) = c.arg.as_ref() {
+                visit(a);
+            }
+            for arm in &c.args {
+                visit(arm);
+            }
+            if let Some(d) = c.defresult.as_ref() {
+                visit(d);
+            }
         }
         Some(NodeEnum::CaseWhen(w)) => {
-            w.expr
-                .as_ref()
-                .is_some_and(|e| subtree_has_whole_row(e, row_names, qualified))
-                || w.result
-                    .as_ref()
-                    .is_some_and(|r| subtree_has_whole_row(r, row_names, qualified))
+            if let Some(e) = w.expr.as_ref() {
+                visit(e);
+            }
+            if let Some(r) = w.result.as_ref() {
+                visit(r);
+            }
         }
-        _ => false,
+        Some(NodeEnum::AArrayExpr(arr)) => {
+            for el in &arr.elements {
+                visit(el);
+            }
+        }
+        Some(NodeEnum::ArrayExpr(arr)) => {
+            for el in &arr.elements {
+                visit(el);
+            }
+        }
+        Some(NodeEnum::AIndirection(ind)) => {
+            if let Some(arg) = ind.arg.as_ref() {
+                visit(arg);
+            }
+            for part in &ind.indirection {
+                visit(part);
+            }
+        }
+        Some(NodeEnum::AIndices(i)) => {
+            if let Some(l) = i.lidx.as_ref() {
+                visit(l);
+            }
+            if let Some(u) = i.uidx.as_ref() {
+                visit(u);
+            }
+        }
+        Some(NodeEnum::XmlExpr(xml)) => {
+            for arg in xml.args.iter().chain(xml.named_args.iter()) {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::XmlSerialize(x)) => {
+            if let Some(expr) = x.expr.as_ref() {
+                visit(expr);
+            }
+        }
+        Some(NodeEnum::NamedArgExpr(named)) => {
+            if let Some(arg) = named.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::RowExpr(row)) => {
+            for arg in &row.args {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::ResTarget(target)) => {
+            if let Some(val) = target.val.as_ref() {
+                visit(val);
+            }
+        }
+        Some(NodeEnum::List(list)) => {
+            for item in &list.items {
+                visit(item);
+            }
+        }
+        Some(NodeEnum::NullIfExpr(n)) => {
+            for arg in &n.args {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::ScalarArrayOpExpr(s)) => {
+            for arg in &s.args {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::SortBy(s)) => {
+            if let Some(expr) = s.node.as_ref() {
+                visit(expr);
+            }
+        }
+        Some(NodeEnum::WindowDef(w)) => for_each_window_def_child(w, visit),
+        Some(NodeEnum::SelectStmt(select)) => {
+            for n in select
+                .distinct_clause
+                .iter()
+                .chain(select.target_list.iter())
+                .chain(select.from_clause.iter())
+                .chain(select.group_clause.iter())
+                .chain(select.window_clause.iter())
+                .chain(select.values_lists.iter())
+                .chain(select.sort_clause.iter())
+                .chain(select.locking_clause.iter())
+            {
+                visit(n);
+            }
+            if let Some(w) = select.where_clause.as_ref() {
+                visit(w);
+            }
+            if let Some(h) = select.having_clause.as_ref() {
+                visit(h);
+            }
+            if let Some(o) = select.limit_offset.as_ref() {
+                visit(o);
+            }
+            if let Some(c) = select.limit_count.as_ref() {
+                visit(c);
+            }
+            if let Some(with) = select.with_clause.as_ref() {
+                for cte in &with.ctes {
+                    visit(cte);
+                }
+            }
+            if let Some(left) = select.larg.as_ref() {
+                let wrap = pg_query::protobuf::Node {
+                    node: Some(NodeEnum::SelectStmt(left.clone())),
+                };
+                visit(&wrap);
+            }
+            if let Some(right) = select.rarg.as_ref() {
+                let wrap = pg_query::protobuf::Node {
+                    node: Some(NodeEnum::SelectStmt(right.clone())),
+                };
+                visit(&wrap);
+            }
+        }
+        Some(NodeEnum::JoinExpr(join)) => {
+            if let Some(l) = join.larg.as_ref() {
+                visit(l);
+            }
+            if let Some(r) = join.rarg.as_ref() {
+                visit(r);
+            }
+            if let Some(q) = join.quals.as_ref() {
+                visit(q);
+            }
+        }
+        Some(NodeEnum::RangeSubselect(sub)) => {
+            if let Some(q) = sub.subquery.as_ref() {
+                visit(q);
+            }
+        }
+        Some(NodeEnum::RangeFunction(func)) => {
+            for call in &func.functions {
+                visit(call);
+            }
+        }
+        Some(NodeEnum::RangeTableSample(sample)) => {
+            if let Some(rel) = sample.relation.as_ref() {
+                visit(rel);
+            }
+            for arg in &sample.args {
+                visit(arg);
+            }
+            if let Some(rep) = sample.repeatable.as_ref() {
+                visit(rep);
+            }
+        }
+        Some(NodeEnum::RangeTableFunc(tf)) => {
+            if let Some(doc) = tf.docexpr.as_ref() {
+                visit(doc);
+            }
+            if let Some(row) = tf.rowexpr.as_ref() {
+                visit(row);
+            }
+            for col in &tf.columns {
+                visit(col);
+            }
+        }
+        Some(NodeEnum::CommonTableExpr(cte)) => {
+            if let Some(q) = cte.ctequery.as_ref() {
+                visit(q);
+            }
+        }
+        Some(NodeEnum::PrepareStmt(p)) => {
+            if let Some(q) = p.query.as_ref() {
+                visit(q);
+            }
+        }
+        Some(NodeEnum::DeclareCursorStmt(d)) => {
+            if let Some(q) = d.query.as_ref() {
+                visit(q);
+            }
+        }
+        Some(NodeEnum::ExplainStmt(e)) => {
+            if let Some(q) = e.query.as_ref() {
+                visit(q);
+            }
+        }
+        Some(NodeEnum::JsonObjectConstructor(j)) => {
+            for expr in &j.exprs {
+                visit(expr);
+            }
+        }
+        Some(NodeEnum::JsonArrayConstructor(j)) => {
+            for expr in &j.exprs {
+                visit(expr);
+            }
+        }
+        Some(NodeEnum::JsonConstructorExpr(j)) => {
+            for arg in &j.args {
+                visit(arg);
+            }
+            if let Some(func) = j.func.as_ref() {
+                visit(func);
+            }
+        }
+        Some(NodeEnum::JsonKeyValue(kv)) => {
+            if let Some(key) = kv.key.as_ref() {
+                visit(key);
+            }
+            if let Some(value) = kv.value.as_ref() {
+                if let Some(raw) = value.raw_expr.as_ref() {
+                    visit(raw);
+                }
+                if let Some(formatted) = value.formatted_expr.as_ref() {
+                    visit(formatted);
+                }
+            }
+        }
+        Some(NodeEnum::JsonValueExpr(v)) => {
+            if let Some(raw) = v.raw_expr.as_ref() {
+                visit(raw);
+            }
+            if let Some(formatted) = v.formatted_expr.as_ref() {
+                visit(formatted);
+            }
+        }
+        Some(NodeEnum::JsonFuncExpr(j)) => {
+            if let Some(ctx) = j.context_item.as_ref() {
+                if let Some(raw) = ctx.raw_expr.as_ref() {
+                    visit(raw);
+                }
+                if let Some(formatted) = ctx.formatted_expr.as_ref() {
+                    visit(formatted);
+                }
+            }
+            if let Some(path) = j.pathspec.as_ref() {
+                visit(path);
+            }
+            for passing in &j.passing {
+                visit(passing);
+            }
+            if let Some(b) = j.on_empty.as_ref() {
+                if let Some(e) = b.expr.as_ref() {
+                    visit(e);
+                }
+            }
+            if let Some(b) = j.on_error.as_ref() {
+                if let Some(e) = b.expr.as_ref() {
+                    visit(e);
+                }
+            }
+        }
+        Some(NodeEnum::JsonTable(j)) => {
+            if let Some(ctx) = j.context_item.as_ref() {
+                if let Some(raw) = ctx.raw_expr.as_ref() {
+                    visit(raw);
+                }
+                if let Some(formatted) = ctx.formatted_expr.as_ref() {
+                    visit(formatted);
+                }
+            }
+            if let Some(path) = j.pathspec.as_ref() {
+                if let Some(s) = path.string.as_ref() {
+                    visit(s);
+                }
+            }
+            for passing in &j.passing {
+                visit(passing);
+            }
+            for col in &j.columns {
+                visit(col);
+            }
+        }
+        Some(NodeEnum::JsonTableColumn(c)) => {
+            if let Some(path) = c.pathspec.as_ref() {
+                if let Some(s) = path.string.as_ref() {
+                    visit(s);
+                }
+            }
+            for nested in &c.columns {
+                visit(nested);
+            }
+            if let Some(b) = c.on_empty.as_ref() {
+                if let Some(e) = b.expr.as_ref() {
+                    visit(e);
+                }
+            }
+            if let Some(b) = c.on_error.as_ref() {
+                if let Some(e) = b.expr.as_ref() {
+                    visit(e);
+                }
+            }
+        }
+        Some(NodeEnum::GroupingSet(set)) => {
+            for member in &set.content {
+                visit(member);
+            }
+        }
+        Some(NodeEnum::SubscriptingRef(sub)) => {
+            if let Some(expr) = sub.refexpr.as_ref() {
+                visit(expr);
+            }
+            for idx in sub.refupperindexpr.iter().chain(sub.reflowerindexpr.iter()) {
+                visit(idx);
+            }
+        }
+        Some(NodeEnum::FieldSelect(f)) => {
+            if let Some(arg) = f.arg.as_ref() {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::RowCompareExpr(r)) => {
+            for arg in r.largs.iter().chain(r.rargs.iter()) {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::DistinctExpr(d)) => {
+            for arg in &d.args {
+                visit(arg);
+            }
+        }
+        Some(NodeEnum::GroupingFunc(g)) => {
+            for arg in &g.args {
+                visit(arg);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn for_each_window_def_child(
+    window: &pg_query::protobuf::WindowDef,
+    visit: &mut dyn FnMut(&pg_query::protobuf::Node),
+) {
+    for part in &window.partition_clause {
+        visit(part);
+    }
+    for sort in &window.order_clause {
+        visit(sort);
+    }
+    if let Some(start) = window.start_offset.as_ref() {
+        visit(start);
+    }
+    if let Some(end) = window.end_offset.as_ref() {
+        visit(end);
     }
 }
 
@@ -4631,6 +5223,61 @@ mod referenced_identifier_probe {
             r#"SELECT count(*) FROM demo.customers
                WHERE xmlserialize(CONTENT xmlforest(u&"email" AS e) AS text)
                      LIKE '%user1@example.com%'"#,
+            &masked
+        ));
+        // Aggregate ORDER BY / WITHIN GROUP, window frame offsets, JSON_VALUE,
+        // JSON_TABLE, PREPARE/DECLARE — previously live OPEN.
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT string_agg(city, ',' ORDER BY u&"email" = 'x') FROM demo.customers"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT mode() WITHIN GROUP (ORDER BY u&"email") FROM demo.customers"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT id, count(*) OVER (PARTITION BY id ORDER BY id ROWS BETWEEN
+               (SELECT count(*) FROM demo.customers t2 WHERE t2.u&"email" = 'x')
+               PRECEDING AND CURRENT ROW) FROM demo.customers"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT count(*) FROM demo.customers
+               WHERE JSON_VALUE(JSON_OBJECT('e': u&"email"), '$.e') = 'x'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"SELECT jt.* FROM demo.customers,
+               JSON_TABLE(json_build_object('e', u&"email"), '$'
+                 COLUMNS (e text PATH '$.e')) jt"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"PREPARE q AS SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'"#,
+            &masked
+        ));
+        assert!(masked_exceeds_outer_projection(
+            r#"DECLARE c CURSOR FOR SELECT count(*) FROM demo.customers WHERE u&"email" = 'x'"#,
+            &masked
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM demo.customers t WHERE (ARRAY[t::text])[1] LIKE '%x%'",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT count(*) FROM demo.customers t WHERE JSON_OBJECT('r': t)::text LIKE '%x%'",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT id FROM demo.customers t LIMIT (SELECT count(*) FROM demo.customers t2 WHERE t2::text LIKE '%@%')",
+            &relations
+        ));
+        assert!(hostile_uses_whole_row(
+            "SELECT string_agg(city, ',' ORDER BY t::text) FROM demo.customers t",
+            &relations
+        ));
+        assert!(!masked_exceeds_outer_projection(
+            r#"SELECT id FROM demo.customers ORDER BY u&"email" USING <"#,
             &masked
         ));
         assert!(!hostile_join_or_rename_masked(

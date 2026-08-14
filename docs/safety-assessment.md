@@ -143,7 +143,10 @@ NATURAL JOIN / `FROM t AS x(c1,c2,…)` renames / unicode `USING` &
 `PARTITION BY`. As of 0.1.89, also `ARRAY`/`CASE`/`LIMIT`/`(t).col`/
 `xmlforest` containers around unicode-escaped masked names. As of 0.1.91, also
 `JOIN … ON`, `BooleanTest` (`IS TRUE`), JSON constructors (`JSON_OBJECT` /
-`JSON_ARRAY`), and `xmlserialize` around those names. Residual
+`JSON_ARRAY`), and `xmlserialize` around those names. As of 0.1.92, also
+aggregate `ORDER BY` / `WITHIN GROUP`, window frame offsets, `JSON_VALUE` /
+`JSON_TABLE`, `PREPARE`/`DECLARE` bodies, and whole-row refs nested in
+`ARRAY`/JSON/XML/`LIMIT`. Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and
 cleartext sort order among masked projections).
