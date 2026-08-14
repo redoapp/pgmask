@@ -396,6 +396,8 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT pg_copy_logical_replication_slot('a','b') FROM pg_catalog.pg_class"#,
         r#"SELECT * FROM information_schema.u&"foreign_table_options""#,
         r#"SELECT * FROM information_schema.u&"_pg_foreign_servers""#,
+        r#"SELECT * FROM information_schema._pg_foreign_future"#,
+        r#"SELECT * FROM _pg_foreign_future"#,
     ];
 
     for sql in oracles {

@@ -1460,11 +1460,12 @@ fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bool {
     }
     // information_schema implements SQL/MED option views on `_pg_*`
     // base views. New ones keep that prefix; a name list alone misses
-    // the next wrapper. Unqualified `_pg_*` still needs the name list
-    // (a CTE can be called `_pg_foo`; only the schema-qualified form
-    // is prefix-matched). `_pg_*` *functions* (`_pg_truetypid`) are
-    // FuncCalls, not RangeVars, and stay catalog-safe helpers.
-    if schema == "information_schema" && relation.starts_with("_pg_") {
+    // the next wrapper. Unqualified `_pg_*` is the same views after
+    // `SET search_path TO information_schema` (RangeVar.schemaname is
+    // empty). A CTE named `_pg_foo` would also match — fail closed.
+    // `_pg_*` *functions* (`_pg_truetypid`) are FuncCalls, not
+    // RangeVars, and stay catalog-safe helpers.
+    if relation.starts_with("_pg_") && (schema.is_empty() || schema == "information_schema") {
         return true;
     }
     LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str())
@@ -3991,6 +3992,9 @@ mod tests {
             "SELECT umoptions FROM _pg_user_mappings",
             r#"SELECT * FROM information_schema.u&"_pg_user_mappings""#,
             "EXPLAIN SELECT * FROM information_schema.column_options",
+            // Prefix, not the name list: a future `_pg_foreign_*` wrapper.
+            "SELECT * FROM information_schema._pg_foreign_future",
+            "SELECT * FROM _pg_foreign_future",
         ] {
             assert!(
                 !reads_only_server_metadata(sql),
