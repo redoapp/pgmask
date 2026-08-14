@@ -1,46 +1,16 @@
 name: CI
 
-# The part of `./scripts/test-all.sh` that a GitHub-hosted runner can honestly
-# run — which is more than the first version of this file assumed.
-#
-# WHAT THE FIRST TWO VERSIONS GOT WRONG
-#
-# v1 ran no database at all. It set PGMASK_ALLOW_SKIP=1 and stopped there, so
-# the 41 tests behind `require_pg!` — every raw-wire adversarial test and every
-# resilience test, including negative_control_the_harness_can_see_a_leak —
-# never ran anywhere in CI. The justification was "these need containers, and
-# containers mean podman". Wrong: they need a reachable Postgres, and podman is
-# only how scripts/test-integration.sh obtains one locally.
-#
-# v2 over-corrected by removing the skip flag from the workspace sweep. All 41
-# then ran concurrently against one backend, creating and dropping relations
-# under each other, and the catalog loader failed with "could not open relation
-# with OID 17545". Forty-one failures, one cause. `test-integration.sh` runs
-# them with --test-threads=1 for exactly this reason.
-#
-# What the gate actually does, and what this now mirrors: the workspace sweep
-# sets PGMASK_ALLOW_SKIP=1 on purpose and lets those tests skip, and a separate
-# entry runs them for real, serially. Two steps, two jobs to do.
-#
-# The skips are therefore expected here — which is precisely how a suite goes
-# quiet without anyone noticing. So the count is asserted against the number of
-# tests that carry the macro, and the serial runs are asserted to skip nothing.
-#
-# WHAT STILL CANNOT RUN HERE
-#
-# The suites that orchestrate podman themselves — starting several engines,
-# swapping catalogs between runs, driving psql corpora. Those are the ones that
-# have caught real disclosures, so green here is not a green gate. The
-# `coverage` job below prints the current list rather than leaving it implied.
-
+# CI covers Rust checks and the real-Postgres tests. Releases still require
+# ./scripts/test-all.sh for the generated and cross-engine campaigns.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
 
-# A superseded push should not keep burning a runner. Never cancel on main:
-# those runs are the record of what the default branch actually did.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -51,69 +21,43 @@ env:
 
 jobs:
   static:
-    name: static checks
+    name: static policy
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # check-repo-invariants.sh derives the untagged-release list from
-          # Cargo.toml's history and compares it against the tags, so a shallow
-          # clone would make it report every release as untagged.
           fetch-depth: 0
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-deny@0.20.2,cargo-machete@0.9.2
+          fallback: none
 
       - run: cargo fmt --all --check
-
-      - name: clippy (warnings fatal)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # Not redundant with clippy: a doc link to an item that does not exist
-      # compiles, lints clean, and is only ever read by someone following it.
-      - name: rustdoc (warnings fatal)
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
-
-      - name: repo invariants
-        run: ./scripts/check-repo-invariants.sh
-
-  audit:
-    name: cargo audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # A prebuilt binary. Compiling cargo-audit from source cost minutes on
-      # every run to check a file that changes rarely.
-      - uses: taiki-e/install-action@cargo-audit
-      # Its own job: a new RUSTSEC advisory appears without anything in this
-      # repository changing, and that must not read as "the tests broke".
-      - run: cargo audit
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+      - run: cargo test --workspace --all-features --doc --locked
+      - run: cargo deny --all-features --locked check --hide-inclusion-graph
+      - run: cargo deny --manifest-path fuzz/Cargo.toml --all-features --locked check --hide-inclusion-graph
+      - run: cargo machete
+      - run: ./scripts/check-repo-invariants.sh
 
   test:
-    name: cargo test (real Postgres)
+    name: tests (real Postgres)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     services:
       postgres:
-        image: postgres:17
-        # The harness connects as `postgres://postgres@host:port/db` with no
-        # password, so trust auth is what it needs — the same thing
-        # scripts/test-integration.sh passes to podman.
+        image: postgres:17@sha256:a65e6a841f6c4dbc4abda3d67fa3bc21824e9611064fcd82e87ea67aad60a0c3
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
-        # Unlike the local suites, this health check is the runner's job and it
-        # gates the step rather than racing it.
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
@@ -121,107 +65,17 @@ jobs:
           --health-retries 20
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-nextest@0.9.143
+          fallback: none
 
-      # Prove the service is actually reachable from the job before running
-      # anything that would otherwise skip or fail confusingly.
-      - name: the database is really there
-        run: |
-          psql "postgres://postgres@127.0.0.1:5432/postgres" -tAc 'select version()'
-
-      # The sweep, with the database-backed tests skipping — the same call the
-      # gate makes. They are run for real, serially, in the next two steps.
-      # Tee'd because the assertion below must be about *this* run.
-      # --nocapture is load-bearing, not noise. "skipping by request" is an
-      # eprintln! inside a passing test, and libtest captures the output of
-      # passing tests, so the line never reaches the log. Without this the
-      # count below reads 0 no matter how many skipped — which is exactly what
-      # scripts/test-all.sh has been reporting for its entire life:
-      # "521 tests (0 need Postgres)", with 41 skipping.
-      - name: workspace tests
-        env:
-          PGMASK_ALLOW_SKIP: "1"
-        run: |
-          set -o pipefail
-          cargo test --workspace --no-fail-fast -- --nocapture 2>&1 | tee /tmp/workspace.log
-
-      # PGMASK_TEST_PG is set per-step, not per-job. Set job-wide it also
-      # reached the sweep above, which then ran these 41 concurrently *and*
-      # left a `canary` schema behind, so the serial run failed on
-      # "duplicate key ... Key (nspname)=(canary) already exists". They must
-      # run exactly once, here, serially: they share one backend, and
-      # --test-threads=1 is load-bearing rather than cautious.
-      # No PGMASK_ALLOW_SKIP, so a missing database fails instead of skipping.
-      - name: adversarial suite (serial, real database)
+      - name: tests
         env:
           PGMASK_TEST_PG: 127.0.0.1:5432
-        run: |
-          set -o pipefail
-          cargo test --test adversarial -- --test-threads=1 2>&1 | tee /tmp/adversarial.log
-
-      - name: resilience suite (serial, real database)
-        env:
-          PGMASK_TEST_PG: 127.0.0.1:5432
-        run: |
-          set -o pipefail
-          cargo test --test resilience -- --test-threads=1 2>&1 | tee /tmp/resilience.log
-
-      # The fuzzing feature gates an entire module in. Without it the
-      # plan_state harness is not compiled at all, and `cargo test` reports a
-      # real count with a verdict that covered none of it.
-      - name: fuzzing-feature tests
-        run: cargo test -p pgmask --lib --features fuzzing --no-fail-fast
-
-      # The skips in the sweep are expected, and "expected skips" is exactly
-      # how a suite stops asserting anything without anyone noticing. So:
-      # the sweep must skip precisely the tests that carry the macro, and the
-      # serial runs must skip none of them.
-      - name: the skips are the ones we intended
-        if: always()
-        run: |
-          expected=$(cat crates/proxy/tests/adversarial.rs crates/proxy/tests/resilience.rs |
-            awk '/#\[(tokio::)?test\]/{t=1} /require_pg!/{if(t){c++;t=0}} END{print c+0}')
-          got=$(grep -c 'skipping by request' /tmp/workspace.log || true)
-          echo "sweep skipped $got, tests carrying require_pg!: $expected"
-          [ "$got" = "$expected" ] || {
-            echo "FAIL: the sweep skipped $got tests but $expected carry the macro."
-            echo "      A test that stopped asserting, or one that stopped skipping."
-            exit 1; }
-
-          for f in /tmp/adversarial.log /tmp/resilience.log; do
-            # This step is `if: always()`, so it also runs when an earlier step
-            # failed and the suite never wrote its log. Say that, rather than
-            # reporting an empty count as a skip and burying the real failure.
-            [ -f "$f" ] || { echo "NOTE: $f absent — that suite did not run; see the failing step above."; continue; }
-            n=$(grep -c 'skipping by request' "$f" || true)
-            [ "$n" = "0" ] || { echo "FAIL: $n tests skipped in $f, which has a database."; exit 1; }
-            grep -E '^test result:' "$f" | sed "s|^|$(basename "$f"): |"
-          done
-          echo "The 41 database-backed tests ran for real."
-
-  coverage:
-    name: what CI does not cover
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      # Derived, not transcribed. A hand-written list of suite names in a shell
-      # `echo` is precisely the kind of thing that goes stale and then reassures
-      # someone — the same drift check-repo-invariants.sh exists to catch.
-      - name: list the suites only the local gate runs
-        run: |
-          echo "Suites in ./scripts/test-all.sh that need podman and do not run here:"
-          grep -oE '\./scripts/[a-z-]+\.(sh|py)' scripts/test-all.sh \
-            | sort -u \
-            | grep -v 'test-all.sh' \
-            | while read -r s; do
-                # test-integration.sh is excluded: podman is only how it gets a
-                # Postgres locally, and the `test` job above has a real one, so
-                # those suites do run here.
-                [ "$s" = "./scripts/test-integration.sh" ] && continue
-                grep -q 'podman' "$s" 2>/dev/null && echo "  $s"
-              done
-          echo
-          echo "Green CI is not a green gate. Run ./scripts/test-all.sh before releasing."
+        run: cargo nextest run --workspace --all-features --locked --profile ci

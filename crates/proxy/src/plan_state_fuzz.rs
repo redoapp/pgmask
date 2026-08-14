@@ -144,7 +144,7 @@ fn bytes_of(name: &'static str) -> Bytes {
     Bytes::from_static(name.as_bytes())
 }
 
-/// A [`PlanState`] plus everything needed to judge its answers.
+/// A `PlanState` plus everything needed to judge its answers.
 pub struct ProtocolModel {
     state: PlanState,
 

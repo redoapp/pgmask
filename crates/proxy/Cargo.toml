@@ -55,5 +55,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-
 proptest.workspace = true
 pgwire = { version = "0.40", default-features = false }
 
+[package.metadata.cargo-machete.renamed]
+# The package exports its library as `iban`.
+iban_validate = "iban"
+
 [lints]
 workspace = true
