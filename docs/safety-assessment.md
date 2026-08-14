@@ -163,8 +163,9 @@ in `pg_catalog` are the same dump without that prefix. Citus
 background-task SQL, shard range keys) were still metadata-only.
 Catalog-shaped RangeVars are classified once against the vanilla
 PostgreSQL 18 surface (every official heap/view/IS relation is
-metadata-safe XOR leaky); an unnamed `pg_catalog` / `information_schema`
-relation is leaky.
+metadata-safe XOR leaky); classified-leaky names are leaky in any
+schema, and an unnamed `pg_catalog` / `information_schema` relation is
+leaky.
 Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and

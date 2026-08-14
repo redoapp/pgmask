@@ -106,7 +106,9 @@ SELECT histogram_bounds FROM pg_stats WHERE tablename='customers' AND attname='l
 ```
 
 Releasing `pg_catalog` wholesale would have handed back the values the proxy
-exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
+exists to hide. Every official Postgres 18 relation is classified once in
+`catalog_surface.rs` (Safe XOR Leaky). Classified-leaky names are refused
+in any schema; unknown catalog-shaped names are leaky too.
 
 - `pg_statistic`, `pg_statistic_ext_data`, `pg_stats`, `pg_stats_ext`,
   `pg_stats_ext_exprs` — sampled values
@@ -114,18 +116,18 @@ exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
   sessions' SQL text, literals included. Unknown `pg_stat_*` views are
   refused the same way (the previous name list was an allow for
   `pg_stat_monitor` / the next extension). Core counter views
-  (`pg_stat_user_tables`, `pg_stat_progress_*`, …) stay allowed.
+  (`pg_stat_user_tables`, listed `pg_stat_progress_*`, …) stay allowed.
   `pg_qualstats*` / `pg_store_plans*` are the same class under other names.
   `pg_show_plans*` / `pg_query_state*` dump running SQL without the
   `pg_stat_*` prefix; forks that put the same dump in `pg_catalog` as
   `citus_stat_activity` / `citus_stat_statements` are refused on
-  substring. `pg_wait_sampling*` and `pg_buffercache` stay allowed.
-  Citus `citus_lock_waits` / `citus_stat_tenants` / `pg_dist_*`
+  substring. Named contrib views (`pg_wait_sampling_{profile,history,current}`,
+  `pg_buffercache`) stay allowed; an unseen `pg_wait_sampling_*` sibling
+  is leaky. Citus `citus_lock_waits` / `citus_stat_tenants` / `pg_dist_*`
   (authinfo, poolinfo, background-task SQL, shard range keys) are the
-  same class without those substrings. Catalog-shaped names are now an
-  allowlist of core heaps/views and SQL-standard information_schema
-  name/grant views — every official Postgres 18 relation classified
-  once, Safe XOR Leaky; an unnamed `pg_catalog` / `information_schema`
+  same class without those substrings. Catalog-shaped names are an
+  allowlist of classified-safe heaps/views and SQL-standard information_schema
+  name/grant views; an unnamed `pg_catalog` / `information_schema`
   relation is leaky.
 - `pg_largeobject` — blob contents
 - `pg_authid`, `pg_shadow`, `pg_user_mapping(s)`, `pg_subscription` — password

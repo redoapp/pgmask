@@ -14,36 +14,41 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   literals, including masked ones. Core counter / LSN / progress views
   (`pg_stat_user_tables`, `pg_stat_replication`, `pg_stat_ssl`,
   `pg_stat_progress_*`, `pg_stat_statements_info`, …) stay allowed so
-  table-size dashboards and `\d` keep working. `pg_statio_*` is a different
-  prefix (block I/O counts) and is unchanged. `pg_qualstats*` /
+  table-size dashboards and `\d` keep working. Listed `pg_statio_*`
+  views (block I/O counts) stay allowed; an unseen name in those
+  families is leaky. `pg_qualstats*` /
   `pg_store_plans*` join the refuse list by prefix (same class, different
   naming). Same class again, still not `pg_stat_*`: `pg_show_plans*`
   (running query text + plans) and `pg_query_state*` (other backends'
   current SQL) were catalog-shaped and metadata-only. Forks that install
   the dump in `pg_catalog` under another name (`citus_stat_activity`,
   `edb_stat_activity`, `citus_stat_statements`) fail closed on substring.
-  `pg_wait_sampling*` (queryid + wait counts) and `pg_buffercache` (block
-  IDs, not tuple bytes) stay allowed. Citus still dumps in `pg_catalog`
+  `pg_wait_sampling_{profile,history,current}` (queryid + wait counts) and
+  `pg_buffercache` (block IDs, not tuple bytes) stay allowed; an unseen
+  `pg_wait_sampling_*` sibling is leaky. Citus still dumps in `pg_catalog`
   without those names: `citus_lock_waits` (blocked SQL), `citus_stat_tenants`
   (live distribution-column values), and `pg_dist_*` (`authinfo` passwords,
   `poolinfo`, background-task SQL, range-partition keys). Those prefixes
   are leaky; `\d` of a heap does not read them. The denylist polarity is
-  now inverted for every catalog-shaped RangeVar: only core `pg_catalog`
-  heaps/views (plus `pg_stat_progress_*` / `pg_statio_*` /
-  `pg_wait_sampling*` / counter `pg_stat_*`) and the SQL-standard
-  information_schema name/grant views keep the fast path.
-  `pg_catalog.hypopg_list_indexes` and `information_schema.not_a_real_view`
-  are leaky; `\d` still reads `pg_class` / `pg_attribute` /
-  `information_schema.tables`. Unqualified fork names without a `pg_`
-  prefix (`citus_lock_waits`) stay on the substring rules. The vanilla
-  PostgreSQL 18 surface is classified once (`catalog_surface.rs`): every
-  official heap, system view, monitoring-stats view, and
-  `information_schema` relation is metadata-safe XOR leaky. CI fails on
-  duplicates, unsorted names, overlap with the leaky fallback, or a
-  `SELECT * FROM pg_catalog.{name}` that disagrees with the table.
-  Unknown catalog-shaped names stay leaky. Contrib exceptions
-  (`pg_buffercache`, `pg_stat_statements_info`, `pg_wait_sampling*`)
-  stay named separately.
+  now inverted for every catalog-shaped RangeVar: only classified-safe
+  `pg_catalog` heaps/views (listed progress / `pg_statio_*` / counter
+  `pg_stat_*`) and the SQL-standard information_schema name/grant views
+  keep the fast path. An unseen `pg_stat_progress_*` is leaky until
+  classified. `pg_catalog.hypopg_list_indexes` and
+  `information_schema.not_a_real_view` are leaky; `\d` still reads
+  `pg_class` / `pg_attribute` / `information_schema.tables`. Unqualified
+  fork names without a `pg_` prefix (`citus_lock_waits`) stay on the
+  substring rules. The vanilla PostgreSQL 18 surface is classified once
+  (`catalog_surface.rs`): every official heap, system view,
+  monitoring-stats view, and `information_schema` relation is
+  metadata-safe XOR leaky. Classified-leaky names are leaky in any
+  schema (`public.pg_stats`, unqualified `user_mapping_options`). CI
+  fails on duplicates, unsorted names, or a `SELECT * FROM
+  pg_catalog.{name}` that disagrees with the table. Unknown
+  catalog-shaped names stay leaky. Named contrib exceptions
+  (`pg_buffercache`, `pg_stat_statements_info`,
+  `pg_wait_sampling_{profile,history,current}`) stay off the vanilla
+  table.
 - SQL `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` / `CLOSE`
   are now refused on **every posture** (`sql_prepare_cursor`). They are a
   second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.

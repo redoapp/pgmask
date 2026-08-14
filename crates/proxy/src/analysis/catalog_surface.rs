@@ -6,12 +6,18 @@
 //! metadata-safe or leaky. There is no third bucket. Unknown catalog-shaped
 //! names stay leaky via the invert in [`super::names::range_var_is_leaky_catalog`].
 //!
-//! Contrib exceptions (`pg_buffercache`, `pg_stat_statements_info`) and
-//! prefixes (`pg_stat_progress_*`, `pg_statio_*`, `pg_wait_sampling*`) are
-//! named separately so a new Postgres major is a table diff, not a hunt.
+//! Contrib exceptions (`pg_buffercache`, `pg_stat_statements_info`,
+//! `pg_wait_sampling_{profile,history,current}`) are named separately.
+//! A new Postgres major is a table diff: progress and `pg_statio_*` views
+//! already listed stay allowed; an unseen name in those families is leaky.
 //!
-//! Tests fail if a name is duplicated, unsorted, classified both ways
-//! (impossible in one table, still checked against the leaky fallback), or if
+//! Classified-leaky names are leaky in **any** schema, so
+//! `SET search_path` / `public.pg_stats` cannot wrap them. Unknown
+//! catalog-shaped names stay leaky via invert. The only rules outside the
+//! table are TOAST oids, future `information_schema._pg_*` wrappers, and
+//! unqualified fork dumps that are not catalog-shaped (`citus_lock_waits`).
+//!
+//! Tests fail if a name is duplicated, unsorted, or if
 //! `SELECT * FROM pg_catalog.{name}` disagrees with the classification.
 //!
 //! [1]: https://www.postgresql.org/docs/18/catalogs-overview.html
@@ -143,6 +149,11 @@ pub const VANILLA_PG_CATALOG: &[(&str, bool)] = &[
     ("pg_statio_user_indexes", true),
     ("pg_statio_user_sequences", true),
     ("pg_statio_user_tables", true),
+    // Sampled cell values. Measured on the demo database: `pg_stats`
+    // returns `most_common_vals = {shared@example.com}` for a
+    // pseudonymised column, and exact `histogram_bounds` for a date
+    // masked to its year. `pg_statistic_ext` is definition-only (`\d`);
+    // the values live in `pg_statistic_ext_data`.
     ("pg_statistic", false),
     ("pg_statistic_ext", true),
     ("pg_statistic_ext_data", false),
@@ -249,8 +260,16 @@ pub const VANILLA_INFORMATION_SCHEMA: &[(&str, bool)] = &[
 /// Contrib relations that are metadata-safe by name, not vanilla Postgres.
 ///
 /// `pg_stat_statements` itself (query text) is *not* here; invert refuses it.
-/// `pg_stat_statements_info` is dealloc counters.
-const CONTRIB_METADATA_SAFE_PG: &[&str] = &["pg_buffercache", "pg_stat_statements_info"];
+/// `pg_stat_statements_info` is dealloc counters. `pg_wait_sampling_*` is
+/// queryid + wait counts, not query text — named, not a prefix, so an unseen
+/// sibling is leaky.
+const CONTRIB_METADATA_SAFE_PG: &[&str] = &[
+    "pg_buffercache",
+    "pg_stat_statements_info",
+    "pg_wait_sampling_current",
+    "pg_wait_sampling_history",
+    "pg_wait_sampling_profile",
+];
 
 fn lookup(table: &[(&str, bool)], name: &str) -> Option<bool> {
     table
@@ -269,19 +288,25 @@ pub(crate) fn vanilla_information_schema_classification(relation: &str) -> Optio
 
 /// Whether a `pg_catalog` / unqualified `pg_*` relation is metadata-safe.
 ///
-/// Vanilla names use the table. Unknown names are leaky unless they match a
-/// counter prefix or a named contrib exception.
+/// Vanilla names use the table. Unknown names are leaky unless they are a
+/// named contrib exception.
 pub(crate) fn relation_is_metadata_safe_pg(relation: &str) -> bool {
     if let Some(safe) = vanilla_pg_classification(relation) {
         return safe;
     }
-    if relation.starts_with("pg_stat_progress_")
-        || relation.starts_with("pg_statio_")
-        || relation.starts_with("pg_wait_sampling")
-    {
-        return true;
-    }
     CONTRIB_METADATA_SAFE_PG.contains(&relation)
+}
+
+/// True when the vanilla tables classify this relation leaky.
+///
+/// Applied in any schema: `public.pg_stats` and unqualified
+/// `user_mapping_options` (after `SET search_path`) wrap the same secrets.
+pub(crate) fn relation_is_classified_leaky(relation: &str) -> bool {
+    matches!(vanilla_pg_classification(relation), Some(false))
+        || matches!(
+            vanilla_information_schema_classification(relation),
+            Some(false)
+        )
 }
 
 /// Whether an `information_schema` relation is metadata-safe.
@@ -295,7 +320,6 @@ pub(crate) fn relation_is_metadata_safe_information_schema(relation: &str) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::super::names::LEAKY_SYSTEM_CATALOGS;
     use super::super::{reads_only_server_metadata, touches_leaky_system_catalog};
     use super::*;
 
@@ -420,20 +444,56 @@ mod tests {
     }
 
     #[test]
-    fn leaky_fallback_does_not_mark_a_vanilla_safe_name_leaky() {
-        for name in LEAKY_SYSTEM_CATALOGS {
-            if let Some(safe) = vanilla_pg_classification(name) {
-                assert!(
-                    !safe,
-                    "{name} is on LEAKY_SYSTEM_CATALOGS and classified metadata-safe"
-                );
-            }
-            if let Some(safe) = vanilla_information_schema_classification(name) {
-                assert!(
-                    !safe,
-                    "{name} is on LEAKY_SYSTEM_CATALOGS and classified metadata-safe"
-                );
-            }
+    fn classified_leaky_is_leaky_in_any_schema() {
+        for sql in [
+            "SELECT * FROM public.pg_stats",
+            "SELECT * FROM public.pg_stat_activity",
+            "SELECT * FROM public.user_mapping_options",
+            "SELECT * FROM user_mapping_options",
+            "SELECT * FROM column_options",
+        ] {
+            assert!(
+                touches_leaky_system_catalog(sql),
+                "classified-leaky must not depend on schema: {sql}"
+            );
+        }
+        // A user table that happens to share a *safe* catalog name is not
+        // this gate's problem; OIDs settle it.
+        assert!(!touches_leaky_system_catalog(
+            "SELECT * FROM public.pg_class"
+        ));
+        assert!(!touches_leaky_system_catalog(
+            "SELECT * FROM information_schema.tables"
+        ));
+        // Unqualified name/grant views are not leaky: they might be user tables.
+        assert!(!touches_leaky_system_catalog("SELECT * FROM tables"));
+    }
+
+    #[test]
+    fn unseen_progress_statio_and_wait_sampling_names_are_leaky() {
+        for name in [
+            "pg_stat_progress_future",
+            "pg_statio_future",
+            "pg_wait_sampling_dump",
+        ] {
+            assert!(
+                !relation_is_metadata_safe_pg(name),
+                "prefix-allow was an allow for an unseen name: {name}"
+            );
+            assert!(
+                touches_leaky_system_catalog(&format!("SELECT * FROM pg_catalog.{name}")),
+                "{name}"
+            );
+        }
+        for name in [
+            "pg_wait_sampling_profile",
+            "pg_wait_sampling_history",
+            "pg_wait_sampling_current",
+        ] {
+            assert!(relation_is_metadata_safe_pg(name), "{name}");
+            assert!(!touches_leaky_system_catalog(&format!(
+                "SELECT * FROM pg_catalog.{name}"
+            )));
         }
     }
 
@@ -449,10 +509,10 @@ mod tests {
                 "{name} must stay metadata-safe as a named contrib exception"
             );
         }
-        assert!(relation_is_metadata_safe_pg("pg_wait_sampling_profile"));
-        assert!(relation_is_metadata_safe_pg("pg_stat_progress_future"));
-        assert!(relation_is_metadata_safe_pg("pg_statio_future"));
         assert!(!relation_is_metadata_safe_pg("pg_stat_statements"));
+        assert!(!relation_is_metadata_safe_pg("pg_stat_progress_future"));
+        assert!(!relation_is_metadata_safe_pg("pg_statio_future"));
+        assert!(!relation_is_metadata_safe_pg("pg_wait_sampling_dump"));
     }
 
     #[test]

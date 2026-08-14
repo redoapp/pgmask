@@ -136,11 +136,10 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
             }
             // A set-returning function in `FROM`.
             //
-            // `LEAKY_SYSTEM_CATALOGS` denies `pg_stat_activity` and
-            // `pg_stat_statements` — "other sessions' SQL text, literals
-            // included". Those are *views*, and the SRFs behind them produce
-            // identical rows while appearing as a `RangeFunction` that neither
-            // the RangeVar arm nor the escape list matches:
+            // Classified-leaky catalogs (`pg_stat_activity`, `pg_stat_statements`)
+            // are views. The SRFs behind them produce identical rows while
+            // appearing as a `RangeFunction` that neither the RangeVar arm nor
+            // the escape list matches:
             //
             //   SELECT a.query FROM pg_stat_get_activity(NULL) a, pg_class c
             //

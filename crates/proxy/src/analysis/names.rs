@@ -6,7 +6,8 @@
 use pg_query::protobuf::node::Node as NodeEnum;
 
 use super::catalog_surface::{
-    relation_is_metadata_safe_information_schema, relation_is_metadata_safe_pg,
+    relation_is_classified_leaky, relation_is_metadata_safe_information_schema,
+    relation_is_metadata_safe_pg,
 };
 
 /// Functions reporting how much storage an object occupies.
@@ -154,8 +155,8 @@ pub(crate) const RANKING_WINDOWS: &[&str] = &[
 /// Set-returning functions allowed in a `FROM` clause of a metadata query.
 ///
 /// An allowlist rather than a denylist, because the denylist here is on
-/// *relations*: `LEAKY_SYSTEM_CATALOGS` denies the `pg_stat_activity` and
-/// `pg_stat_statements` views, and the SRFs behind them —
+/// *relations*: classified-leaky catalogs (`pg_stat_activity`,
+/// `pg_stat_statements`, …) and the SRFs behind them —
 /// `pg_stat_get_activity()`, `pg_stat_statements()` — return identical rows
 /// while appearing as a `RangeFunction` that no relation rule matches. Naming
 /// those two would leave every other data-bearing SRF, `pg_ls_waldir()`
@@ -232,96 +233,16 @@ pub(crate) fn function_name(parts: &[pg_query::protobuf::Node]) -> Option<String
     }
 }
 
-/// Catalogs that hold user data, not metadata about it.
-///
-/// Measured, not assumed. On the demo database `pg_stats` returns
-/// `most_common_vals = {shared@example.com}` for a pseudonymised column, and
-/// exact `histogram_bounds` for a date masked to its year and an IP masked to
-/// its /24. Releasing `pg_catalog` wholesale would hand back the values the
-/// proxy exists to hide.
-///
-/// `pg_statistic_ext` is deliberately absent: it records *which* extended
-/// statistics objects exist. The values live in `pg_statistic_ext_data`, and
-/// `\d` reads the former.
-///
-/// TOAST heaps are not on this name list: they are `pg_toast.pg_toast_<oid>`
-/// and the oid is not known statically. [`range_var_is_leaky_catalog`] matches
-/// the schema / `pg_toast_` prefix instead.
-///
-/// Vanilla Postgres 18 names are classified in
-/// [`super::catalog_surface`]. This list is the unqualified fallback
-/// (`user_mapping_options` with empty schema) plus contrib dumps that are
-/// not vanilla (`pg_stat_statements`). A name classified metadata-safe
-/// there must not appear here — CI checks the overlap.
-pub(crate) const LEAKY_SYSTEM_CATALOGS: &[&str] = &[
-    // Sampled values from user tables.
-    "pg_statistic",
-    "pg_statistic_ext_data",
-    "pg_stats",
-    "pg_stats_ext",
-    "pg_stats_ext_exprs",
-    // Other sessions' SQL text, literals included. Session-local
-    // `pg_cursors.statement` / `pg_prepared_statements` carry the same
-    // class of text (DECLARE / PREPARE bodies with literals).
-    // `pg_stat_*` besides the metadata-safe allowlist is also leaky —
-    // see [`range_var_is_leaky_catalog`]. These two stay named so the
-    // list documents the core views; extensions (`pg_stat_monitor`,
-    // `pg_qualstats`) are caught by the prefix, not by this table.
-    "pg_stat_activity",
-    "pg_stat_statements",
-    "pg_prepared_statements",
-    "pg_cursors",
-    // Replication conninfo can embed passwords.
-    "pg_stat_wal_receiver",
-    // Large object contents.
-    "pg_largeobject",
-    // Password hashes and connection strings.
-    "pg_authid",
-    "pg_shadow",
-    "pg_user",
-    "pg_user_mapping",
-    "pg_user_mappings",
-    "pg_subscription",
-    // FDW server / wrapper options: the same class as user mappings
-    // (passwords, endpoints). `pg_foreign_table` stays off the list so `\d`
-    // of a foreign table still works; heap `\d` never reads these two.
-    "pg_foreign_server",
-    "pg_foreign_data_wrapper",
-    // SQL-standard wrappers of the same option catalogs. `FROM
-    // information_schema.user_mapping_options` is metadata-only (schema
-    // allowlist) and never names `pg_user_mapping`, so the pg_ catalog
-    // denylist does not see it. The previous pass caught three of the
-    // five PUBLIC option views; `column_options` / `foreign_table_options`
-    // (attfdwoptions / ftoptions) are the same class. Internal
-    // `_pg_*` base views carry the raw option arrays those wrappers
-    // explode — GRANT is not PUBLIC, but a superuser (or
-    // `SET search_path TO information_schema`) still reads them.
-    "user_mapping_options",
-    "foreign_server_options",
-    "foreign_data_wrapper_options",
-    "column_options",
-    "foreign_table_options",
-    "_pg_user_mappings",
-    "_pg_foreign_servers",
-    "_pg_foreign_data_wrappers",
-    "_pg_foreign_tables",
-    "_pg_foreign_table_columns",
-    // Host configuration and file contents.
-    "pg_file_settings",
-    "pg_hba_file_rules",
-    "pg_ident_file_mappings",
-    "pg_backend_memory_contexts",
-];
-
 /// Catalogs whose rows are user data, session SQL, passwords, or toasted
 /// cell bytes. Refused at the frontend on every posture.
 ///
-/// Catalog-shaped names (`pg_catalog.*`, unqualified `pg_*`,
-/// `information_schema.*`) are classified in [`super::catalog_surface`]:
-/// every official Postgres 18 heap/view is metadata-safe XOR leaky, and an
-/// unnamed one is leaky. Prefixes (`pg_stat_progress_*` / `pg_statio_*` /
-/// `pg_wait_sampling*`) and contrib exceptions (`pg_buffercache`,
-/// `pg_stat_statements_info`) live there too.
+/// Classification lives in [`super::catalog_surface`]: every official
+/// Postgres 18 heap/view is metadata-safe XOR leaky. A classified-leaky
+/// name is leaky in any schema. Catalog-shaped unknown names are leaky.
+/// Named contrib exceptions (`pg_buffercache`, `pg_stat_statements_info`,
+/// `pg_wait_sampling_{profile,history,current}`) stay allowed. The rules
+/// outside that table are TOAST, future `_pg_*` wrappers, and unqualified
+/// fork dumps that are not catalog-shaped.
 pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bool {
     let schema = v.schemaname.to_ascii_lowercase();
     let relation = v.relname.to_ascii_lowercase();
@@ -346,18 +267,19 @@ pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bo
         return true;
     }
     // Fork dumps whose *unqualified* names are not catalog-shaped
-    // (`citus_lock_waits` has no `pg_` prefix). Qualified
-    // `pg_catalog.citus_lock_waits` is caught by the invert below.
+    // (`citus_lock_waits` has no `pg_` prefix). Invert never sees them.
+    // Qualified `pg_catalog.citus_lock_waits` is unknown and leaky anyway.
     // `pg_stat_statements_info` is a counter view and must stay off
     // the `stat_statements` substring.
-    if relation.starts_with("citus_stat_")
-        || relation.contains("stat_activity")
-        || relation.contains("lock_waits")
-        || (relation.contains("stat_statements") && !relation_is_metadata_safe_pg(&relation))
-    {
+    if is_non_catalog_shaped_fork_dump(&relation) {
         return true;
     }
-    // Invert: a catalog-shaped name not on the allowlist is leaky.
+    // Classified leaky in any schema: `public.pg_stats` and unqualified
+    // `user_mapping_options` wrap the same secrets the table already named.
+    if relation_is_classified_leaky(&relation) {
+        return true;
+    }
+    // Invert: a catalog-shaped name not classified metadata-safe is leaky.
     // `pg_catalog.hypopg_list_indexes`, `pg_dist_authinfo`,
     // `information_schema.not_yet_invented_options`, and the next
     // extension were metadata-only because the schema matched.
@@ -367,7 +289,18 @@ pub(crate) fn range_var_is_leaky_catalog(v: &pg_query::protobuf::RangeVar) -> bo
     if schema == "pg_catalog" || (schema.is_empty() && relation.starts_with("pg_")) {
         return !relation_is_metadata_safe_pg(&relation);
     }
-    LEAKY_SYSTEM_CATALOGS.contains(&relation.as_str())
+    false
+}
+
+/// Unqualified fork dumps invert cannot see (`citus_lock_waits` has no `pg_`
+/// prefix). Substring, not a name list: the next `edb_stat_activity` must
+/// fail closed. Catalog-shaped forks (`pg_dist_*`) are unknown and leaky
+/// via invert instead.
+fn is_non_catalog_shaped_fork_dump(relation: &str) -> bool {
+    relation.starts_with("citus_stat_")
+        || relation.contains("stat_activity")
+        || relation.contains("lock_waits")
+        || (relation.contains("stat_statements") && !relation_is_metadata_safe_pg(relation))
 }
 
 /// Functions that reach data the parse tree never names.
