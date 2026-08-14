@@ -87,6 +87,10 @@ pub enum Cause {
     NoticeFlood,
     /// DML, DDL, `DO`/`CALL`, or other mutating SQL — pgmask is read-only.
     WriteRefused,
+    /// SQL `PREPARE`/`EXECUTE`/`DEALLOCATE` or `DECLARE`/`FETCH`/`CLOSE`.
+    /// The extended protocol (Parse/Bind/Execute) is the supported path;
+    /// `SELECT … FETCH FIRST n ROWS` is a limit clause, not this class.
+    SqlPrepareCursor,
     /// A function call outside the trusted `pg_catalog` allowlist.
     UntrustedFunction,
     /// Statement named a system catalog that holds sampled user data,
@@ -113,6 +117,7 @@ impl Cause {
         Cause::RateLimited,
         Cause::NoticeFlood,
         Cause::WriteRefused,
+        Cause::SqlPrepareCursor,
         Cause::UntrustedFunction,
         Cause::LeakyCatalog,
     ];
@@ -136,6 +141,7 @@ impl Cause {
             Cause::RateLimited => "rate_limited",
             Cause::NoticeFlood => "notice_flood",
             Cause::WriteRefused => "write_refused",
+            Cause::SqlPrepareCursor => "sql_prepare_cursor",
             Cause::UntrustedFunction => "untrusted_function",
             Cause::LeakyCatalog => "leaky_catalog",
         }

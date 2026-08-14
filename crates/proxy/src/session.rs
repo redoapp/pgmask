@@ -10,10 +10,11 @@
 //! **The masking plan is bound to the `RowDescription`, never to the statement.**
 //!
 //! Every row-producing path in the protocol emits a `RowDescription` first —
-//! cursors, `FETCH`, multi-statement simple queries, resumed portals, functions.
-//! So they are all covered without special handling, and the only two paths that
-//! emit rows *without* one, `COPY ... TO STDOUT` and the legacy `FunctionCall`,
-//! are refused outright.
+//! extended-protocol portals, multi-statement simple queries, resumed
+//! statements. So they are all covered without special handling. SQL
+//! `DECLARE`/`FETCH`/`CLOSE` are refused as a statement class (use Parse/Bind
+//! instead). The only two paths that emit rows *without* a `RowDescription`,
+//! `COPY ... TO STDOUT` and the legacy `FunctionCall`, are refused outright.
 //!
 //! Corollary, enforced below: a `DataRow` with no active plan is a bug or an
 //! attack. It is never forwarded.
@@ -503,6 +504,23 @@ impl Session {
         }
     }
 
+    /// SQL `PREPARE`/`DECLARE` and the statements that only exist to use them.
+    fn refuse_sql_prepare_or_cursor(&mut self, out: &mut Batch, with_ready: bool) {
+        self.policy.metrics.record(Cause::SqlPrepareCursor);
+        let err = protocol::build_error(
+            protocol::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+            "pgmask: SQL PREPARE, EXECUTE, DEALLOCATE, DECLARE, FETCH, and CLOSE are not permitted",
+            Some(
+                "Use ordinary SELECT, or the extended protocol Parse/Bind/Execute. \
+                 SELECT ... FETCH FIRST n ROWS is a limit clause and is allowed.",
+            ),
+        );
+        out.client(Vetted::synthetic(&err));
+        if with_ready {
+            self.synthetic_ready(out);
+        }
+    }
+
     /// DML / DDL / `DO` / `CALL` — pgmask never writes.
     fn refuse_write(&mut self, out: &mut Batch, with_ready: bool) {
         self.policy.metrics.record(Cause::WriteRefused);
@@ -549,6 +567,10 @@ impl Session {
     fn refuse_frontend_sql(&mut self, sql: &str, out: &mut Batch, with_ready: bool) -> bool {
         if analysis::is_write_statement(sql) {
             self.refuse_write(out, with_ready);
+            return true;
+        }
+        if analysis::is_sql_prepare_or_cursor(sql) {
+            self.refuse_sql_prepare_or_cursor(out, with_ready);
             return true;
         }
         if analysis::calls_untrusted_function(sql) {
@@ -2207,6 +2229,56 @@ mask = "none"
         );
         assert!(!out.to_backend.is_empty());
         assert!(out.to_client.is_empty());
+    }
+
+    #[test]
+    fn sql_prepare_and_cursors_are_refused_before_the_backend() {
+        // Statement class, every posture — not a write, and not hostile-only.
+        let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
+        for sql in [
+            "PREPARE q AS SELECT 1\0",
+            "EXECUTE q\0",
+            "DEALLOCATE q\0",
+            "DECLARE c CURSOR FOR SELECT 1\0",
+            "FETCH ALL FROM c\0",
+            "CLOSE c\0",
+        ] {
+            let mut out = Batch::default();
+            session.handle_frontend(
+                Message::new(protocol::F_QUERY, Bytes::from(sql.as_bytes().to_vec())),
+                &mut out,
+            );
+            assert!(out.to_backend.is_empty(), "must not reach Postgres: {sql}");
+            let text = String::from_utf8_lossy(&out.to_client);
+            assert!(
+                text.contains("SQL PREPARE") || text.contains("DECLARE"),
+                "got: {text} for {sql}"
+            );
+            assert!(
+                !text.contains("read-only"),
+                "must be a dedicated cause, not write_refused: {text}"
+            );
+        }
+        assert!(session.policy.metrics.count(Cause::SqlPrepareCursor) >= 6);
+        assert_eq!(session.policy.metrics.count(Cause::WriteRefused), 0);
+
+        // Ordinary SELECT, including FETCH FIRST as a limit, still goes through.
+        for sql in [
+            &b"SELECT 1\0"[..],
+            &b"SELECT 1 FETCH FIRST 1 ROW ONLY\0"[..],
+        ] {
+            let mut out = Batch::default();
+            session.handle_frontend(
+                Message::new(protocol::F_QUERY, Bytes::copy_from_slice(sql)),
+                &mut out,
+            );
+            assert!(
+                !out.to_backend.is_empty(),
+                "SELECT must still reach Postgres: {}",
+                String::from_utf8_lossy(sql)
+            );
+            assert!(out.to_client.is_empty());
+        }
     }
 
     #[test]

@@ -2686,15 +2686,12 @@ fn node_is_join_or_rename(
         }
         Some(NodeEnum::JoinExpr(join)) => {
             if join.is_natural
-                && (join_side_has_masked_relation(
-                    join.larg.as_deref(),
-                    relation_columns,
-                    masked,
-                ) || join_side_has_masked_relation(
-                    join.rarg.as_deref(),
-                    relation_columns,
-                    masked,
-                ))
+                && (join_side_has_masked_relation(join.larg.as_deref(), relation_columns, masked)
+                    || join_side_has_masked_relation(
+                        join.rarg.as_deref(),
+                        relation_columns,
+                        masked,
+                    ))
             {
                 return true;
             }
@@ -3677,6 +3674,36 @@ pub fn is_procedural_statement(sql: &str) -> bool {
     false
 }
 
+/// SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` /
+/// `CLOSE`. A second copy of the extended protocol (`Parse`/`Bind`/`Execute`
+/// and named portals). Their query bodies are invisible to
+/// `pg_query::nodes()`, which made them a recurring oracle under hostile
+/// analysis. Analysts keep ordinary `SELECT` — including
+/// `SELECT … FETCH FIRST n ROWS`, which is a `SelectStmt` limit, not a
+/// `FetchStmt` — and protocol Parse/Bind.
+///
+/// Parse failure returns false, same as [`is_write_statement`]; other gates
+/// still apply. Refused on every posture, not only hostile.
+pub fn is_sql_prepare_or_cursor(sql: &str) -> bool {
+    use pg_query::NodeRef;
+
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        match node {
+            NodeRef::PrepareStmt(_)
+            | NodeRef::ExecuteStmt(_)
+            | NodeRef::DeallocateStmt(_)
+            | NodeRef::DeclareCursorStmt(_)
+            | NodeRef::FetchStmt(_)
+            | NodeRef::ClosePortalStmt(_) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Anything that is not on the read-only allowlist.
 ///
 /// Fail-closed: every `*Stmt` node must be explicitly permitted, or the
@@ -3684,6 +3711,10 @@ pub fn is_procedural_statement(sql: &str) -> bool {
 /// `CHECKPOINT` (and would miss the next DDL variant pg_query adds). pgmask
 /// is a read-only masking proxy — writes and admin DDL are refused on every
 /// posture, not only hostile.
+///
+/// SQL `PREPARE`/`DECLARE` and friends stay on this allowlist so they are
+/// not bucketed as writes; [`is_sql_prepare_or_cursor`] refuses them with
+/// a dedicated error.
 pub fn is_write_statement(sql: &str) -> bool {
     use pg_query::NodeRef;
 
@@ -5796,10 +5827,56 @@ mod referenced_identifier_probe {
             "PREPARE q AS SELECT 1",
             "EXECUTE q",
             "DEALLOCATE q",
+            "DECLARE c CURSOR FOR SELECT 1",
+            "FETCH ALL FROM c",
+            "MOVE FORWARD 1 FROM c",
+            "CLOSE c",
+            "SELECT 1 FETCH FIRST 1 ROW ONLY",
             "DISCARD ALL",
             "RESET ALL",
         ] {
             assert!(!is_write_statement(sql), "expected read: {sql}");
+        }
+    }
+
+    #[test]
+    fn sql_prepare_and_cursor_statements_are_recognised() {
+        for sql in [
+            "PREPARE q AS SELECT 1",
+            "PREPARE q AS SELECT count(*) FROM demo.customers WHERE email = 'x'",
+            "EXECUTE q",
+            "EXECUTE q(1)",
+            "DEALLOCATE q",
+            "DEALLOCATE ALL",
+            "DECLARE c CURSOR FOR SELECT 1",
+            "DECLARE c CURSOR WITH HOLD FOR SELECT email FROM demo.customers",
+            "FETCH ALL FROM c",
+            "FETCH FORWARD 10 FROM c",
+            "MOVE FORWARD 1 FROM c",
+            "CLOSE c",
+            "CLOSE ALL",
+        ] {
+            assert!(
+                is_sql_prepare_or_cursor(sql),
+                "expected SQL PREPARE/cursor: {sql}"
+            );
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT email, id FROM demo.customers WHERE id = 1",
+            "SELECT * FROM demo.customers FETCH FIRST 10 ROWS ONLY",
+            "SELECT * FROM demo.customers FETCH FIRST 10 ROWS WITH TIES",
+            "SELECT 1 FETCH FIRST 1 ROW ONLY",
+            "BEGIN",
+            "EXPLAIN SELECT 1",
+            "SHOW search_path",
+            "DISCARD ALL",
+            "not valid sql at all",
+        ] {
+            assert!(
+                !is_sql_prepare_or_cursor(sql),
+                "must not refuse ordinary SELECT/session SQL: {sql}"
+            );
         }
     }
 

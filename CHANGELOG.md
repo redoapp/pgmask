@@ -6,6 +6,12 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
 `pg_query::nodes()` never visits. Unicode-escaped masked names
 (`u&"email"`) are invisible to the lexer, so a missed node was an allow:
 
+- SQL `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` / `CLOSE`
+  are now refused on **every posture** (`sql_prepare_cursor`). They are a
+  second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.
+  Analysts keep ordinary `SELECT` (including `SELECT … FETCH FIRST n ROWS`,
+  a limit clause) and the extended protocol. Walkers on PREPARE/DECLARE
+  bodies remain as defense in depth.
 - `string_agg(city, ',' ORDER BY u&"email" = 'x')` / `WITHIN GROUP (ORDER BY …)`
   — `FuncCall.agg_order` was never walked
 - `ROWS BETWEEN (SELECT … WHERE u&"email" = 'x') PRECEDING AND CURRENT ROW`

@@ -209,7 +209,7 @@ async fn pipelined_interleaved_portals_stay_masked() -> Result<()> {
 // --- Bypass: rows arriving detached from their statement --------------------
 
 #[tokio::test]
-async fn cursors_stay_masked() -> Result<()> {
+async fn sql_declare_and_fetch_are_refused() -> Result<()> {
     require_pg!();
     load_schema(DB).await?;
     let proxy = start_proxy(DB, default_rules()).await?;
@@ -218,10 +218,13 @@ async fn cursors_stay_masked() -> Result<()> {
     client
         .simple_query("DECLARE c CURSOR FOR SELECT email, name, note FROM canary.subjects")
         .await?;
-    let fetched = client.simple_query("FETCH ALL FROM c").await?;
+    assert_refused(&client, "DECLARE");
+    assert_no_canary(&client, "DECLARE");
+    client.simple_query("FETCH ALL FROM c").await?;
+    assert_refused(&client, "FETCH");
+    assert_no_canary(&client, "FETCH");
     client.simple_query("COMMIT").await?;
-    assert_exercised(&fetched, &client, "cursor FETCH");
-    assert_no_canary(&client, "cursor FETCH");
+    assert_no_canary(&client, "cursor path");
     Ok(())
 }
 
@@ -449,6 +452,8 @@ async fn no_canary_escapes_across_every_path() -> Result<()> {
         "SELECT email FROM canary.subjects UNION SELECT email FROM canary.subjects",
         "SELECT * FROM canary.all_subjects()",
         "BEGIN",
+        // SQL DECLARE/FETCH are refused (sql_prepare_cursor). Still must not
+        // leak; reconnect and continue.
         "DECLARE c2 CURSOR FOR SELECT * FROM canary.subjects",
         "FETCH ALL FROM c2",
         "COMMIT",

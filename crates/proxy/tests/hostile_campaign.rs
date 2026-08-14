@@ -115,6 +115,7 @@ fn run_pass() -> Vec<(String, &'static str)> {
         "SELECT email FROM demo.customers WHERE id IN (1, 2)",
         "SELECT city FROM demo.customers WHERE city = 'Denver'",
         "SELECT count(*) FROM demo.customers WHERE city = 'Denver'",
+        "SELECT email FROM demo.customers FETCH FIRST 10 ROWS ONLY",
     ] {
         check(sql, must_allow_projection(sql));
     }
@@ -610,11 +611,7 @@ fn run_pass() -> Vec<(String, &'static str)> {
         |e| format!("SELECT string_agg(city, ',' ORDER BY ({e})::text) FROM demo.customers"),
         |e| format!("SELECT id, count(*) OVER (PARTITION BY ({e})::text) FROM demo.customers"),
         |e| format!("SELECT id, count(*) OVER (ORDER BY ({e})::text) FROM demo.customers"),
-        |e| {
-            format!(
-                "SELECT id FROM demo.customers ORDER BY ({e})::text = 'x'"
-            )
-        },
+        |e| format!("SELECT id FROM demo.customers ORDER BY ({e})::text = 'x'"),
         |e| {
             format!(
                 "SELECT id FROM demo.customers LIMIT (SELECT count(*) FROM demo.customers WHERE ({e})::text LIKE '%x%')"
@@ -623,7 +620,9 @@ fn run_pass() -> Vec<(String, &'static str)> {
         |e| format!("SELECT count(*) FROM demo.customers GROUP BY {e}"),
         |e| format!("SELECT count(*) FROM demo.customers HAVING bool_or(({e})::text LIKE '%x%')"),
         |e| format!("SELECT DISTINCT ON ({e}) id FROM demo.customers"),
-        |e| format!("PREPARE q AS SELECT count(*) FROM demo.customers WHERE ({e})::text LIKE '%x%'"),
+        |e| {
+            format!("PREPARE q AS SELECT count(*) FROM demo.customers WHERE ({e})::text LIKE '%x%'")
+        },
         |e| {
             format!(
                 "DECLARE c CURSOR FOR SELECT count(*) FROM demo.customers WHERE ({e})::text LIKE '%x%'"
@@ -654,12 +653,10 @@ fn run_pass() -> Vec<(String, &'static str)> {
         },
         |e| format!("SELECT json_arrayagg(city ORDER BY ({e})::text) FROM demo.customers"),
         |e| format!("SELECT json_objectagg(city: id ORDER BY ({e})::text) FROM demo.customers"),
+        |e| format!("SELECT mode() WITHIN GROUP (ORDER BY ({e})::text) FROM demo.customers"),
         |e| {
-            format!(
-                "SELECT mode() WITHIN GROUP (ORDER BY ({e})::text) FROM demo.customers"
-            )
+            format!("SELECT GROUPING({e}), count(*) FROM demo.customers GROUP BY GROUPING SETS (({e}), ())")
         },
-        |e| format!("SELECT GROUPING({e}), count(*) FROM demo.customers GROUP BY GROUPING SETS (({e}), ())"),
         |e| format!("SELECT count(*) FROM demo.customers GROUP BY CUBE({e})"),
         |e| format!("SELECT count(*) FROM demo.customers GROUP BY ROLLUP({e})"),
         |e| {
@@ -755,7 +752,11 @@ fn run_pass() -> Vec<(String, &'static str)> {
         |e| format!("SELECT json_agg({e}) FROM demo.customers t"),
         |e| format!("SELECT json_arrayagg({e}) FROM demo.customers t"),
         |e| format!("SELECT json_objectagg('k': {e}) FROM demo.customers t"),
-        |e| format!("PREPARE q AS SELECT count(*) FROM demo.customers t WHERE ({e})::text LIKE '%x%'"),
+        |e| {
+            format!(
+                "PREPARE q AS SELECT count(*) FROM demo.customers t WHERE ({e})::text LIKE '%x%'"
+            )
+        },
         |e| {
             format!(
                 "DECLARE c CURSOR FOR SELECT count(*) FROM demo.customers t WHERE ({e})::text LIKE '%x%'"

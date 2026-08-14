@@ -141,9 +141,11 @@ attnum it came from — and `0` for both when the field is a computed expression
 That is engine-authoritative provenance, free, with no SQL parsing.
 
 The governing rule: **bind the masking plan to the `RowDescription`, never to the
-statement.** Every row-producing path in the protocol emits one first, so cursors,
-`FETCH`, multi-statement queries, resumed portals and re-executed prepared
-statements are all covered without special handling. Exactly two paths emit rows
+statement.** Every row-producing path in the protocol emits one first, so
+extended-protocol portals, multi-statement queries, and re-executed prepared
+statements are all covered without special handling. SQL `PREPARE` / `DECLARE` /
+`FETCH` / `CLOSE` are refused as a statement class — use ordinary `SELECT`, or
+Parse/Bind/Execute. Exactly two paths emit rows
 *without* one — `COPY ... TO STDOUT` and the legacy `FunctionCall` message — and
 both are refused. A `DataRow` arriving with no active plan is never forwarded.
 
@@ -353,7 +355,10 @@ error-channel `CASE`) while still serving `SELECT email, id FROM t WHERE id = 1`
 posture is unchanged.
 On every posture, pgmask is **read-only**: only an allowlist of read/session
 statements reach Postgres (`SELECT` without row locks, `EXPLAIN`, `SET`/`SHOW`,
-transactions, prepare/execute, cursors). DML, DDL (including `CREATE VIEW`),
+transactions). SQL `PREPARE`/`EXECUTE`/`DEALLOCATE` and `DECLARE`/`FETCH`/`CLOSE`
+are refused (`sql_prepare_cursor`); `SELECT … FETCH FIRST n ROWS` is a limit
+clause and stays allowed. Drivers should use the extended protocol
+Parse/Bind/Execute. DML, DDL (including `CREATE VIEW`),
 `LOAD`, `DO`, `CALL`, and similar are refused first. Pair with
 `rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
 
