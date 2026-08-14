@@ -1,4 +1,9 @@
-# Postgres Masking Proxy — Build Handoff
+# pgmask build handoff
+
+> [!NOTE]
+> This is the detailed design and implementation record. Start with the
+> [README](../README.md), [security model](security.md), or
+> [operations guide](operations.md) for current usage.
 
 **Status:** built. This is the original plan, kept because several of its
 predictions turned out to be wrong and the corrections are the useful part.
