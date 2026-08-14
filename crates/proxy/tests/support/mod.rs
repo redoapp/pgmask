@@ -592,6 +592,45 @@ pub fn function_call_msg(oid: u32) -> Message {
 
 /// The assertion the whole suite exists for.
 #[track_caller]
+/// A statement was actually *exercised* — the proxy either served rows or
+/// refused it with a `pgmask:` message — rather than silently doing nothing.
+///
+/// This is the guard against vacuous masking tests. `assert_no_canary` alone
+/// passes whether the query was served-and-masked, refused, or dropped on the
+/// floor — an error carries no canary. Pairing it with this turns "no canary
+/// crossed" into "the proxy handled this statement and no canary crossed".
+pub fn assert_exercised(msgs: &[Message], client: &RawClient, context: &str) {
+    let served = msgs.iter().any(|m| m.tag == b'D');
+    let refused = client.received_text().contains("pgmask:");
+    assert!(
+        served || refused,
+        "{context}: the proxy neither served a row nor refused with a pgmask \
+         message — the statement was not exercised, so a clean canary check \
+         asserts nothing"
+    );
+}
+
+/// The proxy served data rows: a masking test that must SUCCEED, not be refused.
+/// A refusal carries no canary, so without this a "stays masked" test passes
+/// even when the path stopped running.
+pub fn assert_served(msgs: &[Message], context: &str) {
+    assert!(
+        msgs.iter().any(|m| m.tag == b'D'),
+        "{context}: expected the query to be served (data rows), but none arrived"
+    );
+}
+
+/// The proxy refused the statement with its own message. A "cannot leak by
+/// refusal" test that only checks for a canary passes if the refusal quietly
+/// stops happening; this pins that the refusal is what closed the path.
+pub fn assert_refused(client: &RawClient, context: &str) {
+    let text = client.received_text();
+    assert!(
+        text.contains("pgmask:"),
+        "{context}: expected a pgmask refusal, got:\n{text}"
+    );
+}
+
 pub fn assert_no_canary(client: &RawClient, context: &str) {
     let text = client.received_text();
     for canary in CANARIES {

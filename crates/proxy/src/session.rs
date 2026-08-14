@@ -887,9 +887,22 @@ impl Session {
 
             protocol::B_NOTICE_RESPONSE => self.handle_notice(msg, out),
 
-            // No result set for this Describe; consume its slot.
+            // No result set for this Describe; consume its slot. NoData can
+            // only answer a Describe — a simple query's result is a
+            // RowDescription or EmptyQueryResponse — so if the queue head is
+            // not a Describe the backend has described something the proxy
+            // never saw requested, and that is refused rather than guessed at.
             b'n' => {
-                self.plans.finish_no_data();
+                if let Err(()) = self.plans.finish_no_data() {
+                    return self.reject(
+                        Rejection {
+                            cause: Cause::Malformed,
+                            message: "pgmask: NoData answered no pending Describe".into(),
+                            hint: None,
+                        },
+                        out,
+                    );
+                }
                 out.client(Vetted::control(&msg))
             }
 
@@ -906,6 +919,33 @@ impl Session {
                 );
                 out.client(Vetted::synthetic(&err));
                 out.close = true;
+            }
+
+            // One result set ended. Its Execute — if any — is done; the next
+            // rows belong to the next queued Execute.
+            protocol::B_COMMAND_COMPLETE => {
+                self.plans.finish_result_set();
+                out.client(Vetted::control(&msg))
+            }
+
+            // An empty simple query (or one with only comments) answers with
+            // EmptyQueryResponse instead of a RowDescription. It consumes its
+            // own description entry and ends its result set in one step;
+            // refusing first means a desync is rejected before any state has
+            // been spent. A Describe never answers this way.
+            protocol::B_EMPTY_QUERY_RESPONSE => {
+                if let Err(()) = self.plans.finish_empty_query() {
+                    return self.reject(
+                        Rejection {
+                            cause: Cause::Malformed,
+                            message: "pgmask: EmptyQueryResponse answered no forwarded Query"
+                                .into(),
+                            hint: None,
+                        },
+                        out,
+                    );
+                }
+                out.client(Vetted::control(&msg))
             }
 
             // Explicit allowlist. The backend direction gets no catch-all: an
@@ -1197,12 +1237,34 @@ impl Session {
 
         // Bind the plan to whatever this RowDescription answers, and make it
         // active — which also covers pipelined Bind-before-Describe ordering.
-        self.plans.finish_description(plan);
+        //
+        // A RowDescription that answered nothing this proxy forwarded is a
+        // desync the queue cannot explain. Failing closed here beats reading
+        // it as a simple result: that guess let one message's description
+        // govern another's rows.
+        if let Err(()) = self.plans.finish_description(plan) {
+            return self.reject(
+                Rejection {
+                    cause: Cause::Malformed,
+                    message: "pgmask: RowDescription answered no forwarded Describe or Query"
+                        .into(),
+                    hint: Some(
+                        "The backend described a result set the proxy never saw requested, so \
+                         its shape cannot be trusted."
+                            .into(),
+                    ),
+                },
+                out,
+            );
+        }
         out.client(Vetted::control(&msg))
     }
 
     fn handle_data_row(&mut self, msg: Message, out: &mut Batch) {
-        let Some(plan) = self.plans.active_plan() else {
+        // One result set streams at a time, each with exactly one governing
+        // plan. A stream with none — a statement that was never described —
+        // is refused rather than guessed at.
+        let Some(plan) = self.plans.streaming_plan() else {
             // Rows we were never given the shape of. Refuse rather than guess.
             return self.reject(
                 Rejection {
@@ -1210,7 +1272,7 @@ impl Session {
                     message: "pgmask: received a data row with no described result set".into(),
                     hint: Some(
                         "The statement produced rows without a RowDescription, so no masking plan \
-                     could be built."
+                         could be built."
                             .into(),
                     ),
                 },
@@ -1597,6 +1659,33 @@ mod tests {
             posture: Posture::Default,
             system_catalogs: SystemCatalogs::Refuse,
             lineage: Lineage::Refuse,
+            roles: HashMap::new(),
+            tls: None,
+            require_client_tls: false,
+            backend_tls: BackendTls::Disable,
+            backend_ca: None,
+            rate_limit: None,
+            max_notices_per_exchange: None,
+        })
+    }
+
+    /// The deployment configs the wire harnesses mirror run
+    /// `lineage = "allow"`, which is what releases a pure expression column
+    /// (`SELECT 1 AS x`). Under lineage refusal such a column is refused at
+    /// the RowDescription, so tests that assert on released passthrough plans
+    /// need the allow policy.
+    fn policy_with_lineage_allow(unclassified: Unclassified, opaque: Opaque) -> Arc<Policy> {
+        Arc::new(Policy {
+            catalog: Arc::new(Catalog::default()),
+            masker: Arc::new(Masker::new(b"k".to_vec())),
+            unclassified,
+            unclassified_mask: Mask::Null,
+            opaque,
+            metrics: Arc::new(Metrics::default()),
+            summaries: Summaries::Allow,
+            posture: Posture::Default,
+            system_catalogs: SystemCatalogs::Refuse,
+            lineage: Lineage::Allow,
             roles: HashMap::new(),
             tls: None,
             require_client_tls: false,
@@ -2225,11 +2314,24 @@ mask = "none"
     #[test]
     fn a_simple_query_invalidates_the_previous_plan() {
         let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
-        session.plans.finish_description(Arc::new(vec![FieldPlan {
-            spec: MaskSpec::new(Mask::None),
-            type_oid: 25,
-            format: 0,
-        }]));
+        session.plans.parse("s".into(), "SELECT 1".into());
+        session
+            .plans
+            .describe(protocol::DescribeTarget::Statement(Bytes::from_static(
+                b"s",
+            )));
+        session
+            .plans
+            .finish_description(Arc::new(vec![FieldPlan {
+                spec: MaskSpec::new(Mask::None),
+                type_oid: 25,
+                format: 0,
+            }]))
+            .unwrap();
+        assert!(
+            session.plans.active_plan().is_some(),
+            "a described result set must be armed before the query arrives"
+        );
         let query = Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1\0"));
         session.handle_frontend(query, &mut Batch::default());
         assert!(
@@ -2252,7 +2354,7 @@ mask = "none"
             .describe(protocol::DescribeTarget::Statement(Bytes::from_static(
                 b"s1",
             )));
-        session.plans.finish_description(plan);
+        session.plans.finish_description(plan).unwrap();
 
         let mut body = bytes::BytesMut::new();
         bytes::BufMut::put_slice(&mut body, b"p1\0s1\0");
@@ -2291,5 +2393,762 @@ mask = "none"
             &mut Batch::default(),
         );
         assert!(session.plans.active_plan().is_none(), "fail closed");
+    }
+
+    fn parse_body(name_sql: &[u8]) -> Bytes {
+        let mut body = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut body, name_sql);
+        bytes::BufMut::put_i16(&mut body, 0);
+        body.freeze()
+    }
+
+    fn exec_body(portal: &[u8]) -> Bytes {
+        let mut body = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut body, portal);
+        bytes::BufMut::put_u8(&mut body, 0);
+        bytes::BufMut::put_i32(&mut body, 0);
+        body.freeze()
+    }
+
+    fn row_description(fields: &[(&str, u32, i16, u32)]) -> Message {
+        let mut body = bytes::BytesMut::new();
+        bytes::BufMut::put_i16(&mut body, fields.len() as i16);
+        for (name, table_oid, column_id, type_oid) in fields {
+            bytes::BufMut::put_slice(&mut body, name.as_bytes());
+            bytes::BufMut::put_u8(&mut body, 0);
+            bytes::BufMut::put_i32(&mut body, *table_oid as i32);
+            bytes::BufMut::put_i16(&mut body, *column_id);
+            bytes::BufMut::put_i32(&mut body, *type_oid as i32);
+            bytes::BufMut::put_i16(&mut body, -1); // typlen
+            bytes::BufMut::put_i32(&mut body, -1); // typmod
+            bytes::BufMut::put_i16(&mut body, 0); // text format
+        }
+        Message::new(protocol::B_ROW_DESCRIPTION, body.freeze())
+    }
+
+    /// A RowDescription that completes an unrelated statement must not arm the
+    /// plan for the Execute that is actually streaming.
+    ///
+    /// The client pipelines one exchange: `Parse(s1) Describe(s1) Parse(sm)
+    /// Bind(p sm) Execute(p) Sync`. The frontend runs to completion before any
+    /// backend response, so when the RowDescription for `s1` finally lands,
+    /// Execute has already armed `p`. Before this fix, that description's
+    /// passthrough plan became `active_plan`, and the never-described `sm`'s
+    /// rows — which arrive with no RowDescription of their own — were cleared
+    /// through it.
+    #[test]
+    fn a_lagging_row_description_does_not_arm_an_unrelated_execute() {
+        let mut session = Session::new(policy_with_lineage_allow(
+            Unclassified::Allow,
+            Opaque::Reject,
+        ));
+        session.handle_frontend(
+            Message::new(protocol::F_PARSE, parse_body(b"s1\0SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_DESCRIBE, Bytes::from_static(b"Ss1\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(
+                protocol::F_PARSE,
+                parse_body(b"sm\0SELECT a FROM fz.t1 LIMIT 2\0"),
+            ),
+            &mut Batch::default(),
+        );
+        let mut bind = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut bind, b"p\0sm\0");
+        session.handle_frontend(
+            Message::new(protocol::F_BIND, bind.freeze()),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_EXECUTE, exec_body(b"p")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(protocol::B_BIND_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+
+        let canary = Bytes::from_static(b"LEAKME");
+        session.handle_backend(protocol::build_data_row(&[Some(canary.clone())]), &mut out);
+        assert!(
+            !out.to_client
+                .windows(canary.len())
+                .any(|w| w == &canary[..]),
+            "the never-described Execute's row must not reach the client"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.to_client).contains("no described result set"),
+            "the refusal must be reported: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+    }
+
+    /// Two Executes pipelined in one exchange are each vetted by their own
+    /// portal's plan. A single `active_plan` used to be overwritten by the
+    /// second Execute, so the first portal's rows were judged against the
+    /// second statement's description.
+    #[test]
+    fn each_execute_is_vetted_by_its_own_portal() {
+        let mut session = Session::new(policy_with_lineage_allow(
+            Unclassified::Allow,
+            Opaque::Reject,
+        ));
+
+        // Exchange 1: describe both statements.
+        session.handle_frontend(
+            Message::new(protocol::F_PARSE, parse_body(b"s1\0SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(
+                protocol::F_PARSE,
+                parse_body(b"s2\0SELECT 1 AS a, 2 AS b\0"),
+            ),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_DESCRIBE, Bytes::from_static(b"Ss1\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_DESCRIBE, Bytes::from_static(b"Ss2\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+        let mut out = Batch::default();
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        session.handle_backend(
+            row_description(&[("a", 0, 0, 25), ("b", 0, 0, 25)]),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(protocol::B_READY_FOR_QUERY, Bytes::from_static(b"I")),
+            &mut out,
+        );
+
+        // Exchange 2: bind and execute both, pipelined with no Sync between.
+        session.handle_frontend(
+            Message::new(protocol::F_BIND, Bytes::from_static(b"p1\0s1\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_EXECUTE, exec_body(b"p1")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_BIND, Bytes::from_static(b"p2\0s2\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_EXECUTE, exec_body(b"p2")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        session.handle_backend(
+            Message::new(protocol::B_BIND_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        // p1's row has one field; the old code judged it with p2's two-field
+        // plan and refused it as malformed.
+        session.handle_backend(
+            protocol::build_data_row(&[Some(Bytes::from_static(b"V1"))]),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(
+                protocol::B_COMMAND_COMPLETE,
+                Bytes::from_static(b"SELECT 1\0"),
+            ),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(protocol::B_BIND_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(
+            protocol::build_data_row(&[
+                Some(Bytes::from_static(b"V2A")),
+                Some(Bytes::from_static(b"V2B")),
+            ]),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(
+                protocol::B_COMMAND_COMPLETE,
+                Bytes::from_static(b"SELECT 2\0"),
+            ),
+            &mut out,
+        );
+
+        assert!(
+            out.to_client.windows(2).any(|w| w == b"V1"),
+            "p1's row must be served by p1's plan: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        assert!(
+            out.to_client.windows(3).any(|w| w == b"V2A"),
+            "p2's row must be served by p2's plan: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.to_client).contains("no described result set"),
+            "both described Executes are legitimate and must not be refused"
+        );
+    }
+
+    /// Rows that follow no Execute still fall back to the plan the
+    /// RowDescription armed — the simple-query path is unchanged.
+    #[test]
+    fn a_simple_query_result_is_still_vetted_by_its_row_description() {
+        let mut session = Session::new(policy_with_lineage_allow(
+            Unclassified::Allow,
+            Opaque::Reject,
+        ));
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        session.handle_backend(
+            protocol::build_data_row(&[Some(Bytes::from_static(b"1"))]),
+            &mut out,
+        );
+        assert!(
+            out.to_client.windows(1).any(|w| w == b"1"),
+            "a simple query's own row must be served"
+        );
+    }
+
+    /// A simple query pipelined ahead of a never-described Execute still has
+    /// its own result served, and the Execute's rows are still refused.
+    ///
+    /// Before the streaming-simple flag, the queued Execute made the simple
+    /// result indistinguishable from an Execute result: the simple
+    /// CommandComplete was mistaken for the Execute's and popped its slot, so
+    /// the harmless `SELECT 1` row was refused as undescribable.
+    #[test]
+    fn a_pipelined_simple_result_is_served_before_a_refused_execute() {
+        let mut session = Session::new(policy_with_lineage_allow(
+            Unclassified::Allow,
+            Opaque::Reject,
+        ));
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(
+                protocol::F_PARSE,
+                parse_body(b"sm\0SELECT a FROM fz.t1 LIMIT 2\0"),
+            ),
+            &mut Batch::default(),
+        );
+        let mut bind = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut bind, b"p\0sm\0");
+        session.handle_frontend(
+            Message::new(protocol::F_BIND, bind.freeze()),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_EXECUTE, exec_body(b"p")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+
+        // The simple query's own result streams first.
+        let mut out = Batch::default();
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        let simple_row = protocol::build_data_row(&[Some(Bytes::from_static(b"1"))]);
+        session.handle_backend(simple_row.clone(), &mut out);
+        session.handle_backend(
+            Message::new(
+                protocol::B_COMMAND_COMPLETE,
+                Bytes::from_static(b"SELECT 1\0"),
+            ),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(protocol::B_READY_FOR_QUERY, Bytes::from_static(b"I")),
+            &mut out,
+        );
+        assert!(
+            out.to_client
+                .windows(simple_row.encode().len())
+                .any(|w| w == &simple_row.encode()[..]),
+            "the simple query's row must be served: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.to_client).contains("no described result set"),
+            "the simple row is legitimate and must not be refused: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+
+        // The never-described Execute's row has no plan and must be refused,
+        // even though the simple CommandComplete already ran.
+        let mut out = Batch::default();
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(protocol::B_BIND_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        let canary = Bytes::from_static(b"LEAKME");
+        session.handle_backend(protocol::build_data_row(&[Some(canary.clone())]), &mut out);
+        assert!(
+            !out.to_client
+                .windows(canary.len())
+                .any(|w| w == &canary[..]),
+            "the never-described Execute's row must not reach the client"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.to_client).contains("no described result set"),
+            "the Execute's row must be refused: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+    }
+
+    /// An Execute pipelined ahead of a simple query keeps its own portal's
+    /// plan, even though the simple query invalidates the active plan before
+    /// the Execute's rows stream. This is the ordering that must *not* mark
+    /// the streaming result simple at `begin_simple_query`: the Execute's
+    /// rows come first and belong to their own portal.
+    #[test]
+    fn an_execute_pipelined_before_a_simple_query_keeps_its_own_plan() {
+        let mut session = Session::new(policy_with_lineage_allow(
+            Unclassified::Allow,
+            Opaque::Reject,
+        ));
+        // One flush: Parse, Describe, Bind, Execute, then a simple query.
+        session.handle_frontend(
+            Message::new(protocol::F_PARSE, parse_body(b"s\0SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_DESCRIBE, Bytes::from_static(b"Ss\0")),
+            &mut Batch::default(),
+        );
+        let mut bind = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut bind, b"p\0s\0");
+        session.handle_frontend(
+            Message::new(protocol::F_BIND, bind.freeze()),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_EXECUTE, exec_body(b"p")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        // The describe's RowDescription and BindComplete, then the Execute's
+        // result, then the simple query's own result.
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(protocol::B_BIND_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        let p_row = protocol::build_data_row(&[Some(Bytes::from_static(b"V1"))]);
+        session.handle_backend(p_row.clone(), &mut out);
+        session.handle_backend(
+            Message::new(
+                protocol::B_COMMAND_COMPLETE,
+                Bytes::from_static(b"SELECT 1\0"),
+            ),
+            &mut out,
+        );
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        let simple_row = protocol::build_data_row(&[Some(Bytes::from_static(b"1"))]);
+        session.handle_backend(simple_row.clone(), &mut out);
+        session.handle_backend(
+            Message::new(
+                protocol::B_COMMAND_COMPLETE,
+                Bytes::from_static(b"SELECT 1\0"),
+            ),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(protocol::B_READY_FOR_QUERY, Bytes::from_static(b"I")),
+            &mut out,
+        );
+
+        assert!(
+            out.to_client
+                .windows(p_row.encode().len())
+                .any(|w| w == &p_row.encode()[..]),
+            "the Execute's row must be vetted by its own portal's plan: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        assert!(
+            out.to_client
+                .windows(simple_row.encode().len())
+                .any(|w| w == &simple_row.encode()[..]),
+            "the simple query's row must be served too: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.to_client).contains("no described result set"),
+            "neither result may be refused"
+        );
+    }
+
+    /// The live leak this fix closes: `Parse(s1) Describe(s1) Bind(p)
+    /// Execute(p) Q("SELECT 1") Sync` pipelined in one flush.
+    ///
+    /// A simple Query used to clear the pending-describe queue even though the
+    /// backend still owed the Describe's RowDescription. That answer then
+    /// arrived with nothing to match, was read as the simple query's result,
+    /// and its plan was built from the simple query's text — so the Execute's
+    /// rows, streamed by the Describe's now-forgotten statement, were vetted by
+    /// the wrong plan. On the wire this served a masked value verbatim.
+    ///
+    /// Under the correct SQL the subquery over `fz.t1` is refused at the
+    /// RowDescription; under the simple query's text it reads as a literal and
+    /// passes straight through.
+    #[test]
+    fn a_pipelined_simple_query_cannot_reclassify_a_pending_describe() {
+        let mut session = Session::new(policy_with_lineage_allow(
+            Unclassified::Allow,
+            Opaque::Reject,
+        ));
+        session.handle_frontend(
+            Message::new(
+                protocol::F_PARSE,
+                parse_body(b"s1\0SELECT (SELECT a FROM fz.t1 LIMIT 1) AS x\0"),
+            ),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_DESCRIBE, Bytes::from_static(b"Ss1\0")),
+            &mut Batch::default(),
+        );
+        let mut bind = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut bind, b"p\0s1\0");
+        session.handle_frontend(
+            Message::new(protocol::F_BIND, bind.freeze()),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_EXECUTE, exec_body(b"p")),
+            &mut Batch::default(),
+        );
+        // The simple query runs *after* the Describe, but the proxy processes
+        // it before the backend answers anything.
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        // The RowDescription that answers s1 arrives after the Query was
+        // processed. It must be matched to the Describe, not to the query.
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        assert!(
+            String::from_utf8_lossy(&out.to_client).contains("no column provenance"),
+            "s1's own RowDescription must be classified under s1's SQL and refused, not read \
+             as the simple query's literal: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        let canary = Bytes::from_static(b"CANARY-T1-A-1");
+        session.handle_backend(protocol::build_data_row(&[Some(canary.clone())]), &mut out);
+        assert!(
+            !out.to_client
+                .windows(canary.len())
+                .any(|w| w == &canary[..]),
+            "the Execute's row must not reach the client after the refusal: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+    }
+
+    /// The reverse interleaving: a simple query pipelined ahead of a
+    /// Describe-and-Execute. The simple query's RowDescription answers first
+    /// and must be matched to the query's own entry, not to the Describe
+    /// queued behind it — and the Describe's RowDescription must still be
+    /// classified under its own statement's SQL.
+    #[test]
+    fn a_pending_describe_is_not_consumed_by_an_earlier_simple_result() {
+        let mut session = Session::new(policy_with_lineage_allow(
+            Unclassified::Allow,
+            Opaque::Reject,
+        ));
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(
+                protocol::F_PARSE,
+                parse_body(b"s2\0SELECT (SELECT a FROM fz.t1 LIMIT 1) AS x\0"),
+            ),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_DESCRIBE, Bytes::from_static(b"Ss2\0")),
+            &mut Batch::default(),
+        );
+        let mut bind = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut bind, b"p\0s2\0");
+        session.handle_frontend(
+            Message::new(protocol::F_BIND, bind.freeze()),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_EXECUTE, exec_body(b"p")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        // The simple query's result streams first, matched to its own entry.
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        session.handle_backend(
+            protocol::build_data_row(&[Some(Bytes::from_static(b"1"))]),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(
+                protocol::B_COMMAND_COMPLETE,
+                Bytes::from_static(b"SELECT 1\0"),
+            ),
+            &mut out,
+        );
+        assert!(
+            out.to_client.windows(1).any(|w| w == b"1"),
+            "the simple query's own row must be served: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.to_client).contains("no column provenance"),
+            "the simple result must not be judged by s2's SQL: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        // The Describe's answer comes next, classified under its own SQL.
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        assert!(
+            String::from_utf8_lossy(&out.to_client).contains("no column provenance"),
+            "s2's RowDescription must be refused under s2's SQL: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        let canary = Bytes::from_static(b"CANARY-T1-A-1");
+        session.handle_backend(protocol::build_data_row(&[Some(canary.clone())]), &mut out);
+        assert!(
+            !out.to_client
+                .windows(canary.len())
+                .any(|w| w == &canary[..]),
+            "the Execute's row must not reach the client after the refusal: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+    }
+
+    /// Two simple queries pipelined in one flush: each RowDescription is
+    /// matched to its own query's entry and SQL, so the first result is not
+    /// classified under the second query's text.
+    #[test]
+    fn two_simple_queries_each_keep_their_own_text() {
+        let mut session = Session::new(policy_with_lineage_allow(
+            Unclassified::Allow,
+            Opaque::Reject,
+        ));
+        session.handle_frontend(
+            Message::new(
+                protocol::F_QUERY,
+                Bytes::from_static(b"SELECT (SELECT a FROM fz.t1 LIMIT 1) AS x\0"),
+            ),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        // The first query's RowDescription answers first. Under its own SQL it
+        // is refused; before this fix it was read as the second query's literal
+        // and passed straight through.
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        assert!(
+            String::from_utf8_lossy(&out.to_client).contains("no column provenance"),
+            "the first result must be classified under its own SQL: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        let canary = Bytes::from_static(b"CANARY-T1-A-1");
+        session.handle_backend(protocol::build_data_row(&[Some(canary.clone())]), &mut out);
+        assert!(
+            !out.to_client
+                .windows(canary.len())
+                .any(|w| w == &canary[..]),
+            "the first query's masked value must not reach the client: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        // The second query's result streams next and is served normally.
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        session.handle_backend(
+            protocol::build_data_row(&[Some(Bytes::from_static(b"1"))]),
+            &mut out,
+        );
+        assert!(
+            out.to_client.windows(1).any(|w| w == b"1"),
+            "the second query's row must be served: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+    }
+
+    /// An empty simple query answers with `EmptyQueryResponse`, which carries
+    /// no RowDescription — so its own queue entry is the only bookkeeping that
+    /// should fire. An Execute pipelined behind it must not lose its slot to
+    /// the empty query's result-set end: its rows still stream, vetted by its
+    /// own statement's plan.
+    #[test]
+    fn an_empty_simple_query_does_not_spend_a_pipelined_executes_slot() {
+        let mut session = Session::new(policy_with_lineage_allow(
+            Unclassified::Allow,
+            Opaque::Reject,
+        ));
+        // Q("") Parse(s) Describe(s) Bind(p) Execute(p) Sync, pipelined.
+        session.handle_frontend(
+            Message::new(protocol::F_QUERY, Bytes::from_static(b"\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_PARSE, parse_body(b"s\0SELECT 1 AS x\0")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_DESCRIBE, Bytes::from_static(b"Ss\0")),
+            &mut Batch::default(),
+        );
+        let mut bind = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut bind, b"p\0s\0");
+        session.handle_frontend(
+            Message::new(protocol::F_BIND, bind.freeze()),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_EXECUTE, exec_body(b"p")),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_SYNC, Bytes::new()),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        // The empty query's exchange answers first, entirely without a
+        // RowDescription: EmptyQueryResponse then ReadyForQuery.
+        session.handle_backend(
+            Message::new(protocol::B_EMPTY_QUERY_RESPONSE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(
+            Message::new(protocol::B_READY_FOR_QUERY, Bytes::from_static(b"I")),
+            &mut out,
+        );
+        // The Describe's exchange follows: ParseComplete, its RowDescription,
+        // BindComplete, the Execute's rows, CommandComplete.
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(row_description(&[("x", 0, 0, 25)]), &mut out);
+        session.handle_backend(
+            Message::new(protocol::B_BIND_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        let row = protocol::build_data_row(&[Some(Bytes::from_static(b"1"))]);
+        session.handle_backend(row.clone(), &mut out);
+        session.handle_backend(
+            Message::new(
+                protocol::B_COMMAND_COMPLETE,
+                Bytes::from_static(b"SELECT 1\0"),
+            ),
+            &mut out,
+        );
+
+        let served = out
+            .to_client
+            .windows(row.encode().len())
+            .any(|w| w == &row.encode()[..]);
+        assert!(
+            served,
+            "the Execute's row must be served by its own plan: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.to_client).contains("no described result set"),
+            "the Execute's result must not be refused by the empty query's result-set end: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
     }
 }

@@ -3,8 +3,9 @@
 //! Every other campaign in this repository generates statements and asks
 //! whether the analysis judged them correctly. This one generates *protocol
 //! interleavings* — Parse, Bind, Describe, Execute, Sync, Close, simple Query,
-//! and the backend replies that acknowledge or reject them — and asks whether
-//! the proxy still knows which SQL and which plan belong to which result set.
+//! EmptyQueryResponse, and the backend replies that acknowledge or reject
+//! them — and asks whether the proxy still knows which SQL and which plan
+//! belong to which result set.
 //!
 //! The disclosure that prompted it was reachable in two messages and no
 //! generated statement could have found it, because both statements involved
@@ -81,6 +82,11 @@ enum Op {
     DiscardDescription,
     /// ErrorResponse: the backend skips to the next Sync.
     ErrorResponse,
+    /// CommandComplete: one result set ended.
+    ResultSetEnd,
+    /// EmptyQueryResponse: one *empty simple query's* result ended, with no
+    /// RowDescription of its own.
+    EmptyQueryResponse,
 
     // --- proxy-initiated ---
     /// `Session::reject` — refuse locally and start swallowing backend replies.
@@ -126,6 +132,8 @@ fuzz_target!(|ops: Vec<Op>| {
             Op::NoData => model.finish_no_data(),
             Op::DiscardDescription => model.discard_description(),
             Op::ErrorResponse => model.discard_failed_epoch(),
+            Op::ResultSetEnd => model.finish_result_set(),
+            Op::EmptyQueryResponse => model.finish_empty_query(),
 
             Op::Reject => model.reject(),
             Op::ReadyForQuery { epoch } => model.finish_suppressed_epoch(epoch),

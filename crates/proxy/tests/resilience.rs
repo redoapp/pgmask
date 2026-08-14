@@ -139,9 +139,12 @@ async fn a_client_vanishing_mid_stream_is_not_a_panic() -> Result<()> {
     // The proxy must survive: a later connection still works normally.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
-    client
+    let msgs = client
         .simple_query("SELECT city FROM canary.subjects")
         .await?;
+    // "Still works" means it still serves — a refused or silent later query
+    // would pass a bare canary check while hiding a proxy that had wedged.
+    assert_served(&msgs, "the proxy still serves after a client vanished");
     assert_no_canary(&client, "after a client vanished mid-stream");
     Ok(())
 }
@@ -208,9 +211,10 @@ async fn many_concurrent_sessions_all_stay_masked() -> Result<()> {
                 _ => "SELECT note, city FROM canary.subjects",
             };
             client.simple_query(sql).await?;
-            client
+            let msgs = client
                 .simple_query("SELECT email, name FROM canary.subjects")
                 .await?;
+            assert_served(&msgs, "concurrent session masked select");
             assert_no_canary(&client, "concurrent session");
             Ok::<_, anyhow::Error>(())
         }));

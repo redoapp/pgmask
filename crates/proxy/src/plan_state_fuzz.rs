@@ -2,13 +2,18 @@
 //!
 //! Every other campaign in this repo fuzzes SQL *shapes* — what a statement
 //! says. None of them fuzzes the order the client says it in, and a disclosure
-//! lived there: `described_sql` used `and_then(..).or_else(..)`, which collapsed
-//! "no Describe is outstanding" and "a Describe is outstanding whose SQL was
-//! never recorded" into one branch, so the second answered with an *earlier
-//! simple query's* text. `SELECT 1, 2` reads as two literals, and fields
-//! belonging to `SELECT upper(email), …` were released on its authority. Three
-//! comments asserted that path already failed closed, and the unit test written
-//! to pin it passed vacuously because `simple_sql` was `None` in its fixture.
+//! lived there: a simple query issued while a `Describe` was still in flight
+//! cleared the describe queue, so the backend's answer to the `Describe` was
+//! read as the simple query's `RowDescription` and classified under the simple
+//! query's text. `SELECT (SELECT a FROM users LIMIT 1) AS x`, described and
+//! executed ahead of a `SELECT 1`, then had its masked value served verbatim —
+//! found live, three ways, on the wire.
+//!
+//! The fix is structural: Describes and simple queries share one FIFO of
+//! description entries in stream order, each carrying the SQL it was created
+//! from, and nothing is cleared early. Every `RowDescription` matches the
+//! message at the head of that queue, so a query cannot displace a Describe's
+//! answer, and two simple queries cannot substitute each other's text.
 //!
 //! No amount of SQL-shape generation reaches that. It is an interleaving.
 //!
@@ -24,9 +29,10 @@
 //!
 //! Two things, kept strictly apart:
 //!
-//! * **Ground truth**, read straight off the private fields: which target is at
-//!   the head of `pending_describes`, and the epochs on each queue. These are
-//!   written by `describe`, `parse`, `bind` and `sync` — never by the functions
+//! * **Ground truth**, read straight off the private fields: which entry is at
+//!   the head of `pending_descriptions` — a Describe or a simple Query — and
+//!   the epochs on each queue. These are written by `describe`,
+//!   `begin_simple_query`, `parse`, `bind` and `sync` — never by the functions
 //!   whose answers are being checked.
 //! * **A monotone shadow**, maintained here: the set of SQL texts ever parsed
 //!   under each statement name, the set of statements each portal was ever
@@ -45,8 +51,9 @@
 //!
 //! | | |
 //! |---|---|
-//! | `described_sql` provenance | the text returned must be one this statement name could have carried — a simple query's text can never answer for a pending Describe, and vice versa |
-//! | plan origin | a plan served by `execute` must have been described for that portal, or for a statement that portal was bound to |
+//! | `described_sql` provenance | the text returned must be the one the head entry was created with — a simple query's text can never answer for a pending Describe, and vice versa |
+//! | plan origin | a plan served by `execute` must have been described for that portal, or for a statement that portal was bound to — never a simple result's plan |
+//! | queue honesty | a simple query enqueues its own entry and never displaces an earlier Describe; a `RowDescription`, `NoData` or `EmptyQueryResponse` only ever consumes the entry it belongs to |
 //! | catalog generation | a plan served after a catalog refresh must have been built after it |
 //! | epoch ordering | queue epochs are non-decreasing and never exceed `sync_epoch` |
 //! | no panic | every sequence, including nonsense ones |
@@ -89,7 +96,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::{FieldPlan, Plan, PlanState};
+use super::{FieldPlan, PendingDescription, Plan, PlanState};
 use crate::mask::{Mask, MaskSpec};
 use crate::protocol::DescribeTarget;
 
@@ -124,9 +131,9 @@ const SIMPLE_SQL: [&str; 3] = ["SELECT 1, 2", "SELECT now()", "SELECT 42"];
 enum Target {
     Statement(&'static str),
     Portal(&'static str),
-    /// `finish_description` with an empty queue: the backend described
-    /// something the proxy never saw a Describe for.
-    Unsolicited,
+    /// A plan built for a simple query's result. It may only serve that
+    /// result, never an Execute's.
+    Simple,
 }
 
 fn name_of(index: u8) -> &'static str {
@@ -243,6 +250,12 @@ impl ProtocolModel {
         // for something it was not described for" is decided here.
         if let Some(id) = self.active_plan_id() {
             let built_for = self.plan_targets.get(&id).cloned().unwrap_or_default();
+            assert!(
+                !built_for.contains(&Target::Simple),
+                "step {}: Execute on portal {portal:?} activated plan {id}, built for a simple \
+                 query's result. A simple result's plan must never reach an Execute's result set.",
+                self.step
+            );
             let described_for_this_portal = built_for.contains(&Target::Portal(portal))
                 || self
                     .bound_from
@@ -293,11 +306,19 @@ impl ProtocolModel {
 
     /// A simple `Query`. `sql = None` models a body the proxy could not decode.
     pub fn simple_query(&mut self, sql: Option<u8>) {
+        let before = self.state.pending_descriptions.len();
         let text = sql.map(|index| SIMPLE_SQL[index as usize % SIMPLE_SQL.len()]);
         if let Some(text) = text {
             self.simple_texts.insert(text);
         }
         self.state.begin_simple_query(text.map(str::to_string));
+        assert_eq!(
+            self.state.pending_descriptions.len(),
+            before + 1,
+            "step {}: a simple Query must enqueue its own result and never displace earlier \
+             Describes or queries — a Describe still in flight is answered before this result",
+            self.step
+        );
         self.after_step();
     }
 
@@ -324,25 +345,58 @@ impl ProtocolModel {
         self.next_plan_id += 1;
         let width = 1 + (fields as usize % 3);
 
-        let target = match self.state.pending_describes.front().map(|p| &p.target) {
-            Some(DescribeTarget::Statement(name)) => Target::Statement(static_name(name)),
-            Some(DescribeTarget::Portal(name)) => Target::Portal(static_name(name)),
-            None => Target::Unsolicited,
+        let make_plan = |id: u32, width: usize| -> Plan {
+            Arc::new(
+                (0..width)
+                    .map(|_| FieldPlan {
+                        spec: MaskSpec::new(Mask::None),
+                        type_oid: id,
+                        format: 0,
+                    })
+                    .collect(),
+            )
+        };
+
+        // A RowDescription that answered a simple query streams it right now;
+        // one that answered a Describe arms a *future* result set.
+        let (expected_simple, target) = match self.state.pending_descriptions.front() {
+            Some(PendingDescription::Describe(pending)) => {
+                let target = match &pending.target {
+                    DescribeTarget::Statement(name) => Target::Statement(static_name(name)),
+                    DescribeTarget::Portal(name) => Target::Portal(static_name(name)),
+                };
+                (false, target)
+            }
+            Some(PendingDescription::Simple(_)) => (true, Target::Simple),
+            None => {
+                // A RowDescription with nothing queued is a desync the proxy
+                // refuses: consuming it as a simple result would classify it
+                // under a text it was not asked with — exactly the
+                // misattribution this fix exists to refuse.
+                assert!(
+                    self.state.finish_description(make_plan(id, width)).is_err(),
+                    "step {}: finish_description accepted a RowDescription with no pending \
+                     Describe or Query",
+                    self.step
+                );
+                self.after_step();
+                return;
+            }
         };
         self.plan_targets.entry(id).or_default().insert(target);
         self.plan_built.insert(id, self.step);
 
-        let plan: Plan = Arc::new(
-            (0..width)
-                .map(|_| FieldPlan {
-                    spec: MaskSpec::new(Mask::None),
-                    type_oid: id,
-                    format: 0,
-                })
-                .collect(),
-        );
-        self.state.finish_description(plan);
+        let plan = make_plan(id, width);
+        self.state
+            .finish_description(plan)
+            .expect("a queued description must be accepted");
 
+        assert!(
+            self.state.streaming_simple_result == expected_simple,
+            "step {}: finish_description set streaming_simple_result for a result set that was \
+             not the one streaming — a Describe was at the head of the queue, or a simple query was",
+            self.step
+        );
         assert_eq!(
             self.active_plan_id(),
             Some(id),
@@ -353,7 +407,70 @@ impl ProtocolModel {
     }
 
     pub fn finish_no_data(&mut self) {
-        self.state.finish_no_data();
+        let expect_ok = matches!(
+            self.state.pending_descriptions.front(),
+            Some(PendingDescription::Describe(_))
+        );
+        let result = self.state.finish_no_data();
+        assert_eq!(
+            result.is_ok(),
+            expect_ok,
+            "step {}: finish_no_data consumed {} — NoData belongs only to a Describe",
+            self.step,
+            if expect_ok {
+                "a Describe"
+            } else {
+                "the wrong entry"
+            }
+        );
+        self.after_step();
+    }
+
+    /// An `EmptyQueryResponse`: an empty simple query's answer. It consumes
+    /// the simple query's own entry and ends the never-started result set in
+    /// one step — no streaming-simple flag survives it. It can never belong to
+    /// a Describe.
+    pub fn finish_empty_query(&mut self) {
+        let expect_ok = matches!(
+            self.state.pending_descriptions.front(),
+            Some(PendingDescription::Simple(_))
+        );
+        let result = self.state.finish_empty_query();
+        assert_eq!(
+            result.is_ok(),
+            expect_ok,
+            "step {}: finish_empty_query consumed {} — EmptyQueryResponse belongs only to a \
+             simple query",
+            self.step,
+            if expect_ok {
+                "a simple Query"
+            } else {
+                "the wrong entry"
+            }
+        );
+        if expect_ok {
+            assert!(
+                !self.state.streaming_simple_result,
+                "step {}: an EmptyQueryResponse left a simple result streaming",
+                self.step
+            );
+        }
+        self.after_step();
+    }
+
+    /// A `CommandComplete`: one result set ended.
+    ///
+    /// The streaming-simple flag is set by a RowDescription that answered a
+    /// simple query; an EmptyQueryResponse ends an empty simple query's
+    /// result on its own. This clears the flag, spending an Execute's queued
+    /// slot exactly when the result was not simple.
+    pub fn finish_result_set(&mut self) {
+        self.state.finish_result_set();
+        assert!(
+            !self.state.streaming_simple_result,
+            "step {}: a result set that just ended is still streaming as simple",
+            self.step
+        );
         self.after_step();
     }
 
@@ -365,6 +482,11 @@ impl ProtocolModel {
     /// An `ErrorResponse`.
     pub fn discard_failed_epoch(&mut self) {
         self.state.discard_failed_epoch();
+        assert!(
+            !self.state.streaming_simple_result,
+            "step {}: a backend error left a simple result streaming",
+            self.step
+        );
         self.after_step();
     }
 
@@ -386,6 +508,11 @@ impl ProtocolModel {
     pub fn finish_suppressed_epoch(&mut self, epoch: u8) {
         let epoch = self.suppressing.take().unwrap_or(u64::from(epoch));
         self.state.finish_suppressed_epoch(epoch);
+        assert!(
+            !self.state.streaming_simple_result,
+            "step {}: suppression ended with a simple result still streaming",
+            self.step
+        );
         self.after_step();
     }
 
@@ -419,19 +546,19 @@ impl ProtocolModel {
     /// **The disclosure invariant.**
     ///
     /// `described_sql` names the statement whose fields are about to be
-    /// classified. Whatever it returns has to be a text that *this* statement
-    /// could have carried.
+    /// classified. Whatever it returns has to be the text the entry at the
+    /// head of the queue was created with.
     ///
-    /// The two arms are checked against disjoint text pools, so the answer
+    /// The two kinds share one queue but disjoint text pools, so the answer
     /// carries its own provenance:
     ///
-    /// * a Describe is outstanding — the answer must be a text parsed under the
-    ///   name at the head of the queue (or, for a portal, under a statement that
-    ///   portal was bound to). A simple query's text is not in that set, and
-    ///   neither is another statement's.
-    /// * nothing is outstanding — this is a simple query, so the answer must be
-    ///   a text some `Query` actually carried. A prepared statement's text
-    ///   answering here is the same substitution in the other direction.
+    /// * a Describe is at the head — the answer must be a text parsed under
+    ///   that name (or, for a portal, under a statement that portal was bound
+    ///   to). A simple query's text is not in that set, and neither is another
+    ///   statement's.
+    /// * a simple Query is at the head — the answer must be a text some `Query`
+    ///   actually carried. A prepared statement's text answering here is the
+    ///   same substitution in the other direction.
     ///
     /// `None` always passes: unknown is the fail-closed answer, and the caller
     /// refuses on it.
@@ -441,8 +568,8 @@ impl ProtocolModel {
         };
         let answer = answer.as_str();
 
-        match self.state.pending_describes.front() {
-            Some(pending) => {
+        match self.state.pending_descriptions.front() {
+            Some(PendingDescription::Describe(pending)) => {
                 let (what, allowed) = match &pending.target {
                     DescribeTarget::Statement(name) => {
                         let name = static_name(name);
@@ -474,16 +601,23 @@ impl ProtocolModel {
                     self.step
                 );
             }
-            None => {
+            Some(PendingDescription::Simple(_)) => {
                 assert!(
                     self.simple_texts.contains(answer),
-                    "step {}: no Describe is outstanding, so described_sql() is answering for a \
-                     simple query, and it returned {answer:?} — which no Query ever carried. \
+                    "step {}: a simple Query is at the head of the queue, so described_sql() is \
+                     answering for it, and it returned {answer:?} — which no Query ever carried. \
                      Known simple texts: {:?}.",
                     self.step,
                     self.simple_texts
                 );
             }
+            // described_sql() answers from the queue head alone, so it cannot
+            // answer while the queue is empty. If it ever does, the source of
+            // the text is unknown and must fail closed.
+            None => panic!(
+                "step {}: described_sql() answered {answer:?} with an empty description queue",
+                self.step
+            ),
         }
     }
 
@@ -522,17 +656,27 @@ impl ProtocolModel {
 
         let describes: Vec<u64> = self
             .state
-            .pending_describes
+            .pending_descriptions
             .iter()
-            .map(|p| p.epoch)
+            .map(|p| match p {
+                PendingDescription::Describe(p) => p.epoch,
+                PendingDescription::Simple(p) => p.epoch,
+            })
             .collect();
         let parses: Vec<u64> = self.state.pending_parses.iter().map(|p| p.epoch).collect();
         let binds: Vec<u64> = self.state.pending_binds.iter().map(|p| p.epoch).collect();
+        let executes: Vec<u64> = self
+            .state
+            .pending_executes
+            .iter()
+            .map(|p| p.epoch)
+            .collect();
 
         for (queue, epochs) in [
-            ("pending_describes", &describes),
+            ("pending_descriptions", &describes),
             ("pending_parses", &parses),
             ("pending_binds", &binds),
+            ("pending_executes", &executes),
         ] {
             assert!(
                 epochs.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -591,40 +735,47 @@ mod tests {
     /// come back without `cargo test` saying so — the fuzz target needs nightly
     /// and is not on the release gate.
     ///
-    /// This is `cargo fuzz tmin`'s output verbatim, and it is two operations:
-    ///
-    /// ```text
-    /// [ SimpleQuery { sql: Some(0) }, DescribeStatement { name: 1 } ]
-    /// ```
-    ///
-    /// A simple query gives the fallback something to reach for, then a
-    /// Describe arrives for a statement the proxy has no SQL for. Under
-    /// `and_then(..).or_else(..)` the second answers with the first's text, and
-    /// `SELECT 1, 2` — two literals, nothing to mask — becomes the identity
-    /// under which the other statement's fields are judged.
-    ///
-    /// The unminimized crash kept a `ParseUndecodable` between them, which is
-    /// how the situation actually arises in production: `parse_parse` returns
-    /// `None` on a non-UTF-8 client encoding, the proxy forwards the Parse
-    /// without recording it, and the backend prepares a statement the proxy has
-    /// no text for. The fuzzer reached that precondition on its own.
+    /// A simple Query issued while a Describe is still in flight must enqueue
+    /// behind it, never displace it. The backend answers in message order, so
+    /// the Describe's RowDescription arrives first and must be matched to the
+    /// Describe — before this fix the queue was cleared and that answer was
+    /// classified under the simple query's text. Proven live on the wire as a
+    /// masked value served in cleartext.
     #[test]
-    fn the_interleaving_that_substituted_a_simple_querys_text() {
+    fn a_simple_query_does_not_displace_a_pending_describe() {
         let mut model = ProtocolModel::new();
-        model.simple_query(Some(0));
+        // P s1; Describe s1; Q "SELECT 1, 2", pipelined.
+        model.parse(1, 0);
         model.describe_statement(1);
+        model.simple_query(Some(0));
+        // The Describe was issued first, so its RowDescription answers first.
+        // It arms a *future* execute's result — it must not read as simple.
+        model.finish_description(2);
+        assert!(
+            !model.state.streaming_simple_result,
+            "a Describe's RowDescription must not stream as a simple result"
+        );
+        // The simple query's own RowDescription comes next, and streams simple.
+        model.finish_description(2);
+        assert!(
+            model.state.streaming_simple_result,
+            "the simple query's RowDescription streams its own result"
+        );
     }
 
-    /// The same substitution with the production precondition spelled out, and
-    /// in the other direction too: once a Describe is consumed, the simple
-    /// query's text is legitimate again, and a prepared statement's text is not.
+    /// An undecodable Parse (non-UTF-8 client encoding) leaves a pending
+    /// Describe with no SQL of its own. Its answer is still matched in stream
+    /// order — the simple query that preceded it consumes its own entry first —
+    /// and the SQL-less Describe stays unknown rather than borrowing any text.
     #[test]
     fn an_undecodable_parse_leaves_a_describe_with_no_sql_of_its_own() {
         let mut model = ProtocolModel::new();
         model.simple_query(Some(0));
         model.parse_undecodable();
         model.describe_statement(1);
-        // Consuming the Describe returns the session to the simple query.
+        // The simple query's result answers first, from its own entry.
+        model.finish_description(1);
+        // The Describe's NoData answers next; it has no SQL of its own.
         model.finish_no_data();
     }
 
@@ -647,8 +798,13 @@ mod tests {
     #[test]
     fn the_whole_alphabet_applies_cleanly() {
         let mut model = ProtocolModel::new();
+        // Two pipelined simple queries: each consumes its own entry in order.
         model.simple_query(Some(0));
         model.simple_query(None);
+        model.finish_description(2);
+        model.finish_result_set();
+        model.finish_description(2);
+        model.finish_result_set();
         model.parse(0, 0);
         model.parse_undecodable();
         model.finish_parse();
@@ -659,6 +815,7 @@ mod tests {
         model.describe_portal(1);
         model.finish_no_data();
         model.execute(1);
+        model.finish_result_set();
         model.sync();
         model.describe_statement(0);
         model.discard_description();
@@ -671,5 +828,50 @@ mod tests {
         model.close_portal(1);
         model.close_statement(0);
         model.clear_active();
+    }
+
+    /// A pipelined simple query followed by a queued Execute: the simple
+    /// result's end must not spend the Execute's slot, and the flag must track
+    /// which result set is really streaming.
+    #[test]
+    fn a_simple_result_end_does_not_spend_the_queued_executes_slot() {
+        let mut model = ProtocolModel::new();
+
+        // Q ...; Sync; Parse(bad) Bind(p bad) Execute(p); Sync, all pipelined.
+        model.simple_query(Some(0));
+        model.sync();
+        model.execute(1);
+        // The simple RowDescription arrives before the Execute's rows. It
+        // answered no Describe, so its result streams as the simple result.
+        model.finish_description(2);
+        assert!(
+            model.state.streaming_simple_result,
+            "the simple result must be streaming"
+        );
+        // Its CommandComplete ends it — the queued Execute owns the next result.
+        model.finish_result_set();
+        assert!(
+            !model.state.streaming_simple_result,
+            "the end must clear the flag"
+        );
+        assert_eq!(
+            model.state.result_owner().as_deref(),
+            Some(&b"a"[..]),
+            "the simple result must not spend the Execute's slot"
+        );
+        assert!(
+            model.state.portal_plan(&bytes_of("a")).is_none(),
+            "the never-described statement leaves the Execute with no plan"
+        );
+        // Its CommandComplete spends the slot; the next result set is the
+        // simple query's again, exactly when a query enqueues its own entry.
+        model.finish_result_set();
+        assert_eq!(model.state.result_owner(), None);
+        model.simple_query(Some(1));
+        model.finish_description(1);
+        assert!(
+            model.state.streaming_simple_result,
+            "a simple query's own entry arms its result"
+        );
     }
 }

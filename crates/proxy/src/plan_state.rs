@@ -4,6 +4,13 @@
 //! pipelining across `Sync` boundaries, and answers `Describe` asynchronously.
 //! Every map and queue needed to preserve those relationships lives here so
 //! invalidation and ordering rules cannot drift across session message arms.
+//!
+//! Result sets are owned too. The backend answers `Execute`s in message order,
+//! so the portal whose rows arrive next is tracked here, and a simple query's
+//! result is recognised because it enqueued its own description entry — which
+//! is also what keeps a Describe still in flight from being answered by a
+//! simple query's text: the two share one FIFO in stream order, each carrying
+//! its own SQL.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -42,6 +49,27 @@ struct PendingDescribe {
     /// the next `Sync`, so exactly the Describes sharing the failing one's
     /// epoch are dead. Anything after that `Sync` remains live.
     epoch: u64,
+}
+
+/// A simple `Query` whose result the backend has not described yet.
+struct PendingSimple {
+    sql: Option<String>,
+    epoch: u64,
+}
+
+/// A message whose backend answer is still owed: a `Describe` that will be
+/// answered by a `RowDescription` or `NoData`, or a simple `Query` answered by
+/// a `RowDescription` or `EmptyQueryResponse`.
+///
+/// Both answer with a `RowDescription`, so they share one FIFO in stream order.
+/// The backend replies in message order, so the front of this queue is always
+/// the description the backend's next `RowDescription` belongs to — every
+/// forwarded Describe and query enqueues here, and nothing is ever cleared
+/// early, so a simple query issued while a Describe is still in flight cannot
+/// steal that Describe's answer.
+enum PendingDescription {
+    Describe(PendingDescribe),
+    Simple(PendingSimple),
 }
 
 /// A frontend mutation that has not yet received its backend acknowledgement.
@@ -91,10 +119,23 @@ pub(crate) struct PlanState {
     /// known later can still be activated for the rows it produces.
     active_portal: Option<Bytes>,
     active_epoch: Option<u64>,
-    pending_describes: VecDeque<PendingDescribe>,
+    pending_descriptions: VecDeque<PendingDescription>,
     pending_parses: VecDeque<PendingMutation>,
     pending_binds: VecDeque<PendingMutation>,
-    simple_sql: Option<String>,
+    /// Portals executed since the last result-set completion, in Execute
+    /// order. PostgreSQL answers Executes in message order, each emitting one
+    /// result set ended by `CommandComplete`, so the front of this queue is
+    /// the portal whose rows arrive next. Rows are vetted with *that* portal's
+    /// own plan, never the single `active_plan`: a pipelined client can have
+    /// several result sets in flight, and the last Execute is not the one
+    /// whose rows come first.
+    pending_executes: VecDeque<PendingMutation>,
+    /// True while the result set streaming from the backend is a simple
+    /// query's — armed by its own RowDescription and ended by its own
+    /// CommandComplete, which spends no executed-portal slot. Extended
+    /// describes arm a *future* result set, not the one streaming, so their
+    /// RowDescriptions clear this.
+    streaming_simple_result: bool,
     sync_epoch: u64,
     /// Catalog generation the cached plans were built under.
     generation: u64,
@@ -144,8 +185,18 @@ impl PlanState {
     pub(crate) fn begin_simple_query(&mut self, sql: Option<String>) {
         self.active_plan = None;
         self.active_epoch = None;
-        self.pending_describes.clear();
-        self.simple_sql = sql;
+        // The backend answers in message order, so this query's RowDescription
+        // (or EmptyQueryResponse) comes after the answers to whatever Describes
+        // and queries precede it. Enqueue it rather than clearing earlier
+        // entries: a Describe still in flight is answered *before* this
+        // result, and clearing its slot here would let this simple query's
+        // text answer for its fields. Each simple query also carries its own
+        // SQL, so a later query cannot substitute its text for this one's.
+        self.pending_descriptions
+            .push_back(PendingDescription::Simple(PendingSimple {
+                sql,
+                epoch: self.sync_epoch,
+            }));
     }
 
     pub(crate) fn parse(&mut self, name: Bytes, sql: String) {
@@ -205,17 +256,76 @@ impl PlanState {
                 .and_then(|statement| self.statement_sql.get(statement))
                 .cloned(),
         };
-        self.pending_describes.push_back(PendingDescribe {
-            target,
-            sql,
-            epoch: self.sync_epoch,
-        });
+        self.pending_descriptions
+            .push_back(PendingDescription::Describe(PendingDescribe {
+                target,
+                sql,
+                epoch: self.sync_epoch,
+            }));
     }
 
     pub(crate) fn execute(&mut self, portal: &Bytes) {
         self.active_plan = self.portal_plans.get(portal).cloned();
         self.active_epoch = Some(self.sync_epoch);
         self.active_portal = Some(portal.clone());
+        // This Execute owns the next result set. A suspended portal (max_rows)
+        // is resumed by re-executing it, and PostgreSQL refuses to run any
+        // other portal while one is suspended, so a front entry already naming
+        // this portal can only be the resume of a result still in flight.
+        if !self
+            .pending_executes
+            .front()
+            .is_some_and(|pending| pending.name == *portal)
+        {
+            self.pending_executes.push_back(PendingMutation {
+                name: portal.clone(),
+                epoch: self.sync_epoch,
+            });
+        }
+    }
+
+    /// The portal whose result set the backend is streaming, if an Execute
+    /// started one that has not ended yet. A simple query's result has no
+    /// owner: its rows are governed by the plan its RowDescription armed.
+    pub(crate) fn result_owner(&self) -> Option<Bytes> {
+        self.pending_executes
+            .front()
+            .map(|pending| pending.name.clone())
+    }
+
+    pub(crate) fn portal_plan(&self, portal: &Bytes) -> Option<Plan> {
+        self.portal_plans.get(portal).cloned()
+    }
+
+    /// The plan that governs the backend's next `DataRow`.
+    ///
+    /// One result set streams at a time. A simple query's is governed by the
+    /// plan its own RowDescription armed; an Execute's by the executed
+    /// portal's own plan — never the single `active_plan`, which a pipelined
+    /// client can have armed for a result set still to come.
+    pub(crate) fn streaming_plan(&self) -> Option<Plan> {
+        if self.streaming_simple_result {
+            return self.active_plan();
+        }
+        match self.result_owner() {
+            // A missing portal plan must stay missing — falling back to
+            // `active_plan` would judge these rows with a *different* result
+            // set's description. The caller refuses on `None`.
+            Some(owner) => self.portal_plan(&owner),
+            None => self.active_plan(),
+        }
+    }
+
+    /// One result set ended (`CommandComplete`). An Execute's result spends
+    /// its queued slot; a simple query's result — which never queued one —
+    /// spends nothing and just clears the flag that named it. An empty simple
+    /// query ends through `finish_empty_query`, which performs this
+    /// bookkeeping for itself.
+    pub(crate) fn finish_result_set(&mut self) {
+        if !self.streaming_simple_result {
+            self.pending_executes.pop_front();
+        }
+        self.streaming_simple_result = false;
     }
 
     /// Build a portal's plan from its statement's plan and the formats its Bind
@@ -326,11 +436,13 @@ impl PlanState {
 
     /// Epoch whose backend traffic must be suppressed after a local refusal.
     pub(crate) fn rejection_epoch(&self) -> u64 {
-        self.pending_describes
-            .front()
-            .map_or(self.active_epoch.unwrap_or(self.sync_epoch), |pending| {
-                pending.epoch
-            })
+        self.pending_descriptions.front().map_or(
+            self.active_epoch.unwrap_or(self.sync_epoch),
+            |pending| match pending {
+                PendingDescription::Describe(pending) => pending.epoch,
+                PendingDescription::Simple(pending) => pending.epoch,
+            },
+        )
     }
 
     /// Finish one locally suppressed exchange without deleting later
@@ -338,17 +450,31 @@ impl PlanState {
     /// the backend did execute these mutations; only their responses were
     /// suppressed, so their provisional state remains valid.
     pub(crate) fn finish_suppressed_epoch(&mut self, epoch: u64) {
-        self.pending_describes
-            .retain(|pending| pending.epoch != epoch);
+        self.pending_descriptions.retain(|pending| match pending {
+            PendingDescription::Describe(pending) => pending.epoch != epoch,
+            PendingDescription::Simple(pending) => pending.epoch != epoch,
+        });
         self.pending_parses.retain(|pending| pending.epoch != epoch);
         self.pending_binds.retain(|pending| pending.epoch != epoch);
+        // The refused exchange's Executes never completed — their
+        // CommandCompletes were swallowed with everything else.
+        self.pending_executes
+            .retain(|pending| pending.epoch != epoch);
+        self.streaming_simple_result = false;
     }
 
     /// Remove provisional state from a failed exchange while preserving later
     /// pipelined exchanges that have already crossed a `Sync`.
     pub(crate) fn discard_failed_epoch(&mut self) {
+        // Whatever was streaming died with the backend's error.
+        self.streaming_simple_result = false;
         let failed_epoch = [
-            self.pending_describes.front().map(|p| p.epoch),
+            self.pending_descriptions
+                .front()
+                .map(|pending| match pending {
+                    PendingDescription::Describe(pending) => pending.epoch,
+                    PendingDescription::Simple(pending) => pending.epoch,
+                }),
             self.pending_parses.front().map(|p| p.epoch),
             self.pending_binds.front().map(|p| p.epoch),
         ]
@@ -400,51 +526,77 @@ impl PlanState {
             }
         }
 
-        self.pending_describes
-            .retain(|pending| pending.epoch != failed_epoch);
+        self.pending_descriptions.retain(|pending| match pending {
+            PendingDescription::Describe(pending) => pending.epoch != failed_epoch,
+            PendingDescription::Simple(pending) => pending.epoch != failed_epoch,
+        });
         self.pending_parses
             .retain(|pending| pending.epoch != failed_epoch);
         self.pending_binds
             .retain(|pending| pending.epoch != failed_epoch);
+        self.pending_executes
+            .retain(|pending| pending.epoch != failed_epoch);
     }
 
-    pub(crate) fn finish_no_data(&mut self) {
-        self.pending_describes.pop_front();
+    /// A `NoData` answers a `Describe` whose statement returns no rows. It can
+    /// never answer a simple query, which is refused rather than guessed at.
+    pub(crate) fn finish_no_data(&mut self) -> Result<(), ()> {
+        match self.pending_descriptions.front() {
+            Some(PendingDescription::Describe(_)) => {
+                self.pending_descriptions.pop_front();
+                Ok(())
+            }
+            _ => Err(()),
+        }
     }
 
-    /// The SQL for *this* result set.
+    /// The SQL for *this* result set, read from the entry whose answer is
+    /// next — the Describe at the head of the queue, or the simple query
+    /// ahead of it.
     ///
-    /// A `match`, not `and_then(..).or_else(..)`. Those collapse two different
-    /// situations into one branch: "no Describe is outstanding, so this is the
-    /// simple query" and "a Describe is outstanding but its SQL was never
-    /// recorded". The second must stay unknown — falling back substitutes some
-    /// earlier simple query's text as the identity of a different statement,
-    /// and the analysis then judges the wrong SQL. `SELECT 1, 2` reads as two
-    /// literals and would release fields belonging to `SELECT upper(email), …`.
-    ///
-    /// That is the same failure the pipelined-Describe fix in 0.1.8 closed, on
-    /// a path that fix did not cover. A pending Describe carries no SQL when
-    /// `parse_parse` could not decode the statement — a non-UTF-8 client
-    /// encoding — while the backend accepted the Parse regardless.
+    /// Each entry carries the SQL it was created from, so the answer is
+    /// structurally attached to the message that caused it: a Describe can
+    /// only answer with the statement's own text, a simple query with its own.
+    /// An outstanding Describe whose SQL was never recorded (`parse_parse`
+    /// could not decode a non-UTF-8 statement) returns `None` rather than
+    /// falling back to some other text — that substitution judged one
+    /// statement's fields by another's authority.
     pub(crate) fn described_sql(&self) -> Option<String> {
-        match self.pending_describes.front() {
-            Some(pending) => pending.sql.clone(),
-            None => self.simple_sql.clone(),
+        match self.pending_descriptions.front() {
+            Some(PendingDescription::Describe(pending)) => pending.sql.clone(),
+            Some(PendingDescription::Simple(pending)) => pending.sql.clone(),
+            None => None,
         }
     }
 
     pub(crate) fn discard_description(&mut self) {
-        self.pending_describes.pop_front();
+        self.pending_descriptions.pop_front();
     }
 
     /// Bind a completed plan to the described target and activate it for the
     /// DataRows that follow the RowDescription.
-    pub(crate) fn finish_description(&mut self, plan: Plan) {
-        let pending = self.pending_describes.pop_front();
-        let epoch = pending
-            .as_ref()
-            .map_or(self.sync_epoch, |pending| pending.epoch);
-        match pending.map(|p| p.target) {
+    ///
+    /// `Err` when the RowDescription answered nothing this proxy forwarded —
+    /// unreachable in a sane stream, and refused rather than read as a simple
+    /// result: guessing lets one message's description govern another's rows.
+    pub(crate) fn finish_description(&mut self, plan: Plan) -> Result<(), ()> {
+        let pending = self.pending_descriptions.pop_front();
+        let (epoch, target) = match pending {
+            Some(PendingDescription::Describe(pending)) => {
+                self.streaming_simple_result = false;
+                (pending.epoch, Some(pending.target))
+            }
+            // A RowDescription that answered a simple query: its whole result
+            // set streams as one unit. An extended Describe's RowDescription
+            // merely arms a plan for an Execute that is still to come, so it
+            // must not mark the current result simple.
+            Some(PendingDescription::Simple(pending)) => {
+                self.streaming_simple_result = true;
+                (pending.epoch, None)
+            }
+            None => return Err(()),
+        };
+        match target {
             Some(DescribeTarget::Statement(name)) => {
                 self.statement_plans.insert(name.clone(), plan.clone());
                 // Any portal already bound to this statement was bound before
@@ -472,6 +624,26 @@ impl PlanState {
         }
         self.active_plan = Some(plan);
         self.active_epoch = Some(epoch);
+        Ok(())
+    }
+
+    /// An `EmptyQueryResponse` answers a simple query with no statements — and
+    /// ends its result set in one step.
+    ///
+    /// An empty query produces no RowDescription, so no `finish_result_set`
+    /// follows its end the way one follows a described simple result. This
+    /// clears the streaming flag and spends no queued Execute's slot on its
+    /// own, so the caller cannot forget the pairing or get the order wrong.
+    /// Describes are never answered this way, and an Execute never is.
+    pub(crate) fn finish_empty_query(&mut self) -> Result<(), ()> {
+        match self.pending_descriptions.front() {
+            Some(PendingDescription::Simple(_)) => {
+                self.pending_descriptions.pop_front();
+                self.streaming_simple_result = false;
+                Ok(())
+            }
+            _ => Err(()),
+        }
     }
 }
 
@@ -506,7 +678,7 @@ mod tests {
         let mut state = PlanState::default();
         state.parse(name("s"), "SELECT secret FROM t".into());
         state.describe(DescribeTarget::Statement(name("s")));
-        state.finish_description(plan());
+        state.finish_description(plan()).unwrap();
 
         // Same generation: the cached plan is still reusable.
         state.invalidate_if_stale(0);
@@ -528,7 +700,7 @@ mod tests {
 
         // A fresh Describe rebuilds it against the new snapshot.
         state.describe(DescribeTarget::Statement(name("s")));
-        state.finish_description(plan());
+        state.finish_description(plan()).unwrap();
         state.bind(name("p"), name("s"), None);
         state.execute(&name("p"));
         assert!(
@@ -542,7 +714,7 @@ mod tests {
         let mut state = PlanState::default();
         state.parse(name("s"), "SELECT 1".into());
         state.describe(DescribeTarget::Statement(name("s")));
-        state.finish_description(plan());
+        state.finish_description(plan()).unwrap();
 
         state.parse(name("s"), "SELECT 1".into());
         state.bind(name("p"), name("s"), Some(vec![1]));
@@ -609,7 +781,7 @@ mod tests {
         let mut state = PlanState::default();
         state.parse(name("s"), "SELECT 1".into());
         state.describe(DescribeTarget::Statement(name("s")));
-        state.finish_description(plan());
+        state.finish_description(plan()).unwrap();
         state.bind(name("p"), name("s"), Some(vec![0]));
         state.execute(&name("p"));
 
@@ -626,6 +798,149 @@ mod tests {
             "closing a statement must implicitly release its portals"
         );
     }
+
+    /// A pipelined simple query streams its own result before a queued
+    /// Execute's rows, and its CommandComplete spends no Execute slot.
+    ///
+    /// `Q ...; Sync; Parse(bad) Bind(p bad) Execute(p); Sync` queues `p`
+    /// before the simple RowDescription arrives. The simple result is armed by
+    /// it and must be vetted by *that* plan; and when it ends, the queued
+    /// Execute must still own the *next* result set. Without the
+    /// streaming-simple flag, the simple CommandComplete popped `p` and the
+    /// simple result, mistaking one innocent result for another.
+    #[test]
+    fn a_pipelined_simple_result_spends_no_execute_slot() {
+        let mut state = PlanState::default();
+        state.begin_simple_query(Some("SELECT 1 AS x".into()));
+        state.parse(name("sm"), "SELECT a FROM fz.t1 LIMIT 2".into());
+        state.bind(name("p"), name("sm"), None);
+        state.execute(&name("p"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p"[..]));
+
+        // The simple RowDescription lands: its own plan governs the rows —
+        // the queued Execute's missing plan must not swallow them.
+        state.finish_description(plan()).unwrap();
+        assert_eq!(
+            state.streaming_plan().map(|p| p.len()),
+            Some(1),
+            "a RowDescription that answered no Describe is a simple result"
+        );
+        assert!(
+            state.portal_plan(&name("p")).is_none(),
+            "the never-described statement leaves the Execute with no plan"
+        );
+
+        // The simple CommandComplete ends its own result, not the Execute's.
+        state.finish_result_set();
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"p"[..]),
+            "the simple result must not spend the Execute's queued slot"
+        );
+        assert!(
+            state.streaming_plan().is_none(),
+            "the Execute's rows have no plan and must be refused"
+        );
+    }
+
+    /// A Describe's RowDescription arms a plan for an Execute still to come;
+    /// it must not govern the rows already streaming. An Execute result is
+    /// vetted by the executed portal's own plan even when that plan is none —
+    /// never by the just-armed `active_plan`.
+    #[test]
+    fn a_describe_row_description_does_not_arm_the_streaming_result() {
+        let mut state = PlanState::default();
+        state.parse(name("s"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("s")));
+        state.execute(&name("p"));
+        state.finish_description(plan()).unwrap();
+        assert!(
+            state.streaming_plan().is_none(),
+            "the describe's plan belongs to a result set still to come"
+        );
+    }
+
+    /// A suspended portal (`max_rows`) is resumed by re-executing it; the
+    /// resume must not queue a second owner for a result set still streaming.
+    #[test]
+    fn a_suspended_portal_resume_does_not_requeue() {
+        let mut state = PlanState::default();
+        state.parse(name("s"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("s")));
+        state.finish_description(plan()).unwrap();
+        state.bind(name("p"), name("s"), None);
+        state.execute(&name("p"));
+        state.execute(&name("p")); // resume: the front already names p
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p"[..]));
+
+        // A suspended portal is never followed by another portal's result, so
+        // one CommandComplete ends it and one pop frees the slot.
+        state.finish_result_set();
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "the resume must not have queued a second owner"
+        );
+    }
+
+    /// A `CommandComplete` ends an Execute's result set and spends its queued
+    /// slot, even when zero rows were returned. (An Execute is never answered
+    /// with `EmptyQueryResponse` — that belongs to an empty simple query.)
+    #[test]
+    fn a_command_complete_spends_the_executes_slot() {
+        let mut state = PlanState::default();
+        state.parse(name("s"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("s")));
+        state.finish_description(plan()).unwrap();
+        state.bind(name("p"), name("s"), None);
+        state.execute(&name("p"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p"[..]));
+
+        state.finish_result_set();
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "the ended result must be charged to its Execute"
+        );
+    }
+
+    /// An `EmptyQueryResponse` answers an empty simple query and ends it in
+    /// one step: it must not spend a queued Execute's slot, because that
+    /// Execute was pipelined *behind* the query and its result is still to
+    /// come. The empty result also must not leave the streaming flag set.
+    #[test]
+    fn an_empty_query_response_does_not_spend_a_pipelined_executes_slot() {
+        let mut state = PlanState::default();
+        // Q("") Parse Describe Bind Execute, pipelined in one flush.
+        state.begin_simple_query(Some(String::new()));
+        state.parse(name("s"), "SELECT 1 AS x".into());
+        state.describe(DescribeTarget::Statement(name("s")));
+        state.bind(name("p"), name("s"), None);
+        state.execute(&name("p"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p"[..]));
+
+        // The empty query's own result answers first, with no RowDescription.
+        state.finish_empty_query().unwrap();
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"p"[..]),
+            "the empty query's end must not spend the Execute's slot"
+        );
+        assert!(
+            !state.streaming_simple_result,
+            "the empty result must not leave a simple result streaming"
+        );
+        // The Describe's answer comes next and still arms the Execute.
+        assert_eq!(
+            state.described_sql().as_deref(),
+            Some("SELECT 1 AS x"),
+            "the queue head must be the Describe after the empty query is consumed"
+        );
+        state.finish_description(plan()).unwrap();
+        assert!(state.active_plan().is_some());
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p"[..]));
+    }
+
     /// A pipelined `Parse, Describe(Statement), Bind, Execute` must still decode
     /// in the format the Bind chose.
     ///
@@ -654,7 +969,7 @@ mod tests {
         );
 
         state.finish_parse();
-        state.finish_description(plan()); // RowDescription, text formats
+        state.finish_description(plan()).unwrap(); // RowDescription, text formats
         state.finish_bind(); // BindComplete — the first moment this is knowable
 
         let active = state.active_plan().expect("a plan for the rows");
@@ -676,7 +991,7 @@ mod tests {
         state.bind(name("portal"), name("stmt"), Some(vec![0]));
         state.execute(&name("portal"));
         state.finish_parse();
-        state.finish_description(plan());
+        state.finish_description(plan()).unwrap();
         state.finish_bind();
         assert_eq!(
             state
@@ -697,7 +1012,7 @@ mod tests {
         state.bind(name("portal"), name("stmt"), None);
         state.execute(&name("portal"));
         state.finish_parse();
-        state.finish_description(plan());
+        state.finish_description(plan()).unwrap();
         state.finish_bind();
         assert_eq!(
             state
@@ -720,6 +1035,98 @@ mod tests {
         assert!(
             state.active_plan().is_none(),
             "no Bind, no Describe, no plan"
+        );
+    }
+
+    /// A result set belongs to the portal that was executed, in Execute order.
+    ///
+    /// `execute` used to overwrite one global `active_plan`, so in a pipelined
+    /// `Execute p1, Execute p2` the second plan governed the first portal's
+    /// rows — a passthrough plan for `p2` released `p1`'s masked columns.
+    #[test]
+    fn each_execute_owns_its_own_result_set() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT 1".into());
+        state.parse(name("s2"), "SELECT 2".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state.finish_description(plan()).unwrap();
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state.finish_description(plan()).unwrap();
+
+        state.bind(name("p1"), name("s1"), None);
+        state.execute(&name("p1"));
+        state.bind(name("p2"), name("s2"), None);
+        state.execute(&name("p2"));
+
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"p1"[..]),
+            "p1's rows come first: the backend executes in message order"
+        );
+        assert!(state.portal_plan(&name("p1")).is_some());
+
+        state.finish_result_set(); // p1's CommandComplete
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"p2"[..]),
+            "the next Execute owns the next result set"
+        );
+
+        state.finish_result_set();
+        assert_eq!(state.result_owner(), None);
+    }
+
+    /// A never-described statement has no portal plan, so the rows its Execute
+    /// produces have an owner with no plan and must fail closed.
+    #[test]
+    fn an_undescribed_execute_owns_rows_without_a_plan() {
+        let mut state = PlanState::default();
+        state.parse(name("sm"), "SELECT secret FROM t".into());
+        state.bind(name("p"), name("sm"), None);
+        state.execute(&name("p"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p"[..]));
+        assert!(
+            state.portal_plan(&name("p")).is_none(),
+            "a statement that was never described has no masking plan"
+        );
+    }
+
+    /// A locally refused exchange dies without its Executes ever reaching
+    /// CommandComplete, so its queued result-set owners must go too.
+    #[test]
+    fn a_suppressed_epoch_drops_its_executed_portals() {
+        let mut state = PlanState::default();
+        state.parse(name("s"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("s")));
+        state.finish_description(plan()).unwrap();
+        state.bind(name("p"), name("s"), None);
+        state.execute(&name("p"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p"[..]));
+
+        state.finish_suppressed_epoch(0);
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "a swallowed result set never completes, so its owner must not linger"
+        );
+    }
+
+    /// Same for an exchange the *backend* rejected: it skips to Sync and never
+    /// emits CommandComplete for the Executes it was asked to run.
+    #[test]
+    fn a_failed_epoch_drops_its_executed_portals() {
+        let mut state = PlanState::default();
+        state.parse(name("s"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("s")));
+        state.finish_description(plan()).unwrap();
+        state.bind(name("p"), name("s"), None);
+        state.execute(&name("p"));
+        state.sync();
+        state.discard_failed_epoch();
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "a backend error aborts the exchange before any CommandComplete"
         );
     }
 }
