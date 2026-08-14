@@ -413,8 +413,16 @@ const RANKING_WINDOWS: &[&str] = &[
 /// short on purpose and exists because psql's `\d` genuinely needs
 /// `generate_series` in `FROM`; without it, describing a table stops working
 /// on four of five Postgres versions, which is the whole reason
-/// `system_catalogs = "allow"` exists.
-const GENERATORS_IN_FROM: &[&str] = &["generate_series", "generate_subscripts", "unnest"];
+/// `system_catalogs = "allow"` exists. `pg_options_to_table` / `aclexplode`
+/// are the same `\d` shape for reloptions and ACLs. Do not put catalog-browser
+/// helpers here — a helper as a FROM SRF is a different shape than `\d`.
+const GENERATORS_IN_FROM: &[&str] = &[
+    "generate_series",
+    "generate_subscripts",
+    "unnest",
+    "pg_options_to_table",
+    "aclexplode",
+];
 
 /// Which release paths the session is willing to open for this result set.
 ///
@@ -1487,8 +1495,8 @@ const CATALOG_ESCAPE_FUNCTIONS: &[&str] = &[
     "lo_export",
     "lo_open",
     "loread",
-    // Target-list form: `SELECT f() FROM pg_class` is metadata-only unless
-    // these names disqualify, which then skips the untrusted-function gate.
+    // Defense in depth: target-list `FuncCall` is an allowlist now, but a
+    // helper that is later added by mistake must still not dump these.
     "pg_stat_get_activity",
     "pg_stat_get_backend_activity",
     "pg_stat_get_wal_receiver",
@@ -1502,6 +1510,181 @@ const CATALOG_ESCAPE_FUNCTIONS: &[&str] = &[
     "pg_get_wal_records_info_till_end_of_wal",
     "pg_get_wal_block_info",
     "pg_get_wal_funames",
+];
+
+/// Catalog-browser helpers allowed on the metadata-only fast path.
+///
+/// Target-list `SELECT f() FROM pg_class` used to be metadata-only unless `f`
+/// was on [`CATALOG_ESCAPE_FUNCTIONS`]. That is denylist polarity: every
+/// unnamed dump (`get_raw_page`, `crosstab`, `pg_sleep`, `set_config`, …)
+/// skipped the untrusted-function gate. Same class as RangeFunction, inverted
+/// the same way — only trusted names, FROM-generators, and this introspection
+/// list keep the fast path. The escape list still wins if a name is on both.
+const CATALOG_HELPER_FUNCTIONS: &[&str] = &[
+    // psql `\d` / GUI browsers.
+    "format_type",
+    "pg_get_userbyid",
+    "pg_get_indexdef",
+    "pg_get_constraintdef",
+    "pg_get_expr",
+    "pg_get_viewdef",
+    "pg_get_functiondef",
+    "pg_get_function_arguments",
+    "pg_get_function_result",
+    "pg_get_function_identity_arguments",
+    "pg_get_function_arg_default",
+    "pg_get_ruledef",
+    "pg_get_triggerdef",
+    "pg_get_serial_sequence",
+    "pg_get_partkeydef",
+    "pg_get_partition_constraintdef",
+    "pg_get_replica_identity_index",
+    "pg_get_statisticsobjdef",
+    "pg_get_statisticsobjdef_columns",
+    "pg_get_statisticsobjdef_expressions",
+    "pg_get_keywords",
+    "pg_get_catalog_foreign_keys",
+    "pg_get_multixact_members",
+    "pg_get_object_address",
+    "pg_identify_object",
+    "pg_identify_object_as_address",
+    "pg_describe_object",
+    "pg_index_column_has_property",
+    "pg_index_has_property",
+    "pg_indexam_has_property",
+    "obj_description",
+    "shobj_description",
+    "col_description",
+    "pg_options_to_table",
+    "aclexplode",
+    "array_to_string",
+    "array_length",
+    "cardinality",
+    "array_upper",
+    "array_lower",
+    "array_ndims",
+    "array_dims",
+    "array_append",
+    "array_prepend",
+    "array_cat",
+    "array_remove",
+    "array_replace",
+    "array_position",
+    "array_positions",
+    "string_to_array",
+    "pg_typeof",
+    "pg_collation_for",
+    "pg_collation_actual_version",
+    "pg_encoding_to_char",
+    "pg_char_to_encoding",
+    "current_setting",
+    "current_schemas",
+    "to_regclass",
+    "to_regtype",
+    "to_regnamespace",
+    "to_regrole",
+    "to_regproc",
+    "to_regprocedure",
+    "to_regoper",
+    "to_regoperator",
+    "to_regcollation",
+    "pg_table_is_visible",
+    "pg_type_is_visible",
+    "pg_function_is_visible",
+    "pg_operator_is_visible",
+    "pg_opclass_is_visible",
+    "pg_opfamily_is_visible",
+    "pg_collation_is_visible",
+    "pg_conversion_is_visible",
+    "pg_ts_config_is_visible",
+    "pg_ts_dict_is_visible",
+    "pg_ts_parser_is_visible",
+    "pg_ts_template_is_visible",
+    "has_table_privilege",
+    "has_schema_privilege",
+    "has_column_privilege",
+    "has_database_privilege",
+    "has_sequence_privilege",
+    "has_function_privilege",
+    "has_language_privilege",
+    "has_tablespace_privilege",
+    "has_foreign_data_wrapper_privilege",
+    "has_server_privilege",
+    "has_type_privilege",
+    "has_parameter_privilege",
+    "pg_has_role",
+    "row_to_json",
+    "to_json",
+    "to_jsonb",
+    "json_build_object",
+    "json_build_array",
+    "jsonb_build_object",
+    "jsonb_build_array",
+    "json_agg",
+    "jsonb_agg",
+    "json_object_agg",
+    "jsonb_object_agg",
+    "array_agg",
+    "string_agg",
+    "xmlagg",
+    "min",
+    "max",
+    "quote_ident",
+    "quote_literal",
+    "quote_nullable",
+    "starts_with",
+    "pg_postmaster_start_time",
+    "pg_conf_load_time",
+    "pg_is_in_recovery",
+    "pg_is_wal_replay_paused",
+    "pg_last_wal_receive_lsn",
+    "pg_last_wal_replay_lsn",
+    "pg_last_xact_replay_timestamp",
+    "pg_current_wal_lsn",
+    "pg_current_wal_insert_lsn",
+    "pg_current_wal_flush_lsn",
+    "pg_walfile_name",
+    "pg_walfile_name_offset",
+    "pg_wal_lsn_diff",
+    "pg_relation_filepath",
+    "pg_relation_filenode",
+    "pg_filenode_relation",
+    "pg_tablespace_location",
+    "pg_tablespace_databases",
+    "pg_current_logfile",
+    "pg_read_all_settings",
+    "pg_my_temp_schema",
+    "pg_is_other_temp_schema",
+    "pg_jit_available",
+    "pg_listening_channels",
+    "pg_notification_queue_usage",
+    "pg_control_system",
+    "pg_control_checkpoint",
+    "pg_control_recovery",
+    "pg_control_init",
+    "pg_get_wal_resource_managers",
+    "age",
+    "txid_current",
+    "txid_current_if_assigned",
+    "txid_current_snapshot",
+    "txid_snapshot_xmin",
+    "txid_snapshot_xmax",
+    "txid_snapshot_xip",
+    "txid_visible_in_snapshot",
+    "txid_status",
+    "pg_current_xact_id",
+    "pg_current_xact_id_if_assigned",
+    "pg_current_snapshot",
+    "pg_snapshot_xmin",
+    "pg_snapshot_xmax",
+    "pg_snapshot_xip",
+    "pg_visible_in_snapshot",
+    "pg_xact_status",
+    "pg_sequence_parameters",
+    "pg_sequence_last_value",
+    "pg_get_function_sqlbody",
+    "pg_relation_is_updatable",
+    "pg_column_is_updatable",
 ];
 
 /// True when this statement reads only server metadata — a `SHOW`, or a query
@@ -1523,8 +1706,9 @@ const CATALOG_ESCAPE_FUNCTIONS: &[&str] = &[
 /// output field, and functions that take SQL as a string.
 ///
 /// Fails closed everywhere: an unparseable statement, a statement that names no
-/// relation at all, a CTE reference that is not declared locally, and any
-/// function on `CATALOG_ESCAPE_FUNCTIONS` all return `false`.
+/// relation at all, a CTE reference that is not declared locally, a target-list
+/// function that is not a catalog helper / trusted name / FROM-generator, and
+/// any function on `CATALOG_ESCAPE_FUNCTIONS` all return `false`.
 pub fn reads_only_server_metadata(sql: &str) -> bool {
     StatementInspection::new(sql).reads_only_server_metadata()
 }
@@ -1635,20 +1819,14 @@ fn reads_only_server_metadata_inspected(inspection: &StatementInspection<'_>) ->
             }
 
             Some(NodeEnum::FuncCall(call)) => {
-                // Compare on the bare name: `pg_catalog.query_to_xml` and
-                // `query_to_xml` are the same function.
-                let last =
-                    call.funcname
-                        .last()
-                        .and_then(|n| n.node.as_ref())
-                        .and_then(|n| match n {
-                            NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
-                            _ => None,
-                        });
-                if let Some(name) = last {
-                    if CATALOG_ESCAPE_FUNCTIONS.contains(&name.as_str()) {
-                        disqualified = true;
-                    }
+                // Same invert as RangeFunction. `SELECT get_raw_page(...) FROM
+                // pg_class` has a catalog RangeVar and constant args, so a
+                // denylist of dump names is an allow for every unnamed one
+                // (pageinspect, `pg_sleep`, `set_config`, …) and skips
+                // untrusted. Helpers / trusted names / FROM-generators keep
+                // the fast path; the escape list still wins if both match.
+                if !func_call_is_catalog_safe(call) {
+                    disqualified = true;
                 }
             }
             _ => {}
@@ -3477,7 +3655,8 @@ fn node_is_write(node: &pg_query::protobuf::Node) -> bool {
 /// trusts; everything else is refused before the backend sees it.
 ///
 /// Metadata-only catalog queries are exempt — they need `format_type` and
-/// friends, and [`reads_only_server_metadata`] already gates that path.
+/// friends, and [`reads_only_server_metadata`] already gates that path
+/// (target-list functions are an allowlist of helpers / trusted names).
 pub fn calls_untrusted_function(sql: &str) -> bool {
     StatementInspection::new(sql).calls_untrusted_function()
 }
@@ -3518,6 +3697,35 @@ fn func_call_is_trusted(call: &pg_query::protobuf::FuncCall) -> bool {
         _ => return false,
     };
     is_trusted_function_name(name)
+}
+
+/// Target-list functions permitted on the metadata-only fast path.
+///
+/// Fail-closed: an unparseable name, a schema other than `pg_catalog` /
+/// `information_schema`, or a name that is not trusted / a FROM-generator /
+/// a catalog helper is not metadata-only. [`CATALOG_ESCAPE_FUNCTIONS`] still
+/// wins if a name is on both lists. `information_schema._pg_*` helpers
+/// implement the SQL-standard views; they are not dump functions.
+fn func_call_is_catalog_safe(call: &pg_query::protobuf::FuncCall) -> bool {
+    let Some(parts) = func_call_name_parts(call) else {
+        return false;
+    };
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, name.as_str()),
+        [schema, name] if schema == "pg_catalog" || schema == "information_schema" => {
+            (Some(schema.as_str()), name.as_str())
+        }
+        _ => return false,
+    };
+    if CATALOG_ESCAPE_FUNCTIONS.contains(&name) {
+        return false;
+    }
+    if schema == Some("information_schema") && name.starts_with("_pg") {
+        return true;
+    }
+    is_trusted_function_name(name)
+        || GENERATORS_IN_FROM.contains(&name)
+        || CATALOG_HELPER_FUNCTIONS.contains(&name)
 }
 
 fn is_trusted_function_name(name: &str) -> bool {
@@ -3668,6 +3876,9 @@ mod tests {
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
             "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) \
              FROM pg_catalog.pg_attribute a WHERE a.attrelid = 1",
+            "SELECT pg_catalog.pg_get_viewdef(c.oid) FROM pg_catalog.pg_class c",
+            "SELECT pg_catalog.pg_get_indexdef(i.indexrelid) FROM pg_catalog.pg_index i",
+            "SELECT * FROM generate_series(1, 3) g, pg_catalog.pg_class c",
             "SELECT table_name FROM information_schema.tables",
             "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_statistic_ext e \
              ON e.stxrelid = c.oid",
@@ -3782,6 +3993,49 @@ mod tests {
             assert!(
                 !reads_only_server_metadata(sql),
                 "must not be released: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn unnamed_target_list_functions_are_not_metadata_only() {
+        // Denylist polarity: `SELECT f() FROM pg_class` skipped untrusted for
+        // every f not on CATALOG_ESCAPE_FUNCTIONS. pageinspect, sleep, GUC
+        // writes, and any future dump were the unnamed remainder.
+        for sql in [
+            "SELECT get_raw_page('demo.customers'::regclass, 0) FROM pg_catalog.pg_class",
+            "SELECT pg_catalog.get_raw_page('demo.customers'::regclass, 0) FROM pg_catalog.pg_class",
+            r#"SELECT u&"get_raw_page"('demo.customers'::regclass, 0) FROM pg_catalog.pg_class"#,
+            "SELECT heap_page_items(get_raw_page('demo.customers'::regclass, 0)) FROM pg_catalog.pg_class",
+            "SELECT pg_sleep(0) FROM pg_catalog.pg_class",
+            "SELECT set_config('application_name', 'x', false) FROM pg_catalog.pg_class",
+            "SELECT pg_file_write('x', 'y', false) FROM pg_catalog.pg_class",
+            "SELECT pg_terminate_backend(pg_backend_pid()) FROM pg_catalog.pg_class",
+            "SELECT not_a_catalog_fn() FROM pg_catalog.pg_class",
+            "SELECT demo.sleep_if(true) FROM pg_catalog.pg_class",
+        ] {
+            assert!(
+                !reads_only_server_metadata(sql),
+                "must not be released: {sql}"
+            );
+            assert!(
+                calls_untrusted_function(sql),
+                "must hit untrusted after losing the fast path: {sql}"
+            );
+        }
+        // Catalog-browser helpers and trusted names keep the fast path.
+        for sql in [
+            "SELECT pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             FROM pg_catalog.pg_attribute a",
+            "SELECT pg_get_userbyid(c.relowner) FROM pg_catalog.pg_class c",
+            "SELECT pg_get_viewdef(c.oid) FROM pg_catalog.pg_class c",
+            "SELECT count(*) FROM pg_catalog.pg_class",
+            "SELECT pg_relation_size(c.oid) FROM pg_catalog.pg_class c",
+        ] {
+            assert!(reads_only_server_metadata(sql), "should be released: {sql}");
+            assert!(
+                !calls_untrusted_function(sql),
+                "metadata-only skips untrusted: {sql}"
             );
         }
     }

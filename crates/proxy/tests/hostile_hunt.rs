@@ -318,6 +318,17 @@ fn hunt_finds_no_new_oracles() {
         r#"SELECT lo_open(1, 262144) FROM pg_catalog.pg_class"#,
         r#"SELECT pg_get_wal_records_info('0/0', '0/0') FROM pg_catalog.pg_class"#,
         r#"SELECT pg_get_wal_block_info('0/0', '0/0') FROM pg_catalog.pg_class"#,
+        // Target-list FuncCall is an allowlist: unnamed dumps joined to
+        // pg_class used to skip the untrusted-function gate.
+        r#"SELECT get_raw_page('demo.customers'::regclass, 0) FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_catalog.get_raw_page('demo.customers'::regclass, 0) FROM pg_catalog.pg_class"#,
+        r#"SELECT u&"get_raw_page"('demo.customers'::regclass, 0) FROM pg_catalog.pg_class"#,
+        r#"SELECT heap_page_items(get_raw_page('demo.customers'::regclass, 0)) FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_sleep(0) FROM pg_catalog.pg_class"#,
+        r#"SELECT set_config('application_name', 'x', false) FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_file_write('x', 'y', false) FROM pg_catalog.pg_class"#,
+        r#"SELECT pg_terminate_backend(pg_backend_pid()) FROM pg_catalog.pg_class"#,
+        r#"SELECT not_a_catalog_fn() FROM pg_catalog.pg_class"#,
     ];
 
     for sql in oracles {

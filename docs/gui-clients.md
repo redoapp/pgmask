@@ -40,7 +40,8 @@ it is the reason this needed fixing rather than documenting as a limitation.
 A result set is released when the statement is a `SHOW`, or when **both**:
 
 1. **The parse tree** shows every relation it reads is a system catalog by name,
-   none of them on the leaky list, and no function that takes SQL as a string.
+   none of them on the leaky list, and every target-list function is a catalog
+   helper (or a trusted name / FROM-generator) — not an unnamed dump.
 2. **The OIDs** in the `RowDescription` all belong to relations that really live
    in `pg_catalog` or `information_schema`, checked against the live database.
 
@@ -136,8 +137,15 @@ covers the `*_to_xml` family (including `schema_to_xml` / `database_to_xml`),
 listings, `pg_stat_file`, large-object accessors (`lo_get` / `loread` / `lo_open`),
 and target-list dumps such as `pg_stat_get_activity()` / `pg_stat_get_wal_receiver()`
 / logical-slot peek / `pg_walinspect` that otherwise look like a catalog query
-when joined to `pg_class`. `format_type`, `pg_get_userbyid`, `pg_get_indexdef`
-and other catalog-browser helpers stay off this list.
+when joined to `pg_class`. Target-list `FuncCall` is now an **allowlist** of
+catalog-browser helpers (`format_type`, `pg_get_userbyid`, `pg_get_indexdef`,
+`pg_get_viewdef`, comments, privileges, `to_reg*`) plus the same trusted
+names / FROM-generators the rest of analysis already permits. A denylist of
+dump names was an allow for every unnamed one: `get_raw_page`, `pg_sleep`,
+`set_config`, `pg_file_write`. The escape list remains as defense in depth
+and still wins if a name is on both. FROM SRFs stay on the short
+`generate_series` / `unnest` / `pg_options_to_table` / `aclexplode` list —
+helpers are not FROM SRFs.
 
 ## What it does not change
 

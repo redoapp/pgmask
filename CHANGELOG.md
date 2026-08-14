@@ -31,7 +31,11 @@ Live membership / cleartext-row oracles under `posture = "hostile"` that
   those target-list dumps. Same polarity, later pass: `pg_stat_get_wal_receiver()`
   (conninfo), `crosstab` / `connectby` (SQL-as-string), the rest of `dblink_*`,
   adminpack `pg_file_read` / `pg_logdir_ls`, `loread` / `lo_open`, and
-  `pg_walinspect` record dumps.
+  `pg_walinspect` record dumps. Target-list `FuncCall` is now an allowlist
+  (helpers / trusted names / FROM-generators); a denylist of dump names was
+  an allow for every unnamed one (`get_raw_page`, `pg_sleep`, `set_config`,
+  `pg_file_write`). The escape list remains defense in depth. `format_type` /
+  `pg_get_viewdef` stay helpers, not dumps.
 - Hostile / read-only / write gates share one descent (`walk_tree` /
   `for_each_child_node`) and one cached parse (`StatementInspection`) instead
   of a parallel `tally_*` match plus `pg_query::nodes()`. The parser is still
