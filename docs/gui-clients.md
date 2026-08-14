@@ -40,7 +40,8 @@ it is the reason this needed fixing rather than documenting as a limitation.
 A result set is released when the statement is a `SHOW`, or when **both**:
 
 1. **The parse tree** shows every relation it reads is a system catalog by name,
-   none of them on the leaky list, and no function that takes SQL as a string.
+   none of them on the leaky list, and every target-list function is a catalog
+   helper (or a trusted name / FROM-generator) — not an unnamed dump.
 2. **The OIDs** in the `RowDescription` all belong to relations that really live
    in `pg_catalog` or `information_schema`, checked against the live database.
 
@@ -114,6 +115,21 @@ exists to hide. The denied list is in `LEAKY_SYSTEM_CATALOGS`:
 - `pg_largeobject` — blob contents
 - `pg_authid`, `pg_shadow`, `pg_user_mapping(s)`, `pg_subscription` — password
   hashes and connection strings
+- `pg_foreign_server`, `pg_foreign_data_wrapper` — FDW options (endpoints,
+  passwords), same class as user mappings. `pg_foreign_table` stays off the
+  list so `\d` of a foreign table still works
+- `information_schema.user_mapping_options`, `foreign_server_options`,
+  `foreign_data_wrapper_options`, `column_options`,
+  `foreign_table_options` — the SQL-standard wrappers of those option
+  catalogs (including column- and foreign-table-level FDW options).
+  They never name `pg_user_mapping`, so a pg_-only denylist misses
+  them. Internal `information_schema._pg_*` base views carry the raw
+  option arrays. `information_schema.user_mappings` / `foreign_servers`
+  / `foreign_tables` / `foreign_data_wrappers` (names, no option
+  values) stay allowed
+- `pg_toast` / `pg_toast_*` — toasted bytes of user columns, including masked
+  ones. `reltoastrelid` from `pg_class` plus `SET search_path TO pg_toast`
+  makes an unqualified `pg_toast_NNNN` look catalog-shaped
 - `pg_file_settings`, `pg_hba_file_rules`, `pg_ident_file_mappings`,
   `pg_backend_memory_contexts` — host configuration
 
@@ -130,8 +146,21 @@ it never reaches Postgres — rather than being nulled after the fact.
 `query_to_xml('SELECT email FROM demo.customers', …)` has no `RangeVar` for
 `customers` in the parse tree, so a relation-based rule cannot see it. Without a
 denylist the whole thing is bypassable in one call. `CATALOG_ESCAPE_FUNCTIONS`
-covers the `*_to_xml` family, `dblink`, `pg_read_file`, `pg_ls_dir`,
-`pg_stat_file` and the large-object accessors.
+covers the `*_to_xml` family (including `schema_to_xml` / `database_to_xml`),
+`dblink` and the rest of `dblink_*`, `crosstab` / `connectby`, `pg_read_file`,
+`pg_file_read` / `pg_logdir_ls`, `pg_ls_dir` and the other `pg_ls_*` directory
+listings, `pg_stat_file`, large-object accessors (`lo_get` / `loread` / `lo_open`),
+and target-list dumps such as `pg_stat_get_activity()` / `pg_stat_get_wal_receiver()`
+/ logical-slot peek / `pg_walinspect` that otherwise look like a catalog query
+when joined to `pg_class`. Target-list `FuncCall` is now an **allowlist** of
+catalog-browser helpers (`format_type`, `pg_get_userbyid`, `pg_get_indexdef`,
+`pg_get_viewdef`, comments, privileges, `to_reg*`) plus the same trusted
+names / FROM-generators the rest of analysis already permits. A denylist of
+dump names was an allow for every unnamed one: `get_raw_page`, `pg_sleep`,
+`set_config`, `pg_file_write`. The escape list remains as defense in depth
+and still wins if a name is on both. FROM SRFs stay on the short
+`generate_series` / `unnest` / `pg_options_to_table` / `aclexplode` list —
+helpers are not FROM SRFs.
 
 ## What it does not change
 

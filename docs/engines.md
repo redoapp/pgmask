@@ -46,7 +46,7 @@ Not by detecting the engine, and not by trusting the extended protocol over the
 simple one. The proxy decides from the statement:
 
 ```rust
-// analysis.rs
+// analysis/catalogs.rs
 pub fn provenance_is_trustworthy(sql: &str) -> bool
 ```
 

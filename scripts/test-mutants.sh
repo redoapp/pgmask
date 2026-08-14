@@ -157,7 +157,7 @@ echo "    in $SHARDS shards, cleaning the scratch copy between each"
 for shard in $(seq 0 $((SHARDS - 1))); do
   echo "==> shard $((shard + 1)) of $SHARDS (--shard $shard/$SHARDS)"
   cargo mutants \
-    --file crates/proxy/src/analysis.rs \
+    --file crates/proxy/src/analysis \
     --file crates/proxy/src/catalog.rs \
     --file crates/proxy/src/lineage.rs \
     --file crates/proxy/src/session.rs \

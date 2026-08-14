@@ -1,5 +1,104 @@
 # Changelog
 
+## 0.1.92 — hostile SQL gate: agg ORDER BY, JSON_TABLE, PREPARE, SEARCH/CYCLE, JSON agg
+
+Live membership / cleartext-row oracles under `posture = "hostile"` that
+`pg_query::nodes()` never visits. Unicode-escaped masked names
+(`u&"email"`) are invisible to the lexer, so a missed node was an allow:
+
+- SQL `PREPARE` / `EXECUTE` / `DEALLOCATE` and `DECLARE` / `FETCH` / `CLOSE`
+  are now refused on **every posture** (`sql_prepare_cursor`). They are a
+  second copy of Parse/Bind/Execute whose bodies `nodes()` does not enter.
+  Analysts keep ordinary `SELECT` (including `SELECT … FETCH FIRST n ROWS`,
+  a limit clause) and the extended protocol. Walkers on PREPARE/DECLARE
+  bodies remain as defense in depth. `EXPLAIN SELECT email FROM t` is the
+  same residual as the inner SELECT; `EXPLAIN` of a predicate oracle is not.
+- `pg_cursors` (session cursor SQL text) and `pg_stat_wal_receiver` (conninfo)
+  are refused as leaky catalogs, same class as `pg_prepared_statements` /
+  `pg_subscription`. `pg_user` (passwd) joins `pg_shadow` / `pg_authid`.
+- `CAST(1 AS numeric((SELECT count(*) WHERE u&"email" = 'x'), 0))` — TypeCast
+  never entered `TypeName.typmods`, a subquery membership oracle. The shared
+  walk now visits typmods (and ColumnDef / XMLSERIALIZE / JSON_TABLE column
+  types), plus other previously skipped children (`JoinExpr.join_using_alias`,
+  `ResTarget.indirection`, `VariableSetStmt.args`, `ExplainStmt.options`,
+  `PrepareStmt.argtypes`, `ExecuteStmt.params`, `CopyStmt` query/WHERE).
+  `JSON_VALUE` / `JSON_QUERY` `RETURNING numeric((SELECT …), 0)` is the same
+  oracle on `JsonOutput.type_name`, which is not a TypeCast and not a Node.
+- `SELECT database_to_xml(…) FROM pg_class` (and `schema_to_xml`,
+  `pg_stat_get_activity()`, `pg_ls_logdir()`, logical-slot peek/get) looked
+  like a metadata-only catalog query, which skips the untrusted-function
+  gate. The escape list now covers the rest of the `*_to_xml` family and
+  those target-list dumps. Same polarity, later pass: `pg_stat_get_wal_receiver()`
+  (conninfo), `crosstab` / `connectby` (SQL-as-string), the rest of `dblink_*`,
+  adminpack `pg_file_read` / `pg_logdir_ls`, `loread` / `lo_open`, and
+  `pg_walinspect` record dumps. Target-list `FuncCall` is now an allowlist
+  (helpers / trusted names / FROM-generators); a denylist of dump names was
+  an allow for every unnamed one (`get_raw_page`, `pg_sleep`, `set_config`,
+  `pg_file_write`). The escape list remains defense in depth. `format_type` /
+  `pg_get_viewdef` stay helpers, not dumps.
+- TOAST heaps (`pg_toast.pg_toast_<oid>` / unqualified `pg_toast_*` after
+  `SET search_path TO pg_toast`) hold toasted bytes of user columns. They
+  were catalog-shaped (`pg_` prefix) and not on the leaky-name list, so
+  `SELECT count(*) FROM pg_toast_NNNN WHERE chunk_data LIKE '%x%'` was a
+  membership oracle the snapshot never names. `pg_foreign_server` /
+  `pg_foreign_data_wrapper` options join user mappings (connection secrets).
+  `pg_foreign_table` stays off the list so `\d` of a foreign table still
+  works. `pg_roles` is still allowed (`\du`).
+  SQL-standard wrappers of the same option catalogs
+  (`information_schema.user_mapping_options` /
+  `foreign_server_options` / `foreign_data_wrapper_options`) were
+  metadata-only because they live in `information_schema` and never name
+  `pg_user_mapping`. The other two PUBLIC option views
+  (`column_options` / `foreign_table_options`) and the internal
+  `_pg_user_mappings` / `_pg_foreign_*` base views (raw `umoptions` /
+  `srvoptions` / `fdwoptions` / `ftoptions` / `attfdwoptions`) were the
+  same hole. `information_schema.user_mappings` / `foreign_servers` /
+  `foreign_tables` / `foreign_data_wrappers` (names, no option values)
+  and `information_schema.tables` stay allowed.
+- Hostile / read-only / write gates share one descent (`walk_tree` /
+  `for_each_child_node`) and one cached parse (`StatementInspection`) instead
+  of a parallel `tally_*` match plus `pg_query::nodes()`. The parser is still
+  pg_query; `nodes()` is not a complete visitor (upstream: it skips node
+  types, including LIMIT and window frames), so absence proofs — masked
+  names, writes, leaky catalogs, metadata-only, provenance, qualification —
+  use the local walk. The session frontend gates parse once. `EXPLAIN INSERT`
+  is a write because the inner statement is visible on that walk.
+- `string_agg(city, ',' ORDER BY u&"email" = 'x')` / `WITHIN GROUP (ORDER BY …)`
+  — `FuncCall.agg_order` was never walked
+- `ROWS BETWEEN (SELECT … WHERE u&"email" = 'x') PRECEDING AND CURRENT ROW`
+  — `WindowDef.start_offset` / `end_offset` skipped
+- `JSON_VALUE` / `JSON_QUERY` / `JSON_EXISTS` / `JSON_TABLE` around those names
+- `PREPARE q AS SELECT count(*) WHERE u&"email" = 'x'` then `EXECUTE q` —
+  `nodes()` does not enter `PrepareStmt` / `DeclareCursorStmt` query bodies
+- Whole-row `t::text` inside `ARRAY[]`, `JSON_OBJECT`/`JSON_ARRAY`,
+  `xmlserialize`, `LIMIT (SELECT … t2::text …)`, aggregate `ORDER BY t::text`,
+  and window `PARTITION BY` / `ORDER BY t::text` — binders inside `LIMIT` were
+  also invisible to `nodes()`, so the inner alias was never a row variable
+- `WITH RECURSIVE r AS (SELECT * FROM …) SEARCH DEPTH FIRST BY u&"email"` —
+  `CommonTableExpr.search_clause` / `cycle_clause` were never walked, and
+  `SELECT *` names no column for the projection tally to notice
+- `json_arrayagg(t)` / `json_objectagg('k': t)` / `JSON_SERIALIZE(t)` /
+  `t IS JSON` — JSON aggregate / serialize / IS JSON nodes were tallied for
+  unicode names but skipped by the whole-row child walk
+- `XMLTABLE (… COLUMNS … DEFAULT u&"email")` — `RangeTableFuncCol.coldefexpr`
+- `PREPARE` of `NATURAL JOIN` / `FROM t AS x(c1,c2,…)` — join/rename walked
+  `nodes()`, which does not enter PREPARE/DECLARE bodies
+- `(SELECT * FROM customers) AS t(c1,c2,…)` and `WITH q(c1,c2,…) AS (SELECT *)`
+  — column-list aliases on subqueries and CTEs hid `email` behind `c2`
+- `json_arrayagg(city) OVER (PARTITION BY u&"email")` — `JsonAggConstructor.over`
+- `analysis.rs` is now `crates/proxy/src/analysis/` (`walk`, `names`, `safety`,
+  `catalogs`, `hostile`, `frontend`). Public `crate::analysis::*` paths are
+  unchanged.
+
+Unparseable SQL with a unicode-escaped masked name failed *open*: the lexer
+sees no `email` token, the tree walk returns nothing, and the gate treated
+"no counts" as safe. It now refuses when the statement does not parse.
+
+Fixed by walking those node kinds in the projection tally, collecting row
+binders and whole-row refs from the statement root (not `nodes()`), walking
+join/rename the same way, and failing closed on a parse error whenever the
+catalog has masked names.
+
 ## 0.1.91 — hostile SQL gate: JOIN ON, BooleanTest, JSON, xmlserialize
 
 Four live membership oracles under `posture = "hostile"` that returned

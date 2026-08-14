@@ -118,7 +118,7 @@ cargo audit >/dev/null 2>&1; record "cargo audit" "$?"
 
 # Rustdoc, warnings fatal. Not redundant with clippy: a doc link to an item that
 # does not exist compiles, lints clean, and is only ever read by someone trying
-# to follow it. `[`referenced_relations`]` sat in `analysis.rs` pointing at a
+# to follow it. `[`referenced_relations`]` sat in `analysis` pointing at a
 # function that was never written, and four usage lines rendered `<seed>` as an
 # unclosed HTML tag. Nothing in this gate looked.
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps >/dev/null 2>&1

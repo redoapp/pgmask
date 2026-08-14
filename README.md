@@ -41,7 +41,7 @@ not the identifying half of a work address, and the domain names an employer.
 Both map deterministically, so the same person is the same pseudonym everywhere
 and "group by employer" still works without naming one.
 
-**v0.1.91**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
+**v0.1.92**, MIT licensed — see [CHANGELOG.md](CHANGELOG.md) for what is and is not
 done, and [LICENSE](LICENSE).
 
 ## Where this stands
@@ -115,7 +115,7 @@ refuses to pass on a technicality: a poison run with masking removed must trip
 the oracle first, a run that never reached masked data exits VACUOUS, the
 harness refusal count is cross-checked against the proxy's own metrics, and the
 fixture is verified unchanged. Beyond that: more fixture shapes,
-and someone other than Claude reading `analysis.rs` and `lineage.rs`.
+and someone other than Claude reading `analysis/` and `lineage.rs`.
 
 `scripts/test-fuzz.sh` also runs 12 binary-result-format checks, 21,600
 per-principal assertions across 24 concurrent sessions of three principals, and
@@ -141,9 +141,11 @@ attnum it came from — and `0` for both when the field is a computed expression
 That is engine-authoritative provenance, free, with no SQL parsing.
 
 The governing rule: **bind the masking plan to the `RowDescription`, never to the
-statement.** Every row-producing path in the protocol emits one first, so cursors,
-`FETCH`, multi-statement queries, resumed portals and re-executed prepared
-statements are all covered without special handling. Exactly two paths emit rows
+statement.** Every row-producing path in the protocol emits one first, so
+extended-protocol portals, multi-statement queries, and re-executed prepared
+statements are all covered without special handling. SQL `PREPARE` / `DECLARE` /
+`FETCH` / `CLOSE` are refused as a statement class — use ordinary `SELECT`, or
+Parse/Bind/Execute. Exactly two paths emit rows
 *without* one — `COPY ... TO STDOUT` and the legacy `FunctionCall` message — and
 both are refused. A `DataRow` arriving with no active plan is never forwarded.
 
@@ -160,7 +162,7 @@ Fields with no provenance are refused — except for a short allowlist of
 expression shapes positively known to carry no column value (`SELECT 1`,
 `now()`, `count(*)`). That rule is an allowlist rather than a search for column
 references because it converts refusals into acceptances, so unsoundness there
-means a leak; see [`crates/proxy/src/analysis.rs`](crates/proxy/src/analysis.rs).
+means a leak; see [`crates/proxy/src/analysis/`](crates/proxy/src/analysis/).
 It cut the false-rejection rate on a real workload from 23% to 6%.
 
 **Provenance is necessary but not sufficient.** Where one output field draws
@@ -353,7 +355,10 @@ error-channel `CASE`) while still serving `SELECT email, id FROM t WHERE id = 1`
 posture is unchanged.
 On every posture, pgmask is **read-only**: only an allowlist of read/session
 statements reach Postgres (`SELECT` without row locks, `EXPLAIN`, `SET`/`SHOW`,
-transactions, prepare/execute, cursors). DML, DDL (including `CREATE VIEW`),
+transactions). SQL `PREPARE`/`EXECUTE`/`DEALLOCATE` and `DECLARE`/`FETCH`/`CLOSE`
+are refused (`sql_prepare_cursor`); `SELECT … FETCH FIRST n ROWS` is a limit
+clause and stays allowed. Drivers should use the extended protocol
+Parse/Bind/Execute. DML, DDL (including `CREATE VIEW`),
 `LOAD`, `DO`, `CALL`, and similar are refused first. Pair with
 `rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
 
@@ -636,8 +641,9 @@ analytical ones, and which you have decides whether Phase 6 is optional.
   `ORDER BY` of masked values is accepted (cells stay masked). Default posture
   does not close predicate oracles; use hostile for containment. Pair with
   `rate_limit_per_minute` and `max_notices_per_exchange` for defense in depth.
-- **Leaky catalogs refused.** `pg_stats`, `pg_authid`, `pg_stat_activity`, and
-  similar are refused at the frontend on every posture (`leaky_catalog`).
+- **Leaky catalogs refused.** `pg_stats`, `pg_authid`, `pg_stat_activity`,
+  `pg_cursors`, `pg_stat_wal_receiver`, and similar are refused at the frontend
+  on every posture (`leaky_catalog`).
 - **Non-text types accept only `mask = "null"`.** Text-family types are
   byte-identical in text and binary formats so they mask correctly either way;
   anything else is refused rather than guessed at.

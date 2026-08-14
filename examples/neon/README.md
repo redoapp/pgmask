@@ -136,7 +136,7 @@ coarsening data *for* us still gets refused, because provenance cannot see inten
 ## Follow-up: the rescue rule (same branch, same corpus)
 
 The measurement above drove one change — an allowlist of expression shapes
-positively known to carry no column value (`analysis.rs`). Re-run against the
+positively known to carry no column value (`analysis`). Re-run against the
 same branch:
 
 | | before | after |

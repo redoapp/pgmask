@@ -61,7 +61,7 @@ something reassuring.
 
 Neither setting authenticates the database. An attacker who can intercept the
 proxy-to-database connection reads every masked column unmasked, and no rule in
-`analysis.rs` has anything to say about it. Put the proxy where that hop is
+`analysis` has anything to say about it. Put the proxy where that hop is
 short — a unix socket, a sidecar, a private subnet — and treat "pgmask is in
 front of it" as saying nothing about network position.
 
@@ -143,7 +143,18 @@ NATURAL JOIN / `FROM t AS x(c1,c2,…)` renames / unicode `USING` &
 `PARTITION BY`. As of 0.1.89, also `ARRAY`/`CASE`/`LIMIT`/`(t).col`/
 `xmlforest` containers around unicode-escaped masked names. As of 0.1.91, also
 `JOIN … ON`, `BooleanTest` (`IS TRUE`), JSON constructors (`JSON_OBJECT` /
-`JSON_ARRAY`), and `xmlserialize` around those names. Residual
+`JSON_ARRAY`), and `xmlserialize` around those names. As of 0.1.92, also
+aggregate `ORDER BY` / `WITHIN GROUP`, window frame offsets, `JSON_VALUE` /
+`JSON_TABLE`, `PREPARE`/`DECLARE` bodies, whole-row refs nested in
+`ARRAY`/JSON/XML/`LIMIT`, CTE `SEARCH`/`CYCLE` column lists, whole-row
+refs inside `json_arrayagg` / `json_objectagg` / `JSON_SERIALIZE` / `IS JSON`,
+and join/rename via `PREPARE` or `(SELECT *) AS t(c1,c2,…)` / CTE column lists.
+SQL `PREPARE`/`EXECUTE`/`DEALLOCATE` and `DECLARE`/`FETCH`/`CLOSE` are now
+refused on every posture (`sql_prepare_cursor`); ordinary `SELECT` (including
+`SELECT … FETCH FIRST n ROWS`) and protocol Parse/Bind stay allowed. `EXPLAIN`
+of those same SELECTs is allowed; `EXPLAIN` of a predicate oracle is not.
+`pg_cursors` and `pg_stat_wal_receiver` join the leaky-catalog refuse list
+(session SQL text / replication conninfo). Residual
 disclosure under hostile + read-only SELECT is the intentional mask surface
 (partial phone, salary buckets, filters on columns with `mask = "none"`, and
 cleartext sort order among masked projections).
@@ -644,7 +655,7 @@ arrived the next morning, in the one module the preceding sweep never opened,
 and the sweep missed it because it asked what values could reach the client and
 never asked what carried them. Each sweep has found the previous sweep's frame.
 
-A human adversary should start with `crates/proxy/src/analysis.rs`, and should
+A human adversary should start with `crates/proxy/src/analysis/`, and should
 distrust the comments. They are unusually detailed and load-bearing, which makes
 them read as specifications; two of today's disclosures were sitting behind a
 comment that asserted the case could not happen.
