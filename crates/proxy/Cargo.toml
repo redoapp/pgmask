@@ -42,7 +42,7 @@ arc-swap = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 sqllineage = "0.2"
 regex = "1.13.1"
 iban_validate = "5.0.1"
