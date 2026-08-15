@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 
