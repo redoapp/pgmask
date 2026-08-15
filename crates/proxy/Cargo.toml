@@ -40,7 +40,7 @@ postgres-types.workspace = true
 secrecy = { version = "0.10", features = ["serde"] }
 arc-swap = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 sqllineage = "0.2"

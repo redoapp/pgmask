@@ -55,11 +55,14 @@ struct PendingDescribe {
 struct PendingSimple {
     sql: Option<String>,
     epoch: u64,
+    /// Frontend order among row-producing or command-completing operations.
+    order: u64,
 }
 
 /// A message whose backend answer is still owed: a `Describe` that will be
 /// answered by a `RowDescription` or `NoData`, or a simple `Query` answered by
-/// a `RowDescription` or `EmptyQueryResponse`.
+/// a `RowDescription`, `EmptyQueryResponse`, or (for a command with no rows)
+/// `CommandComplete`.
 ///
 /// Both answer with a `RowDescription`, so they share one FIFO in stream order.
 /// The backend replies in message order, so the front of this queue is always
@@ -80,6 +83,14 @@ enum PendingDescription {
 struct PendingMutation {
     name: Bytes,
     epoch: u64,
+}
+
+/// An Execute whose CommandComplete is still owed.
+struct PendingExecute {
+    name: Bytes,
+    epoch: u64,
+    /// Frontend order shared with simple Query messages.
+    order: u64,
 }
 
 /// All state that binds SQL, statements, portals, descriptions, and row plans.
@@ -129,7 +140,7 @@ pub(crate) struct PlanState {
     /// own plan, never the single `active_plan`: a pipelined client can have
     /// several result sets in flight, and the last Execute is not the one
     /// whose rows come first.
-    pending_executes: VecDeque<PendingMutation>,
+    pending_executes: VecDeque<PendingExecute>,
     /// True while the result set streaming from the backend is a simple
     /// query's — armed by its own RowDescription and ended by its own
     /// CommandComplete, which spends no executed-portal slot. Extended
@@ -137,6 +148,7 @@ pub(crate) struct PlanState {
     /// RowDescriptions clear this.
     streaming_simple_result: bool,
     sync_epoch: u64,
+    next_result_order: u64,
     /// Catalog generation the cached plans were built under.
     generation: u64,
 }
@@ -185,6 +197,8 @@ impl PlanState {
     pub(crate) fn begin_simple_query(&mut self, sql: Option<String>) {
         self.active_plan = None;
         self.active_epoch = None;
+        let order = self.next_result_order;
+        self.next_result_order = self.next_result_order.saturating_add(1);
         // The backend answers in message order, so this query's RowDescription
         // (or EmptyQueryResponse) comes after the answers to whatever Describes
         // and queries precede it. Enqueue it rather than clearing earlier
@@ -196,6 +210,7 @@ impl PlanState {
             .push_back(PendingDescription::Simple(PendingSimple {
                 sql,
                 epoch: self.sync_epoch,
+                order,
             }));
     }
 
@@ -277,9 +292,12 @@ impl PlanState {
             .front()
             .is_some_and(|pending| pending.name == *portal)
         {
-            self.pending_executes.push_back(PendingMutation {
+            let order = self.next_result_order;
+            self.next_result_order = self.next_result_order.saturating_add(1);
+            self.pending_executes.push_back(PendingExecute {
                 name: portal.clone(),
                 epoch: self.sync_epoch,
+                order,
             });
         }
     }
@@ -316,16 +334,36 @@ impl PlanState {
         }
     }
 
-    /// One result set ended (`CommandComplete`). An Execute's result spends
-    /// its queued slot; a simple query's result — which never queued one —
-    /// spends nothing and just clears the flag that named it. An empty simple
-    /// query ends through `finish_empty_query`, which performs this
-    /// bookkeeping for itself.
+    /// One result set or no-row command ended (`CommandComplete`).
+    ///
+    /// A simple `BEGIN`, `SET`, or other command has no RowDescription, so its
+    /// pending description is still at the head of the queue when this arrives.
+    /// Psycopg sends exactly that shape before its first transactional extended
+    /// query. Leaving the slot behind relabels the next RowDescription as
+    /// `BEGIN`, and every computed field is then refused as provenance-free.
+    ///
+    /// Simple Query and Execute share a monotonic frontend order, so comparing
+    /// the queue heads preserves protocol order even when a client pipelines
+    /// them in either direction. Error-recovery epochs stay independent: a
+    /// Query is a synchronization boundary, but changing epoch assignment here
+    /// would alter which provisional Parse/Bind state an ErrorResponse removes.
     pub(crate) fn finish_result_set(&mut self) {
-        if !self.streaming_simple_result {
+        if self.streaming_simple_result {
+            self.streaming_simple_result = false;
+            return;
+        }
+
+        let simple_order = match self.pending_descriptions.front() {
+            Some(PendingDescription::Simple(pending)) => Some(pending.order),
+            _ => None,
+        };
+        let execute_order = self.pending_executes.front().map(|pending| pending.order);
+
+        if simple_order.is_some_and(|simple| execute_order.is_none_or(|execute| simple < execute)) {
+            self.pending_descriptions.pop_front();
+        } else {
             self.pending_executes.pop_front();
         }
-        self.streaming_simple_result = false;
     }
 
     /// Build a portal's plan from its statement's plan and the formats its Bind

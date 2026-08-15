@@ -53,7 +53,7 @@
 //! |---|---|
 //! | `described_sql` provenance | the text returned must be the one the head entry was created with — a simple query's text can never answer for a pending Describe, and vice versa |
 //! | plan origin | a plan served by `execute` must have been described for that portal, or for a statement that portal was bound to — never a simple result's plan |
-//! | queue honesty | a simple query enqueues its own entry and never displaces an earlier Describe; a `RowDescription`, `NoData` or `EmptyQueryResponse` only ever consumes the entry it belongs to |
+//! | queue honesty | a simple query enqueues its own entry and never displaces an earlier Describe; a `RowDescription`, `NoData`, `EmptyQueryResponse`, or no-row `CommandComplete` only ever consumes the entry it belongs to |
 //! | catalog generation | a plan served after a catalog refresh must have been built after it |
 //! | epoch ordering | queue epochs are non-decreasing and never exceed `sync_epoch` |
 //! | no panic | every sequence, including nonsense ones |
@@ -124,7 +124,7 @@ const PARSE_SQL: [&str; 6] = [
 /// `SELECT 1, 2` is the exact text from the disclosure: two integer literals,
 /// no provenance, nothing to mask — which is why substituting it as another
 /// statement's identity releases that statement's fields.
-const SIMPLE_SQL: [&str; 3] = ["SELECT 1, 2", "SELECT now()", "SELECT 42"];
+const SIMPLE_SQL: [&str; 4] = ["SELECT 1, 2", "SELECT now()", "SELECT 42", "BEGIN"];
 
 /// A Describe target, as the oracle records it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -461,16 +461,56 @@ impl ProtocolModel {
     /// A `CommandComplete`: one result set ended.
     ///
     /// The streaming-simple flag is set by a RowDescription that answered a
-    /// simple query; an EmptyQueryResponse ends an empty simple query's
-    /// result on its own. This clears the flag, spending an Execute's queued
-    /// slot exactly when the result was not simple.
+    /// simple query; a no-row simple command still has its pending description
+    /// at the queue head. An EmptyQueryResponse ends an empty simple query on
+    /// its own. This must consume the oldest simple Query or Execute owner,
+    /// without spending a later operation's slot.
     pub fn finish_result_set(&mut self) {
+        let descriptions_before = self.state.pending_descriptions.len();
+        let executes_before = self.state.pending_executes.len();
+        let was_streaming_simple = self.state.streaming_simple_result;
+        let simple_order = match self.state.pending_descriptions.front() {
+            Some(PendingDescription::Simple(pending)) => Some(pending.order),
+            _ => None,
+        };
+        let execute_order = self
+            .state
+            .pending_executes
+            .front()
+            .map(|pending| pending.order);
+        let expected_simple = !was_streaming_simple
+            && simple_order
+                .is_some_and(|simple| execute_order.is_none_or(|execute| simple < execute));
+
         self.state.finish_result_set();
         assert!(
             !self.state.streaming_simple_result,
             "step {}: a result set that just ended is still streaming as simple",
             self.step
         );
+        if was_streaming_simple {
+            assert_eq!(self.state.pending_descriptions.len(), descriptions_before);
+            assert_eq!(self.state.pending_executes.len(), executes_before);
+        } else if expected_simple {
+            assert_eq!(
+                self.state.pending_descriptions.len() + 1,
+                descriptions_before,
+                "step {}: a no-row simple command did not consume its own pending slot",
+                self.step
+            );
+            assert_eq!(self.state.pending_executes.len(), executes_before);
+        } else if execute_order.is_some() {
+            assert_eq!(self.state.pending_descriptions.len(), descriptions_before);
+            assert_eq!(
+                self.state.pending_executes.len() + 1,
+                executes_before,
+                "step {}: CommandComplete did not consume its Execute owner",
+                self.step
+            );
+        } else {
+            assert_eq!(self.state.pending_descriptions.len(), descriptions_before);
+            assert_eq!(self.state.pending_executes.len(), executes_before);
+        }
         self.after_step();
     }
 
@@ -671,6 +711,36 @@ impl ProtocolModel {
             .iter()
             .map(|p| p.epoch)
             .collect();
+
+        let result_orders: Vec<u64> = self
+            .state
+            .pending_descriptions
+            .iter()
+            .filter_map(|pending| match pending {
+                PendingDescription::Simple(pending) => Some(pending.order),
+                PendingDescription::Describe(_) => None,
+            })
+            .chain(
+                self.state
+                    .pending_executes
+                    .iter()
+                    .map(|pending| pending.order),
+            )
+            .collect();
+        assert!(
+            result_orders
+                .iter()
+                .all(|order| *order < self.state.next_result_order),
+            "step {}: pending result order is not below next_result_order {}: {result_orders:?}",
+            self.step,
+            self.state.next_result_order
+        );
+        assert_eq!(
+            result_orders.iter().copied().collect::<BTreeSet<_>>().len(),
+            result_orders.len(),
+            "step {}: pending simple Query and Execute owners share an order: {result_orders:?}",
+            self.step
+        );
 
         for (queue, epochs) in [
             ("pending_descriptions", &describes),
@@ -873,5 +943,19 @@ mod tests {
             model.state.streaming_simple_result,
             "a simple query's own entry arms its result"
         );
+    }
+
+    /// Psycopg opens an implicit transaction with a simple `BEGIN`, which has
+    /// no RowDescription. Its CommandComplete must consume the Query owner and
+    /// leave a later Execute queued.
+    #[test]
+    fn a_no_row_simple_command_consumes_its_own_slot() {
+        let mut model = ProtocolModel::new();
+        model.simple_query(Some(3)); // BEGIN
+        model.execute(1);
+
+        model.finish_result_set();
+        assert!(model.state.pending_descriptions.is_empty());
+        assert_eq!(model.state.result_owner().as_deref(), Some(&b"a"[..]));
     }
 }

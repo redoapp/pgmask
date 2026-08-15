@@ -1282,18 +1282,6 @@ fn classify(rule: &ColumnRule, types: &HashMap<String, SemanticType>) -> Result<
     Ok(classification)
 }
 
-/// Make a libpq connection string usable by the catalog connection.
-///
-/// Managed providers hand out DSNs with `channel_binding=require` — Neon does
-/// it by default. Channel binding ties authentication to the TLS certificate of
-/// the endpoint the client is talking to, and pgmask terminates TLS by design,
-/// so the requirement can never be satisfied and the driver fails with the
-/// wonderfully unhelpful "server did not use channel binding".
-///
-/// Rather than make every operator discover that, rewrite it to `disable` and
-/// say so once. The proxy-to-backend leg is still encrypted; what is given up is
-/// the ability to *detect* an endpoint that re-originates TLS, which is exactly
-/// what this process is. See `docs/phase4.md`.
 /// Views whose expansion contains a set operation, so their provenance cannot be
 /// believed.
 ///
@@ -1354,29 +1342,47 @@ fn opaque_views(defs: &HashMap<String, Option<String>>) -> HashSet<String> {
     opaque
 }
 
+/// Make a PostgreSQL URI usable by the catalog connection.
+///
+/// `tokio-postgres` does not parse libpq's verify modes. Rustls still enforces
+/// certificate and hostname verification; only the URI spelling changes.
+/// Channel binding stays enabled because this connection goes directly to the
+/// backend and tokio-postgres-rustls supplies the required certificate digest.
 pub fn sanitize_catalog_dsn(dsn: &str) -> (String, Option<&'static str>) {
-    if !dsn.contains("channel_binding") {
+    let Some((base, query)) = dsn.split_once('?') else {
         return (dsn.to_string(), None);
-    }
-    let rewritten = dsn
+    };
+    let mut changed = false;
+    let rewritten_query = query
         .split('&')
         .map(|part| {
-            let key = part.rsplit('?').next().unwrap_or(part);
-            if key.starts_with("channel_binding=") {
-                part.replace(key, "channel_binding=disable")
+            if matches!(part, "sslmode=verify-full" | "sslmode=verify-ca") {
+                changed = true;
+                "sslmode=require"
             } else {
-                part.to_string()
+                part
             }
         })
         .collect::<Vec<_>>()
         .join("&");
+    if !changed {
+        return (dsn.to_string(), None);
+    }
     (
-        rewritten,
+        format!("{base}?{rewritten_query}"),
         Some(
-            "catalog_dsn requested channel_binding; rewritten to disable — pgmask \
-             terminates TLS, so channel binding can never be satisfied through it",
+            "catalog_dsn certificate verification is enforced with rustls; sslmode was \
+             rewritten to require only for tokio-postgres parsing",
         ),
     )
+}
+
+fn catalog_dsn_verifies_server(dsn: &str) -> bool {
+    dsn.split_once('?').is_some_and(|(_, query)| {
+        query
+            .split('&')
+            .any(|part| matches!(part, "sslmode=verify-full" | "sslmode=verify-ca"))
+    })
 }
 
 /// Reject parameter combinations that silently do nothing.
@@ -1479,12 +1485,18 @@ async fn resolve_snapshot(
     // NoTls connector here meant the catalog could not be resolved against Neon
     // (or RDS with rds.force_ssl, or Cloud SQL) at all — the proxy would fail to
     // start against exactly the databases it is most useful in front of.
-    // Catalog resolution always spoke TLS with AcceptAny — matching
-    // `backend_tls = "require"`. verify-full for the session hop is a separate
-    // setting; the catalog DSN often points at the same host and should not
-    // start failing because an operator tightened the data path alone.
-    let connector =
-        tokio_postgres_rustls::MakeRustlsConnect::new(crate::tls::backend_client_config_insecure());
+    // Honor the catalog DSN independently of `backend_tls`: this is a separate,
+    // direct connection. tokio-postgres cannot parse libpq's verify modes, so
+    // `sanitize_catalog_dsn` translates their spelling after this check while
+    // rustls enforces certificate and hostname verification here.
+    let tls_mode = if catalog_dsn_verifies_server(dsn) {
+        crate::tls::BackendTls::VerifyFull
+    } else {
+        crate::tls::BackendTls::Require
+    };
+    let connector = tokio_postgres_rustls::MakeRustlsConnect::new(
+        crate::tls::backend_client_config(tls_mode, None)?,
+    );
     let (dsn, note) = sanitize_catalog_dsn(dsn);
     if let Some(note) = note {
         // Once per resolve is noisy; once per process would need state. The
@@ -2173,20 +2185,23 @@ by_role = { analyst = "partial" }
     }
 
     #[test]
-    fn channel_binding_is_rewritten_not_dropped() {
+    fn neon_verify_full_is_adapted_without_dropping_channel_binding() {
         let (out, note) = sanitize_catalog_dsn(
-            "postgresql://u:p@h/db?sslmode=require&channel_binding=require&options=-c%20x",
+            "postgresql://u:p@h/db?sslmode=verify-full&channel_binding=require&options=-c%20x",
         );
-        assert!(out.contains("channel_binding=disable"), "got: {out}");
+        assert!(out.contains("channel_binding=require"), "got: {out}");
         assert!(
             out.contains("sslmode=require"),
-            "other params survive: {out}"
+            "tokio-postgres receives its supported spelling: {out}"
         );
         assert!(
             out.contains("options=-c%20x"),
             "other params survive: {out}"
         );
         assert!(note.is_some(), "the rewrite must be announced");
+        assert!(catalog_dsn_verifies_server(
+            "postgresql://u:p@h/db?sslmode=verify-full&channel_binding=require"
+        ));
     }
 
     #[test]
@@ -2198,11 +2213,23 @@ by_role = { analyst = "partial" }
     }
 
     #[test]
-    fn channel_binding_as_the_first_parameter_is_handled() {
-        let (out, _) =
+    fn channel_binding_without_a_verify_mode_is_untouched() {
+        let dsn =
             sanitize_catalog_dsn("postgresql://u:p@h/db?channel_binding=require&sslmode=require");
-        assert!(out.contains("channel_binding=disable"), "got: {out}");
-        assert!(out.contains("sslmode=require"), "got: {out}");
+        assert_eq!(
+            dsn.0,
+            "postgresql://u:p@h/db?channel_binding=require&sslmode=require"
+        );
+        assert!(dsn.1.is_none());
+    }
+
+    #[test]
+    fn verify_ca_uses_the_stronger_verify_full_connector() {
+        let dsn = "postgresql://u:p@h/db?sslmode=verify-ca";
+        let (out, note) = sanitize_catalog_dsn(dsn);
+        assert_eq!(out, "postgresql://u:p@h/db?sslmode=require");
+        assert!(note.is_some());
+        assert!(catalog_dsn_verifies_server(dsn));
     }
 
     #[test]

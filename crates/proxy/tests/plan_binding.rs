@@ -36,7 +36,9 @@ use pgmask::{Catalog, Policy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use support::{bind_msg, describe_statement, execute_msg, parse_msg, sync_msg, RawClient};
+use support::{
+    bind_msg, describe_portal, describe_statement, execute_msg, parse_msg, sync_msg, RawClient,
+};
 
 const CANARY: &str = "CANARY_EMAIL_a1b2c3";
 
@@ -272,6 +274,43 @@ async fn control_harness_sees_an_unmasked_row() {
     assert!(
         c.received_text().contains(CANARY),
         "control failed: harness cannot detect a leak"
+    );
+}
+
+/// Psycopg starts an implicit transaction with a simple `BEGIN`, then runs the
+/// user's statement through the extended protocol. `BEGIN` has no
+/// RowDescription: its CommandComplete must consume the simple query's pending
+/// description slot, or the next RowDescription is analysed as `BEGIN` rather
+/// than as the statement that produced it.
+#[tokio::test]
+async fn no_row_simple_command_does_not_relabel_the_next_extended_result() {
+    let backend = fake_backend(vec![
+        cat(&[command_complete("BEGIN"), ready()]),
+        cat(&[
+            tagless(b'1'),
+            tagless(b'2'),
+            row_description(&[("?column?", 0, 0, 23)]),
+            data_row(&[CANARY]),
+            command_complete("SELECT 1"),
+            ready(),
+        ]),
+    ])
+    .await;
+    let proxy = start_proxy(backend, Unclassified::Mask, Opaque::Reject).await;
+    let mut c = RawClient::connect(proxy, "db").await.unwrap();
+
+    c.simple_query("BEGIN").await.unwrap();
+
+    c.send(parse_msg("", "SELECT 1")).await.unwrap();
+    c.send(bind_msg("", "")).await.unwrap();
+    c.send(describe_portal("")).await.unwrap();
+    c.send(execute_msg("", 0)).await.unwrap();
+    c.send(sync_msg()).await.unwrap();
+    c.read_until_ready_or_eof().await.unwrap();
+
+    assert!(
+        c.received_text().contains(CANARY),
+        "a no-row simple command relabelled the next extended result"
     );
 }
 
