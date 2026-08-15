@@ -285,6 +285,46 @@ fn unnamed_target_list_functions_are_not_metadata_only() {
 }
 
 #[test]
+fn harlequin_schema_query_is_metadata_only() {
+    // PostgreSQL lowers `LIKE ... ESCAPE` to its internal `like_escape`
+    // helper. Harlequin uses that form while loading the schema tree; the
+    // parser-generated helper must not be mistaken for a user-defined call.
+    let sql = r#"
+        SELECT schema_name
+        FROM information_schema.schemata
+        WHERE catalog_name = current_database()
+          AND schema_name != $1
+          AND schema_name NOT LIKE $2 ESCAPE $3
+        ORDER BY schema_name
+    "#;
+
+    assert!(reads_only_server_metadata(sql));
+    assert!(!calls_untrusted_function(sql));
+}
+
+#[test]
+fn harlequin_relation_description_is_metadata_only() {
+    // Reduced from Harlequin's `Describe Relation` action. `string_agg` may
+    // combine catalog metadata here, but must stay untrusted over user tables.
+    let sql = r#"
+        WITH index_columns AS (
+            SELECT i.indexrelid, unnest(i.indkey) AS attnum
+            FROM pg_catalog.pg_index i
+        )
+        SELECT string_agg(a.attname, ', ')
+        FROM index_columns i
+        JOIN pg_catalog.pg_attribute a
+          ON a.attrelid = i.indexrelid AND a.attnum = i.attnum
+    "#;
+
+    assert!(reads_only_server_metadata(sql));
+    assert!(!calls_untrusted_function(sql));
+    assert!(calls_untrusted_function(
+        "SELECT string_agg(email, ', ') FROM users"
+    ));
+}
+
+#[test]
 fn data_bearing_set_returning_functions_do_not_get_the_metadata_fast_path() {
     // Range functions can expose the same data as denied catalog views,
     // while a joined pg_catalog relation supplies the otherwise-required

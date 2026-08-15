@@ -360,6 +360,10 @@ pub(crate) const CATALOG_HELPER_FUNCTIONS: &[&str] = &[
     "pg_options_to_table",
     "aclexplode",
     "array_to_string",
+    // Harlequin's relation description aggregates pg_attribute names. This is
+    // safe only inside the metadata-only path; it remains untrusted over user
+    // tables because this list is not the general function allowlist.
+    "string_agg",
     "array_length",
     "cardinality",
     "array_upper",
@@ -546,4 +550,7 @@ const TEXT_FUNCTIONS: &[&str] = &[
     "convert_to",
     "encode",
     "decode",
+    // PostgreSQL lowers `LIKE ... ESCAPE` to this pg_catalog helper. It only
+    // transforms the pattern and escape character passed to it.
+    "like_escape",
 ];

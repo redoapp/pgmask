@@ -40,10 +40,11 @@ address has this property.
 `NoTls`, so the proxy could not start against Neon, RDS with `rds.force_ssl`, or
 Cloud SQL — the databases it is most useful in front of.
 
-**3. `channel_binding=require` in the DSN.** Neon puts it in every connection
-string it hands out. tokio-postgres honours it and fails with "server did not use
-channel binding". pgmask now rewrites it to `disable` and says so, because
-channel binding can never be satisfied through something that terminates TLS.
+**3. Neon's strict DSN options.** Neon emits `sslmode=verify-full` and
+`channel_binding=require`. Catalog resolution now verifies the certificate and
+hostname and preserves channel binding. A client connecting *through* pgmask
+must still use `channel_binding=disable`, because its TLS endpoint is the proxy,
+not Neon.
 
 **4. A plaintext client cannot be offered `-PLUS` at all.** This corrected an
 earlier conclusion. libpq does not quietly fall back when the server advertises
