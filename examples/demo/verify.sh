@@ -149,7 +149,7 @@ check "1d. GROUP BY with a count returns real counts" \
   "12500" "$(proxied 'SELECT city, count(*) FROM demo.customers GROUP BY city ORDER BY 1 LIMIT 2;')"
 # ...and the rescue must not extend to anything touching a column.
 check "1e. an aggregate that emits a stored value is still refused" \
-  "no column provenance" "$(proxied 'SELECT max(email) FROM demo.customers;')"
+  "only trusted pg_catalog functions" "$(proxied 'SELECT max(email) FROM demo.customers;')"
 
 # 2 — classified masked, allowed passthrough, unclassified default-denied.
 row="$(proxied 'SELECT email, name, phone, city, internal_note FROM demo.customers WHERE id = 1;')"
@@ -177,8 +177,8 @@ check "3c. SETOF-returning function is rejected" \
   "$(proxied 'SELECT * FROM (SELECT email FROM demo.customers LIMIT 1) q UNION SELECT email FROM demo.customers LIMIT 1;')"
 
 # 4 — the two paths that emit rows with no RowDescription.
-check "4. COPY TO STDOUT is refused" \
-  "COPY ... TO is not permitted" \
+check "4. COPY TO STDOUT is refused as non-SELECT SQL" \
+  "pgmask: read-only" \
   "$(proxied 'COPY (SELECT email FROM demo.customers LIMIT 2) TO STDOUT;')"
 
 # 6 — error DETAIL echoes column values verbatim.
@@ -188,12 +188,11 @@ leak="$(direct "$conflict")"
 check  "6a. Postgres really does leak the value in DETAIL" "Key (id)=(1)" "$leak"
 scrubbed="$(proxied "$conflict")"
 refute "6b. pgmask scrubs it"                              "Key (id)=(1)" "$scrubbed"
-# The message used to be kept here. It is not any more: `RAISE EXCEPTION` lets
-# SQL choose it, so there is no locale-independent way to tell a message
-# Postgres wrote from one a client did. What is left has to be actionable, and
-# 23505 is unique_violation.
+# Writes are stopped before they reach Postgres, so the backend cannot echo a
+# stored value in an error. The proxy returns a stable insufficient_privilege
+# SQLSTATE instead.
 refute "6c. and withholds the message, which SQL can choose" "duplicate key" "$scrubbed"
-check  "6d. ...leaving the SQLSTATE, which says the same thing" "23505" \
+check  "6d. ...returning the read-only SQLSTATE" "42501" \
        "$(proxied_verbose "$conflict")"
 
 # 7 — a rejection must not poison the session.
@@ -246,7 +245,6 @@ DSN="postgres://postgres:demo@localhost:$PG_PORT/demo" \
   echo "catalog_dsn = \"postgres://postgres:demo@localhost:$PG_PORT/demo\""
   echo "pseudonym_key = \"generated-catalog-smoke-test\""
   echo "unclassified = \"mask\""
-  echo "unclassified_mask = \"null\""
   echo "opaque = \"reject\""
   cat /tmp/pgmask-generated.toml
 } > /tmp/pgmask-generated-full.toml
@@ -403,7 +401,7 @@ check "14b. ...with what it looks like"           "looks like free_text" "$out"
 check "14c. ...and the exit status fails a build" "1" "$(chk_status examples/demo/catalog.toml)"
 # Coverage gaps are not exposures, and saying so keeps the check from being
 # read as an alarm.
-check "14d. ...described as a gap, not a leak"    "not an exposure" "$out"
+check "14d. ...described as a gap, not a leak"    "coverage gap" "$out"
 
 { cat examples/demo/catalog.toml
   printf '\n[[column]]\nrelation = "demo.customers"\ncolumn = "internal_note"\nmask = "null"\n'

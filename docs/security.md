@@ -15,7 +15,7 @@ This property assumes:
 - PostgreSQL authenticates the user.
 - The catalog correctly marks every column that may be released with
   `mask = "none"`.
-- Unclassified columns keep the default `null` mask.
+- Unclassified columns keep the type-aware default-deny policy.
 - pgmask and its configuration are not compromised.
 
 An omitted catalog entry fails closed by default. An incorrect `mask = "none"`
@@ -84,7 +84,8 @@ masking policy during the session.
 
 ## Catalog safety
 
-- Keep `unclassified = "mask"` and `unclassified_mask = "null"`.
+- Keep `unclassified = "mask"`. Type awareness never passes an undeclared
+  value through unchanged: unsupported and ambiguous types become `NULL`.
 - Review `mask = "none"` like an access-control grant.
 - Use semantic types to keep repeated policy consistent.
 - Give unrelated identifiers different pseudonym domains.

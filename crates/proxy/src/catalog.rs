@@ -7,8 +7,9 @@
 //! because OIDs are not stable across DDL. `CREATE OR REPLACE VIEW` keeps a
 //! relation's OID but `DROP VIEW; CREATE VIEW` does not, and plenty of migration
 //! tooling does the latter. A catalog pinned at boot silently loses coverage the
-//! first time that happens: with `unclassified = "mask"` the columns quietly turn
-//! to NULL, and with `unclassified = "allow"` they quietly stop being masked.
+//! first time that happens: with `unclassified = "mask"` the columns quietly use
+//! the type-aware fallback, and with `unclassified = "allow"` they quietly stop
+//! being masked.
 
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
@@ -288,9 +289,6 @@ pub struct Config {
     pub unclassified: Unclassified,
     #[serde(default = "default_opaque")]
     pub opaque: Opaque,
-    /// Mask applied to unclassified columns when `unclassified = "mask"`.
-    #[serde(default = "default_unclassified_mask")]
-    pub unclassified_mask: Mask,
     #[serde(default)]
     pub column: Vec<ColumnRule>,
     #[serde(default)]
@@ -397,9 +395,6 @@ fn default_unclassified() -> Unclassified {
 fn default_opaque() -> Opaque {
     Opaque::Reject
 }
-fn default_unclassified_mask() -> Mask {
-    Mask::Null
-}
 fn default_refresh_seconds() -> u64 {
     30
 }
@@ -430,23 +425,11 @@ impl Config {
     }
 
     /// Whole-config checks that a per-field deserialiser cannot make.
-    ///
-    /// `unclassified_mask` is the one that matters. It is the mask every
-    /// undeclared column gets — the entire content of "default-deny" — and it
-    /// was never validated, while column rules were. There is also no syntax
-    /// for giving it parameters, so it silently used `MaskSpec::default()`:
-    ///
-    ///   unclassified_mask = "numeric-bucket"   # bucket defaults to 1 -> floor(v,1) == v
-    ///   unclassified_mask = "range"            # start = end = 0 -> masks nothing
-    ///
-    /// Both load clean, log `unclassified=Mask`, and return every undeclared
-    /// column verbatim. Default-deny becomes default-allow with no warning.
     pub(crate) fn validate(&self) -> Result<()> {
         self.validate_client_tls()?;
         self.validate_backend_tls()?;
         self.validate_pseudonym_key()?;
         self.validate_unique_column_rules()?;
-        self.validate_unclassified_policy()?;
         self.validate_rate_limit()
     }
 
@@ -568,32 +551,16 @@ impl Config {
         }
         Ok(())
     }
-
-    fn validate_unclassified_policy(&self) -> Result<()> {
-        if self.unclassified != Unclassified::Mask {
-            return Ok(());
-        }
-        if self.unclassified_mask == Mask::None {
-            bail!(
-                "unclassified = \"mask\" with unclassified_mask = \"none\" is a \
-                 contradiction: every undeclared column would be served in the clear. \
-                 Use unclassified = \"allow\" if that is what you want."
-            );
-        }
-
-        // Parameterless by construction, so only masks that are safe with
-        // default parameters can be used here.
-        validate_spec(&MaskSpec::new(self.unclassified_mask), "unclassified_mask").context(
-            "unclassified_mask takes no parameters, so a mask that needs them cannot be used \
-             as the default-deny mask",
-        )
-    }
 }
 
 /// One consistent view of the classification, swapped atomically on refresh.
 #[derive(Debug, Default)]
 pub struct Snapshot {
     by_column: HashMap<(u32, i16), Classification>,
+    /// Stable `schema.relation.column` identity for every live user column,
+    /// including columns absent from the policy catalog. Type-aware fallback
+    /// uses it to separate pseudonym domains without tying them to volatile
+    /// relation OIDs.
     names: HashMap<(u32, i16), String>,
     /// Relation OIDs we know about, so an unknown one can be told apart from a
     /// relation we resolved whose column is merely unclassified.
@@ -1026,6 +993,16 @@ impl Snapshot {
         );
         self.names.insert((table_oid, column_id), name.to_string());
         self.relations.insert(table_oid);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_column_name_for_test(
+        &mut self,
+        table_oid: u32,
+        column_id: i16,
+        name: &str,
+    ) {
+        self.names.insert((table_oid, column_id), name.to_string());
     }
 }
 
@@ -1531,9 +1508,13 @@ async fn resolve_snapshot(
     // Every user relation and its columns. Bounded by schema count, loaded once
     // per refresh, and lineage cannot resolve anything without it.
     let mut relation_columns: HashMap<String, Vec<String>> = HashMap::new();
+    let mut column_names: HashMap<(u32, i16), String> = HashMap::new();
     for row in client
         .query(
-            "SELECT n.nspname || '.' || c.relname AS relation, a.attname AS column
+            "SELECT n.nspname || '.' || c.relname AS relation,
+                    a.attname AS column,
+                    c.oid::int8 AS oid,
+                    a.attnum AS attnum
                FROM pg_class c
                JOIN pg_namespace n ON n.oid = c.relnamespace
                JOIN pg_attribute a ON a.attrelid = c.oid
@@ -1550,6 +1531,9 @@ async fn resolve_snapshot(
     {
         let relation: String = row.get("relation");
         let column: String = row.get("column");
+        let oid: i64 = row.get("oid");
+        let attnum: i16 = row.get("attnum");
+        column_names.insert((oid as u32, attnum), format!("{relation}.{column}"));
         relation_columns
             .entry(relation.to_ascii_lowercase())
             .or_default()
@@ -1700,6 +1684,7 @@ async fn resolve_snapshot(
     // meant to.
     if rules.is_empty() {
         let snapshot = Snapshot {
+            names: column_names,
             system_relations,
             relation_columns,
             opaque_views,
@@ -1748,6 +1733,7 @@ async fn resolve_snapshot(
     handle.abort();
 
     let mut snapshot = Snapshot {
+        names: column_names,
         system_relations,
         relation_columns,
         opaque_views,
@@ -2018,44 +2004,18 @@ mod tests {
         assert!(!snapshot.statement_touches_opaque_view("SELECT FROM WHERE (("));
     }
 
-    /// `unclassified_mask` is the whole content of default-deny and was the
-    /// one mask never validated. `numeric-bucket` and `range` take parameters
-    /// it has no syntax for, so they used defaults that mask nothing.
     #[test]
-    fn a_default_deny_mask_that_masks_nothing_is_refused() {
-        let base = r#"
-listen = "127.0.0.1:1"
+    fn the_old_unclassified_mask_knob_is_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
 backend = "127.0.0.1:2"
 catalog_dsn = "postgres://x@y/z"
 pseudonym_key = "a-long-enough-key"
-unclassified = "mask"
-"#;
-        for (mask, expect) in [
-            ("numeric-bucket", "takes no parameters"),
-            ("range", "takes no parameters"),
-            ("none", "contradiction"),
-        ] {
-            let toml_src = format!("{base}unclassified_mask = \"{mask}\"\n");
-            let config: Config = toml::from_str(&toml_src).expect("parses");
-            let err = config
-                .validate()
-                .expect_err(&format!("{mask} must be refused"));
-            let text = format!("{err:#}");
-            assert!(text.contains(expect), "{mask}: got {text}");
-        }
-        // Masks that are safe with default parameters still work.
-        for mask in ["null", "redact", "partial", "hash", "pseudonym"] {
-            let toml_src = format!("{base}unclassified_mask = \"{mask}\"\n");
-            let config: Config = toml::from_str(&toml_src).expect("parses");
-            config
-                .validate()
-                .unwrap_or_else(|e| panic!("{mask}: {e:#}"));
-        }
-        // And `unclassified = "allow"` is not second-guessed.
-        let toml_src =
-            base.replace("mask\"", "allow\"").to_string() + "unclassified_mask = \"none\"\n";
-        let config: Config = toml::from_str(&toml_src).expect("parses");
-        config.validate().expect("allow is the operator's choice");
+unclassified_mask = "null"
+"#,
+        )
+        .expect_err("the universal fallback no longer exists");
+        assert!(format!("{err:#}").contains("unknown field `unclassified_mask`"));
     }
 
     #[test]

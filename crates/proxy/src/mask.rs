@@ -399,6 +399,32 @@ impl MaskSpec {
         }
     }
 
+    /// Conservative fallback for a column absent from the policy catalog.
+    ///
+    /// A wire type can tell us which transformations are sound, not whether a
+    /// value is harmless. Text and UUID values therefore become opaque stable
+    /// handles, temporal values lose month/day/time, and IPs lose the host.
+    /// Types for which even a coarse value may disclose the data's meaning —
+    /// numbers, booleans, containers, extension types, and packed IPs — stay
+    /// withheld as NULL.
+    pub fn for_unclassified(type_oid: u32, format: i16, domain: Arc<str>) -> Self {
+        let kind = if is_text_family(type_oid) || type_oid == OID_UUID {
+            Mask::Pseudonym
+        } else if matches!(type_oid, OID_DATE | OID_TIMESTAMP | OID_TIMESTAMPTZ) {
+            Mask::DateYear
+        } else if matches!(type_oid, OID_INET | OID_CIDR) && format == FORMAT_TEXT {
+            Mask::IpPrefix
+        } else {
+            Mask::Null
+        };
+        let mut spec = Self::new(kind);
+        if kind == Mask::Pseudonym {
+            spec.domain = Some(domain);
+        }
+        debug_assert!(spec.supports(type_oid, format));
+        spec
+    }
+
     pub fn is_passthrough(&self) -> bool {
         self.kind == Mask::None
     }

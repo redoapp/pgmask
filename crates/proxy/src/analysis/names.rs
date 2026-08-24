@@ -340,6 +340,7 @@ pub(crate) const CATALOG_HELPER_FUNCTIONS: &[&str] = &[
     "pg_get_serial_sequence",
     "pg_get_partkeydef",
     "pg_get_partition_constraintdef",
+    "pg_partition_ancestors",
     "pg_get_replica_identity_index",
     "pg_get_statisticsobjdef",
     "pg_get_statisticsobjdef_columns",
@@ -490,6 +491,7 @@ pub(crate) const CATALOG_HELPER_FUNCTIONS: &[&str] = &[
     "pg_sequence_last_value",
     "pg_get_function_sqlbody",
     "pg_relation_is_updatable",
+    "pg_relation_is_publishable",
     "pg_column_is_updatable",
 ];
 

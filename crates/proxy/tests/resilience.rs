@@ -229,7 +229,7 @@ async fn many_concurrent_sessions_all_stay_masked() -> Result<()> {
 
 /// `DROP VIEW; CREATE VIEW` — what a lot of migration tooling emits — gives the
 /// view a new pg_class OID. A catalog pinned at boot silently stops classifying
-/// those columns: with default-deny they turn to NULL, and with
+/// those columns: with default-deny they use the type-aware fallback, and with
 /// `unclassified = "allow"` they stop being masked at all.
 #[tokio::test]
 async fn a_recreated_view_is_reclassified_after_refresh() -> Result<()> {

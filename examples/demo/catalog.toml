@@ -7,7 +7,6 @@ pseudonym_key = "demo-key-not-for-production"
 
 # Default-deny: a column with provenance but no rule below is masked, not passed.
 unclassified = "mask"
-unclassified_mask = "null"
 
 # A result set containing any field with no provenance is refused outright.
 opaque = "reject"
@@ -130,7 +129,7 @@ relation = "demo.customers"
 column = "account_uuid"
 type = "account_id"
 
-# demo.customers.internal_note is deliberately absent: default-deny nulls it.
+# demo.customers.internal_note is deliberately absent: default-deny masks it.
 
 # --- demo.customer_directory ------------------------------------------------
 # Phase 0 finding: Postgres reports the VIEW's OID, not the base table's, so a
@@ -196,4 +195,4 @@ relation = "demo.orders"
 column = "ship_address"
 type = "street_address"
 
-# demo.orders.internal_note is deliberately absent: default-deny nulls it.
+# demo.orders.internal_note is deliberately absent: default-deny masks it.

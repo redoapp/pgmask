@@ -137,7 +137,7 @@ refused before execution, and `FOR UPDATE` joins the read-only gate. As of
 `CREATE VIEW` / `LOAD` / `CHECKPOINT` and other DDL the denylist missed).
 As of 0.1.81, hostile also treats unclassified columns (including on
 uncatalogued tables) like masked ones for predicates — closing
-`WHERE internal_note = …` / `WHERE token = …` after default-deny nulls the
+`WHERE internal_note = …` / `WHERE token = …` after default-deny masks the
 projection. As of 0.1.82, hostile predicate checks and leaky-catalog reads
 (`pg_stats`, `pg_authid`, …) are refused at the frontend before Postgres runs
 them — closing the remaining execute-then-refuse timing/error channel for
