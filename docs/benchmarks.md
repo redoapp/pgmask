@@ -21,7 +21,7 @@ Three runs, so the figure is a range rather than false precision.
 |---|---|---|---|
 | latency, 1 row (mean) | 0.184 ms | 0.182 ms | within noise |
 | throughput, 10k rows (mean) | 1.99 ms | 4.90 ms | +2.91 ms |
-| per masked row | — | — | **0.22–0.29 µs** |
+| per masked row | — | — | **0.19–0.21 µs** (0.1.94; was 0.22–0.29) |
 | rows/sec | 5.0 M | 2.0 M | 2.4× slower |
 
 Interactive latency is free. Bulk scans cost roughly 2.4× — acceptable for the
@@ -44,6 +44,14 @@ optimisation work, which is the only reason these were found rather than shipped
 | batch the flush; cheap hex; zero-copy passthrough | 2.39 | −40% |
 | pre-keyed HMAC; direct frame build; no per-message `Vec` | 2.13 | −11% |
 | **coalesce writes into one buffer** | **~0.25** | **−88%** |
+| fuse decode/mask/encode into one pass; per-plan HMAC domain priming (0.1.94) | 0.19–0.21 | −10–20% |
+
+The 0.1.94 row was measured back-to-back against 0.1.93 on **one** Postgres
+instance: 0.21–0.26 µs/row before, 0.19–0.21 after, three runs each. That
+pairing matters more than the absolute figures — across container instances in
+the same hour, the *direct* path's mean for the same query varied from 2 ms to
+4 ms (page cache and autovacuum state), which is wider than the effect. Compare
+versions only against the same live backend, minutes apart.
 
 The last row is the whole story. The first fix batched the *flush* but still
 issued one `write_all` per message — a syscall per row. Copying each frame into
