@@ -1145,12 +1145,6 @@ impl Catalog {
         self.snapshot.load_full()
     }
 
-    pub fn name_of(&self, table_oid: u32, column_id: i16) -> Option<String> {
-        self.snapshot()
-            .name_of(table_oid, column_id)
-            .map(str::to_string)
-    }
-
     pub fn len(&self) -> usize {
         self.snapshot().len()
     }

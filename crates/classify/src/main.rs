@@ -313,7 +313,7 @@ fn width_permits(semantic_type: &str, max_length: Option<i32>) -> bool {
 }
 
 /// The config name of a mask, matching the strings `mask_fits` expects and the
-/// kebab-case serde uses in the catalog file.
+/// kebab-case serde uses in the catalog file. `mask_kind` is its inverse.
 fn mask_name_opt(mask: Option<&pgmask::mask::Mask>) -> Option<&'static str> {
     mask.map(mask_name)
 }
@@ -386,40 +386,106 @@ fn _index_of(mask: pgmask::mask::Mask) -> usize {
     }
 }
 
+/// The inverse of `mask_name`: the config string back to the `Mask` it names.
+///
+/// `None` for a string pgmask has never heard of. Kept honest by the
+/// round-trip test over `ALL_MASKS` below, which itself cannot drift because
+/// `_index_of` stops the crate compiling when a variant is added.
+fn mask_kind(name: &str) -> Option<pgmask::mask::Mask> {
+    use pgmask::mask::Mask;
+    Some(match name {
+        "none" => Mask::None,
+        "null" => Mask::Null,
+        "redact" => Mask::Redact,
+        "partial" => Mask::Partial,
+        "inner" => Mask::Inner,
+        "outer" => Mask::Outer,
+        "range" => Mask::Range,
+        "hash" => Mask::Hash,
+        "pseudonym" => Mask::Pseudonym,
+        "date-year" => Mask::DateYear,
+        "date-month" => Mask::DateMonth,
+        "numeric-bucket" => Mask::NumericBucket,
+        "ip-prefix" => Mask::IpPrefix,
+        "scrub" => Mask::Scrub,
+        _ => return None,
+    })
+}
+
+/// The type OID behind a `format_type(atttypid, NULL)` string, for the types
+/// the proxy's capability table knows how to answer for.
+///
+/// `None` for anything else — `boolean`, `json`, arrays, `money`, extension
+/// types. That is not "the proxy refuses these"; it is "this tool cannot vouch
+/// for them", and `mask_fits` treats the two the same way.
+fn type_oid(data_type: &str) -> Option<u32> {
+    use pgmask::mask::{
+        OID_BPCHAR, OID_CIDR, OID_DATE, OID_FLOAT4, OID_FLOAT8, OID_INET, OID_INT2, OID_INT4,
+        OID_INT8, OID_NUMERIC, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_UUID, OID_VARCHAR,
+    };
+    Some(match data_type {
+        // `mask.rs` only names constants for types *beyond* the text family;
+        // `text` and `name` live in `protocol.rs`'s TEXT_FAMILY_OIDS list, so
+        // their pg_type OIDs are written out here.
+        "text" => 25,
+        "name" => 19,
+        "character varying" => OID_VARCHAR,
+        "character" => OID_BPCHAR,
+        "uuid" => OID_UUID,
+        "date" => OID_DATE,
+        "timestamp without time zone" => OID_TIMESTAMP,
+        "timestamp with time zone" => OID_TIMESTAMPTZ,
+        "inet" => OID_INET,
+        "cidr" => OID_CIDR,
+        "smallint" => OID_INT2,
+        "integer" => OID_INT4,
+        "bigint" => OID_INT8,
+        "real" => OID_FLOAT4,
+        "double precision" => OID_FLOAT8,
+        "numeric" => OID_NUMERIC,
+        _ => return None,
+    })
+}
+
 /// Whether a proposed mask can actually apply to this column's type.
 ///
 /// Found by running this against TPC-DS, which has `c_birth_year` as an
 /// integer: the name matches the birth rule, but a date mask cannot decode an
 /// int4. A proposal that would fail at runtime is worse than no proposal, so
 /// the mismatch is surfaced as a review item rather than emitted.
+///
+/// The answer is `MaskSpec::supports` — the same capability table the proxy
+/// consults at plan time — asked in text format, the only format classify ever
+/// deals in. This used to be a string-keyed copy of that table, and the copy
+/// drifted three ways: `inner`, `outer`, `range`, `hash` and `scrub` fell
+/// through to a permissive `_ => true`, so `--check` accepted any of them on
+/// an integer column and the proxy refused the result set at runtime — the
+/// outage this function exists to prevent, for five of the seven masks it
+/// applied to. The copy also called `numeric-bucket` fine on `money`, which
+/// the proxy has never supported. Delegating removes the copy, so the next
+/// drift cannot happen.
+///
+/// Anything unrecognised — a mask name pgmask does not define, a `data_type`
+/// with no OID mapping above — is `false`, never `true`. The permissive
+/// default was exactly how the `_ => true` bug worked: "unknown" quietly
+/// became "accepted", and the proxy disagreed at runtime. `false` costs a
+/// review item; `true` costs an outage. (Unknown mask names cannot reach here
+/// from a loaded catalog anyway — serde rejects them at load — so that arm is
+/// belt and braces.)
 fn mask_fits(mask: &str, data_type: &str) -> bool {
-    let numeric = matches!(
-        data_type,
-        "smallint" | "integer" | "bigint" | "numeric" | "real" | "double precision" | "money"
-    );
-    let textual = data_type.contains("char") || data_type == "text";
-    match mask {
-        "date-year" | "date-month" | "date-quarter" => {
-            data_type.starts_with("date") || data_type.starts_with("timestamp")
-        }
-        "numeric-bucket" | "numeric-range" => numeric,
-        "ip-prefix" => textual || data_type == "inet" || data_type == "cidr",
-        // Every mask that rewrites text in place. TPC-DS's `i_manager_id` is an
-        // integer that matched the manager rule; redacting it would fail.
-        //
-        // `inner`, `outer`, `range`, `hash` and `scrub` were missing and fell
-        // through to `_ => true`, so `--check` accepted any of them on an
-        // integer column and the proxy refused the result set at runtime —
-        // which is the outage this function exists to prevent, for five of the
-        // seven masks it applies to. Found while proposing `range` for a
-        // postcode and noticing the arm was not there.
-        "partial" | "redact" | "inner" | "outer" | "range" | "hash" | "scrub" => textual,
-        // `null` withholds whatever it is, and `pseudonym` covers text and uuid.
-        "null" | "none" => true,
-        "pseudonym" => textual || data_type == "uuid",
-        // Unknown names are the catalog loader's problem, not this one's.
-        _ => true,
+    use pgmask::mask::{Mask, MaskSpec, FORMAT_TEXT};
+    let Some(kind) = mask_kind(mask) else {
+        return false;
+    };
+    // `null` withholds whatever it is and `none` passes it through; neither
+    // needs the type to be known, and `supports` says yes for every OID.
+    if matches!(kind, Mask::None | Mask::Null) {
+        return true;
     }
+    let Some(oid) = type_oid(data_type) else {
+        return false;
+    };
+    MaskSpec::new(kind).supports(oid, FORMAT_TEXT)
 }
 
 struct Column {
@@ -1447,6 +1513,100 @@ mod tests {
         assert!(mask_fits("null", "bigint"));
         assert!(mask_fits("numeric-bucket", "numeric"));
         assert!(!mask_fits("numeric-bucket", "text"));
+    }
+
+    /// Every `format_type` string the OID mapping knows.
+    const MAPPED_TYPES: &[&str] = &[
+        "text",
+        "name",
+        "character varying",
+        "character",
+        "uuid",
+        "date",
+        "timestamp without time zone",
+        "timestamp with time zone",
+        "inet",
+        "cidr",
+        "smallint",
+        "integer",
+        "bigint",
+        "real",
+        "double precision",
+        "numeric",
+    ];
+
+    /// `mask_name` and `mask_kind` are inverses over every mask that exists.
+    ///
+    /// `mask_kind`'s `_ => None` arm is the one place a new variant could slip
+    /// through: `_index_of` forces `ALL_MASKS` and `mask_name` to learn about
+    /// it at compile time, and this closes the loop at test time.
+    #[test]
+    fn mask_kind_round_trips_every_mask_name() {
+        for mask in ALL_MASKS {
+            assert_eq!(mask_kind(mask_name(mask)), Some(*mask));
+        }
+        assert_eq!(mask_kind("date-quarter"), None, "never a real mask");
+    }
+
+    /// `mask_fits` must agree with the proxy's own capability table, exactly.
+    ///
+    /// This is the drift gate. `mask_fits` was a string-keyed copy of
+    /// `MaskSpec::supports` and the copy went wrong three separate ways;
+    /// now it delegates, and this test walks every (mask, data_type) pair the
+    /// classifier can name to prove the delegation is faithful — including the
+    /// OID mapping, which is the one piece still written by hand.
+    #[test]
+    fn mask_fits_agrees_with_the_proxy_for_every_pair() {
+        use pgmask::mask::{MaskSpec, FORMAT_TEXT};
+        for mask in ALL_MASKS {
+            for data_type in MAPPED_TYPES {
+                let oid = type_oid(data_type).expect("every mapped type has an OID");
+                assert_eq!(
+                    mask_fits(mask_name(mask), data_type),
+                    MaskSpec::new(*mask).supports(oid, FORMAT_TEXT),
+                    "`{}` on {data_type}",
+                    mask_name(mask),
+                );
+            }
+        }
+    }
+
+    /// The disagreements the old string table would have shipped.
+    ///
+    /// `numeric-bucket` on `money` is the permissive one: the table listed
+    /// `money` among its numeric types, the proxy never supported it, and
+    /// `--check` would have blessed a catalog the proxy refuses at runtime.
+    /// `name` is the conservative one: it is text-family on the wire, but the
+    /// table's `contains("char") || == "text"` test had never heard of it and
+    /// flagged working rules for review.
+    #[test]
+    fn the_cases_the_old_string_table_got_wrong() {
+        assert!(
+            !mask_fits("numeric-bucket", "money"),
+            "the proxy refuses money; accepting it here was the outage-shaped drift"
+        );
+        for mask in ["redact", "partial", "hash", "pseudonym", "scrub"] {
+            assert!(mask_fits(mask, "name"), "{mask} works on `name` at runtime");
+        }
+    }
+
+    /// A type this tool cannot vouch for is a mismatch, not a pass.
+    ///
+    /// The `_ => true` bug was precisely "unknown quietly became accepted":
+    /// `--check` said yes, the proxy said no, and the disagreement surfaced as
+    /// a refused result set in production. Unknown data types now fail closed
+    /// — except under `null` and `none`, which never touch the value.
+    #[test]
+    fn an_unknown_data_type_is_refused_not_waved_through() {
+        for data_type in ["boolean", "money", "json", "text[]", "citext"] {
+            assert!(!mask_fits("redact", data_type), "redact on {data_type}");
+            assert!(
+                !mask_fits("date-year", data_type),
+                "date-year on {data_type}"
+            );
+            assert!(mask_fits("null", data_type), "null withholds anything");
+            assert!(mask_fits("none", data_type), "none touches nothing");
+        }
     }
 
     /// A postcode's identifying half is its tail, which is what `partial` keeps.
