@@ -30,6 +30,7 @@ use tokio::net::TcpStream;
 use crate::analysis::{self, Safety};
 use crate::catalog::{
     Catalog, Config, Lineage, Opaque, Posture, Snapshot, Summaries, SystemCatalogs, Unclassified,
+    UnclassifiedMask,
 };
 use crate::lineage::{self, Verdict};
 use crate::mask::{Mask, MaskSpec, Masker};
@@ -52,6 +53,7 @@ pub struct Policy {
     catalog: Arc<Catalog>,
     masker: Arc<Masker>,
     unclassified: Unclassified,
+    unclassified_mask: UnclassifiedMask,
     opaque: Opaque,
     metrics: Arc<Metrics>,
     summaries: Summaries,
@@ -152,6 +154,7 @@ impl Policy {
                 config.pseudonym_key.expose_secret().as_bytes().to_vec(),
             )),
             unclassified: config.unclassified,
+            unclassified_mask: config.unclassified_mask,
             opaque: config.opaque,
             metrics: Arc::new(Metrics::default()),
             summaries: config.effective_summaries(),
@@ -208,6 +211,10 @@ impl Policy {
         let mut plan = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
             let provably_safe = analysis.safety.get(index).copied() == Some(Safety::Releasable);
+            // Set only by the type-aware unclassified fallback: a default mask
+            // that cannot be applied to some value nulls that field instead of
+            // refusing the stream. Operator-chosen masks stay fail-closed.
+            let mut lenient = false;
             // A set operation can put values from several columns into one
             // output field, and CockroachDB reports the first branch's OID for
             // the whole thing. Believing it applies one column's mask to
@@ -278,6 +285,12 @@ impl Policy {
                                     ),
                                 });
                             }
+                            // Deliberately stricter than the type-aware
+                            // unclassified fallback, and documented with it on
+                            // `MaskSpec::for_unclassified`: a provenance-free
+                            // field has no stable column identity to key a
+                            // pseudonym domain, so NULL is the only honest
+                            // default here.
                             Opaque::Mask => MaskSpec::new(Mask::Null),
                         },
                     }
@@ -301,26 +314,29 @@ impl Policy {
                         // rate floor, so a storm of misses cannot become a query
                         // storm against the catalog.
                         self.catalog.note_unknown_relation();
-                        match self.unclassified {
-                            Unclassified::Mask => {
-                                let stable_name = snapshot
-                                    .name_of(field.table_oid, field.column_id)
-                                    .map_or_else(
-                                        || {
-                                            format!(
-                                                "oid.{}.{}.{}",
-                                                field.table_oid, field.column_id, field.name
-                                            )
-                                        },
-                                        str::to_owned,
-                                    );
+                        match (self.unclassified, self.unclassified_mask) {
+                            (Unclassified::Mask, UnclassifiedMask::TypeAware) => {
+                                lenient = true;
+                                // Only a name the *catalog* resolved keys a
+                                // pseudonym domain. There is no OID-based
+                                // fallback: an OID is volatile across DDL and
+                                // `field.name` is a client-chosen alias, so a
+                                // handle keyed on either silently changes
+                                // across a refresh or a rename — an unstable
+                                // "stable handle" is worse than an honest NULL,
+                                // which is what `for_unclassified` degrades to
+                                // when no stable identity exists.
                                 MaskSpec::for_unclassified(
                                     field.type_oid,
                                     field.format,
-                                    format!("unclassified:{stable_name}").into(),
+                                    field.type_mod,
+                                    snapshot.name_of(field.table_oid, field.column_id),
                                 )
                             }
-                            Unclassified::Allow => MaskSpec::new(Mask::None),
+                            (Unclassified::Mask, UnclassifiedMask::Null) => {
+                                MaskSpec::new(Mask::Null)
+                            }
+                            (Unclassified::Allow, _) => MaskSpec::new(Mask::None),
                         }
                     }
                 }
@@ -328,7 +344,8 @@ impl Policy {
 
             // Catch type/format mismatches once here rather than per row, so a
             // misconfiguration refuses the result set instead of dying halfway
-            // through a stream.
+            // through a stream. A lenient (fallback-origin) spec is chosen
+            // *from* `supports`, so it cannot fail this check.
             if !spec.supports(field.type_oid, field.format) {
                 let name = snapshot
                     .name_of(field.table_oid, field.column_id)
@@ -351,6 +368,7 @@ impl Policy {
                 spec,
                 type_oid: field.type_oid,
                 format: field.format,
+                lenient,
             });
         }
         Ok(Arc::new(plan))
@@ -1411,6 +1429,7 @@ impl Session {
                         spec: MaskSpec::new(Mask::None),
                         type_oid: field.type_oid,
                         format: field.format,
+                        lenient: false,
                     })
                     .collect::<Vec<_>>(),
             ))
@@ -1532,6 +1551,18 @@ impl Session {
                     changed = true;
                     self.masked_fields = self.masked_fields.saturating_add(1);
                     masked.push(new_value);
+                }
+                // A type-aware *fallback* mask that cannot honour this value
+                // nulls the field — strictly less disclosure — rather than
+                // killing the stream. The old unclassified default was NULL
+                // unconditionally, and values it handled fine ('infinity'
+                // timestamps, `SET datestyle` output, a Bind that flipped the
+                // portal to a binary format the mask cannot decode) must not
+                // become mid-stream rejections now.
+                Err(_) if field.lenient => {
+                    changed = true;
+                    self.masked_fields = self.masked_fields.saturating_add(1);
+                    masked.push(None);
                 }
                 Err(err) => {
                     return self.reject(
@@ -1859,6 +1890,7 @@ mod tests {
             catalog: Arc::new(Catalog::default()),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified,
+            unclassified_mask: UnclassifiedMask::default(),
             opaque,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
@@ -1885,6 +1917,7 @@ mod tests {
             catalog: Arc::new(Catalog::default()),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified,
+            unclassified_mask: UnclassifiedMask::default(),
             opaque,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
@@ -1917,6 +1950,7 @@ mod tests {
             table_oid,
             column_id,
             type_oid,
+            type_mod: -1,
             format,
         }
     }
@@ -1997,6 +2031,7 @@ mask = "none"
     #[test]
     fn unclassified_columns_are_masked_by_type() {
         let p = policy(Unclassified::Mask, Opaque::Reject);
+        let mut snapshot = crate::catalog::Snapshot::default();
         let fields = [
             field("body", 16391, 1, 25),
             field("account_uuid", 16391, 2, crate::mask::OID_UUID),
@@ -2013,9 +2048,16 @@ mask = "none"
             // rather than selecting a mask that refuses the entire result set.
             field_with_format("packed_ip", 16391, 12, crate::mask::OID_CIDR, 1),
         ];
+        for f in &fields {
+            snapshot.insert_column_name_for_test(
+                f.table_oid,
+                f.column_id,
+                &format!("demo.t.{}", f.name),
+            );
+        }
         let plan = p
             .plan_for(
-                &p.catalog.snapshot(),
+                &snapshot,
                 &fields,
                 &HashSet::new(),
                 &FieldAnalysis {
@@ -2047,6 +2089,103 @@ mask = "none"
         assert!(plan
             .iter()
             .all(|field| field.spec.supports(field.type_oid, field.format)));
+        assert!(
+            plan.iter().all(|field| field.lenient),
+            "every fallback plan must degrade per-value rather than reject the stream"
+        );
+    }
+
+    /// A column the catalog has not resolved yet — a table created between
+    /// refreshes — has no stable identity to key a pseudonym domain, so text
+    /// and uuid fall back to honest NULL rather than to a handle that would
+    /// silently change when the refresh lands or the client picks an alias.
+    #[test]
+    fn unclassified_columns_without_a_stable_name_null_rather_than_pseudonymise() {
+        let p = policy(Unclassified::Mask, Opaque::Reject);
+        let plan = p
+            .plan_for(
+                &p.catalog.snapshot(),
+                &[
+                    field("body", 16391, 1, 25),
+                    field("account_uuid", 16391, 2, crate::mask::OID_UUID),
+                    // No stable name is needed for masks that keep no linkable
+                    // identity: coarse dates and IP prefixes stay type-aware.
+                    field("birthday", 16391, 3, crate::mask::OID_DATE),
+                ],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .unwrap();
+        assert_eq!(
+            plan.iter().map(|field| field.spec.kind).collect::<Vec<_>>(),
+            [Mask::Null, Mask::Null, Mask::DateYear]
+        );
+    }
+
+    /// `unclassified_mask = "null"` restores the strict pre-type-aware default.
+    #[test]
+    fn strict_null_unclassified_mask_nulls_every_type() {
+        let mut p = policy(Unclassified::Mask, Opaque::Reject);
+        Arc::get_mut(&mut p).unwrap().unclassified_mask = UnclassifiedMask::Null;
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_column_name_for_test(16391, 1, "demo.t.body");
+        let plan = p
+            .plan_for(
+                &snapshot,
+                &[
+                    field("body", 16391, 1, 25),
+                    field("birthday", 16391, 2, crate::mask::OID_DATE),
+                ],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .unwrap();
+        assert!(plan.iter().all(|field| field.spec.kind == Mask::Null));
+    }
+
+    /// A pseudonym is 16 characters (and up to 33 for email-shaped values), so
+    /// a declared column width that cannot hold one falls back to NULL: a
+    /// handle truncated by a fixed-width client binding collides with others.
+    #[test]
+    fn narrow_character_columns_null_rather_than_overflow_their_declared_width() {
+        let p = policy(Unclassified::Mask, Opaque::Reject);
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_column_name_for_test(16391, 1, "demo.t.country");
+        snapshot.insert_column_name_for_test(16391, 2, "demo.t.note");
+        let mut narrow = field("country", 16391, 1, 1042);
+        narrow.type_mod = 2 + 4; // char(2): declared limit plus VARHDRSZ
+        let mut wide = field("note", 16391, 2, 1043);
+        wide.type_mod = 120 + 4; // varchar(120)
+        let plan = p
+            .plan_for(
+                &snapshot,
+                &[narrow, wide],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .unwrap();
+        assert_eq!(
+            plan.iter().map(|field| field.spec.kind).collect::<Vec<_>>(),
+            [Mask::Null, Mask::Pseudonym]
+        );
     }
 
     #[test]
@@ -2256,6 +2395,7 @@ mask = "none"
             catalog: Arc::new(Catalog::from_snapshot_for_test(snapshot)),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified: Unclassified::Allow,
+            unclassified_mask: UnclassifiedMask::default(),
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
@@ -2504,6 +2644,7 @@ mask = "none"
             catalog: Arc::new(Catalog::default()),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified: Unclassified::Allow,
+            unclassified_mask: UnclassifiedMask::default(),
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
@@ -2525,6 +2666,7 @@ mask = "none"
             catalog: Arc::new(Catalog::default()),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified: Unclassified::Allow,
+            unclassified_mask: UnclassifiedMask::default(),
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
@@ -2880,6 +3022,7 @@ mask = "none"
                 spec: MaskSpec::new(Mask::None),
                 type_oid: 25,
                 format: 0,
+                lenient: false,
             }]))
             .unwrap();
         assert!(
@@ -2901,6 +3044,7 @@ mask = "none"
             spec: MaskSpec::new(Mask::None),
             type_oid: 25,
             format: 0,
+            lenient: false,
         }]);
         session.plans.parse("s1".into(), "SELECT 1".into());
         session

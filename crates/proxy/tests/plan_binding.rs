@@ -213,6 +213,7 @@ async fn start_proxy(
         catalog_dsn: "postgres://unused".into(),
         pseudonym_key: "test-key-long-enough".into(),
         unclassified,
+        unclassified_mask: Default::default(),
         opaque,
         column: Vec::new(),
         semantic_type: Vec::new(),

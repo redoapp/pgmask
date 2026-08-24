@@ -337,6 +337,10 @@ pub struct FieldDescription {
     /// pg_attribute attnum, or 0.
     pub column_id: i16,
     pub type_oid: u32,
+    /// pg_attribute atttypmod: `-1` when the type is unbounded. For
+    /// varchar/bpchar a non-negative value is the declared character limit
+    /// plus `VARHDRSZ` (4).
+    pub type_mod: i32,
     pub format: i16,
 }
 
@@ -365,13 +369,14 @@ pub fn parse_row_description(body: &Bytes) -> Result<Vec<FieldDescription>> {
         let column_id = buf.get_i16();
         let type_oid = buf.get_u32();
         let _type_size = buf.get_i16();
-        let _type_mod = buf.get_i32();
+        let type_mod = buf.get_i32();
         let format = buf.get_i16();
         fields.push(FieldDescription {
             name,
             table_oid,
             column_id,
             type_oid,
+            type_mod,
             format,
         });
     }

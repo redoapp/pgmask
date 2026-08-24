@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.1.92**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.1.93**. Licensed under the [MIT License](LICENSE).
 
 ## What pgmask provides
 
@@ -169,6 +169,7 @@ and unresolved configured columns are startup errors.
 | Setting | Default | Behavior |
 |---|---|---|
 | `unclassified` | `mask` | Type-aware masking for columns missing from the catalog. `allow` is an incremental-rollout escape hatch. |
+| `unclassified_mask` | `type-aware` | Which mask `unclassified = "mask"` applies. `null` restores strict `NULL` for every unclassified value, giving up the equality-preserving pseudonyms. |
 | `opaque` | `reject` | Reject computed or otherwise unclassified result fields. `mask` replaces them with `NULL`. |
 | `lineage` | `refuse` | When enabled, release an expression only if all resolved source columns are explicitly released. |
 | `summaries` | `allow` | Allow supported reducing aggregates, while applying the source column's policy when required. |
@@ -212,7 +213,11 @@ not.
 - Unclassified text and UUID values become column-scoped pseudonyms; dates and
   timestamps reduce to a year; text-format IPs reduce to a network prefix.
   Numeric, boolean, structured, binary, custom, and unsupported wire types
-  become `NULL`.
+  become `NULL`. A value or format the chosen default mask cannot transform
+  (an `infinity` timestamp, a non-ISO `DateStyle`, a binary-bound IP), a column
+  the catalog has not resolved yet, or a character column too narrow to hold a
+  pseudonym also becomes `NULL` rather than an error. Set
+  `unclassified_mask = "null"` for strict `NULL` across the board.
 - Safe scalar values such as literals, `now()`, and `count(*)` pass through.
 - Expressions over masked columns, value-returning aggregates such as `max`,
   set operations, recursive common table expressions, and set-returning

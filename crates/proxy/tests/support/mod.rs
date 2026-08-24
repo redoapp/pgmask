@@ -37,7 +37,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 42
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 43
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -378,6 +378,7 @@ pub async fn start_proxy_at_full(
         catalog_dsn: backend_dsn(db),
         pseudonym_key: "test-key-long-enough".into(),
         unclassified,
+        unclassified_mask: Default::default(),
         opaque,
         column: rules,
         semantic_type: Vec::new(),
@@ -549,6 +550,21 @@ pub fn bind_msg(portal: &str, statement: &str) -> Message {
     body.put_i16(0); // no parameter format codes
     body.put_i16(0); // no parameters
     body.put_i16(0); // default result format (text)
+    Message::new(b'B', body.freeze())
+}
+
+/// A Bind that asks for one result format for every column — `1` is how JDBC
+/// and tokio-postgres request binary transfer.
+pub fn bind_msg_with_result_format(portal: &str, statement: &str, format: i16) -> Message {
+    let mut body = BytesMut::new();
+    body.put_slice(portal.as_bytes());
+    body.put_u8(0);
+    body.put_slice(statement.as_bytes());
+    body.put_u8(0);
+    body.put_i16(0); // no parameter format codes
+    body.put_i16(0); // no parameters
+    body.put_i16(1); // one result-format code, applied to all columns
+    body.put_i16(format);
     Message::new(b'B', body.freeze())
 }
 

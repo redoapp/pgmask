@@ -352,6 +352,7 @@ impl ProtocolModel {
                         spec: MaskSpec::new(Mask::None),
                         type_oid: id,
                         format: 0,
+                        lenient: false,
                     })
                     .collect(),
             )
