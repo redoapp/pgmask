@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.1.93 — type-aware defaults hardened: no mid-stream rejections, strict-null opt-out
+
+Fixes from a review of the 0.1.92 type-aware defaults:
+
+- **Fallback masks never kill a stream.** The old unclassified default
+  (`NULL`) was total; the type-aware masks can fail per value. A fallback mask
+  that cannot honour a value or format — an `infinity` timestamp, output under
+  a non-ISO `DateStyle`, an inet column a Bind flipped to binary format — now
+  nulls that field instead of rejecting the result set mid-stream.
+  Operator-configured masks stay fail-closed.
+- **`unclassified_mask` is back, as a policy choice.** `type-aware` (default)
+  or `null`, which restores the strict pre-0.1.92 posture of `NULL` for every
+  unclassified value. A config still carrying the removed knob's
+  `unclassified_mask = "null"` keeps its old strict meaning instead of failing
+  to boot; the old universal-mask values (`redact`, `none`, …) stay rejected.
+- **Pseudonym domains only from stable identities.** The fallback no longer
+  keys a pseudonym domain on the volatile relation OID plus the client-chosen
+  output alias. A column the catalog has not resolved yet nulls instead —
+  an unstable "stable handle" breaks the joins it exists to preserve.
+- **Email-shaped pseudonyms honour domain separation end to end.** The
+  employer half of a pseudonymised email was keyed only on the plaintext
+  domain, so columns in different pseudonym domains emitted linkable `@…`
+  halves. It now mixes in `spec.domain` like the value half. Emitted
+  email-shaped pseudonyms change under the same key.
+- **Declared column widths are respected.** A pseudonym no longer overflows a
+  narrow `char(n)`/`varchar(n)`; columns too narrow to hold every pseudonym
+  shape fall back to `NULL`.
+- **`classified_column_names` means classified again.** The all-columns name
+  map added for pseudonym domains is now a separate snapshot field, restoring
+  the rejection-bucketing metric's meaning, the refresh change-detector's
+  scope, and the refresh loop's cost.
+- **One capability table.** `MaskSpec::for_unclassified` now selects from
+  `MaskSpec::supports` instead of hand-copying its type arms.
+
 ## 0.1.92 — hostile SQL gate: agg ORDER BY, JSON_TABLE, PREPARE, SEARCH/CYCLE, JSON agg
 
 ### Type-aware defaults for unclassified columns

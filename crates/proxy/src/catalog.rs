@@ -92,6 +92,27 @@ pub enum Unclassified {
     Allow,
 }
 
+/// *Which* mask `unclassified = "mask"` applies.
+///
+/// The type-aware default keeps unclassified data usable — stable pseudonyms
+/// for text and UUID, year-only dates, network-prefix IPs — but pseudonyms
+/// preserve equality and frequency, and a client who can also filter on the
+/// cleartext (`WHERE col = '…'` runs on the backend) can decode a
+/// low-cardinality column's handles in a handful of queries. `posture =
+/// "hostile"` closes that predicate route; `unclassified_mask = "null"` opts
+/// out of the disclosure entirely, restoring the strict pre-0.1.92 default of
+/// NULL for every unclassified value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnclassifiedMask {
+    /// Pseudonyms, coarse dates and IP prefixes chosen per wire type; NULL for
+    /// everything else. See `MaskSpec::for_unclassified`.
+    #[default]
+    TypeAware,
+    /// Strict NULL for every unclassified value, whatever its type.
+    Null,
+}
+
 /// What to do with a result set containing a field with NO provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -287,6 +308,10 @@ pub struct Config {
     pub pseudonym_key: SecretString,
     #[serde(default = "default_unclassified")]
     pub unclassified: Unclassified,
+    /// Which mask `unclassified = "mask"` applies: `type-aware` (default) or
+    /// strict `null`. Ignored under `unclassified = "allow"`.
+    #[serde(default)]
+    pub unclassified_mask: UnclassifiedMask,
     #[serde(default = "default_opaque")]
     pub opaque: Opaque,
     #[serde(default)]
@@ -557,11 +582,17 @@ impl Config {
 #[derive(Debug, Default)]
 pub struct Snapshot {
     by_column: HashMap<(u32, i16), Classification>,
-    /// Stable `schema.relation.column` identity for every live user column,
-    /// including columns absent from the policy catalog. Type-aware fallback
-    /// uses it to separate pseudonym domains without tying them to volatile
-    /// relation OIDs.
+    /// `schema.relation.column` display names of the **classified** columns —
+    /// exactly one entry per resolved rule, spelled as the rule wrote it.
+    /// Backs refresh-diff logging and rejection bucketing; kept separate from
+    /// `all_columns` so neither reader silently changes meaning when the other
+    /// map grows.
     names: HashMap<(u32, i16), String>,
+    /// Stable `schema.relation.column` identity for **every** live user column,
+    /// classified or not, spelled the way `pg_attribute` reports it. The
+    /// type-aware fallback keys unclassified pseudonym domains on it, so the
+    /// domains survive OID churn and do not depend on client-chosen aliases.
+    all_columns: HashMap<(u32, i16), String>,
     /// Relation OIDs we know about, so an unknown one can be told apart from a
     /// relation we resolved whose column is merely unclassified.
     relations: HashSet<u32>,
@@ -861,8 +892,14 @@ impl Snapshot {
         self.by_column.get(&(table_oid, column_id))
     }
 
+    /// Stable `schema.relation.column` identity of a live column, classified or
+    /// not. Prefers the engine's own spelling (`all_columns`) so the same
+    /// column answers identically whether or not a rule covers it.
     pub fn name_of(&self, table_oid: u32, column_id: i16) -> Option<&str> {
-        self.names.get(&(table_oid, column_id)).map(String::as_str)
+        self.all_columns
+            .get(&(table_oid, column_id))
+            .or_else(|| self.names.get(&(table_oid, column_id)))
+            .map(String::as_str)
     }
 
     pub fn knows_relation(&self, table_oid: u32) -> bool {
@@ -992,17 +1029,23 @@ impl Snapshot {
             },
         );
         self.names.insert((table_oid, column_id), name.to_string());
+        // A resolve also sees every classified column in the all-columns pass.
+        self.all_columns
+            .insert((table_oid, column_id), name.to_string());
         self.relations.insert(table_oid);
     }
 
     #[cfg(test)]
+    /// Register a live-but-unclassified column's stable identity, the way the
+    /// all-columns pass of a refresh would — without classifying it.
     pub(crate) fn insert_column_name_for_test(
         &mut self,
         table_oid: u32,
         column_id: i16,
         name: &str,
     ) {
-        self.names.insert((table_oid, column_id), name.to_string());
+        self.all_columns
+            .insert((table_oid, column_id), name.to_string());
     }
 }
 
@@ -1684,7 +1727,7 @@ async fn resolve_snapshot(
     // meant to.
     if rules.is_empty() {
         let snapshot = Snapshot {
-            names: column_names,
+            all_columns: column_names,
             system_relations,
             relation_columns,
             opaque_views,
@@ -1733,7 +1776,7 @@ async fn resolve_snapshot(
     handle.abort();
 
     let mut snapshot = Snapshot {
-        names: column_names,
+        all_columns: column_names,
         system_relations,
         relation_columns,
         opaque_views,
@@ -2004,18 +2047,38 @@ mod tests {
         assert!(!snapshot.statement_touches_opaque_view("SELECT FROM WHERE (("));
     }
 
+    /// `unclassified_mask` selects the fallback *family*, not an arbitrary
+    /// mask: `type-aware` (default) or strict `null`. A config carrying the
+    /// pre-0.1.92 knob's `"null"` keeps its old strict meaning across the
+    /// upgrade instead of failing to boot — a boot failure whose only remedy
+    /// was deleting the line silently switched deployments to the looser
+    /// policy. The old knob's other values (`"redact"`, `"none"`, …) stay
+    /// rejected: none of them was a sound universal fallback.
     #[test]
-    fn the_old_unclassified_mask_knob_is_rejected() {
-        let err = toml::from_str::<Config>(
-            r#"
+    fn unclassified_mask_selects_type_aware_or_strict_null() {
+        let base = r#"
 backend = "127.0.0.1:2"
 catalog_dsn = "postgres://x@y/z"
 pseudonym_key = "a-long-enough-key"
-unclassified_mask = "null"
-"#,
-        )
-        .expect_err("the universal fallback no longer exists");
-        assert!(format!("{err:#}").contains("unknown field `unclassified_mask`"));
+"#;
+        let config: Config = toml::from_str(base).expect("parses");
+        assert_eq!(config.unclassified_mask, UnclassifiedMask::TypeAware);
+
+        let config: Config =
+            toml::from_str(&format!("{base}unclassified_mask = \"null\"\n")).expect("parses");
+        assert_eq!(config.unclassified_mask, UnclassifiedMask::Null);
+
+        let config: Config =
+            toml::from_str(&format!("{base}unclassified_mask = \"type-aware\"\n")).expect("parses");
+        assert_eq!(config.unclassified_mask, UnclassifiedMask::TypeAware);
+
+        for old in ["none", "redact", "pseudonym", "hash"] {
+            assert!(
+                toml::from_str::<Config>(&format!("{base}unclassified_mask = \"{old}\"\n"))
+                    .is_err(),
+                "the old universal-mask value {old:?} must not parse"
+            );
+        }
     }
 
     #[test]

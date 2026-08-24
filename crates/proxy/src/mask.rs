@@ -42,6 +42,8 @@ pub const OID_TIMESTAMPTZ: u32 = 1184;
 pub const OID_UUID: u32 = 2950;
 pub const OID_INET: u32 = 869;
 pub const OID_CIDR: u32 = 650;
+pub const OID_VARCHAR: u32 = 1043;
+pub const OID_BPCHAR: u32 = 1042;
 
 /// Structured identifiers, and the placeholder each becomes.
 ///
@@ -286,6 +288,12 @@ fn canonical_uuid(bytes: &[u8], format: i16) -> Option<[u8; 16]> {
 /// Fixed pseudonym width, in hex characters. 64 bits.
 const PSEUDONYM_HEX_CHARS: usize = 16;
 
+/// The widest text a pseudonym can render: the email shape, `16 hex` + `@` +
+/// `8 hex` + `.invalid`. A plain value is 16 characters; the fallback cannot
+/// know per column which shape its values will take, so fitting a declared
+/// column width means fitting this.
+const PSEUDONYM_MAX_CHARS: usize = PSEUDONYM_HEX_CHARS + 1 + 8 + ".invalid".len();
+
 pub const FORMAT_TEXT: i16 = 0;
 pub const FORMAT_BINARY: i16 = 1;
 
@@ -407,26 +415,71 @@ impl MaskSpec {
     /// Types for which even a coarse value may disclose the data's meaning —
     /// numbers, booleans, containers, extension types, and packed IPs — stay
     /// withheld as NULL.
-    pub fn for_unclassified(type_oid: u32, format: i16, domain: Arc<str>) -> Self {
-        let kind = if is_text_family(type_oid) || type_oid == OID_UUID {
-            Mask::Pseudonym
-        } else if matches!(type_oid, OID_DATE | OID_TIMESTAMP | OID_TIMESTAMPTZ) {
-            Mask::DateYear
-        } else if matches!(type_oid, OID_INET | OID_CIDR) && format == FORMAT_TEXT {
-            Mask::IpPrefix
-        } else {
-            Mask::Null
-        };
-        let mut spec = Self::new(kind);
-        if kind == Mask::Pseudonym {
-            spec.domain = Some(domain);
+    ///
+    /// **This is the one mechanism that decides the default policy for an
+    /// unclassified stored column.** The other two "no policy" situations stay
+    /// deliberately stricter and are documented at their sites: a field with no
+    /// provenance (`Opaque::Mask`) is nulled, and an unattributable summary is
+    /// refused — an expression output has no stable column identity to key a
+    /// pseudonym domain, and its bytes may combine several columns.
+    ///
+    /// Candidates are tried in preference order and accepted only when
+    /// [`supports`](Self::supports) — the authoritative mask/type capability
+    /// table — agrees, so widening or narrowing `supports` moves this fallback
+    /// with it instead of drifting away from it. On top of capability, each
+    /// candidate has an intent gate:
+    ///
+    /// - `pseudonym` needs a stable column identity to key its domain
+    ///   (`stable_name`; without one the handle would silently change across
+    ///   catalog refreshes and output aliases, breaking the joins it exists to
+    ///   preserve), and a declared column width the handle can fit.
+    /// - `ip-prefix` is only *meant* for IP-typed columns here, even though the
+    ///   mask is also capable of rewriting free text an operator points it at.
+    pub fn for_unclassified(
+        type_oid: u32,
+        format: i16,
+        type_mod: i32,
+        stable_name: Option<&str>,
+    ) -> Self {
+        for kind in [Mask::Pseudonym, Mask::DateYear, Mask::IpPrefix] {
+            if !Self::new(kind).supports(type_oid, format) {
+                continue;
+            }
+            match kind {
+                Mask::Pseudonym => {
+                    if let Some(name) = stable_name {
+                        if Self::pseudonym_fits_declared_width(type_oid, type_mod) {
+                            let mut spec = Self::new(kind);
+                            spec.domain = Some(format!("unclassified:{name}").into());
+                            return spec;
+                        }
+                    }
+                }
+                // Capable of text, but the fallback only intends it for IPs.
+                Mask::IpPrefix if !matches!(type_oid, OID_INET | OID_CIDR) => {}
+                _ => return Self::new(kind),
+            }
         }
-        debug_assert!(spec.supports(type_oid, format));
-        spec
+        Self::new(Mask::Null)
     }
 
     pub fn is_passthrough(&self) -> bool {
         self.kind == Mask::None
+    }
+
+    /// Whether every rendering of a pseudonym fits the column's declared width.
+    ///
+    /// A `char(2)` country code reports bpchar, which is text-family, but a
+    /// 16-character handle in a column whose metadata says two characters gets
+    /// truncated by fixed-width client bindings — collapsing distinct values
+    /// into colliding handles — or refused by anything re-inserting the result.
+    /// `type_mod` for varchar/bpchar is the declared limit plus `VARHDRSZ` (4);
+    /// `-1` means unbounded.
+    fn pseudonym_fits_declared_width(type_oid: u32, type_mod: i32) -> bool {
+        if !matches!(type_oid, OID_VARCHAR | OID_BPCHAR) || type_mod < 4 {
+            return true;
+        }
+        usize::try_from(type_mod.saturating_sub(4)).is_ok_and(|limit| limit >= PSEUDONYM_MAX_CHARS)
     }
 
     /// Can this mask honour the given type in the given wire format?
@@ -624,6 +677,15 @@ impl Masker {
                 hex_into(&digest[..PSEUDONYM_HEX_CHARS / 2], &mut out);
                 out.push('@');
                 let mut mac = self.mac.clone();
+                // The employer half honours the same per-column domain
+                // separation as the value half. Without `spec.domain` in the
+                // key, two columns in *different* pseudonym domains emitted
+                // identical `@…` halves for the same employer, linking rows the
+                // domains exist to keep unlinkable.
+                if let Some(spec_domain) = &spec.domain {
+                    mac.update(spec_domain.as_bytes());
+                    mac.update(b"\x00");
+                }
                 mac.update(b"domain\x00");
                 mac.update(domain.as_bytes());
                 let dd: [u8; 32] = mac.finalize().into_bytes().into();
@@ -1389,6 +1451,32 @@ mod tests {
         let mut same = spec(Mask::Pseudonym);
         same.domain = Some("person".into());
         assert_eq!(apply_text(&people, "12345"), apply_text(&same, "12345"));
+    }
+
+    /// Domain separation must hold for *every byte* of an email-shaped output.
+    ///
+    /// The value half always honoured `spec.domain`; the employer half was
+    /// keyed only on the plaintext domain, so two columns in different
+    /// pseudonym domains emitted identical `@…` halves for the same employer —
+    /// enough to link rows across columns the domains exist to keep unlinkable.
+    #[test]
+    fn separate_domains_break_email_employer_linkage() {
+        let mut people = spec(Mask::Pseudonym);
+        people.domain = Some("person".into());
+        let mut accounts = spec(Mask::Pseudonym);
+        accounts.domain = Some("account".into());
+
+        let a = apply_text(&people, "alice@tinystartup.io");
+        let b = apply_text(&accounts, "bob@tinystartup.io");
+        let employer_half = |s: &str| s.split('@').nth(1).unwrap().to_string();
+        assert_ne!(
+            employer_half(&a),
+            employer_half(&b),
+            "the employer half must not link across pseudonym domains"
+        );
+        // ...while inside one domain the employer stays groupable.
+        let c = apply_text(&people, "carol@tinystartup.io");
+        assert_eq!(employer_half(&a), employer_half(&c));
     }
 
     #[test]

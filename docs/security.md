@@ -86,6 +86,11 @@ masking policy during the session.
 
 - Keep `unclassified = "mask"`. Type awareness never passes an undeclared
   value through unchanged: unsupported and ambiguous types become `NULL`.
+- Know what type-aware pseudonyms disclose: they preserve equality and
+  frequency, and a client who can also filter on the cleartext (`WHERE` runs on
+  the backend) can decode a low-cardinality column's handles in a few queries.
+  `posture = "hostile"` closes the predicate route; `unclassified_mask =
+  "null"` opts out of the disclosure entirely.
 - Review `mask = "none"` like an access-control grant.
 - Use semantic types to keep repeated policy consistent.
 - Give unrelated identifiers different pseudonym domains.

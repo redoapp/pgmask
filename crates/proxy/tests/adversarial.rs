@@ -1008,6 +1008,110 @@ async fn an_empty_catalog_masks_everything_and_still_refuses() -> Result<()> {
     Ok(())
 }
 
+/// The type-aware unclassified fallback degrades to NULL instead of refusing.
+///
+/// The pre-type-aware default (`NULL` for everything) was total; the masks
+/// that replaced it can fail per value. Each phase here is a shape that used
+/// to work under blanket NULL and would refuse mid-stream if a fallback
+/// failure were treated like a configured-mask failure:
+///
+/// 1. a `timestamptz` holding the ordinary sentinel `infinity`;
+/// 2. a session that ran `SET datestyle TO 'German'` (allowed through the
+///    read-only gate), so date output no longer parses as ISO;
+/// 3. an unclassified `inet` column bound with binary result format, which
+///    the text-only `ip-prefix` fallback cannot decode.
+///
+/// In every case the result set must be *served*, with the affected field
+/// nulled and nothing sensitive crossing.
+#[tokio::test]
+async fn type_aware_fallback_degrades_to_null_instead_of_refusing() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    exec_direct(
+        DB,
+        "DROP TABLE IF EXISTS canary.netlog;
+         CREATE TABLE canary.netlog (id int, ip inet, seen timestamptz, email text);
+         INSERT INTO canary.netlog VALUES
+           (1, '10.1.2.3', 'infinity', 'CANARY_EMAIL_a1b2c3'),
+           (2, '10.1.2.4', '2077-06-15 10:00:00+00', 'CANARY_EMAIL_a1b2c3');",
+    )
+    .await?;
+    let proxy = start_proxy(DB, Vec::new()).await?;
+
+    // Phase 1: 'infinity' cannot be truncated to a year; the row must still be
+    // served, with the field nulled rather than the stream refused.
+    {
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let msgs = client
+            .simple_query("SELECT ip, seen, email FROM canary.netlog ORDER BY id")
+            .await?;
+        assert_served(&msgs, "infinity timestamptz under the fallback");
+        let text = client.received_text();
+        assert!(
+            !text.contains("pgmask:"),
+            "a fallback-mask failure must not refuse the stream:\n{text}"
+        );
+        assert!(
+            !text.contains("infinity"),
+            "the undecodable value must be nulled, not passed through:\n{text}"
+        );
+        assert!(
+            !text.contains("2077-06"),
+            "the decodable row must still be coarsened to its year:\n{text}"
+        );
+        assert_no_canary(&client, "type-aware fallback, text formats");
+    }
+
+    // Phase 2: a client-chosen DateStyle makes every date rendering
+    // undecodable. Served, nulled, no refusal.
+    {
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        client.simple_query("SET datestyle TO 'German'").await?;
+        let msgs = client
+            .simple_query("SELECT seen FROM canary.netlog WHERE id = 2")
+            .await?;
+        assert_served(&msgs, "German DateStyle under the fallback");
+        let text = client.received_text();
+        assert!(
+            !text.contains("pgmask:"),
+            "SET datestyle must not turn the fallback into a refusal:\n{text}"
+        );
+        assert!(
+            !text.contains("2077"),
+            "the non-ISO rendering must be nulled, not passed through:\n{text}"
+        );
+    }
+
+    // Phase 3: Describe(Statement) reports text, so the fallback picks
+    // ip-prefix; the Bind then flips the portal to binary, which ip-prefix
+    // cannot decode. The rows must still be served, nulled.
+    {
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        client
+            .send(parse_msg("s", "SELECT ip FROM canary.netlog ORDER BY id"))
+            .await?;
+        client.send(describe_statement("s")).await?;
+        client
+            .send(bind_msg_with_result_format("p", "s", 1))
+            .await?;
+        client.send(execute_msg("p", 0)).await?;
+        client.send(sync_msg()).await?;
+        let msgs = client.read_until_ready().await?;
+        assert_served(&msgs, "binary-bound unclassified inet");
+        let text = client.received_text();
+        assert!(
+            !text.contains("pgmask:"),
+            "a Bind-time format flip must not refuse a fallback plan:\n{text}"
+        );
+        assert!(
+            !text.contains("10.1.2"),
+            "the packed value must be nulled, never decoded or passed:\n{text}"
+        );
+    }
+
+    Ok(())
+}
+
 /// An error still says enough to act on.
 ///
 /// Withholding the message is only defensible if the `SQLSTATE` survives — it
