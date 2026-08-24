@@ -10,13 +10,15 @@ pub mod lineage;
 pub mod mask;
 pub mod metrics;
 mod plan_state;
+pub(crate) mod policy;
 pub mod protocol;
 pub mod rate_limit;
 pub mod session;
 pub mod tls;
 
 pub use catalog::{Catalog, Config};
-pub use session::{handle_connection, Policy};
+pub use policy::Policy;
+pub use session::handle_connection;
 
 /// Extended-query protocol state machine, exposed for the sequence fuzzer.
 ///
