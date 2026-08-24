@@ -30,7 +30,6 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use pgmask::catalog::{Config, Lineage, Opaque, Summaries, SystemCatalogs, Unclassified};
-use pgmask::mask::Mask;
 use pgmask::protocol::{FrameReader, Message};
 use pgmask::{Catalog, Policy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -214,7 +213,6 @@ async fn start_proxy(
         catalog_dsn: "postgres://unused".into(),
         pseudonym_key: "test-key-long-enough".into(),
         unclassified,
-        unclassified_mask: Mask::Null,
         opaque,
         column: Vec::new(),
         semantic_type: Vec::new(),

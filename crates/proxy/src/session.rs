@@ -52,7 +52,6 @@ pub struct Policy {
     catalog: Arc<Catalog>,
     masker: Arc<Masker>,
     unclassified: Unclassified,
-    unclassified_mask: Mask,
     opaque: Opaque,
     metrics: Arc<Metrics>,
     summaries: Summaries,
@@ -153,7 +152,6 @@ impl Policy {
                 config.pseudonym_key.expose_secret().as_bytes().to_vec(),
             )),
             unclassified: config.unclassified,
-            unclassified_mask: config.unclassified_mask,
             opaque: config.opaque,
             metrics: Arc::new(Metrics::default()),
             summaries: config.effective_summaries(),
@@ -303,10 +301,27 @@ impl Policy {
                         // rate floor, so a storm of misses cannot become a query
                         // storm against the catalog.
                         self.catalog.note_unknown_relation();
-                        MaskSpec::new(match self.unclassified {
-                            Unclassified::Mask => self.unclassified_mask,
-                            Unclassified::Allow => Mask::None,
-                        })
+                        match self.unclassified {
+                            Unclassified::Mask => {
+                                let stable_name = snapshot
+                                    .name_of(field.table_oid, field.column_id)
+                                    .map_or_else(
+                                        || {
+                                            format!(
+                                                "oid.{}.{}.{}",
+                                                field.table_oid, field.column_id, field.name
+                                            )
+                                        },
+                                        str::to_owned,
+                                    );
+                                MaskSpec::for_unclassified(
+                                    field.type_oid,
+                                    field.format,
+                                    format!("unclassified:{stable_name}").into(),
+                                )
+                            }
+                            Unclassified::Allow => MaskSpec::new(Mask::None),
+                        }
                     }
                 }
             };
@@ -1177,8 +1192,8 @@ impl Session {
         // A statement that reads only metadata-only system catalogs carries
         // nothing from a user table, so every field is released — including the
         // ones that DO have provenance, which point at catalog relations no
-        // catalog file lists and which default-deny would otherwise null. That
-        // nulling is what breaks `\d`: psql feeds the OID from one query into
+        // catalog file lists and which default-deny would otherwise mask. The
+        // OID becomes NULL, which breaks `\d`: psql feeds it into
         // the next and gets `invalid input syntax for type oid: ""`.
         // Two independent gates, and both must hold.
         //
@@ -1844,7 +1859,6 @@ mod tests {
             catalog: Arc::new(Catalog::default()),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified,
-            unclassified_mask: Mask::Null,
             opaque,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
@@ -1871,7 +1885,6 @@ mod tests {
             catalog: Arc::new(Catalog::default()),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified,
-            unclassified_mask: Mask::Null,
             opaque,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
@@ -1889,12 +1902,22 @@ mod tests {
     }
 
     fn field(name: &str, table_oid: u32, column_id: i16, type_oid: u32) -> FieldDescription {
+        field_with_format(name, table_oid, column_id, type_oid, 0)
+    }
+
+    fn field_with_format(
+        name: &str,
+        table_oid: u32,
+        column_id: i16,
+        type_oid: u32,
+        format: i16,
+    ) -> FieldDescription {
         FieldDescription {
             name: name.into(),
             table_oid,
             column_id,
             type_oid,
-            format: 0,
+            format,
         }
     }
 
@@ -1906,13 +1929,6 @@ backend = "h:1"
 catalog_dsn = "postgres://unused"
 pseudonym_key = "short"
 unclassified = "allow"
-"#,
-            r#"
-backend = "h:1"
-catalog_dsn = "postgres://unused"
-pseudonym_key = "a-long-enough-key"
-unclassified = "mask"
-unclassified_mask = "none"
 "#,
             r#"
 backend = "h:1"
@@ -1979,12 +1995,28 @@ mask = "none"
     }
 
     #[test]
-    fn unclassified_columns_are_masked_by_default() {
+    fn unclassified_columns_are_masked_by_type() {
         let p = policy(Unclassified::Mask, Opaque::Reject);
+        let fields = [
+            field("body", 16391, 1, 25),
+            field("account_uuid", 16391, 2, crate::mask::OID_UUID),
+            field("birthday", 16391, 3, crate::mask::OID_DATE),
+            field("created_at", 16391, 4, crate::mask::OID_TIMESTAMP),
+            field("last_seen_at", 16391, 5, crate::mask::OID_TIMESTAMPTZ),
+            field("client_ip", 16391, 6, crate::mask::OID_INET),
+            field("salary", 16391, 7, crate::mask::OID_INT8),
+            field("sensitive_flag", 16391, 8, 16),
+            field("payload", 16391, 9, 3802),
+            field("values", 16391, 10, 1007),
+            field("custom", 16391, 11, 16399),
+            // inet/cidr binary is packed; type awareness must fall back to NULL
+            // rather than selecting a mask that refuses the entire result set.
+            field_with_format("packed_ip", 16391, 12, crate::mask::OID_CIDR, 1),
+        ];
         let plan = p
             .plan_for(
                 &p.catalog.snapshot(),
-                &[field("email", 16391, 2, 25)],
+                &fields,
                 &HashSet::new(),
                 &FieldAnalysis {
                     safety: &[],
@@ -1995,7 +2027,60 @@ mask = "none"
             )
             .ok()
             .unwrap();
-        assert_eq!(plan[0].spec.kind, Mask::Null, "default-deny");
+        assert_eq!(
+            plan.iter().map(|field| field.spec.kind).collect::<Vec<_>>(),
+            [
+                Mask::Pseudonym,
+                Mask::Pseudonym,
+                Mask::DateYear,
+                Mask::DateYear,
+                Mask::DateYear,
+                Mask::IpPrefix,
+                Mask::Null,
+                Mask::Null,
+                Mask::Null,
+                Mask::Null,
+                Mask::Null,
+                Mask::Null,
+            ]
+        );
+        assert!(plan
+            .iter()
+            .all(|field| field.spec.supports(field.type_oid, field.format)));
+    }
+
+    #[test]
+    fn unclassified_pseudonym_domains_are_stable_and_column_separated() {
+        let p = policy(Unclassified::Mask, Opaque::Reject);
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_column_name_for_test(101, 1, "crm.activities.from_value");
+        snapshot.insert_column_name_for_test(202, 7, "crm.activities.from_value");
+        snapshot.insert_column_name_for_test(303, 1, "crm.activities.to_value");
+
+        let plan = p
+            .plan_for(
+                &snapshot,
+                &[
+                    field("from_value", 101, 1, 25),
+                    field("from_value", 202, 7, 25),
+                    field("to_value", 303, 1, 25),
+                ],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .unwrap();
+
+        assert_eq!(plan[0].spec.domain, plan[1].spec.domain, "OID churn");
+        assert_ne!(
+            plan[0].spec.domain, plan[2].spec.domain,
+            "unrelated columns must not become linkable"
+        );
     }
 
     #[test]
@@ -2171,7 +2256,6 @@ mask = "none"
             catalog: Arc::new(Catalog::from_snapshot_for_test(snapshot)),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified: Unclassified::Allow,
-            unclassified_mask: Mask::Null,
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
@@ -2420,7 +2504,6 @@ mask = "none"
             catalog: Arc::new(Catalog::default()),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified: Unclassified::Allow,
-            unclassified_mask: Mask::Null,
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,
@@ -2442,7 +2525,6 @@ mask = "none"
             catalog: Arc::new(Catalog::default()),
             masker: Arc::new(Masker::new(b"k".to_vec())),
             unclassified: Unclassified::Allow,
-            unclassified_mask: Mask::Null,
             opaque: Opaque::Reject,
             metrics: Arc::new(Metrics::default()),
             summaries: Summaries::Allow,

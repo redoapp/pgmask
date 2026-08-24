@@ -325,6 +325,64 @@ fn harlequin_relation_description_is_metadata_only() {
 }
 
 #[test]
+fn psql_describe_partition_query_is_metadata_only() {
+    // PostgreSQL 17's `psql \d` checks foreign keys on every partition
+    // ancestor. The function returns catalog OIDs and belongs on the same
+    // metadata-only path as the surrounding `pg_constraint` read.
+    let sql = r#"
+        SELECT conname, conrelid::pg_catalog.regclass AS ontable,
+               pg_catalog.pg_get_constraintdef(oid, true) AS condef
+          FROM pg_catalog.pg_constraint c
+         WHERE confrelid IN (
+                   SELECT pg_catalog.pg_partition_ancestors('16386')
+                   UNION ALL VALUES ('16386'::pg_catalog.regclass)
+               )
+           AND contype = 'f' AND conparentid = 0
+        ORDER BY conname
+    "#;
+
+    assert!(reads_only_server_metadata(sql));
+    assert!(!calls_untrusted_function(sql));
+
+    // PostgreSQL 17 also describes publications. `pg_relation_is_publishable`
+    // returns catalog metadata; it does not read rows from the relation.
+    let publication_sql = r#"
+        SELECT pubname, NULL, NULL
+          FROM pg_catalog.pg_publication p
+          JOIN pg_catalog.pg_publication_namespace pn ON p.oid = pn.pnpubid
+          JOIN pg_catalog.pg_class pc ON pc.relnamespace = pn.pnnspid
+         WHERE pc.oid = '16386'
+           AND pg_catalog.pg_relation_is_publishable('16386')
+        UNION
+        SELECT pubname, pg_get_expr(pr.prqual, c.oid),
+               CASE WHEN pr.prattrs IS NOT NULL THEN
+                   (SELECT string_agg(attname, ', ')
+                      FROM pg_catalog.generate_series(
+                               0,
+                               pg_catalog.array_upper(
+                                   pr.prattrs::pg_catalog.int2[], 1
+                               )
+                           ) s,
+                           pg_catalog.pg_attribute
+                     WHERE attrelid = pr.prrelid AND attnum = prattrs[s])
+               ELSE NULL END
+          FROM pg_catalog.pg_publication p
+          JOIN pg_catalog.pg_publication_rel pr ON p.oid = pr.prpubid
+          JOIN pg_catalog.pg_class c ON c.oid = pr.prrelid
+         WHERE pr.prrelid = '16386'
+        UNION
+        SELECT pubname, NULL, NULL
+          FROM pg_catalog.pg_publication p
+         WHERE p.puballtables
+           AND pg_catalog.pg_relation_is_publishable('16386')
+        ORDER BY 1
+    "#;
+
+    assert!(reads_only_server_metadata(publication_sql));
+    assert!(!calls_untrusted_function(publication_sql));
+}
+
+#[test]
 fn data_bearing_set_returning_functions_do_not_get_the_metadata_fast_path() {
     // Range functions can expose the same data as denied catalog views,
     // while a joined pg_catalog relation supplies the otherwise-required

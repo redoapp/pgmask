@@ -2,6 +2,19 @@
 
 ## 0.1.92 — hostile SQL gate: agg ORDER BY, JSON_TABLE, PREPARE, SEARCH/CYCLE, JSON agg
 
+### Type-aware defaults for unclassified columns
+
+`unclassified = "mask"` now pseudonymises text and UUID values, reduces dates
+and timestamps to a year, and removes host bits from text-format IP addresses.
+Numeric, boolean, structured, custom, and unsupported binary values remain
+withheld as `NULL`.
+
+This removes the `unclassified_mask` setting. Delete that line before upgrading;
+configs that still contain it are rejected at startup. Pseudonyms use stable,
+column-scoped domains so unrelated unclassified columns are not linkable.
+
+The lockfile also updates `h2` to 0.4.16, fixing RUSTSEC-2026-0258.
+
 Live membership / cleartext-row oracles under `posture = "hostile"` that
 `pg_query::nodes()` never visits. Unicode-escaped masked names
 (`u&"email"`) are invisible to the lexer, so a missed node was an allow:

@@ -17,7 +17,7 @@ CREATE TABLE demo.customers (
   annual_salary int NOT NULL,
   last_ip       text NOT NULL,
   account_uuid  uuid NOT NULL,
-  -- Never added to catalog.toml, so default-deny should null it out.
+  -- Never added to catalog.toml, so default-deny should mask it.
   internal_note text
 );
 

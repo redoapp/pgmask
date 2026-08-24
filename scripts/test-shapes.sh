@@ -180,7 +180,6 @@ backend = "127.0.0.1:$port"
 catalog_dsn = "$dsn"
 pseudonym_key = "shape-sweep-key-1"
 unclassified = "mask"
-unclassified_mask = "null"
 opaque = "reject"
 catalog_refresh_seconds = 30
 

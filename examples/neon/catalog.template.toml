@@ -12,10 +12,9 @@ backend       = "__BACKEND__"
 catalog_dsn   = "__DSN__"
 pseudonym_key = "neon-experiment-key"
 
-unclassified      = "__UNCLASSIFIED__"
-unclassified_mask = "null"
-opaque            = "__OPAQUE__"
-backend_tls       = "require"
+unclassified = "__UNCLASSIFIED__"
+opaque       = "__OPAQUE__"
+backend_tls  = "require"
 
 catalog_refresh_seconds  = 300
 metrics_interval_seconds = 5

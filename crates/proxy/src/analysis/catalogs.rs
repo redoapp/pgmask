@@ -5,7 +5,7 @@
 //! `pg_get_userbyid(c.relowner)`, `format_type(...)`, `'pg_class'::regclass` —
 //! so output classification refuses them, and the columns that *do* have
 //! provenance point at catalog tables that are not in anyone's catalog file, so
-//! default-deny nulls them.
+//! default-deny masks them.
 //!
 //! Nulling is the worse half. `\d` sends a follow-up query built from the OID
 //! the first one returned; masked to NULL, psql interpolates an empty string and
@@ -28,7 +28,7 @@ use super::walk::{tree_any, walk_parsed};
 use super::StatementInspection;
 
 /// True when the statement names a catalog that holds sampled user data,
-/// other sessions' SQL, passwords, or similar — values default-deny nulling
+/// other sessions' SQL, passwords, or similar — default-deny masking
 /// is not enough for, because the query still runs and soft stats / empty
 /// shapes remain. Refused at the frontend on every posture.
 pub fn touches_leaky_system_catalog(sql: &str) -> bool {

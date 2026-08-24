@@ -1255,7 +1255,7 @@ async fn a_reshaped_masked_column_stays_masked_under_default_deny() -> Result<()
     let msgs = after
         .simple_query("SELECT secret FROM canary.reshape")
         .await?;
-    // Default-deny masks the reshaped column to NULL and still serves the row —
+    // Default-deny masks the reshaped column and still serves the row —
     // the guarantee is that the value never appears, not that the query is
     // refused.
     assert_served(&msgs, "reshape: immediately after ALTER");

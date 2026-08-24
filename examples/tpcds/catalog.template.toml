@@ -12,9 +12,8 @@ backend       = "127.0.0.1:55440"
 catalog_dsn   = "__DSN__"
 pseudonym_key = "tpcds-experiment"
 
-unclassified      = "__UNCLASSIFIED__"
-unclassified_mask = "null"
-opaque            = "__OPAQUE__"
+unclassified = "__UNCLASSIFIED__"
+opaque       = "__OPAQUE__"
 
 catalog_refresh_seconds  = 300
 metrics_interval_seconds = 5

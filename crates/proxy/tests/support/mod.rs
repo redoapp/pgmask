@@ -379,7 +379,6 @@ pub async fn start_proxy_at_full(
         pseudonym_key: "test-key-long-enough".into(),
         unclassified,
         opaque,
-        unclassified_mask: Mask::Null,
         column: rules,
         semantic_type: Vec::new(),
         role: roles,

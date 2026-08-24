@@ -8,7 +8,7 @@ Read the [security model](security.md) before production deployment.
 - Block direct user access to PostgreSQL.
 - Use a `SELECT`-only database role or a read replica.
 - Require client TLS and protect the backend hop.
-- Keep `unclassified = "mask"` with `unclassified_mask = "null"`.
+- Keep `unclassified = "mask"`.
 - Run `classify --check` against the migrated schema.
 - Alert on coverage warnings and rejection metrics.
 
@@ -18,7 +18,7 @@ Schema and policy changes can deploy in either order under default-deny:
 
 | Order | Temporary behavior |
 |---|---|
-| Schema first | New columns are unclassified and return `NULL`. |
+| Schema first | New columns use the type-aware default-deny policy. |
 | Policy first | New rules remain unresolved until the columns exist. |
 
 Both orders reduce utility rather than expose an unclassified value. This does
@@ -28,8 +28,8 @@ Common schema changes behave as follows:
 
 | Change | Runtime behavior | `classify --check` |
 |---|---|---|
-| Add a column | Default mask until classified | Reports a missing rule |
-| Rename a column | New name is masked; old rule is unresolved | Reports both |
+| Add a column | Type-aware fallback until classified | Reports a missing rule |
+| Rename a column | New name uses type-aware fallback; old rule is unresolved | Reports both |
 | Drop a column | Rule becomes unresolved | Reports a stale rule |
 | Recreate a relation | OIDs refresh; unknown OIDs use default policy | No policy change required |
 | Change a column type | Incompatible masks reject the result set | Reports the mismatch |

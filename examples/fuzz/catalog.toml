@@ -3,7 +3,6 @@ backend = "127.0.0.1:55432"
 catalog_dsn = "postgres://postgres:demo@localhost:55432/fuzzdb"
 pseudonym_key = "fuzz-fixture-key"
 unclassified = "mask"
-unclassified_mask = "null"
 opaque = "reject"
 lineage = "allow"
 catalog_refresh_seconds = 300

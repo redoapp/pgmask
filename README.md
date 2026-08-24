@@ -121,7 +121,6 @@ pseudonym_key = "replace-with-at-least-16-random-bytes"
 
 # Safe defaults.
 unclassified = "mask"
-unclassified_mask = "null"
 opaque = "reject"
 lineage = "refuse"
 summaries = "allow"
@@ -169,7 +168,7 @@ and unresolved configured columns are startup errors.
 
 | Setting | Default | Behavior |
 |---|---|---|
-| `unclassified` | `mask` | Mask columns missing from the catalog. `allow` is an incremental-rollout escape hatch. |
+| `unclassified` | `mask` | Type-aware masking for columns missing from the catalog. `allow` is an incremental-rollout escape hatch. |
 | `opaque` | `reject` | Reject computed or otherwise unclassified result fields. `mask` replaces them with `NULL`. |
 | `lineage` | `refuse` | When enabled, release an expression only if all resolved source columns are explicitly released. |
 | `summaries` | `allow` | Allow supported reducing aggregates, while applying the source column's policy when required. |
@@ -210,7 +209,10 @@ not.
 ## Query behavior
 
 - Plain classified columns use their catalog policy.
-- Unclassified columns use `unclassified_mask`, which defaults to `NULL`.
+- Unclassified text and UUID values become column-scoped pseudonyms; dates and
+  timestamps reduce to a year; text-format IPs reduce to a network prefix.
+  Numeric, boolean, structured, binary, custom, and unsupported wire types
+  become `NULL`.
 - Safe scalar values such as literals, `now()`, and `count(*)` pass through.
 - Expressions over masked columns, value-returning aggregates such as `max`,
   set operations, recursive common table expressions, and set-returning
