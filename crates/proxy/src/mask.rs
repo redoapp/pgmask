@@ -558,6 +558,26 @@ pub struct Masker {
     mac: HmacSha256,
 }
 
+/// HMAC state with a spec's domain separator already absorbed.
+///
+/// The domain is fixed for the lifetime of a plan, but `digest` used to
+/// re-absorb it for every value — 20-60 domain bytes plus the separator, which
+/// pushes most short values from one SHA-256 compression block to two. Priming
+/// once when the plan is built and cloning the primed state per row is the same
+/// trade `Masker::mac` already makes for the key schedule.
+///
+/// Opaque on purpose: the only way to make one is [`Masker::prime`], so a
+/// primed state can never carry the wrong domain for the spec it rides with.
+#[derive(Clone)]
+pub struct PrimedMac(HmacSha256);
+
+impl std::fmt::Debug for PrimedMac {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The state derives from the pseudonym key; never print it.
+        f.write_str("PrimedMac(..)")
+    }
+}
+
 impl Masker {
     pub fn new(key: impl Into<Vec<u8>>) -> Self {
         let key = key.into();
@@ -573,6 +593,22 @@ impl Masker {
     pub fn apply(
         &self,
         spec: &MaskSpec,
+        type_oid: u32,
+        format: i16,
+        value: Option<Bytes>,
+    ) -> Result<Option<Bytes>, MaskError> {
+        self.apply_primed(spec, None, type_oid, format, value)
+    }
+
+    /// [`apply`](Self::apply) with an optional pre-primed HMAC state.
+    ///
+    /// `primed` must come from [`prime`](Self::prime) on the same spec — the
+    /// opaque [`PrimedMac`] type makes any other origin impossible. `None` is
+    /// always correct and merely pays the per-value domain absorb.
+    pub fn apply_primed(
+        &self,
+        spec: &MaskSpec,
+        primed: Option<&PrimedMac>,
         type_oid: u32,
         format: i16,
         value: Option<Bytes>,
@@ -601,10 +637,10 @@ impl Masker {
             Mask::Range => text_op(&bytes, |t| range(t, spec.start as usize, spec.end as usize)),
             Mask::Hash => {
                 let mut out = String::with_capacity(32);
-                hex_into(&self.digest(spec, &bytes)[..16], &mut out);
+                hex_into(&self.digest(spec, primed, &bytes)[..16], &mut out);
                 Bytes::from(out)
             }
-            Mask::Pseudonym => self.pseudonym(spec, type_oid, format, &bytes)?,
+            Mask::Pseudonym => self.pseudonym(spec, primed, type_oid, format, &bytes)?,
             Mask::DateYear | Mask::DateMonth => truncate_date(&bytes, type_oid, format, spec.kind)?,
             Mask::NumericBucket => bucket_number(&bytes, type_oid, format, spec.bucket)?,
             Mask::IpPrefix => text_op(&bytes, ip_prefix),
@@ -614,14 +650,38 @@ impl Masker {
         Ok(Some(out))
     }
 
-    fn digest(&self, spec: &MaskSpec, input: &[u8]) -> [u8; 32] {
+    /// Absorb a spec's domain separator once, for cloning per row.
+    ///
+    /// `Some` only for the digest-based masks (`hash`, `pseudonym`) — the only
+    /// ones whose per-value cost the priming reduces.
+    pub fn prime(&self, spec: &MaskSpec) -> Option<PrimedMac> {
+        if !matches!(spec.kind, Mask::Hash | Mask::Pseudonym) {
+            return None;
+        }
         let mut mac = self.mac.clone();
-        // Domain separation: same value in different domains must not collide,
-        // so unrelated columns cannot be linked by comparing pseudonyms.
         if let Some(domain) = &spec.domain {
             mac.update(domain.as_bytes());
             mac.update(b"\x00");
         }
+        Some(PrimedMac(mac))
+    }
+
+    fn digest(&self, spec: &MaskSpec, primed: Option<&PrimedMac>, input: &[u8]) -> [u8; 32] {
+        let mut mac = match primed {
+            // The domain separator is already absorbed into the primed state.
+            Some(primed) => primed.0.clone(),
+            None => {
+                let mut mac = self.mac.clone();
+                // Domain separation: same value in different domains must not
+                // collide, so unrelated columns cannot be linked by comparing
+                // pseudonyms.
+                if let Some(domain) = &spec.domain {
+                    mac.update(domain.as_bytes());
+                    mac.update(b"\x00");
+                }
+                mac
+            }
+        };
         mac.update(input);
         mac.finalize().into_bytes().into()
     }
@@ -637,6 +697,7 @@ impl Masker {
     fn pseudonym(
         &self,
         spec: &MaskSpec,
+        primed: Option<&PrimedMac>,
         type_oid: u32,
         format: i16,
         bytes: &Bytes,
@@ -652,7 +713,7 @@ impl Masker {
             // first end-to-end test that asked for binary results.
             let canonical =
                 canonical_uuid(bytes, format).ok_or(MaskError::Undecodable { type_oid, format })?;
-            let digest = self.digest(spec, &Bytes::copy_from_slice(&canonical));
+            let digest = self.digest(spec, primed, &Bytes::copy_from_slice(&canonical));
             return Ok(if format == FORMAT_BINARY {
                 Bytes::copy_from_slice(&uuid_bytes(&digest))
             } else {
@@ -660,7 +721,7 @@ impl Masker {
             });
         }
 
-        let digest = self.digest(spec, bytes);
+        let digest = self.digest(spec, primed, bytes);
 
         let text = String::from_utf8_lossy(bytes);
         let as_email = text
@@ -1427,6 +1488,33 @@ mod tests {
     }
 
     // --- Pseudonyms and domains ---------------------------------------------
+
+    /// Priming is a pure precomputation: a primed apply must be byte-identical
+    /// to the unprimed one for every digest-based shape, or every pseudonym
+    /// ever issued changes value the moment the hot path adopts priming.
+    #[test]
+    fn primed_and_unprimed_digests_agree() {
+        let m = masker();
+        for kind in [Mask::Pseudonym, Mask::Hash] {
+            for domain in [None, Some("person")] {
+                let mut spec = spec(kind);
+                spec.domain = domain.map(Into::into);
+                let primed = m.prime(&spec);
+                assert!(primed.is_some(), "digest-based masks must prime");
+                for value in ["12345", "alice@tinystartup.io", ""] {
+                    let raw = Bytes::copy_from_slice(value.as_bytes());
+                    let plain = m.apply(&spec, 25, FORMAT_TEXT, Some(raw.clone())).unwrap();
+                    let fast = m
+                        .apply_primed(&spec, primed.as_ref(), 25, FORMAT_TEXT, Some(raw))
+                        .unwrap();
+                    assert_eq!(plain, fast, "{kind:?} domain {domain:?} value {value:?}");
+                }
+            }
+        }
+        // Non-digest masks have nothing to prime.
+        assert!(m.prime(&spec(Mask::Redact)).is_none());
+        assert!(m.prime(&spec(Mask::DateYear)).is_none());
+    }
 
     #[test]
     fn pseudonym_is_deterministic() {

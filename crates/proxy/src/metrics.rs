@@ -57,6 +57,10 @@ pub enum Cause {
     OpaqueFunction,
     /// The configured mask cannot apply to this column's type.
     MaskTypeMismatch,
+    /// An automatic fallback would return NULL for a source column constrained
+    /// NOT NULL directly or through its domain. Refused before RowDescription
+    /// so typed clients do not receive a proxy-introduced unexpected NULL.
+    NullabilityMismatch,
     /// Rows arrived with no described result set.
     NoActivePlan,
     /// A COPY stream, which carries no RowDescription.
@@ -105,6 +109,7 @@ impl Cause {
         Cause::OpaqueAggregate,
         Cause::OpaqueFunction,
         Cause::MaskTypeMismatch,
+        Cause::NullabilityMismatch,
         Cause::NoActivePlan,
         Cause::CopyStream,
         Cause::FunctionCallMessage,
@@ -129,6 +134,7 @@ impl Cause {
             Cause::OpaqueAggregate => "opaque_aggregate",
             Cause::OpaqueFunction => "opaque_function",
             Cause::MaskTypeMismatch => "mask_type_mismatch",
+            Cause::NullabilityMismatch => "nullability_mismatch",
             Cause::NoActivePlan => "no_active_plan",
             Cause::CopyStream => "copy_stream",
             Cause::FunctionCallMessage => "function_call_message",

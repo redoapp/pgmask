@@ -422,6 +422,71 @@ pub fn parse_data_row(body: &Bytes) -> Result<Vec<Option<Bytes>>> {
     Ok(out)
 }
 
+/// Incremental reader over a `DataRow` body, for the masking loop.
+///
+/// `parse_data_row` collects every field into a `Vec` before the caller looks
+/// at any of them. The masking path visits each field exactly once and writes
+/// its output straight into the outbound frame, so the collection is a per-row
+/// allocation that buys nothing there. This reader yields the same zero-copy
+/// `Option<Bytes>` slices one at a time and enforces the same framing rules:
+/// the declared count, no truncation, no trailing bytes.
+pub struct DataRowReader {
+    buf: Bytes,
+    remaining_fields: i16,
+}
+
+impl DataRowReader {
+    pub fn new(body: &Bytes) -> Result<Self> {
+        let mut buf = body.clone();
+        if buf.remaining() < 2 {
+            bail!("truncated DataRow");
+        }
+        let count = buf.get_i16();
+        if count < 0 {
+            bail!("negative DataRow field count");
+        }
+        Ok(Self {
+            buf,
+            remaining_fields: count,
+        })
+    }
+
+    pub fn field_count(&self) -> usize {
+        // Non-negative by the constructor check.
+        self.remaining_fields.max(0) as usize
+    }
+
+    /// The next field, or `Ok(None)` when the declared count is exhausted.
+    ///
+    /// After `Ok(None)`, the frame is fully validated: a body with trailing
+    /// bytes fails here rather than being silently accepted.
+    pub fn next_field(&mut self) -> Result<Option<Option<Bytes>>> {
+        if self.remaining_fields == 0 {
+            if !self.buf.is_empty() {
+                bail!("trailing bytes in DataRow");
+            }
+            return Ok(None);
+        }
+        // Non-zero by the early return above; saturating states the bound.
+        self.remaining_fields = self.remaining_fields.saturating_sub(1);
+        if self.buf.remaining() < 4 {
+            bail!("truncated DataRow field length");
+        }
+        let len = self.buf.get_i32();
+        if len == -1 {
+            return Ok(Some(None));
+        }
+        if len < -1 {
+            bail!("invalid negative DataRow field length");
+        }
+        let len = len as usize;
+        if self.buf.remaining() < len {
+            bail!("truncated DataRow field body");
+        }
+        Ok(Some(Some(self.buf.split_to(len))))
+    }
+}
+
 /// Build a `DataRow` frame directly.
 ///
 /// Writes the tag and length prefix in place rather than building a body and

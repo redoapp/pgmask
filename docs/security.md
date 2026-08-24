@@ -86,6 +86,12 @@ masking policy during the session.
 
 - Keep `unclassified = "mask"`. Type awareness never passes an undeclared
   value through unchanged: unsupported and ambiguous types become `NULL`.
+  When the catalog says the source is `NOT NULL`, directly or through a domain
+  chain, an automatic `NULL` fallback is rejected instead. This is based on the
+  source constraint, not full query-result nullability: an outer join can make
+  the result nullable and may therefore be conservatively over-rejected.
+  Explicit `unclassified_mask = "null"` deliberately overrides the guard.
+  Added or removed constraints take effect after the next catalog refresh.
 - Know what type-aware pseudonyms disclose: they preserve equality and
   frequency, and a client who can also filter on the cleartext (`WHERE` runs on
   the backend) can decode a low-cardinality column's handles in a few queries.

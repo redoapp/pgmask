@@ -353,6 +353,7 @@ impl ProtocolModel {
                         type_oid: id,
                         format: 0,
                         lenient: false,
+                        primed: None,
                     })
                     .collect(),
             )

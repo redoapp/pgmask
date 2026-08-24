@@ -35,6 +35,30 @@ proptest! {
         let _ = parse_data_row(&Bytes::from(bytes));
     }
 
+    /// The incremental reader the masking loop uses must accept exactly the
+    /// frames `parse_data_row` accepts, yield the same fields, and refuse the
+    /// same malformations — on arbitrary bytes, not just well-formed rows. A
+    /// disagreement here means the fused path judges different bytes from the
+    /// ones the collected path validated.
+    #[test]
+    fn data_row_reader_agrees_with_parse_data_row(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+        let body = Bytes::from(bytes);
+        let collected = parse_data_row(&body);
+        let streamed = (|| -> anyhow::Result<Vec<Option<Bytes>>> {
+            let mut reader = DataRowReader::new(&body)?;
+            let mut out = Vec::new();
+            while let Some(field) = reader.next_field()? {
+                out.push(field);
+            }
+            Ok(out)
+        })();
+        match (collected, streamed) {
+            (Ok(a), Ok(b)) => prop_assert_eq!(a, b),
+            (Err(_), Err(_)) => {}
+            (a, b) => prop_assert!(false, "collected {a:?} but streamed {b:?}"),
+        }
+    }
+
     #[test]
     fn error_scrubbing_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
         let _ = scrub_error(&Bytes::from(bytes));

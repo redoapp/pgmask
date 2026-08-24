@@ -35,15 +35,18 @@ pub(crate) struct FieldPlan {
     pub(crate) spec: MaskSpec,
     pub(crate) type_oid: u32,
     pub(crate) format: i16,
-    /// The spec is the *type-aware fallback* for an unclassified column, not an
-    /// operator's choice. A fallback mask that cannot be applied to some value
-    /// or format degrades that field to NULL — strictly less disclosure —
-    /// instead of refusing the result set: the old unclassified default was
-    /// total (`NULL` for everything), and replacing it with masks that can fail
-    /// per value (`date-year` on `infinity`, `ip-prefix` after a Bind flips the
-    /// portal to binary) must not turn previously-working queries into
-    /// mid-stream rejections. A configured mask stays fail-closed.
+    /// The spec is the *type-aware fallback* for an unclassified nullable (or
+    /// catalog-unresolved) column, not an operator's choice. A fallback mask
+    /// that cannot be applied to some value or format degrades that field to
+    /// NULL — strictly less disclosure — instead of refusing the result set.
+    /// Declared NOT NULL sources and configured masks stay fail-closed.
     pub(crate) lenient: bool,
+    /// HMAC state with this spec's pseudonym domain already absorbed, built
+    /// once when the plan is bound. The domain is fixed for the plan's
+    /// lifetime, and re-absorbing 20-60 domain bytes per value pushed most
+    /// short pseudonym inputs from one SHA-256 compression block to two.
+    /// `None` for masks that do not digest; always safe to ignore.
+    pub(crate) primed: Option<crate::mask::PrimedMac>,
 }
 
 pub(crate) type Plan = Arc<Vec<FieldPlan>>;
@@ -707,6 +710,7 @@ mod tests {
             type_oid: 25,
             format: 0,
             lenient: false,
+            primed: None,
         }])
     }
 
