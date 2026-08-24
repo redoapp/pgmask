@@ -564,7 +564,7 @@ pub struct Masker {
 /// re-absorb it for every value — 20-60 domain bytes plus the separator, which
 /// pushes most short values from one SHA-256 compression block to two. Priming
 /// once when the plan is built and cloning the primed state per row is the same
-/// trade [`Masker::mac`] already makes for the key schedule.
+/// trade `Masker::mac` already makes for the key schedule.
 ///
 /// Opaque on purpose: the only way to make one is [`Masker::prime`], so a
 /// primed state can never carry the wrong domain for the spec it rides with.
