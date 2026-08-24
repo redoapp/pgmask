@@ -4,12 +4,21 @@
 
 Fixes from a review of the 0.1.92 type-aware defaults:
 
-- **Fallback masks never kill a stream.** The old unclassified default
-  (`NULL`) was total; the type-aware masks can fail per value. A fallback mask
-  that cannot honour a value or format — an `infinity` timestamp, output under
-  a non-ISO `DateStyle`, an inet column a Bind flipped to binary format — now
-  nulls that field instead of rejecting the result set mid-stream.
-  Operator-configured masks stay fail-closed.
+- **Automatic fallbacks preserve declared nullability.** A type-aware default
+  no longer sends `NULL` for a catalog-resolved `NOT NULL` source column,
+  including constraints inherited through nested domains. If the type has only
+  a `NULL` mask, pgmask refuses the result before its row description; if a
+  non-NULL mask fails for one value, it fails closed instead of degrading that
+  value to `NULL`. This source-based check can conservatively over-reject an
+  outer-join result. Explicit `unclassified_mask = "null"` keeps its
+  operator-chosen behavior.
+- **Nullable fallback masks do not kill a stream.** The old unclassified
+  default (`NULL`) was total; the type-aware masks can fail per value. For a
+  nullable or catalog-unresolved source, a fallback mask that cannot honour a
+  value or format — an `infinity` timestamp, output under a non-ISO
+  `DateStyle`, an inet column a Bind flipped to binary format — now nulls that
+  field instead of rejecting the result set mid-stream. Operator-configured
+  masks and declared `NOT NULL` sources stay fail-closed.
 - **`unclassified_mask` is back, as a policy choice.** `type-aware` (default)
   or `null`, which restores the strict pre-0.1.92 posture of `NULL` for every
   unclassified value. A config still carrying the removed knob's

@@ -211,10 +211,12 @@ impl Policy {
         let mut plan = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
             let provably_safe = analysis.safety.get(index).copied() == Some(Safety::Releasable);
-            // Set only by the type-aware unclassified fallback: a default mask
-            // that cannot be applied to some value nulls that field instead of
-            // refusing the stream. Operator-chosen masks stay fail-closed.
+            // Set only by the type-aware unclassified fallback when source
+            // nullability permits it: a default mask that cannot be applied to
+            // some value nulls that field instead of refusing the stream.
+            // Operator-chosen masks stay fail-closed.
             let mut lenient = false;
+            let mut type_aware_fallback = false;
             // A set operation can put values from several columns into one
             // output field, and CockroachDB reports the first branch's OID for
             // the whole thing. Believing it applies one column's mask to
@@ -316,7 +318,7 @@ impl Policy {
                         self.catalog.note_unknown_relation();
                         match (self.unclassified, self.unclassified_mask) {
                             (Unclassified::Mask, UnclassifiedMask::TypeAware) => {
-                                lenient = true;
+                                type_aware_fallback = true;
                                 // Only a name the *catalog* resolved keys a
                                 // pseudonym domain. There is no OID-based
                                 // fallback: an OID is volatile across DDL and
@@ -341,6 +343,31 @@ impl Policy {
                     }
                 }
             };
+
+            if type_aware_fallback {
+                let source_is_not_null =
+                    snapshot.is_not_null(field.table_oid, field.column_id) == Some(true);
+                if source_is_not_null && spec.kind == Mask::Null {
+                    let name = snapshot
+                        .name_of(field.table_oid, field.column_id)
+                        .unwrap_or(&field.name);
+                    return Err(Rejection {
+                        cause: Cause::NullabilityMismatch,
+                        message: format!(
+                            "pgmask: automatic mask for {name} would return NULL for a NOT NULL column"
+                        ),
+                        hint: Some(
+                            "Classify the column with a compatible non-NULL mask, make the source column nullable, or explicitly choose unclassified_mask = \"null\"."
+                                .into(),
+                        ),
+                    });
+                }
+                // For a declared NOT NULL source, a value-specific transform
+                // failure must reject rather than surprise a strongly typed
+                // client with NULL. Nullable and unresolved sources retain the
+                // availability-oriented automatic fallback.
+                lenient = !source_is_not_null;
+            }
 
             // Catch type/format mismatches once here rather than per row, so a
             // misconfiguration refuses the result set instead of dying halfway
@@ -2095,6 +2122,65 @@ mask = "none"
         );
     }
 
+    /// The wire protocol permits NULL for any result field, but a client that
+    /// learned this stored column's NOT NULL contract will decode it into a
+    /// non-optional type. An automatic fallback must fail before RowDescription
+    /// rather than return a value that contradicts that contract.
+    #[test]
+    fn automatic_null_fallback_rejects_a_not_null_column() {
+        let p = policy(Unclassified::Mask, Opaque::Reject);
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_column_name_for_test(16_391, 7, "demo.t.salary");
+        snapshot.mark_not_null_for_test(16_391, 7);
+
+        let err = p
+            .plan_for(
+                &snapshot,
+                &[field("salary", 16_391, 7, crate::mask::OID_INT8)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
+            )
+            .expect_err("an automatic NULL must not violate source nullability");
+
+        assert_eq!(err.cause, Cause::NullabilityMismatch);
+        assert!(err.message.contains("NOT NULL"), "{}", err.message);
+        assert!(err.message.contains("demo.t.salary"), "{}", err.message);
+    }
+
+    #[test]
+    fn not_null_type_aware_mask_does_not_degrade_value_failures_to_null() {
+        let p = policy(Unclassified::Mask, Opaque::Reject);
+        let mut snapshot = crate::catalog::Snapshot::default();
+        snapshot.insert_column_name_for_test(16_391, 3, "demo.t.birthday");
+        snapshot.mark_not_null_for_test(16_391, 3);
+
+        let plan = p
+            .plan_for(
+                &snapshot,
+                &[field("birthday", 16_391, 3, crate::mask::OID_DATE)],
+                &HashSet::new(),
+                &FieldAnalysis {
+                    safety: &[],
+                    lineage: &[],
+                    summary: &[],
+                    trust_provenance: true,
+                },
+            )
+            .ok()
+            .expect("date-year can preserve NOT NULL for transformable values");
+
+        assert_eq!(plan[0].spec.kind, Mask::DateYear);
+        assert!(
+            !plan[0].lenient,
+            "a per-value failure must reject rather than produce NULL"
+        );
+    }
+
     /// A column the catalog has not resolved yet — a table created between
     /// refreshes — has no stable identity to key a pseudonym domain, so text
     /// and uuid fall back to honest NULL rather than to a handle that would
@@ -2135,6 +2221,7 @@ mask = "none"
         Arc::get_mut(&mut p).unwrap().unclassified_mask = UnclassifiedMask::Null;
         let mut snapshot = crate::catalog::Snapshot::default();
         snapshot.insert_column_name_for_test(16391, 1, "demo.t.body");
+        snapshot.mark_not_null_for_test(16391, 1);
         let plan = p
             .plan_for(
                 &snapshot,

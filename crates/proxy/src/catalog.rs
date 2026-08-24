@@ -593,6 +593,11 @@ pub struct Snapshot {
     /// type-aware fallback keys unclassified pseudonym domains on it, so the
     /// domains survive OID churn and do not depend on client-chosen aliases.
     all_columns: HashMap<(u32, i16), String>,
+    /// Whether each live user column is effectively NOT NULL, either directly
+    /// or through any domain in its type chain. Kept separately from names
+    /// because a missing entry means the catalog has not resolved the column,
+    /// while `false` means it positively resolved as nullable.
+    column_not_null: HashMap<(u32, i16), bool>,
     /// Relation OIDs we know about, so an unknown one can be told apart from a
     /// relation we resolved whose column is merely unclassified.
     relations: HashSet<u32>,
@@ -902,6 +907,11 @@ impl Snapshot {
             .map(String::as_str)
     }
 
+    /// The source column's effective nullability, when the catalog resolved it.
+    pub(crate) fn is_not_null(&self, table_oid: u32, column_id: i16) -> Option<bool> {
+        self.column_not_null.get(&(table_oid, column_id)).copied()
+    }
+
     pub fn knows_relation(&self, table_oid: u32) -> bool {
         self.relations.contains(&table_oid)
     }
@@ -1046,6 +1056,11 @@ impl Snapshot {
     ) {
         self.all_columns
             .insert((table_oid, column_id), name.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_not_null_for_test(&mut self, table_oid: u32, column_id: i16) {
+        self.column_not_null.insert((table_oid, column_id), true);
     }
 }
 
@@ -1549,24 +1564,49 @@ async fn resolve_snapshot(
         .collect();
 
     // Every user relation and its columns. Bounded by schema count, loaded once
-    // per refresh, and lineage cannot resolve anything without it.
+    // per refresh, and lineage cannot resolve anything without it. The
+    // recursive arm follows domain base types so `CREATE DOMAIN ... NOT NULL`
+    // remains effective even through another domain; ordinary columns add no
+    // recursive rows.
     let mut relation_columns: HashMap<String, Vec<String>> = HashMap::new();
     let mut column_names: HashMap<(u32, i16), String> = HashMap::new();
+    let mut column_not_null: HashMap<(u32, i16), bool> = HashMap::new();
     for row in client
         .query(
-            "SELECT n.nspname || '.' || c.relname AS relation,
-                    a.attname AS column,
-                    c.oid::int8 AS oid,
-                    a.attnum AS attnum
-               FROM pg_class c
-               JOIN pg_namespace n ON n.oid = c.relnamespace
-               JOIN pg_attribute a ON a.attrelid = c.oid
-              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-                AND n.nspname NOT LIKE 'pg_temp%'
-                AND a.attnum > 0
-                AND NOT a.attisdropped
-                AND c.relkind = ANY('{r,v,m,p,f}')
-              ORDER BY 1, a.attnum",
+            "WITH RECURSIVE user_columns AS (
+                 SELECT n.nspname || '.' || c.relname AS relation,
+                        a.attname AS column_name,
+                        c.oid::int8 AS oid,
+                        a.attnum AS attnum,
+                        a.atttypid AS type_oid,
+                        a.attnotnull AS not_null
+                   FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   JOIN pg_attribute a ON a.attrelid = c.oid
+                  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                    AND n.nspname NOT LIKE 'pg_temp%'
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped
+                    AND c.relkind = ANY('{r,v,m,p,f}')
+             ), column_types AS (
+                 SELECT u.relation, u.column_name, u.oid, u.attnum,
+                        t.typbasetype AS base_type_oid,
+                        (u.not_null OR t.typnotnull) AS not_null
+                   FROM user_columns u
+                   JOIN pg_type t ON t.oid = u.type_oid
+                 UNION ALL
+                 SELECT c.relation, c.column_name, c.oid, c.attnum,
+                        t.typbasetype AS base_type_oid,
+                        (c.not_null OR t.typnotnull) AS not_null
+                   FROM column_types c
+                   JOIN pg_type t ON t.oid = c.base_type_oid
+                  WHERE c.base_type_oid <> 0
+             )
+             SELECT relation, column_name AS column, oid, attnum,
+                    bool_or(not_null) AS not_null
+               FROM column_types
+              GROUP BY relation, column_name, oid, attnum
+              ORDER BY relation, attnum",
             &[],
         )
         .await
@@ -1576,7 +1616,9 @@ async fn resolve_snapshot(
         let column: String = row.get("column");
         let oid: i64 = row.get("oid");
         let attnum: i16 = row.get("attnum");
+        let not_null: bool = row.get("not_null");
         column_names.insert((oid as u32, attnum), format!("{relation}.{column}"));
+        column_not_null.insert((oid as u32, attnum), not_null);
         relation_columns
             .entry(relation.to_ascii_lowercase())
             .or_default()
@@ -1728,6 +1770,7 @@ async fn resolve_snapshot(
     if rules.is_empty() {
         let snapshot = Snapshot {
             all_columns: column_names,
+            column_not_null,
             system_relations,
             relation_columns,
             opaque_views,
@@ -1777,6 +1820,7 @@ async fn resolve_snapshot(
 
     let mut snapshot = Snapshot {
         all_columns: column_names,
+        column_not_null,
         system_relations,
         relation_columns,
         opaque_views,

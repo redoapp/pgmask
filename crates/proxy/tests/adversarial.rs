@@ -1112,6 +1112,96 @@ async fn type_aware_fallback_degrades_to_null_instead_of_refusing() -> Result<()
     Ok(())
 }
 
+/// Catalog-resolved source nullability, including direct and nested domain
+/// constraints, keeps automatic NULL fallbacks from contradicting a stored
+/// column's declared contract. Nullable columns and domains retain the
+/// availability-oriented fallback; the strict-NULL configuration is covered
+/// separately by unit tests because it is an explicit operator choice.
+#[tokio::test]
+async fn type_aware_fallback_preserves_declared_not_null() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    exec_direct(
+        DB,
+        "DROP TABLE IF EXISTS canary.nullability;
+         DROP DOMAIN IF EXISTS canary.required_bigint;
+         CREATE DOMAIN canary.required_bigint AS bigint NOT NULL;
+         CREATE DOMAIN canary.nested_required_bigint AS canary.required_bigint;
+         CREATE DOMAIN canary.optional_bigint AS bigint;
+         CREATE TABLE canary.nullability (
+           required bigint NOT NULL,
+           domain_required canary.required_bigint,
+           nested_domain_required canary.nested_required_bigint,
+           domain_optional canary.optional_bigint,
+           optional bigint
+         );
+         INSERT INTO canary.nullability VALUES (42, 42, 42, 42, 42);",
+    )
+    .await?;
+    let proxy = start_proxy(DB, Vec::new()).await?;
+
+    let mut required = RawClient::connect(proxy.addr, DB).await?;
+    let msgs = required
+        .simple_query("SELECT required FROM canary.nullability")
+        .await?;
+    assert!(
+        !msgs.iter().any(|message| message.tag == b'T'),
+        "the incompatible result must be refused before RowDescription"
+    );
+    assert_refused(&required, "automatic NULL for NOT NULL bigint");
+    assert!(
+        required.received_text().contains("NOT NULL"),
+        "the refusal should explain the source contract"
+    );
+
+    let mut domain_required = RawClient::connect(proxy.addr, DB).await?;
+    let msgs = domain_required
+        .simple_query("SELECT domain_required FROM canary.nullability")
+        .await?;
+    assert!(
+        !msgs.iter().any(|message| message.tag == b'T'),
+        "a domain's NOT NULL constraint must be enforced before RowDescription"
+    );
+    assert_refused(
+        &domain_required,
+        "automatic NULL for domain-constrained bigint",
+    );
+
+    let mut nested_domain_required = RawClient::connect(proxy.addr, DB).await?;
+    let msgs = nested_domain_required
+        .simple_query("SELECT nested_domain_required FROM canary.nullability")
+        .await?;
+    assert!(
+        !msgs.iter().any(|message| message.tag == b'T'),
+        "an inherited domain NOT NULL constraint must be enforced before RowDescription"
+    );
+    assert_refused(
+        &nested_domain_required,
+        "automatic NULL for nested domain-constrained bigint",
+    );
+
+    let mut domain_optional = RawClient::connect(proxy.addr, DB).await?;
+    let msgs = domain_optional
+        .simple_query("SELECT domain_optional FROM canary.nullability")
+        .await?;
+    assert_served(&msgs, "automatic NULL for a nullable domain");
+    assert!(
+        !domain_optional.received_text().contains("pgmask:"),
+        "a nullable domain should retain the automatic NULL fallback"
+    );
+
+    let mut optional = RawClient::connect(proxy.addr, DB).await?;
+    let msgs = optional
+        .simple_query("SELECT optional FROM canary.nullability")
+        .await?;
+    assert_served(&msgs, "automatic NULL for nullable bigint");
+    assert!(
+        !optional.received_text().contains("pgmask:"),
+        "a nullable source should retain the automatic NULL fallback"
+    );
+    Ok(())
+}
+
 /// An error still says enough to act on.
 ///
 /// Withholding the message is only defensible if the `SQLSTATE` survives — it

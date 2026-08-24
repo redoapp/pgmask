@@ -217,7 +217,16 @@ not.
   (an `infinity` timestamp, a non-ISO `DateStyle`, a binary-bound IP), a column
   the catalog has not resolved yet, or a character column too narrow to hold a
   pseudonym also becomes `NULL` rather than an error. Set
-  `unclassified_mask = "null"` for strict `NULL` across the board.
+  `unclassified_mask = "null"` for strict `NULL` across the board. For a
+  catalog-resolved `NOT NULL` column—including a constraint inherited through
+  a domain chain—the automatic policy instead rejects the result before its row
+  description if its type has only a `NULL` fallback; value-specific mask
+  failures reject rather than introducing a new `NULL`. This is deliberately
+  source-conservative: an outer join can make a `NOT NULL` source nullable in
+  that particular result, but pgmask may still reject it because pgwire does
+  not describe result nullability. An explicit `unclassified_mask = "null"`
+  remains an operator choice and can still return `NULL`. Constraint DDL is
+  reflected after the next catalog refresh, like other source metadata.
 - Safe scalar values such as literals, `now()`, and `count(*)` pass through.
 - Expressions over masked columns, value-returning aggregates such as `max`,
   set operations, recursive common table expressions, and set-returning

@@ -35,14 +35,11 @@ pub(crate) struct FieldPlan {
     pub(crate) spec: MaskSpec,
     pub(crate) type_oid: u32,
     pub(crate) format: i16,
-    /// The spec is the *type-aware fallback* for an unclassified column, not an
-    /// operator's choice. A fallback mask that cannot be applied to some value
-    /// or format degrades that field to NULL — strictly less disclosure —
-    /// instead of refusing the result set: the old unclassified default was
-    /// total (`NULL` for everything), and replacing it with masks that can fail
-    /// per value (`date-year` on `infinity`, `ip-prefix` after a Bind flips the
-    /// portal to binary) must not turn previously-working queries into
-    /// mid-stream rejections. A configured mask stays fail-closed.
+    /// The spec is the *type-aware fallback* for an unclassified nullable (or
+    /// catalog-unresolved) column, not an operator's choice. A fallback mask
+    /// that cannot be applied to some value or format degrades that field to
+    /// NULL — strictly less disclosure — instead of refusing the result set.
+    /// Declared NOT NULL sources and configured masks stay fail-closed.
     pub(crate) lenient: bool,
 }
 
