@@ -65,8 +65,13 @@ impl Vetted {
     }
 
     /// A row whose every field was run through the active plan.
-    fn data_row(values: &[Option<Bytes>]) -> Self {
-        Self(protocol::build_data_row(values).encode())
+    ///
+    /// Takes the finished frame rather than the field values: the masking loop
+    /// in `handle_data_row` encodes each field as it clears, so by the time a
+    /// row can be vetted it is already wire-shaped. That loop is the only
+    /// caller, which is what keeps this constructor's claim true.
+    fn masked_row(frame: BytesMut) -> Self {
+        Self(frame.freeze())
     }
 
     /// A row we are forwarding unchanged because the plan masks nothing in it.
@@ -988,6 +993,7 @@ impl Session {
                         type_oid: field.type_oid,
                         format: field.format,
                         lenient: false,
+                        primed: None,
                     })
                     .collect::<Vec<_>>(),
             ))
@@ -1064,27 +1070,31 @@ impl Session {
             );
         };
 
-        let values = match protocol::parse_data_row(&msg.body) {
-            Ok(values) => values,
-            Err(err) => {
-                return self.reject(
-                    Rejection {
-                        cause: Cause::Malformed,
-                        message: format!("pgmask: could not parse DataRow: {err}"),
-                        hint: None,
-                    },
-                    out,
-                )
-            }
+        // One fused pass: decode each field, mask it, and append it straight to
+        // the outbound frame. The previous shape collected every parsed field
+        // into a `Vec`, collected every masked field into a second `Vec`, and
+        // then encoded those into a third buffer — two allocations and a full
+        // extra traversal per row, on the hottest path in the proxy. The
+        // framing rules `parse_data_row` enforced (declared count, no
+        // truncation, no trailing bytes) are enforced identically by
+        // `DataRowReader`, including on the all-passthrough path below.
+        let malformed = |err: &anyhow::Error| Rejection {
+            cause: Cause::Malformed,
+            message: format!("pgmask: could not parse DataRow: {err}"),
+            hint: None,
+        };
+        let mut reader = match protocol::DataRowReader::new(&msg.body) {
+            Ok(reader) => reader,
+            Err(err) => return self.reject(malformed(&err), out),
         };
 
-        if values.len() != plan.len() {
+        if reader.field_count() != plan.len() {
             return self.reject(
                 Rejection {
                     cause: Cause::Malformed,
                     message: format!(
                         "pgmask: row has {} fields but the described result set has {}",
-                        values.len(),
+                        reader.field_count(),
                         plan.len()
                     ),
                     hint: None,
@@ -1093,52 +1103,112 @@ impl Session {
             );
         }
 
-        let mut masked = Vec::with_capacity(values.len());
-        let mut changed = false;
-        for (value, field) in values.into_iter().zip(plan.iter()) {
-            if field.spec.is_passthrough() {
-                masked.push(value);
-                continue;
+        // A plan that masks nothing forwards the original bytes untouched —
+        // after walking the frame, so a malformed row is still refused rather
+        // than relayed. This is what every row of a fully released result set
+        // costs.
+        if plan.iter().all(|field| field.spec.is_passthrough()) {
+            loop {
+                match reader.next_field() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(err) => return self.reject(malformed(&err), out),
+                }
             }
-            match self
-                .policy
-                .masker
-                .apply(&field.spec, field.type_oid, field.format, value)
-            {
-                Ok(new_value) => {
-                    changed = true;
-                    self.masked_fields = self.masked_fields.saturating_add(1);
-                    masked.push(new_value);
-                }
-                // A type-aware *fallback* mask that cannot honour this value
-                // nulls the field — strictly less disclosure — rather than
-                // killing the stream. The old unclassified default was NULL
-                // unconditionally, and values it handled fine ('infinity'
-                // timestamps, `SET datestyle` output, a Bind that flipped the
-                // portal to a binary format the mask cannot decode) must not
-                // become mid-stream rejections now.
-                Err(_) if field.lenient => {
-                    changed = true;
-                    self.masked_fields = self.masked_fields.saturating_add(1);
-                    masked.push(None);
-                }
-                Err(err) => {
+            return out.client(Vetted::unmasked_row(&msg, &plan));
+        }
+
+        // Tag + length placeholder + field count; the length is patched once
+        // the masked sizes are known. Capacity is a hint — masks keep values
+        // in the same size class, so the input size is the right guess.
+        let mut frame = BytesMut::with_capacity(msg.body.len().saturating_add(16));
+        frame.put_u8(protocol::B_DATA_ROW);
+        frame.put_i32(0);
+        frame.put_i16(plan.len() as i16);
+        for field in plan.iter() {
+            // The count was checked against the plan above, so a missing field
+            // here is a framing violation, not a shorter row.
+            let value = match reader.next_field() {
+                Ok(Some(value)) => value,
+                Ok(None) => {
                     return self.reject(
                         Rejection {
-                            cause: Cause::MaskTypeMismatch,
-                            message: format!("pgmask: {err}"),
+                            cause: Cause::Malformed,
+                            message: "pgmask: DataRow ended before its declared field count".into(),
                             hint: None,
                         },
                         out,
                     )
                 }
+                Err(err) => return self.reject(malformed(&err), out),
+            };
+            let masked = if field.spec.is_passthrough() {
+                value
+            } else {
+                match self.policy.masker.apply_primed(
+                    &field.spec,
+                    field.primed.as_ref(),
+                    field.type_oid,
+                    field.format,
+                    value,
+                ) {
+                    Ok(masked) => {
+                        self.masked_fields = self.masked_fields.saturating_add(1);
+                        masked
+                    }
+                    // A type-aware *fallback* mask that cannot honour this
+                    // value nulls the field — strictly less disclosure —
+                    // rather than killing the stream. The old unclassified
+                    // default was NULL unconditionally, and values it handled
+                    // fine ('infinity' timestamps, `SET datestyle` output, a
+                    // Bind that flipped the portal to a binary format the mask
+                    // cannot decode) must not become mid-stream rejections now.
+                    Err(_) if field.lenient => {
+                        self.masked_fields = self.masked_fields.saturating_add(1);
+                        None
+                    }
+                    Err(err) => {
+                        return self.reject(
+                            Rejection {
+                                cause: Cause::MaskTypeMismatch,
+                                message: format!("pgmask: {err}"),
+                                hint: None,
+                            },
+                            out,
+                        )
+                    }
+                }
+            };
+            match masked {
+                None => frame.put_i32(-1),
+                Some(bytes) => {
+                    frame.put_i32(i32::try_from(bytes.len()).unwrap_or(i32::MAX));
+                    frame.put_slice(&bytes);
+                }
             }
         }
-
-        if !changed {
-            return out.client(Vetted::unmasked_row(&msg, &plan));
+        // The declared count is exhausted; this is the trailing-bytes check.
+        if let Err(err) = reader.next_field() {
+            return self.reject(malformed(&err), out);
         }
-        out.client(Vetted::data_row(&masked))
+
+        // Patch the length: everything after the tag byte, including the
+        // length field itself, exactly as `Message::encode` frames it.
+        let body_len = i32::try_from(frame.len().saturating_sub(1)).unwrap_or(i32::MAX);
+        let Some(slot) = frame.get_mut(1..5) else {
+            // Unreachable — the header was written seven lines up — but a
+            // refusal beats a panic on the one path that must not die.
+            return self.reject(
+                Rejection {
+                    cause: Cause::Malformed,
+                    message: "pgmask: could not frame masked DataRow".into(),
+                    hint: None,
+                },
+                out,
+            );
+        };
+        slot.copy_from_slice(&body_len.to_be_bytes());
+        out.client(Vetted::masked_row(frame));
     }
 }
 
@@ -1885,6 +1955,7 @@ mod tests {
                 type_oid: 25,
                 format: 0,
                 lenient: false,
+                primed: None,
             }]))
             .unwrap();
         assert!(
@@ -1907,6 +1978,7 @@ mod tests {
             type_oid: 25,
             format: 0,
             lenient: false,
+            primed: None,
         }]);
         session.plans.parse("s1".into(), "SELECT 1".into());
         session

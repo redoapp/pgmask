@@ -1,8 +1,6 @@
 # Changelog
 
-## 0.1.93 — type-aware defaults hardened: no mid-stream rejections, strict-null opt-out
-
-Fixes from a review of the 0.1.92 type-aware defaults:
+## 0.1.94 — nullability-aware fallbacks; plan decisions extracted; row path fused
 
 - **Automatic fallbacks preserve declared nullability.** A type-aware default
   no longer sends `NULL` for a catalog-resolved `NOT NULL` source column,
@@ -11,14 +9,34 @@ Fixes from a review of the 0.1.92 type-aware defaults:
   non-NULL mask fails for one value, it fails closed instead of degrading that
   value to `NULL`. This source-based check can conservatively over-reject an
   outer-join result. Explicit `unclassified_mask = "null"` keeps its
-  operator-chosen behavior.
-- **Nullable fallback masks do not kill a stream.** The old unclassified
-  default (`NULL`) was total; the type-aware masks can fail per value. For a
-  nullable or catalog-unresolved source, a fallback mask that cannot honour a
-  value or format — an `infinity` timestamp, output under a non-ISO
-  `DateStyle`, an inet column a Bind flipped to binary format — now nulls that
-  field instead of rejecting the result set mid-stream. Operator-configured
-  masks and declared `NOT NULL` sources stay fail-closed.
+  operator-chosen behavior. Per-value leniency (below, 0.1.93) is accordingly
+  limited to nullable or catalog-unresolved sources.
+- **Plan decisions extracted from the session state machine.** `policy.rs` now
+  owns "what plan does a described result set get"; `session.rs` keeps the
+  wire I/O loop. Pure move, no behavior change.
+- **The row masking path is one fused pass.** Each field is decoded, masked,
+  and encoded straight into the outbound frame; the two intermediate
+  per-row `Vec`s and the full extra copy are gone, and the pseudonym domain
+  is absorbed into the HMAC state once per plan instead of once per value.
+  A property test pins the incremental frame reader to `parse_data_row`
+  byte-for-byte, and a unit test pins primed digests to unprimed ones.
+- **One mask capability table.** `classify`'s `mask_fits` now maps
+  information_schema type names to OIDs and delegates to `MaskSpec::supports`,
+  failing closed on unknown types in both directions; a 224-pair agreement
+  test pins the two together. The old string table accepted `numeric-bucket`
+  on `money` (the proxy refuses it at runtime) and refused text masks on
+  `name` (the proxy accepts them). Dead `Catalog::name_of` removed.
+
+## 0.1.93 — type-aware defaults hardened: no mid-stream rejections, strict-null opt-out
+
+Fixes from a review of the 0.1.92 type-aware defaults:
+
+- **Fallback masks never kill a stream.** The old unclassified default
+  (`NULL`) was total; the type-aware masks can fail per value. A fallback mask
+  that cannot honour a value or format — an `infinity` timestamp, output under
+  a non-ISO `DateStyle`, an inet column a Bind flipped to binary format — now
+  nulls that field instead of rejecting the result set mid-stream.
+  Operator-configured masks stay fail-closed.
 - **`unclassified_mask` is back, as a policy choice.** `type-aware` (default)
   or `null`, which restores the strict pre-0.1.92 posture of `NULL` for every
   unclassified value. A config still carrying the removed knob's

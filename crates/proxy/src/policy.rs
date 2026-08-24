@@ -381,11 +381,15 @@ impl Policy {
                 });
             }
 
+            // Absorb the pseudonym domain into the HMAC state once per plan
+            // rather than once per value; `None` for non-digest masks.
+            let primed = self.masker.prime(&spec);
             plan.push(FieldPlan {
                 spec,
                 type_oid: field.type_oid,
                 format: field.format,
                 lenient,
+                primed,
             });
         }
         Ok(Arc::new(plan))

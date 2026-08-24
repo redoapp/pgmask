@@ -41,6 +41,12 @@ pub(crate) struct FieldPlan {
     /// NULL — strictly less disclosure — instead of refusing the result set.
     /// Declared NOT NULL sources and configured masks stay fail-closed.
     pub(crate) lenient: bool,
+    /// HMAC state with this spec's pseudonym domain already absorbed, built
+    /// once when the plan is bound. The domain is fixed for the plan's
+    /// lifetime, and re-absorbing 20-60 domain bytes per value pushed most
+    /// short pseudonym inputs from one SHA-256 compression block to two.
+    /// `None` for masks that do not digest; always safe to ignore.
+    pub(crate) primed: Option<crate::mask::PrimedMac>,
 }
 
 pub(crate) type Plan = Arc<Vec<FieldPlan>>;
@@ -704,6 +710,7 @@ mod tests {
             type_oid: 25,
             format: 0,
             lenient: false,
+            primed: None,
         }])
     }
 
