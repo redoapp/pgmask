@@ -12,6 +12,21 @@ fn columns_inside_scalar_subqueries_are_seen() {
     assert!(cols.contains(&"id".to_string()), "got {cols:?}");
 }
 
+/// The statement that leaked under `lineage = "allow"`: a released column
+/// concatenated with a unicode-escaped masked column inside a scalar subquery.
+/// `sqllineage` reports only the released source; the backstop must still see
+/// the masked name.
+#[test]
+fn unicode_escaped_names_inside_scalar_subqueries_are_seen() {
+    let sql = r#"SELECT city || (SELECT u&"email" FROM fz.people c2
+                 WHERE c2.id = fz.people.id LIMIT 1) FROM fz.people"#;
+    let cols = referenced_identifiers(sql).expect("scans");
+    assert!(cols.contains(&"email".to_string()), "got {cols:?}");
+    let sql = r#"SELECT city || (SELECT u&"e\006dail" FROM fz.people LIMIT 1) FROM fz.people"#;
+    let cols = referenced_identifiers(sql).expect("scans");
+    assert!(cols.contains(&"email".to_string()), "got {cols:?}");
+}
+
 /// A summary over a singleton group is the value it summarised, so the
 /// grouping has to be read — or admitted to be unreadable.
 #[test]
@@ -234,9 +249,10 @@ fn the_predicates_whole_rules_rest_on() {
     assert!(is_parseable("SELECT 1"));
     assert!(!is_parseable("SELEKT ¯\\_(ツ)_/¯ FROM"));
 
-    // The lexer is the backstop under lineage, the catalog fast path and
-    // the singleton-group guard. Its word test survived three mutations, so
-    // pin the edges it actually has to get right.
+    // The lexer (plus decoded parse-tree names) is the backstop under
+    // lineage, the catalog fast path and the singleton-group guard. Its
+    // word test survived three mutations, so pin the edges it actually
+    // has to get right.
     let ids = |sql: &str| referenced_identifiers(sql).expect("scans");
     // A quoted name keeps its spelling, minus the quotes, and an escaped
     // quote inside one survives.
@@ -250,6 +266,17 @@ fn the_predicates_whole_rules_rest_on() {
     assert!(ids("SELECT a$b FROM t").contains(&"a$b".to_string()));
     // And an operator is not a name, or every statement would name one.
     assert!(!ids("SELECT a + b FROM t").contains(&"+".to_string()));
+    // Unicode-escaped identifiers are names, not punctuation. The source
+    // spelling is `u&"email"`; the catalog name is `email`.
+    assert!(ids(r#"SELECT u&"email" FROM t"#).contains(&"email".to_string()));
+    assert!(ids(r#"SELECT U&"email" FROM t"#).contains(&"email".to_string()));
+    assert!(ids(r#"SELECT u&"e\006dail" FROM t"#).contains(&"email".to_string()));
+    assert!(ids(r#"SELECT u&"e\+00006dail" FROM t"#).contains(&"email".to_string()));
+    // A custom UESCAPE redefines the alphabet. Guessing `\` would name the
+    // wrong identifier, so the whole scan fails closed.
+    assert!(referenced_identifiers(r#"SELECT u&"email" UESCAPE '!' FROM t"#).is_none());
+    // Truncated hex is not a name we can clear.
+    assert!(referenced_identifiers(r#"SELECT u&"e\00" FROM t"#).is_none());
 }
 
 /// Found by `cargo mutants`, not by review: two guards no test detected

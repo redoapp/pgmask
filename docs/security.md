@@ -119,8 +119,11 @@ never prints values, but the output still requires human review.
 - Set operations, recursive common table expressions, set-returning functions,
   and expressions over masked columns are normally opaque.
 - `lineage = "allow"` may release an expression when every resolved source is
-  explicitly released. It is off by default because incomplete lineage is a
-  release risk.
+  explicitly released *and* the output expression is a closed composition of
+  columns and literals (no scalar subquery, window, or unlisted node). It is
+  off by default because incomplete lineage is a release risk. A masked name
+  in any identifier encoding the engine accepts — including `u&"…"` unicode
+  escapes — still blocks that release.
 - `system_catalogs = "allow"` releases approved metadata needed by GUI clients.
   Known catalogs containing sampled values or SQL text remain blocked.
 - Views need their own rules. pgmask also marks views containing set operations

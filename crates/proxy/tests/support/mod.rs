@@ -37,7 +37,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 44
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 45
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -347,6 +347,7 @@ pub async fn start_proxy_with_roles(
         Unclassified::Mask,
         Opaque::Reject,
         roles,
+        Lineage::Refuse,
     )
     .await
 }
@@ -360,7 +361,32 @@ pub async fn start_proxy_at(
     unclassified: Unclassified,
     opaque: Opaque,
 ) -> Result<ProxyHandle> {
-    start_proxy_at_full(backend, db, rules, unclassified, opaque, Vec::new()).await
+    start_proxy_at_full(
+        backend,
+        db,
+        rules,
+        unclassified,
+        opaque,
+        Vec::new(),
+        Lineage::Refuse,
+    )
+    .await
+}
+
+/// Same as [`start_proxy`], but with lineage inverted — the posture the GUI
+/// catalog ships, and the only one where a missed source is a release.
+pub async fn start_proxy_allowing_lineage(db: &str, rules: Vec<ColumnRule>) -> Result<ProxyHandle> {
+    let backend = backend_addr().context("PGMASK_TEST_PG")?;
+    start_proxy_at_full(
+        &backend,
+        db,
+        rules,
+        Unclassified::Mask,
+        Opaque::Reject,
+        Vec::new(),
+        Lineage::Allow,
+    )
+    .await
 }
 
 pub async fn start_proxy_at_full(
@@ -370,6 +396,7 @@ pub async fn start_proxy_at_full(
     unclassified: Unclassified,
     opaque: Opaque,
     roles: Vec<pgmask::catalog::Role>,
+    lineage: Lineage,
 ) -> Result<ProxyHandle> {
     let backend = backend.to_string();
     let config = Config {
@@ -397,7 +424,7 @@ pub async fn start_proxy_at_full(
         summaries: pgmask::catalog::Summaries::Allow,
         posture: pgmask::catalog::Posture::Default,
         system_catalogs: SystemCatalogs::Refuse,
-        lineage: Lineage::Refuse,
+        lineage,
         metrics_listen: None,
         rate_limit_per_minute: 0,
         rate_limit_burst: 0,

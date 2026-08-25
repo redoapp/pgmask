@@ -49,8 +49,19 @@
 //!    releasing it releases all of them.
 //! 6. **The backstop.** If a masked column's *name* appears anywhere in the
 //!    statement, nothing is released — whatever the resolver reported.
+//!    Names come from the token stream (including decoded `u&"…"` idents)
+//!    union the parse tree (which already expands those escapes on
+//!    `ColumnRef`). Either source alone has a blind spot the other covers.
+//! 7. **A `Release` is an allowlist of shapes.** A non-empty source list is
+//!    not a complete source list. `sqllineage` does not descend into a
+//!    `SubLink`, so `city || (SELECT email FROM …)` reports only `city`.
+//!    Guards 1–5 named the last construct that leaked; 7 inverts the
+//!    question the way [`crate::analysis`] does: the output expression must
+//!    be built only from node types that cannot hide a nested query. A
+//!    `SubLink`, a window, or a node kind we have not listed stays
+//!    unresolved — even when every *reported* source is released.
 //!
-//! # Why 6 exists, and why it is the last one
+//! # Why 6 and 7 both exist
 //!
 //! Guards 1-5 are each shaped like the bug that produced them. Three of this
 //! project's five disclosures were the same mistake in different clothes:
@@ -63,12 +74,23 @@
 //! That approach can only ever cover constructs someone has thought of, and the
 //! third arrived after the first two were fixed.
 //!
+//! Guard 7 stops treating "we found some sources and they are released" as
+//! "we found every source". It does not try to teach the resolver about
+//! `SubLink`; it refuses to `Release` an expression the resolver is not
+//! trusted to have finished. FROM-clause subqueries and CTEs stay eligible:
+//! they are not `SubLink`s, and tracing through them is the resolver's job.
+//!
 //! Guard 6 does not ask about constructs. It asks whether a masked column is
-//! named in the statement at all, using the **lexer** — every identifier in the
-//! text is a token, with none of the traversal gaps a tree walk has. If no
-//! masked name is present, no field can carry a masked value however the
-//! expressions nest. The resolver and the backstop must both agree before
-//! anything is released, and they fail independently.
+//! named in the statement at all — including in WHERE, which 7 does not
+//! inspect, because a predicate is not a source of the projected value.
+//! The **lexer** supplies every identifier spelling in the text
+//! (unicode-escaped idents decoded to their catalog names); the **parse
+//! tree** supplies names the token stream does not spell as words.
+//!
+//! A disclosure now needs the resolver to under-report, the shape to look
+//! closed, *and* the backstop to miss the name. The unicode-escaped concat
+//! that leaked under the GUI catalog failed 6 and would now fail 7 even if
+//! the subquery had named only released columns.
 //!
 //! The premise — that the backstop sees everything the resolver can name — is
 //! asserted in `tests/lineage_superset.rs` rather than assumed. That test has
@@ -84,7 +106,7 @@ use std::sync::Arc;
 
 use sqllineage::types::{AnalyzeOptions, CatalogProvider, ColumnOrigin, Dialect, TableRef};
 
-use crate::analysis::StatementInspection;
+use crate::analysis::{output_lineage_is_closed, StatementInspection};
 use crate::catalog::Snapshot;
 
 /// What lineage can say about one output field.
@@ -227,23 +249,33 @@ pub(crate) fn resolve_inspected(
     // This asks a question `sqllineage` is not involved in: does the statement
     // mention a masked column at all? If it does not, no output field can carry
     // a masked value however the expressions nest and whatever the resolver
-    // saw. It is computed from `pg_query`'s tree, independently of the
-    // resolver, so both have to miss the same column for a release to be wrong.
+    // saw. It is computed from the token stream (unicode-escaped identifiers
+    // decoded) union the parse tree (`ColumnRef` names already expanded),
+    // independently of the resolver, so the resolver *and* every name source
+    // have to miss the same column for a release to be wrong. The token
+    // stream alone missed `u&"email"`; the tree alone once missed `id` in a
+    // `WindowDef`.
     //
     // Applied as a *downgrade of `Release`* rather than an early return, so a
     // field `sqllineage` correctly identified as `Blocked` still names the
     // column it derives from. That message is the difference between a ticket
     // and a rewrite, and an early return threw it away.
     //
+    // Guard 7 is the other downgrade of `Release`: even when no masked name
+    // appears, a `SubLink` in the output is incomplete sources, and "we
+    // found `city`" is not "we found every source".
+    //
     // The cost is utility, not safety: `SELECT upper(city) FROM people WHERE
     // email = 'x'` no longer releases, because `email` is mentioned. That
     // statement is a predicate oracle anyway.
     let masked_column_in_statement =
         snapshot.inspection_references_masked_column(inspection, roles);
+    let shape_closed = output_lineage_is_closed(inspection, field_count);
 
     mappings
         .iter()
-        .map(|mapping| {
+        .enumerate()
+        .map(|(index, mapping)| {
             // Guard 2: silence is not safety.
             if mapping.sources.is_empty() {
                 return Verdict::Unresolved;
@@ -298,6 +330,10 @@ pub(crate) fn resolve_inspected(
             match blocked {
                 Some(column) => Verdict::Blocked(column),
                 None if masked_column_in_statement => Verdict::Unresolved,
+                // Guard 7: reported sources are not complete sources.
+                None if !shape_closed.get(index).is_some_and(|closed| *closed) => {
+                    Verdict::Unresolved
+                }
                 None => Verdict::Release,
             }
         })
@@ -570,11 +606,55 @@ mod tests {
             "SELECT min((SELECT secret FROM demo.t LIMIT 1)) OVER (PARTITION BY shared) FROM demo.t",
             "SELECT upper(shared) FROM demo.t WHERE secret = 'x'",
             "SELECT shared FROM demo.t ORDER BY secret",
+            // Closed output, unicode-escaped name in a predicate: Guard 7
+            // does not look at WHERE, so only the backstop naming `secret`
+            // can refuse. The concat cases below are also SubLinks and would
+            // stay refused even if decode stopped working.
+            r#"SELECT upper(shared) FROM demo.t WHERE u&"secret" = 'x'"#,
+            r#"SELECT upper(shared) FROM demo.t WHERE u&"s\0065cret" = 'x'"#,
+            r#"SELECT shared || (SELECT u&"secret" FROM demo.t WHERE shared = demo.t.shared LIMIT 1) FROM demo.t"#,
+            r#"SELECT shared || (SELECT u&"s\0065cret" FROM demo.t LIMIT 1) FROM demo.t"#,
+            r#"SELECT CONCAT(shared, (SELECT u&"secret" FROM demo.t LIMIT 1)) FROM demo.t"#,
+            r#"SELECT ARRAY[shared, (SELECT u&"secret" FROM demo.t LIMIT 1)] FROM demo.t"#,
         ] {
             assert_ne!(
                 resolve(sql, 1, &snapshot, &HashSet::new())[0],
                 Verdict::Release,
                 "a masked column is named here, so nothing may be released: {sql}"
+            );
+        }
+    }
+
+    /// A scalar subquery in the *output* is not a complete source list.
+    ///
+    /// `sqllineage` does not descend into a `SubLink`. Concatenating a released
+    /// column with one looks fully resolved (`shared` only) and used to
+    /// `Release` — which is a disclosure as soon as the subquery reads a
+    /// masked column the backstop fails to name. The closed-shape guard
+    /// refuses on the construct, independently of which names appear.
+    ///
+    /// A subquery in WHERE is a predicate, not a source of the field, and
+    /// still resolves below.
+    #[test]
+    fn a_subquery_in_the_output_is_never_released_on_reported_sources() {
+        let mut s = Snapshot::default();
+        s.insert_relation_for_test(
+            "demo.t",
+            &[("shared", Mask::None), ("secret", Mask::Redact)],
+        );
+        let snapshot = Arc::new(s);
+        for sql in [
+            "SELECT shared || (SELECT shared FROM demo.t LIMIT 1) FROM demo.t",
+            "SELECT CONCAT(shared, (SELECT shared FROM demo.t LIMIT 1)) FROM demo.t",
+            "SELECT ARRAY[shared, (SELECT shared FROM demo.t LIMIT 1)] FROM demo.t",
+            "SELECT (SELECT shared FROM demo.t LIMIT 1) FROM demo.t",
+            // One closed branch does not make the other complete.
+            "SELECT shared FROM demo.t UNION SELECT (SELECT shared FROM demo.t LIMIT 1)",
+        ] {
+            assert_ne!(
+                resolve(sql, 1, &snapshot, &HashSet::new())[0],
+                Verdict::Release,
+                "a SubLink feeds this field and sqllineage does not look inside: {sql}"
             );
         }
     }

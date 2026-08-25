@@ -789,10 +789,20 @@ comment that asserted the case could not happen.
   to follow is configuring nothing. Pinned by a test with a live control.
 - **Lineage inverts the safety property and is off by default** (`lineage =
   "refuse"`). It is the one place where failing to notice a source column
-  releases rather than refuses, which is why it carries six documented guards
-  and a name-based backstop. Read on 2026-08-11 and nothing found; that is a
-  reading, not a proof, and it is the module to hand a second reviewer first if
-  you intend to turn it on.
+  releases rather than refuses, which is why it carries seven documented
+  guards: existence, empty sources, field-count, parse, opaque views, a
+  name-based backstop, and an allowlist of output shapes whose sources the
+  resolver is trusted to have finished. Read on 2026-08-11 and nothing found;
+  that is a reading, not a proof, and it is the module to hand a second
+  reviewer first if you intend to turn it on. On 2026-08-25 the backstop was
+  found not to name unicode-escaped identifiers (`u&"email"` / `u&"e\006dail"`),
+  so a released column concatenated with a masked one inside a scalar subquery
+  came through in the clear under the shipped GUI catalog. Closed by decoding
+  those encodings in the lexer (and failing the scan on `UESCAPE`) and by
+  refusing to `Release` any output expression that contains a `SubLink` (or
+  any node kind not on the allowlist), even when the subquery names only
+  released columns — not numbered in the tables above, because it is
+  reachable only with lineage inverted from the default.
 - The 2026-08-11 diagnostic fixes are now exercised on **both engines**, for the
   channels each engine actually has. Measured on CockroachDB v25.4.14: `DO $$ …
   RAISE EXCEPTION $$` carries a value exactly as on Postgres, and so do

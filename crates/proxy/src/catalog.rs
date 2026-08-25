@@ -768,7 +768,11 @@ impl Snapshot {
         inspection: &crate::analysis::StatementInspection<'_>,
         roles: &HashSet<String>,
     ) -> bool {
-        let Some(identifiers) = inspection.identifiers() else {
+        // Lexer spellings union decoded parse-tree names. `u&"email"` is not
+        // the word `email` in the token stream; it is `email` on the ColumnRef.
+        // Either source missing the name is how `city || (SELECT u&"email" …)`
+        // released a masked address under `lineage = "allow"`.
+        let Some(identifiers) = inspection.backstop_identifiers() else {
             return true;
         };
         identifiers.iter().any(|identifier| {
@@ -871,7 +875,6 @@ impl Snapshot {
         }
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     pub fn insert_system_relation_for_test(&mut self, table_oid: u32) {
         self.system_relations.insert(table_oid);
@@ -1938,6 +1941,32 @@ mod tests {
         assert!(
             !snapshot.statement_references_masked_column("SELECT 1 FROM demo.customers", &roles)
         );
+        // Unicode-escaped names in a scalar subquery: the token is not the
+        // word `email`, and sqllineage does not look inside. Measured
+        // releasing a concatenated address under `lineage = "allow"`.
+        assert!(snapshot.statement_references_masked_column(
+            r#"SELECT city || (SELECT u&"email" FROM demo.customers LIMIT 1) FROM demo.customers"#,
+            &roles
+        ));
+        assert!(snapshot.statement_references_masked_column(
+            r#"SELECT city || (SELECT u&"e\006dail" FROM demo.customers LIMIT 1) FROM demo.customers"#,
+            &roles
+        ));
+        // Closed output: decode has to be what sees the name, because there
+        // is no SubLink for Guard 7 to refuse.
+        assert!(snapshot.statement_references_masked_column(
+            r#"SELECT city FROM demo.customers WHERE u&"email" = 'x'"#,
+            &roles
+        ));
+        assert!(snapshot.statement_references_masked_column(
+            r#"SELECT city FROM demo.customers WHERE u&"e\006dail" = 'x'"#,
+            &roles
+        ));
+        // A custom UESCAPE redefines the alphabet; the scan fails closed.
+        assert!(snapshot.statement_references_masked_column(
+            r#"SELECT u&"city" UESCAPE '!' FROM demo.customers"#,
+            &roles
+        ));
 
         // The system-relation set decides whether a whole result set is served
         // unmasked. Constant in either direction is a different failure: `true`

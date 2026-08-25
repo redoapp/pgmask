@@ -86,15 +86,18 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use pg_query::protobuf::node::Node as NodeEnum;
-use pg_query::protobuf::SelectStmt;
+use pg_query::protobuf::{SelectStmt, Token};
 
 mod catalog_surface;
 mod catalogs;
 mod frontend;
 mod hostile;
+mod lineage_shape;
 mod names;
 mod safety;
 mod walk;
+
+use walk::walk_parsed;
 
 pub use catalog_surface::{VANILLA_INFORMATION_SCHEMA, VANILLA_PG_CATALOG};
 pub use catalogs::{
@@ -108,6 +111,8 @@ pub use hostile::{
     hostile_join_or_rename_masked, hostile_uses_whole_row, masked_exceeds_outer_projection,
 };
 pub use safety::{analyze, Relaxations, Safety};
+
+pub(crate) use lineage_shape::output_lineage_is_closed;
 
 use catalogs::{
     every_relation_is_qualified_inspected, provenance_is_trustworthy_inspected,
@@ -234,6 +239,21 @@ impl<'sql> StatementInspection<'sql> {
         self.identifiers
             .get_or_init(|| scan_identifiers(self.sql))
             .as_deref()
+    }
+
+    /// Names the lineage backstop may treat as column or relation mentions.
+    ///
+    /// The token stream is the complete source of *spellings in the text*, and
+    /// the parse tree is the complete source of *decoded* names (`u&"email"`
+    /// is `email` on a `ColumnRef`). Either source alone has a blind spot the
+    /// other covers; a name either of them reports is a name the statement
+    /// mentioned. `None` when even the scanner cannot read the text.
+    pub fn backstop_identifiers(&self) -> Option<Vec<String>> {
+        let mut names = self.identifiers()?.to_vec();
+        if let Some(parsed) = self.parsed() {
+            names.extend(tree_identifier_names(parsed));
+        }
+        Some(names)
     }
 
     pub fn output_safety(&self, field_count: usize, allow: Relaxations) -> Vec<Safety> {
@@ -408,8 +428,8 @@ pub fn is_parseable(sql: &str) -> bool {
 /// That is deliberate: this is a backstop, and over-naming costs a refusal
 /// while under-naming costs a disclosure.
 ///
-/// **Why the lexer and not the parse tree.** The first version of this walked
-/// `pg_query`'s node tree for `ColumnRef`s, and the containment test in
+/// **Why the lexer and not the parse tree alone.** The first version of this
+/// walked `pg_query`'s node tree for `ColumnRef`s, and the containment test in
 /// `tests/lineage_superset.rs` immediately caught it missing `id` in
 ///
 /// ```sql
@@ -421,6 +441,21 @@ pub fn is_parseable(sql: &str) -> bool {
 /// backstop. The token stream has no such gap: every identifier in the text is
 /// a token, whatever the grammar does with it afterwards.
 ///
+/// The token stream still has to *name* what it sees. Unicode-escaped
+/// identifiers (`u&"email"`, `u&"e\006dail"`) are one token whose source
+/// spelling is not the catalog name; leaving them unnamed let
+/// `lineage = "allow"` release `city || (SELECT u&"email" …)` because
+/// `sqllineage` does not look inside the subquery and the backstop never
+/// saw `email`. They are decoded here. An encoding we cannot decode — a
+/// malformed `u&"…"` or a `UESCAPE` clause that redefines the escape
+/// character — fails the whole scan, which callers treat as "could mention
+/// anything".
+///
+/// The lineage backstop unions this set with decoded parse-tree names
+/// ([`StatementInspection::backstop_identifiers`]) so a name either source
+/// reports is a name the statement mentioned. Hostile counting stays on
+/// this function so a unicode ident is still one mention, not two.
+///
 /// `None` when the text cannot even be scanned, which the caller must treat as
 /// "could mention anything".
 pub fn referenced_identifiers(sql: &str) -> Option<Vec<String>> {
@@ -429,43 +464,145 @@ pub fn referenced_identifiers(sql: &str) -> Option<Vec<String>> {
 
 fn scan_identifiers(sql: &str) -> Option<Vec<String>> {
     let scanned = pg_query::scan(sql).ok()?;
-    Some(
-        scanned
-            .tokens
-            .iter()
-            .filter_map(|token| {
-                let start = usize::try_from(token.start).ok()?;
-                let end = usize::try_from(token.end).ok()?;
-                let text = sql.get(start..end)?;
-                // Not `token() == Ident`. Two whole classes of name are not
-                // `Ident`, and an audit found both:
-                //
-                //   * a *quoted* name's span includes its quotes, so `"email"`
-                //     never matched the catalog's `email`
-                //   * pg_query lexes unreserved keywords as their own token
-                //     types, so a column called `value`, `source`, `name`,
-                //     `comment`, `owner` or `year` produced no token at all
-                //
-                // Either one silently reopened the hole this function exists to
-                // close, and neither is exotic — every ORM quotes identifiers,
-                // and `comment` and `source` are ordinary column names.
-                //
-                // So the rule is textual rather than grammatical: anything
-                // shaped like a name counts, keyword or not. Over-naming costs
-                // a refusal; under-naming is a disclosure.
-                if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
-                    // `""` is an escaped quote inside a quoted identifier.
-                    return Some(inner.replace("\"\"", "\"").to_ascii_lowercase());
+    let mut names = Vec::new();
+    for token in &scanned.tokens {
+        if token.token == Token::Uescape as i32 {
+            // `U&"d!0061t" UESCAPE '!'` is `dat`. We do not apply a caller-chosen
+            // escape; naming the wrong identifier would be a release.
+            return None;
+        }
+        let start = usize::try_from(token.start).ok()?;
+        let end = usize::try_from(token.end).ok()?;
+        let text = sql.get(start..end)?;
+        // `UIDENT`, or any token whose source is spelled as one: an encoding
+        // we do not recognise is a name we cannot clear.
+        if token.token == Token::Uident as i32 || is_unicode_ident_spelling(text) {
+            names.push(decode_unicode_ident(text)?);
+            continue;
+        }
+        // Not `token() == Ident`. Two whole classes of name are not
+        // `Ident`, and an audit found both:
+        //
+        //   * a *quoted* name's span includes its quotes, so `"email"`
+        //     never matched the catalog's `email`
+        //   * pg_query lexes unreserved keywords as their own token
+        //     types, so a column called `value`, `source`, `name`,
+        //     `comment`, `owner` or `year` produced no token at all
+        //
+        // Either one silently reopened the hole this function exists to
+        // close, and neither is exotic — every ORM quotes identifiers,
+        // and `comment` and `source` are ordinary column names.
+        //
+        // So the rule is textual rather than grammatical: anything
+        // shaped like a name counts, keyword or not. Over-naming costs
+        // a refusal; under-naming is a disclosure.
+        if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            // `""` is an escaped quote inside a quoted identifier.
+            names.push(inner.replace("\"\"", "\"").to_ascii_lowercase());
+            continue;
+        }
+        let word = !text.is_empty()
+            && text.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && text
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        if word {
+            names.push(text.to_ascii_lowercase());
+        }
+    }
+    Some(names)
+}
+
+fn is_unicode_ident_spelling(text: &str) -> bool {
+    text.starts_with("u&") || text.starts_with("U&")
+}
+
+/// Decode `u&"email"` / `U&"e\006dail"` to the catalog name `email`.
+///
+/// `\XXXX` is four hex digits, `\+XXXXXX` is six. `""` is a literal quote.
+/// A doubled escape is a literal escape. Anything else fails closed.
+fn decode_unicode_ident(text: &str) -> Option<String> {
+    let body = text
+        .strip_prefix("u&")
+        .or_else(|| text.strip_prefix("U&"))?;
+    let inner = body.strip_prefix('"')?.strip_suffix('"')?;
+    decode_unicode_ident_body(inner, '\\').map(|name| name.to_ascii_lowercase())
+}
+
+fn decode_unicode_ident_body(inner: &str, escape: char) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            if chars.next() == Some('"') {
+                out.push('"');
+                continue;
+            }
+            return None;
+        }
+        if c != escape {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            '+' => out.push(hex_codepoint(&mut chars, 6)?),
+            c if c == escape => out.push(escape),
+            c => {
+                // The consumed char is the first of four hex digits.
+                let mut value = c.to_digit(16)?;
+                for _ in 0..3 {
+                    value = value
+                        .saturating_mul(16)
+                        .saturating_add(chars.next()?.to_digit(16)?);
                 }
-                let word = !text.is_empty()
-                    && text.starts_with(|c: char| c.is_alphabetic() || c == '_')
-                    && text
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
-                word.then(|| text.to_ascii_lowercase())
-            })
-            .collect(),
-    )
+                out.push(char::from_u32(value)?);
+            }
+        }
+    }
+    Some(out)
+}
+
+fn hex_codepoint(chars: &mut std::str::Chars<'_>, width: usize) -> Option<char> {
+    let mut value = 0u32;
+    for _ in 0..width {
+        value = value
+            .saturating_mul(16)
+            .saturating_add(chars.next()?.to_digit(16)?);
+    }
+    char::from_u32(value)
+}
+
+/// Decoded names the parse tree reports: `ColumnRef` fields (unicode escapes
+/// already expanded), alias / `USING` `String` nodes, `ColumnDef` names, and
+/// `RangeVar` relation names.
+///
+/// Complements [`scan_identifiers`]. The tree names what the token stream
+/// spelled as `u&"email"`; the token stream names `id` inside a `WindowDef`
+/// the walker historically skipped. Union is the backstop; either source
+/// alone is how this leaked.
+fn tree_identifier_names(parsed: &pg_query::ParseResult) -> Vec<String> {
+    let mut names = Vec::new();
+    walk_parsed(parsed, &mut |node| match node.node.as_ref() {
+        Some(NodeEnum::ColumnRef(column)) => {
+            for field in &column.fields {
+                if let Some(NodeEnum::String(s)) = field.node.as_ref() {
+                    names.push(s.sval.to_ascii_lowercase());
+                }
+            }
+        }
+        Some(NodeEnum::String(s)) => names.push(s.sval.to_ascii_lowercase()),
+        Some(NodeEnum::ColumnDef(def)) => names.push(def.colname.to_ascii_lowercase()),
+        Some(NodeEnum::RangeVar(range)) => {
+            if !range.relname.is_empty() {
+                names.push(range.relname.to_ascii_lowercase());
+            }
+            if !range.schemaname.is_empty() {
+                names.push(range.schemaname.to_ascii_lowercase());
+            }
+        }
+        _ => {}
+    });
+    names
 }
 
 #[cfg(test)]

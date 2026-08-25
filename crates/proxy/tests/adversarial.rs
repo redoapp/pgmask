@@ -1236,6 +1236,88 @@ async fn an_error_still_carries_its_sqlstate() -> Result<()> {
     Ok(())
 }
 
+/// `lineage = "allow"` releases an expression whose resolved sources are all
+/// passthrough. That inverts the default, so a name the resolver never reports
+/// has to be a name the backstop still sees — including encodings the token
+/// stream does not spell as the catalog word.
+///
+/// Measured through the shipped GUI catalog: concatenating released `city`
+/// with `u&"email"` inside a scalar subquery returned the address in the
+/// clear (`Denveruser1@example.com`). `sqllineage` does not enter the
+/// subquery; the lexer used to skip the `UIDENT`. Same hole for `CONCAT`
+/// and `ARRAY`. Bare `SELECT u&"email"` was already masked (OID provenance).
+#[tokio::test]
+async fn lineage_does_not_release_a_unicode_escaped_masked_name() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy_allowing_lineage(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    // Control: lineage still releases an expression over only passthrough
+    // columns. If this is refused, the leak queries below prove nothing —
+    // they would be refused because lineage is off, not because the backstop
+    // named `email`.
+    let msgs = client
+        .simple_query("SELECT upper(city) FROM canary.subjects")
+        .await?;
+    assert_served(&msgs, "lineage still releases a passthrough expression");
+    assert!(
+        client.received_text().contains("PORTLAND"),
+        "city is mask = none: {}",
+        client.received_text()
+    );
+    assert_no_canary(&client, "passthrough expression under lineage");
+
+    // Guard 7: a SubLink in the output is incomplete sources even when every
+    // named column is released. Guard 6 does not fire here (`city` is
+    // `mask = "none"`). The unicode cases below would still be refused if
+    // this were missing; this is the pin that it is not.
+    {
+        let sql = "SELECT city || (SELECT city FROM canary.subjects LIMIT 1) \
+                   FROM canary.subjects";
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let msgs = client.simple_query(sql).await?;
+        assert_exercised(&msgs, &client, sql);
+        assert_refused(&client, sql);
+        assert_no_canary(&client, sql);
+    }
+    // A subquery in WHERE is a predicate, not a source of the field.
+    {
+        let sql = "SELECT upper(city) FROM canary.subjects \
+                   WHERE city IN (SELECT city FROM canary.subjects)";
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let msgs = client.simple_query(sql).await?;
+        assert_served(&msgs, sql);
+        assert!(
+            client.received_text().contains("PORTLAND"),
+            "{sql}: {}",
+            client.received_text()
+        );
+        assert_no_canary(&client, sql);
+    }
+
+    for sql in [
+        r#"SELECT city || (SELECT u&"email" FROM canary.subjects c2
+            WHERE c2.id = canary.subjects.id LIMIT 1)
+           FROM canary.subjects WHERE id = 1"#,
+        r#"SELECT city || (SELECT u&"e\006dail" FROM canary.subjects LIMIT 1)
+           FROM canary.subjects"#,
+        r#"SELECT CONCAT(city, (SELECT u&"email" FROM canary.subjects LIMIT 1))
+           FROM canary.subjects"#,
+        r#"SELECT ARRAY[city, (SELECT u&"email" FROM canary.subjects LIMIT 1)]
+           FROM canary.subjects"#,
+    ] {
+        // A fresh client so a refusal on an earlier spelling cannot satisfy
+        // `assert_refused` for a later one that started leaking.
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let msgs = client.simple_query(sql).await?;
+        assert_exercised(&msgs, &client, sql);
+        assert_refused(&client, sql);
+        assert_no_canary(&client, sql);
+    }
+    Ok(())
+}
+
 // --- The rescue path --------------------------------------------------------
 //
 // analysis turns refusals into passthroughs for expressions positively
