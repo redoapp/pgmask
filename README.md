@@ -205,7 +205,10 @@ free text is required and partial disclosure is acceptable.
 Pseudonyms preserve equality. This keeps joins useful, but also exposes
 frequency and repeated identity. Semantic types act as pseudonym domains:
 columns in the same domain remain linkable; columns in different domains do
-not.
+not. They are output aliases, not blind indexes: pgmask does not translate a
+pseudonym supplied in a query back to its source value, and an emitted
+pseudonym cannot be used to look up a row unless another system maintains that
+mapping.
 
 ## Query behavior
 

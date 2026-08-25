@@ -131,6 +131,12 @@ never prints values, but the output still requires human review.
 - `scrub` reveals text it does not recognize. It misses names, street addresses,
   and many obfuscated identifiers.
 - Pseudonyms are deterministic. They preserve equality, joins, and frequency.
+- Hashes and pseudonyms are one-way, not guess-proof. A party with the
+  pseudonym key, or access to an oracle that computes the same mask, can test
+  candidate inputs. Guessable values such as email addresses, phone numbers,
+  and sequential identifiers therefore still depend on key and oracle access;
+  high-entropy random identifiers do not depend on key secrecy for preimage
+  resistance.
 - Partial masks intentionally reveal part of a value.
 - Numeric buckets can return an exact value when the source lies on a bucket
   boundary.
@@ -143,6 +149,9 @@ pgmask does not provide:
 
 - Database authentication or authorization.
 - Network isolation.
+- Blind indexes or lookup by an emitted hash or pseudonym. Masking happens on
+  result rows; pgmask neither reverses pseudonyms nor rewrites query predicates
+  containing them.
 - Protection after the proxy or database host is compromised.
 - Differential privacy, minimum group sizes, or protection from differencing.
 - A proof that arbitrary sequences of allowed queries reveal no information.

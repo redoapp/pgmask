@@ -315,6 +315,9 @@ pub enum Mask {
     /// Mask characters in `[start, end)`.
     Range,
     /// Non-reversible digest, hex.
+    ///
+    /// One-way is not guess-proof: possession of the key permits offline
+    /// candidate testing, so low-entropy inputs still depend on key secrecy.
     Hash,
     /// Keyed, deterministic, shaped like the input. Joins still work.
     ///
@@ -322,6 +325,8 @@ pub enum Mask {
     /// distinct principals and join them across tables. Usually the point, but
     /// it is a real disclosure — choose it per column deliberately, and see
     /// `domain` for controlling *which* joins remain possible.
+    /// The emitted value is an output alias, not a blind index: pgmask does not
+    /// translate it back into a source value when it appears in a predicate.
     Pseudonym,
     /// Truncate a date or timestamp to 1 January of its year.
     DateYear,
