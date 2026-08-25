@@ -38,8 +38,9 @@ pub(crate) fn masked_exceeds_outer_projection_inspected(
     if masked.is_empty() {
         return false;
     }
-    // Unicode-escaped names are invisible to the lexer. If we cannot parse,
-    // we cannot count them, and allowing the statement is a leak on any
+    // A parse failure still refuses: unicode-escaped names are now decoded
+    // in the token stream, but a tree the walker cannot even build is a
+    // count we cannot trust, and allowing the statement is a leak on any
     // syntax pg_query lags the engine on (JSON_TABLE, …). Fail closed.
     let Some(parsed) = inspection.parsed() else {
         return true;

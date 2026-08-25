@@ -15,7 +15,11 @@
 //! **This test has already done its job once.** The backstop originally walked
 //! `pg_query`'s parse tree for `ColumnRef`s, and this caught it missing `id` in
 //! `sum(n) OVER (ORDER BY id …)` — the walker does not enter a `WindowDef`.
-//! The backstop is lexical now, which has no such gap.
+//! The token stream has no such gap. Unicode-escaped identifiers are the
+//! other direction (`u&"email"` is not the word `email`); they are decoded
+//! here so the containment still holds. The lineage backstop unions this
+//! set with the tree; this suite pins the lexer half, which is what the
+//! resolver can name.
 //!
 //! One exception is legitimate and is skipped: `SELECT *`. There `sqllineage`
 //! names columns that appear nowhere in the text, and it is the complete side —
@@ -59,6 +63,7 @@ const STATEMENTS: &[&str] = &[
     "SELECT (SELECT email FROM fz.people LIMIT 1) AS c0 FROM fz.t1",
     "SELECT a FROM fz.t1 WHERE id IN (SELECT t_id FROM fz.u WHERE note IS NOT NULL)",
     "SELECT t.a FROM fz.t1 t, LATERAL (SELECT note FROM fz.u WHERE t_id = t.id) x",
+    r#"SELECT city || (SELECT u&"email" FROM fz.people c2 WHERE c2.id = fz.people.id LIMIT 1) FROM fz.people"#,
     "WITH RECURSIVE c(id, a) AS (SELECT id, a FROM fz.t1 WHERE id = 1 \
      UNION ALL SELECT t.id, t.a FROM fz.t1 t JOIN c ON t.id = c.id + 1) SELECT a FROM c",
 ];
@@ -127,11 +132,11 @@ fn the_backstop_sees_every_column_the_resolver_reports() {
 #[test]
 fn the_lexical_backstop_keeps_every_postgres_identifier_shape() {
     let seen = analysis::referenced_identifiers(
-        r#"SELECT "email", value, source, "a""b", émail FROM customer"#,
+        r#"SELECT "email", value, source, "a""b", émail, u&"phone", u&"n\0061me" FROM customer"#,
     )
     .expect("valid PostgreSQL must scan");
 
-    for identifier in ["email", "value", "source", "a\"b", "émail"] {
+    for identifier in ["email", "value", "source", "a\"b", "émail", "phone", "name"] {
         assert!(
             seen.iter().any(|seen| seen == identifier),
             "backstop missed {identifier:?}; it saw {seen:?}"

@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.1.94**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.1.95**. Licensed under the [MIT License](LICENSE).
 
 ## What pgmask provides
 
@@ -171,13 +171,16 @@ and unresolved configured columns are startup errors.
 | `unclassified` | `mask` | Type-aware masking for columns missing from the catalog. `allow` is an incremental-rollout escape hatch. |
 | `unclassified_mask` | `type-aware` | Which mask `unclassified = "mask"` applies. `null` restores strict `NULL` for every unclassified value, giving up the equality-preserving pseudonyms. |
 | `opaque` | `reject` | Reject computed or otherwise unclassified result fields. `mask` replaces them with `NULL`. |
-| `lineage` | `refuse` | When enabled, release an expression only if all resolved source columns are explicitly released. |
+| `lineage` | `refuse` | When enabled, release an expression only if all resolved source columns are explicitly released and the output shape cannot hide a nested query. |
 | `summaries` | `allow` | Allow supported reducing aggregates, while applying the source column's policy when required. |
 | `posture` | `default` | `hostile` refuses masked-column use outside a bare projection and forces summaries off. |
 | `system_catalogs` | `refuse` | `allow` enables approved metadata queries needed by GUI clients and `psql` `\d`. |
 
 `lineage = "allow"` improves compatibility but is less conservative: an
-incomplete lineage result could release data. It is off by default.
+incomplete lineage result could release data. It is off by default. A release
+now also requires the output expression to be a closed shape (no scalar
+subquery in the field). A masked column named anywhere in the statement,
+including as `u&"…"`, still blocks release.
 
 `system_catalogs = "allow"` is required for most GUI clients. pgmask still
 rejects catalog relations that may contain user values or SQL text. See

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.95 — lineage Release is an allowlist; unicode-escaped names are decoded
+
+- **A non-empty source list is not a complete source list.** `sqllineage`
+  does not descend into a scalar subquery, so `city || (SELECT email FROM …)`
+  reports only `city` and used to `Release` whenever that column was
+  passthrough. Guard 7 inverts the question the way analysis does: the
+  output expression must be a closed composition of columns and literals.
+  A `SubLink`, a window, or a node kind we have not listed stays unresolved,
+  even when every *reported* source is released. FROM-clause subqueries,
+  CTEs, and a subquery in WHERE still resolve — they are not sources of the
+  projected value. The unicode-escaped concat that leaked through the GUI
+  catalog is now refused on the construct, not only on the name.
+- **`lineage = "allow"` no longer releases a masked column spelled `u&"…"`.**
+  Guard 6 asks whether a masked name appears anywhere in the statement. The
+  token `u&"email"` is not the word `email`, so concatenating a released
+  column with a unicode-escaped masked column inside a scalar subquery —
+  `city || (SELECT u&"email" FROM …)` — returned the address in the clear
+  through the shipped GUI catalog. The same hole held for hex escapes
+  (`u&"e\006dail"`), `CONCAT`, and `ARRAY`. The lexer now decodes unicode
+  identifiers (and fails the whole scan on `UESCAPE` or truncated hex); the
+  lineage backstop unions those names with the parse tree, which already
+  expanded the escapes on `ColumnRef`. Hostile counting stays on the lexer
+  so a unicode ident is still one mention, not two. Bare `SELECT u&"email"`
+  was already masked (OID provenance) and is unchanged.
+
 ## 0.1.94 — nullability-aware fallbacks; plan decisions extracted; row path fused
 
 - **Automatic fallbacks preserve declared nullability.** A type-aware default
