@@ -103,6 +103,21 @@ struct PendingExecute {
     epoch: u64,
     /// Frontend order shared with simple Query messages.
     order: u64,
+    /// Plan that governed this Execute when it was issued.
+    ///
+    /// Bind of the same portal name overwrites `portal_plans` immediately.
+    /// Looking that map up by owner name then judges in-flight DataRows with
+    /// the *new* binding's plan. A classified first result plus a same-arity
+    /// all-passthrough rebind took `Vetted::unmasked_row`. Snapshotting here
+    /// is what keeps those rows bound to the Execute that produced them.
+    /// `None` when the statement was not yet described; filled in when the
+    /// plan lands, but only if this slot's [`bind_generation`] still matches
+    /// the portal's current one.
+    plan: Option<Plan>,
+    /// Bind generation this Execute ran against. Resume of the same portal
+    /// shares an owner only when this still matches; a Bind in between bumps
+    /// it, and the next Execute is a new result set.
+    bind_generation: u64,
 }
 
 /// All state that binds SQL, statements, portals, descriptions, and row plans.
@@ -137,6 +152,15 @@ pub(crate) struct PlanState {
     /// and a proxy that errors on valid queries is one an operator routes
     /// around.
     portal_formats: HashMap<Bytes, Option<Vec<i16>>>,
+    /// How many times each portal name has been Bound.
+    ///
+    /// `execute` treats a second Execute of the same name as a resume of one
+    /// result set — two `Execute p` before PortalSuspended share an owner.
+    /// A Bind in between is not a resume: it replaces the portal. Without
+    /// this counter the second Execute of a reused name skipped the queue,
+    /// `portal_plans[p]` already held the new plan, and in-flight DataRows
+    /// were judged with it. See [`PendingExecute::bind_generation`].
+    portal_bind_generations: HashMap<Bytes, u64>,
     active_plan: Option<Plan>,
     /// Portal named by the most recent Execute, so a plan that only becomes
     /// known later can still be activated for the rows it produces.
@@ -152,7 +176,35 @@ pub(crate) struct PlanState {
     /// own plan, never the single `active_plan`: a pipelined client can have
     /// several result sets in flight, and the last Execute is not the one
     /// whose rows come first.
+    ///
+    /// `PortalSuspended` is not completion. A limited Execute leaves its owner
+    /// here so a resume of the *same* portal does not re-queue, but a later
+    /// Execute of a *different* portal is a new result set — Postgres runs it.
+    /// See [`PlanState::suspend_result`].
+    ///
+    /// A sibling without PortalSuspended: two full Executes (`max_rows=0`)
+    /// that reuse one portal name. Bind of the second statement overwrites
+    /// `portal_plans` before the first DataRows are judged. `execute` treated
+    /// the second Execute as a resume (the front already named that portal),
+    /// so `streaming_plan` applied the new all-passthrough plan to the
+    /// classified first result. `Vetted::unmasked_row` released the poison
+    /// row. Unnamed portal `""` and binary Bind leaked the same way.
+    /// Pass-then-class over-masked (fail-closed). Two different portal names
+    /// in one Sync, and a Sync between the two PBEs, were already safe.
+    ///
+    /// Each owner snapshotted its plan at Execute. Bind bumps a per-portal
+    /// generation so a later Execute of the same name after a rebind is a
+    /// new result set, not a resume. Unknown (no snapshot, generation no
+    /// longer current) refuses DataRows rather than unmasking.
     pending_executes: VecDeque<PendingExecute>,
+    /// The front of `pending_executes` is a portal that has emitted
+    /// `PortalSuspended` and is not the result currently streaming.
+    ///
+    /// Distinguishes "Execute p1 then Execute p2, both in flight" (p1 still
+    /// owns the next DataRows) from "Execute p1, PortalSuspended, Execute p2"
+    /// (p2 owns them). Without the flag those are the same queue shape, and
+    /// the second used the first's plan.
+    suspended: bool,
     /// True while the result set streaming from the backend is a simple
     /// query's — armed by its own RowDescription and ended by its own
     /// CommandComplete, which spends no executed-portal slot. Extended
@@ -241,6 +293,7 @@ impl PlanState {
             for portal in stale_portals {
                 self.portal_plans.remove(&portal);
                 self.portal_formats.remove(&portal);
+                self.portal_bind_generations.remove(&portal);
             }
         }
         self.statement_sql.insert(name.clone(), sql);
@@ -258,7 +311,15 @@ impl PlanState {
             epoch: self.sync_epoch,
         });
         self.portal_formats.insert(portal.clone(), formats.clone());
-        let Some(statement_plan) = self.statement_plans.get(&statement) else {
+        // Bump first so any in-flight Execute of this name keeps its
+        // snapshot. The new plan is for the *next* Execute, not the rows
+        // already owed.
+        self.bump_bind_generation(&portal);
+        let Some(portal_plan) = self
+            .statement_plans
+            .get(&statement)
+            .map(|statement_plan| Self::stamp(statement_plan, formats.as_ref()))
+        else {
             // The statement has no plan yet — the Describe's RowDescription is
             // still in flight. The formats are remembered above and applied by
             // `finish_description` when it lands.
@@ -270,8 +331,7 @@ impl PlanState {
         // until Bind. Re-stamp the plan with this portal's actual formats.
         // An unparseable Bind keeps the described format. A wrong format then
         // fails decoding and refuses the result set rather than guessing.
-        let portal_plan = Self::stamp(statement_plan, formats.as_ref());
-        self.portal_plans.insert(portal, portal_plan);
+        self.install_portal_plan(portal, portal_plan);
     }
 
     pub(crate) fn describe(&mut self, target: DescribeTarget) {
@@ -296,22 +356,139 @@ impl PlanState {
         self.active_epoch = Some(self.sync_epoch);
         self.active_portal = Some(portal.clone());
         // This Execute owns the next result set. A suspended portal (max_rows)
-        // is resumed by re-executing it, and PostgreSQL refuses to run any
-        // other portal while one is suspended, so a front entry already naming
-        // this portal can only be the resume of a result still in flight.
-        if !self
-            .pending_executes
-            .front()
-            .is_some_and(|pending| pending.name == *portal)
-        {
-            let order = self.next_result_order;
-            self.next_result_order = self.next_result_order.saturating_add(1);
-            self.pending_executes.push_back(PendingExecute {
-                name: portal.clone(),
-                epoch: self.sync_epoch,
-                order,
-            });
+        // is resumed by re-executing it. The next lines used to say PostgreSQL
+        // refuses to run any other portal while one is suspended, so a front
+        // entry already naming this portal could only be that resume. That
+        // refusal is false — we measured it. After PortalSuspended the backend
+        // will run a *different* named portal, and CommandComplete then popped
+        // the still-queued suspended owner, so those DataRows were vetted with
+        // the stale plan. An all-passthrough plan takes `Vetted::unmasked_row`
+        // and released email, salary, birth, uuid, phone, IP, notes, address
+        // (same arity as the suspended result). A mixed plan leaked only the
+        // passthrough slots.
+        //
+        // Resume of the *same* portal still must not re-queue: two Execute(p)
+        // messages before PortalSuspended arrives share one owner. A different
+        // portal after we have seen PortalSuspended must not inherit that
+        // owner — `suspend_result` marks the pause, and the branch below
+        // discards it so `streaming_plan` is this portal's, or none.
+        //
+        // A sibling of that leak: resume of the *same* portal after Sync,
+        // without BEGIN. Sync ends the implicit transaction; Postgres
+        // destroys the named portal (SQLSTATE 34000). This branch clears
+        // `suspended` and returns, so the destroyed portal stays the owner.
+        // `discard_failed_epoch` used to return early (no pending
+        // Parse/Bind/Describe) and leave that all-passthrough plan on
+        // `pending_executes`. The next portal queued behind the zombie;
+        // same-arity classified DataRows went out via `Vetted::unmasked_row`.
+        //
+        // A sibling without PortalSuspended: two full Executes (`max_rows=0`)
+        // that reuse one portal name. Bind overwrites `portal_plans` before
+        // the first DataRows are judged; the second Execute was treated as a
+        // resume (the front already named that portal), so `streaming_plan`
+        // applied the new all-passthrough plan to the classified first
+        // result. `Vetted::unmasked_row` released the poison row. Unnamed
+        // portal `""` and binary Bind leaked the same way. Pass-then-class
+        // over-masked (fail-closed). Two different portal names, and a Sync
+        // between the two PBEs, were already safe. Resume still shares an
+        // owner only when the name *and* bind generation match; the owner's
+        // plan is snapshotted at Execute. Unknown refuses DataRows.
+        if self.suspended {
+            self.suspended = false;
+            if self.is_resume(portal) {
+                // Stamp the resume onto this Sync's epoch so a 34000
+                // ErrorResponse discards *this* exchange, not only the
+                // original limited Execute's.
+                //
+                // That stamp closed only A's own Execute. A later-epoch
+                // ErrorResponse that is not that Execute — simple Query
+                // `1/0` (H10a), Describe of the dead portal (H5b, 34000
+                // on Describe not resume), Parse `SELECT !!!`, Bind of a
+                // missing statement — still left the original slot on
+                // `pending_executes`. [`PlanState::ready_for_query`] Idle
+                // discards the owner because the implicit transaction
+                // ended; [`PlanState::discard_failed_epoch`] also drops
+                // older-epoch Executes while `suspended`.
+                if let Some(pending) = self.pending_executes.front_mut() {
+                    pending.epoch = self.sync_epoch;
+                }
+                return;
+            }
+            let _ = self.pending_executes.pop_front();
+        } else if self.is_resume(portal) {
+            return;
         }
+        let order = self.next_result_order;
+        self.next_result_order = self.next_result_order.saturating_add(1);
+        self.pending_executes.push_back(PendingExecute {
+            name: portal.clone(),
+            epoch: self.sync_epoch,
+            order,
+            plan: self.portal_plans.get(portal).cloned(),
+            bind_generation: self.bind_generation(portal),
+        });
+    }
+
+    /// `PortalSuspended`: the streaming Execute paused; it has not completed.
+    ///
+    /// Found live: after `Execute p_pass max_rows=1` the next DataRows of a
+    /// different named portal (`SELECT email, name`, same arity) were judged
+    /// with `p_pass`'s all-passthrough plan and forwarded by
+    /// `Vetted::unmasked_row`. The comment on [`PlanState::execute`] that
+    /// Postgres refuses a second portal while one is suspended was wrong —
+    /// it runs it. `CommandComplete` then popped the *suspended* owner.
+    ///
+    /// A resume of the same portal (pipelined `Execute p; Execute p`) shares
+    /// one owner and must keep it. A later Execute already queued, or one
+    /// that arrives after this message, is a different result set: drop the
+    /// paused owner so `streaming_plan` cannot inherit it. Resume re-queues.
+    /// Unknown (no remaining owner) refuses DataRows rather than falling
+    /// back to the suspended plan.
+    ///
+    /// Resume after Sync, without BEGIN, is a sibling: Postgres destroys the
+    /// named portal (SQLSTATE 34000). That ErrorResponse must discard the
+    /// owner — see [`PlanState::discard_failed_epoch`] — or the next portal
+    /// inherits this all-passthrough plan the same way.
+    ///
+    /// After `PortalSuspended`, `ReadyForQuery Idle` means those named
+    /// portals are already gone — see [`PlanState::ready_for_query`]. Do
+    /// not wait for a later-epoch error to notice. The resume-only stamp
+    /// missed H10a (`SELECT 1/0`) and H5b (34000 on Describe).
+    pub(crate) fn suspend_result(&mut self) {
+        if self.pending_executes.len() > 1 {
+            let _ = self.pending_executes.pop_front();
+            self.suspended = false;
+        } else {
+            self.suspended = true;
+        }
+    }
+
+    /// `ReadyForQuery` after `PortalSuspended`.
+    ///
+    /// Postgres destroys named portals of an implicit transaction at
+    /// transaction end. After `PortalSuspended`, `ReadyForQuery Idle`
+    /// (`Z` status `I`) means those portals are gone — discard the
+    /// suspended result owner. A later-epoch ErrorResponse that is not
+    /// the paused portal's own Execute (H10a: simple Query `1/0`; H5b:
+    /// 34000 on Describe of the dead portal, not resume Execute; Parse
+    /// `SELECT !!!`; Bind of a missing statement) used to leave that
+    /// all-passthrough plan on `pending_executes`. The next same-arity
+    /// portal inherited it via `Vetted::unmasked_row`. The resume-only
+    /// epoch stamp closed only 34000 on A's own Execute.
+    ///
+    /// `ReadyForQuery InTxn` (`T`) must not discard: `BEGIN; suspend;
+    /// Sync` keeps the portal. InFailedTxn (`E`) is left to
+    /// [`PlanState::discard_failed_epoch`], which has already run.
+    pub(crate) fn ready_for_query(&mut self, status: u8) {
+        if !self.suspended || status != b'I' {
+            return;
+        }
+        // Implicit transaction ended; every queued Execute's portal is gone.
+        self.pending_executes.clear();
+        self.suspended = false;
+        self.active_plan = None;
+        self.active_portal = None;
+        self.active_epoch = None;
     }
 
     /// The portal whose result set the backend is streaming, if an Execute
@@ -327,22 +504,84 @@ impl PlanState {
         self.portal_plans.get(portal).cloned()
     }
 
+    fn bind_generation(&self, portal: &Bytes) -> u64 {
+        self.portal_bind_generations
+            .get(portal)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn bump_bind_generation(&mut self, portal: &Bytes) {
+        let next = self.bind_generation(portal).saturating_add(1);
+        self.portal_bind_generations.insert(portal.clone(), next);
+    }
+
+    /// Same portal name *and* the same Bind. A Bind in between is a new
+    /// result set, not a resume.
+    fn is_resume(&self, portal: &Bytes) -> bool {
+        self.pending_executes.front().is_some_and(|pending| {
+            pending.name == *portal && pending.bind_generation == self.bind_generation(portal)
+        })
+    }
+
+    fn fill_pending_plan(&mut self, portal: &Bytes, plan: &Plan) {
+        let generation = self.bind_generation(portal);
+        for pending in &mut self.pending_executes {
+            if pending.name == *portal
+                && pending.bind_generation == generation
+                && pending.plan.is_none()
+            {
+                pending.plan = Some(plan.clone());
+            }
+        }
+    }
+
+    fn install_portal_plan(&mut self, portal: Bytes, plan: Plan) {
+        self.fill_pending_plan(&portal, &plan);
+        self.portal_plans.insert(portal, plan);
+    }
+
     /// The plan that governs the backend's next `DataRow`.
     ///
     /// One result set streams at a time. A simple query's is governed by the
     /// plan its own RowDescription armed; an Execute's by the executed
     /// portal's own plan — never the single `active_plan`, which a pipelined
     /// client can have armed for a result set still to come.
+    ///
+    /// That "own plan" is the snapshot on the owner slot, not a lookup of
+    /// `portal_plans` by name. Bind of the same portal overwrites the map
+    /// before the first DataRows are judged; looking it up then applied a
+    /// later all-passthrough plan to a classified result (`unmasked_row`).
+    /// A missing snapshot falls back to the map only while this Execute's
+    /// bind generation is still current — otherwise unknown, and the caller
+    /// refuses rather than unmasking.
     pub(crate) fn streaming_plan(&self) -> Option<Plan> {
         if self.streaming_simple_result {
             return self.active_plan();
         }
-        match self.result_owner() {
-            // A missing portal plan must stay missing — falling back to
-            // `active_plan` would judge these rows with a *different* result
-            // set's description. The caller refuses on `None`.
-            Some(owner) => self.portal_plan(&owner),
-            None => self.active_plan(),
+        if self.result_owner().is_none() {
+            // After PortalSuspended with no remaining owner there is no
+            // streaming result. Falling back to `active_plan` would re-apply
+            // the suspended portal's plan to the next portal's DataRows —
+            // the 0.1.97 leak (`unmasked_row` under an all-passthrough plan).
+            if self.suspended {
+                return None;
+            }
+            return self.active_plan();
+        }
+        // A missing portal plan must stay missing — falling back to
+        // `active_plan` would judge these rows with a *different* result
+        // set's description. The caller refuses on `None`.
+        let pending = self.pending_executes.front()?;
+        if let Some(plan) = pending.plan.clone() {
+            return Some(plan);
+        }
+        let generation = pending.bind_generation;
+        let name = pending.name.clone();
+        if generation == self.bind_generation(&name) {
+            self.portal_plan(&name)
+        } else {
+            None
         }
     }
 
@@ -364,6 +603,11 @@ impl PlanState {
             self.streaming_simple_result = false;
             return;
         }
+        // This CommandComplete ended an Execute's result, not a pause.
+        // A simple result above can interleave after PortalSuspended and
+        // must leave `suspended` set so a later different portal still
+        // cannot inherit the paused owner.
+        self.suspended = false;
 
         let simple_order = match self.pending_descriptions.front() {
             Some(PendingDescription::Simple(pending)) => Some(pending.order),
@@ -426,12 +670,14 @@ impl PlanState {
                     self.portal_statement.remove(&portal);
                     self.portal_plans.remove(&portal);
                     self.portal_formats.remove(&portal);
+                    self.portal_bind_generations.remove(&portal);
                 }
             }
             DescribeTarget::Portal(portal) => {
                 self.portal_statement.remove(&portal);
                 self.portal_plans.remove(&portal);
                 self.portal_formats.remove(&portal);
+                self.portal_bind_generations.remove(&portal);
             }
         }
     }
@@ -464,17 +710,23 @@ impl PlanState {
         // built the plan a moment ago while leaving `active_plan` set to the
         // statement's text-format one.
         if !self.portal_plans.contains_key(&portal) {
-            if let Some(statement_plan) = self
+            let stamped = self
                 .portal_statement
                 .get(&portal)
                 .and_then(|statement| self.statement_plans.get(statement))
-            {
-                let stamped = Self::stamp(
-                    statement_plan,
-                    self.portal_formats.get(&portal).and_then(Option::as_ref),
-                );
-                self.portal_plans.insert(portal.clone(), stamped);
+                .map(|statement_plan| {
+                    Self::stamp(
+                        statement_plan,
+                        self.portal_formats.get(&portal).and_then(Option::as_ref),
+                    )
+                });
+            if let Some(stamped) = stamped {
+                self.install_portal_plan(portal.clone(), stamped);
             }
+        } else if let Some(plan) = self.portal_plans.get(&portal).cloned() {
+            // Execute already ran and snapshotted nothing; the plan exists
+            // now. Fill only this binding — a later Bind bumped generation.
+            self.fill_pending_plan(&portal, &plan);
         }
         // The rows about to arrive belong to this portal, not to the statement.
         if self.active_portal.as_ref() == Some(&portal) {
@@ -511,6 +763,7 @@ impl PlanState {
         self.pending_executes
             .retain(|pending| pending.epoch != epoch);
         self.streaming_simple_result = false;
+        self.suspended = false;
     }
 
     /// Remove provisional state from a failed exchange while preserving later
@@ -518,6 +771,24 @@ impl PlanState {
     pub(crate) fn discard_failed_epoch(&mut self) {
         // Whatever was streaming died with the backend's error.
         self.streaming_simple_result = false;
+        // Do not clear `suspended` before the retain below. Clearing it
+        // first left an older-epoch Execute on `pending_executes` when
+        // the ErrorResponse belonged to a later Parse/Bind/Describe/
+        // simple Query. H10a: Query `SELECT 1/0` after PortalSuspended
+        // + Idle. H5b: 34000 on Describe of the dead portal, not on
+        // resume Execute. The resume-only epoch stamp missed both.
+        let was_suspended = self.suspended;
+        // An ErrorResponse that completes an Execute must not leave
+        // `streaming_plan` pointing at a portal that no longer exists. The
+        // comment on [`PlanState::execute`] that Postgres refuses a second
+        // portal while one is suspended was wrong — we measured it. A sibling:
+        // resume after Sync, without BEGIN. Sync ends the implicit
+        // transaction; Postgres destroys the named portal (SQLSTATE 34000).
+        // Resume clears `suspended` but leaves that portal as owner. There is
+        // no pending Parse/Bind/Describe, so the early return below used to
+        // keep the all-passthrough plan on `pending_executes`. The next
+        // portal queued behind the zombie; same-arity classified DataRows
+        // went out via `Vetted::unmasked_row`.
         let failed_epoch = [
             self.pending_descriptions
                 .front()
@@ -530,8 +801,15 @@ impl PlanState {
         ]
         .into_iter()
         .flatten()
-        .min();
+        .min()
+        .or_else(|| self.pending_executes.front().map(|pending| pending.epoch));
+        // The destroyed portal's plan must not govern the next DataRows via
+        // `streaming_plan`'s `active_plan` fallback.
+        self.active_plan = None;
+        self.active_portal = None;
+        self.active_epoch = None;
         let Some(failed_epoch) = failed_epoch else {
+            self.suspended = false;
             return;
         };
 
@@ -584,8 +862,18 @@ impl PlanState {
             .retain(|pending| pending.epoch != failed_epoch);
         self.pending_binds
             .retain(|pending| pending.epoch != failed_epoch);
-        self.pending_executes
-            .retain(|pending| pending.epoch != failed_epoch);
+        self.pending_executes.retain(|pending| {
+            if pending.epoch == failed_epoch {
+                return false;
+            }
+            // A paused portal whose epoch predates this error cannot
+            // produce further rows. Keep later-epoch Executes.
+            if was_suspended && pending.epoch < failed_epoch {
+                return false;
+            }
+            true
+        });
+        self.suspended = false;
     }
 
     /// A `NoData` answers a `Describe` whose statement returns no rows. It can
@@ -664,11 +952,11 @@ impl PlanState {
                         &plan,
                         self.portal_formats.get(&portal).and_then(Option::as_ref),
                     );
-                    self.portal_plans.insert(portal, stamped);
+                    self.install_portal_plan(portal, stamped);
                 }
             }
             Some(DescribeTarget::Portal(name)) => {
-                self.portal_plans.insert(name, plan.clone());
+                self.install_portal_plan(name, plan.clone());
             }
             None => {}
         }
@@ -712,6 +1000,54 @@ mod tests {
             lenient: false,
             primed: None,
         }])
+    }
+
+    fn marked_plan(oid: u32, spec: Mask) -> Plan {
+        Arc::new(vec![
+            FieldPlan {
+                spec: MaskSpec::new(spec),
+                type_oid: oid,
+                format: 0,
+                lenient: false,
+                primed: None,
+            },
+            FieldPlan {
+                spec: MaskSpec::new(spec),
+                type_oid: oid,
+                format: 0,
+                lenient: false,
+                primed: None,
+            },
+        ])
+    }
+
+    fn mixed_plan(oid: u32) -> Plan {
+        Arc::new(vec![
+            FieldPlan {
+                spec: MaskSpec::new(Mask::None),
+                type_oid: oid,
+                format: 0,
+                lenient: false,
+                primed: None,
+            },
+            FieldPlan {
+                spec: MaskSpec::new(Mask::Redact),
+                type_oid: oid,
+                format: 0,
+                lenient: false,
+                primed: None,
+            },
+        ])
+    }
+
+    fn plan_oid(plan: &[FieldPlan]) -> u32 {
+        plan.first().map(|field| field.type_oid).unwrap()
+    }
+
+    fn streaming_oid(state: &PlanState) -> Option<u32> {
+        state
+            .streaming_plan()
+            .and_then(|plan| plan.first().map(|field| field.type_oid))
     }
 
     fn name(value: &'static str) -> Bytes {
@@ -925,8 +1261,11 @@ mod tests {
         state.execute(&name("p")); // resume: the front already names p
         assert_eq!(state.result_owner().as_deref(), Some(&b"p"[..]));
 
-        // A suspended portal is never followed by another portal's result, so
-        // one CommandComplete ends it and one pop frees the slot.
+        // A *resume* of the same portal is never followed by another portal's
+        // result on this owner: one CommandComplete ends it and one pop frees
+        // the slot. (A *different* portal after PortalSuspended is a different
+        // result set — see
+        // `a_different_portal_after_suspend_does_not_inherit_the_stale_plan`.)
         state.finish_result_set();
         assert_eq!(
             state.result_owner(),
@@ -1163,6 +1502,145 @@ mod tests {
         );
     }
 
+    /// After PortalSuspended, a different named portal's DataRows must not
+    /// inherit the paused owner's plan.
+    ///
+    /// Measured live: `Execute p_pass max_rows=1` (city, id — all passthrough)
+    /// then `Execute p_mask` (`email, name`, same arity) served the canaries
+    /// through `Vetted::unmasked_row`. `pending_executes` still named `p_pass`,
+    /// and CommandComplete popped that owner rather than `p_mask`. The comment
+    /// that Postgres refuses the second portal was wrong.
+    #[test]
+    fn a_different_portal_after_suspend_does_not_inherit_the_stale_plan() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+        state.parse(name("s2"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+
+        state.bind(name("p1"), name("s1"), None);
+        state.execute(&name("p1"));
+        assert_eq!(
+            streaming_oid(&state),
+            Some(1),
+            "the limited Execute's own rows use its plan"
+        );
+
+        state.suspend_result();
+        state.bind(name("p2"), name("s2"), None);
+        state.execute(&name("p2"));
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"p2"[..]),
+            "the next portal owns the next result set"
+        );
+        assert_eq!(
+            streaming_oid(&state),
+            Some(2),
+            "those DataRows must not inherit the suspended all-passthrough plan"
+        );
+
+        state.finish_result_set();
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "CommandComplete spends the portal that actually completed, not the paused one"
+        );
+
+        // Resume re-queues the paused portal; it was discarded, not completed.
+        state.execute(&name("p1"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p1"[..]));
+        assert_eq!(streaming_oid(&state), Some(1));
+    }
+
+    /// Same leak with a mixed plan: only the passthrough *slots* released.
+    /// The second portal's plan must govern every slot, not just the masked
+    /// ones of the first.
+    #[test]
+    fn a_mixed_stale_plan_after_suspend_does_not_release_passthrough_slots() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT city, note FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state.finish_description(mixed_plan(1)).unwrap();
+        state.parse(name("s2"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+
+        state.bind(name("p1"), name("s1"), None);
+        state.execute(&name("p1"));
+        state.suspend_result();
+        state.bind(name("p2"), name("s2"), None);
+        state.execute(&name("p2"));
+
+        let streaming = state.streaming_plan().expect("p2 has a plan");
+        assert_eq!(plan_oid(&streaming), 2);
+        assert!(
+            streaming.iter().all(|field| !field.spec.is_passthrough()),
+            "a passthrough slot from the suspended plan must not survive onto p2"
+        );
+    }
+
+    /// Pipelined `Execute p1 max_rows=1; Execute p2` — PortalSuspended arrives
+    /// with both owners queued. Postgres then streams p2; p1 must not still
+    /// own those rows.
+    #[test]
+    fn a_pipelined_execute_after_a_limited_execute_switches_on_suspend() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+        state.parse(name("s2"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+
+        state.bind(name("p1"), name("s1"), None);
+        state.execute(&name("p1"));
+        state.bind(name("p2"), name("s2"), None);
+        state.execute(&name("p2"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p1"[..]));
+        assert_eq!(streaming_oid(&state), Some(1));
+
+        state.suspend_result();
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"p2"[..]),
+            "after PortalSuspended the already-queued Execute owns the stream"
+        );
+        assert_eq!(streaming_oid(&state), Some(2));
+
+        state.finish_result_set();
+        assert_eq!(state.result_owner(), None);
+    }
+
+    /// Resume after we have seen PortalSuspended keeps the paused owner and
+    /// does not queue a second slot.
+    #[test]
+    fn a_resume_after_portal_suspended_keeps_the_owner() {
+        let mut state = PlanState::default();
+        state.parse(name("s"), "SELECT 1".into());
+        state.describe(DescribeTarget::Statement(name("s")));
+        state.finish_description(plan()).unwrap();
+        state.bind(name("p"), name("s"), None);
+        state.execute(&name("p"));
+        state.suspend_result();
+        state.execute(&name("p"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"p"[..]));
+        state.finish_result_set();
+        assert_eq!(state.result_owner(), None);
+    }
+
     /// Same for an exchange the *backend* rejected: it skips to Sync and never
     /// emits CommandComplete for the Executes it was asked to run.
     #[test]
@@ -1179,6 +1657,444 @@ mod tests {
             state.result_owner(),
             None,
             "a backend error aborts the exchange before any CommandComplete"
+        );
+    }
+
+    /// Failed resume of a suspended named portal after Sync must not leave
+    /// that portal as a zombie result owner.
+    ///
+    /// Measured live: `Execute A max_rows=1 Sync` (PortalSuspended, city|id
+    /// passthrough), then `Execute A max_rows=0 Sync`. Sync without BEGIN
+    /// ended the implicit transaction; Postgres destroyed A (SQLSTATE 34000).
+    /// Resume cleared `suspended` but left A on `pending_executes`.
+    /// `discard_failed_epoch` returned early — no pending Parse/Bind/Describe.
+    /// Execute B (`email, name`, same arity) queued behind the zombie and
+    /// `streaming_plan` used A's all-passthrough plan; `Vetted::unmasked_row`
+    /// released the canaries. Sibling of the 0.1.97 leak: the comment that
+    /// Postgres refuses a second portal while one is suspended was wrong.
+    #[test]
+    fn a_failed_resume_after_sync_does_not_leave_a_zombie_owner() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+        state.finish_parse();
+        state.bind(name("A"), name("s1"), None);
+        state.finish_bind();
+        state.execute(&name("A"));
+        state.suspend_result();
+        state.sync();
+
+        // Resume: the portal is gone on the backend. This is the early-return
+        // path — Parse/Bind/Describe already completed.
+        state.execute(&name("A"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"A"[..]));
+        assert!(
+            state.pending_parses.is_empty()
+                && state.pending_binds.is_empty()
+                && state.pending_descriptions.is_empty(),
+            "the 34000 path has no pending Parse/Bind/Describe"
+        );
+        state.discard_failed_epoch();
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "a 34000 must not leave the destroyed portal as result owner"
+        );
+        assert!(
+            state.streaming_plan().is_none(),
+            "streaming_plan must not still name the destroyed portal's plan"
+        );
+
+        state.parse(name("s2"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+        state.bind(name("B"), name("s2"), None);
+        state.execute(&name("B"));
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"B"[..]),
+            "the next portal must own its own result set, not queue behind A"
+        );
+        assert_eq!(
+            streaming_oid(&state),
+            Some(2),
+            "those DataRows must not inherit the zombie all-passthrough plan"
+        );
+    }
+
+    /// H10a: a later-epoch simple Query error after PortalSuspended + Idle
+    /// must not leave the paused portal as result owner.
+    ///
+    /// Measured live: `Execute A max_rows=1 Sync` (PortalSuspended,
+    /// ReadyForQuery Idle), `Query SELECT 1/0` (22012), then Execute B
+    /// (`email, name`, same arity). The resume-only epoch stamp closed
+    /// only 34000 on A's own Execute. This error is not that Execute;
+    /// `discard_failed_epoch` used to drop only the Query's epoch and
+    /// leave A's all-passthrough plan queued. `Vetted::unmasked_row`
+    /// released the canaries.
+    #[test]
+    fn a_simple_query_error_after_suspend_idle_does_not_leave_a_zombie_owner() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+        state.finish_parse();
+        state.bind(name("A"), name("s1"), None);
+        state.finish_bind();
+        state.execute(&name("A"));
+        state.suspend_result();
+        state.sync();
+        state.ready_for_query(b'I');
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "ReadyForQuery Idle after PortalSuspended must discard the \
+             destroyed portal — Postgres ended the implicit transaction"
+        );
+        assert!(
+            state.streaming_plan().is_none(),
+            "streaming_plan must not still name the destroyed portal's plan"
+        );
+
+        state.begin_simple_query(Some("SELECT 1/0".into()));
+        state.discard_failed_epoch();
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "a 22012 on a later simple Query must not restore the paused owner"
+        );
+
+        state.parse(name("s2"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+        state.bind(name("B"), name("s2"), None);
+        state.execute(&name("B"));
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"B"[..]),
+            "the next portal must own its own result set, not queue behind A"
+        );
+        assert_eq!(
+            streaming_oid(&state),
+            Some(2),
+            "those DataRows must not inherit the zombie all-passthrough plan"
+        );
+    }
+
+    /// H5b: Describe of the dead portal (34000) after suspend+Idle.
+    ///
+    /// Same owner leak as H10a; the ErrorResponse is on Describe, not
+    /// resume Execute, so the resume-only stamp never saw it.
+    #[test]
+    fn describe_of_a_dead_portal_after_suspend_idle_does_not_leave_a_zombie_owner() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+        state.finish_parse();
+        state.bind(name("A"), name("s1"), None);
+        state.finish_bind();
+        state.execute(&name("A"));
+        state.suspend_result();
+        state.sync();
+        state.ready_for_query(b'I');
+        assert_eq!(state.result_owner(), None);
+
+        state.describe(DescribeTarget::Portal(name("A")));
+        state.discard_failed_epoch();
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "34000 on Describe of the dead portal must not restore the paused owner"
+        );
+
+        state.parse(name("s2"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+        state.bind(name("B"), name("s2"), None);
+        state.execute(&name("B"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"B"[..]));
+        assert_eq!(streaming_oid(&state), Some(2));
+    }
+
+    /// `discard_failed_epoch` must not clear `suspended` while leaving
+    /// an older-epoch Execute in the queue — the RFQ Idle path is not
+    /// the only way a later error arrives (pipelined Query before the
+    /// backend's ReadyForQuery is processed).
+    #[test]
+    fn a_later_epoch_error_while_suspended_drops_the_older_owner() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+        state.finish_parse();
+        state.bind(name("A"), name("s1"), None);
+        state.finish_bind();
+        state.execute(&name("A"));
+        state.suspend_result();
+        state.sync();
+        // No ready_for_query: the ErrorResponse is the first notice.
+        state.begin_simple_query(Some("SELECT 1/0".into()));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"A"[..]));
+        state.discard_failed_epoch();
+        assert_eq!(
+            state.result_owner(),
+            None,
+            "a later-epoch error while suspended must drop the paused owner, \
+             not only the failing Query's epoch"
+        );
+        assert!(
+            !state.suspended,
+            "suspended must not stay set after the paused owner is gone"
+        );
+
+        state.parse(name("s2"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+        state.bind(name("B"), name("s2"), None);
+        state.execute(&name("B"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"B"[..]));
+        assert_eq!(streaming_oid(&state), Some(2));
+    }
+
+    /// `BEGIN; suspend; Sync` keeps the portal. ReadyForQuery InTxn
+    /// must not discard the owner; a different portal still uses its
+    /// own plan, and resume of A still sees A's.
+    #[test]
+    fn ready_for_query_in_txn_keeps_the_suspended_owner() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+        state.parse(name("s2"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+
+        state.bind(name("A"), name("s1"), None);
+        state.execute(&name("A"));
+        state.suspend_result();
+        state.sync();
+        state.ready_for_query(b'T');
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"A"[..]),
+            "ReadyForQuery InTxn must keep the suspended portal — BEGIN did"
+        );
+        assert_eq!(streaming_oid(&state), Some(1));
+
+        state.bind(name("B"), name("s2"), None);
+        state.execute(&name("B"));
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"B"[..]),
+            "a different portal after suspend still owns its own result set"
+        );
+        assert_eq!(
+            streaming_oid(&state),
+            Some(2),
+            "B's DataRows must use B's plan, not A's"
+        );
+
+        state.finish_result_set();
+        state.execute(&name("A"));
+        assert_eq!(state.result_owner().as_deref(), Some(&b"A"[..]));
+        assert_eq!(
+            streaming_oid(&state),
+            Some(1),
+            "resume of A inside the transaction must still see A's plan"
+        );
+    }
+
+    /// Rebinding the same portal before CommandComplete must not judge
+    /// in-flight DataRows with the new plan.
+    ///
+    /// Measured live: `Bind p s_class; Execute p 0; Bind p s_pass; Execute p 0;
+    /// Sync`. The second Bind overwrote `portal_plans[p]`; the second Execute
+    /// was treated as a resume; `streaming_plan` applied the all-passthrough
+    /// plan to the classified first row. `Vetted::unmasked_row` released
+    /// email. Unnamed portal `""` leaked the same way. Pass-then-class
+    /// over-masked (fail-closed). Two different portal names were already
+    /// safe.
+    #[test]
+    fn rebinding_the_same_portal_does_not_release_inflight_classified_rows() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+        state.parse(name("s2"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+
+        state.bind(name("p"), name("s1"), None);
+        state.execute(&name("p"));
+        assert_eq!(streaming_oid(&state), Some(2));
+
+        state.bind(name("p"), name("s2"), None);
+        assert_eq!(
+            streaming_oid(&state),
+            Some(2),
+            "Bind of the same portal must not replace the in-flight Execute's plan"
+        );
+        assert!(
+            state
+                .streaming_plan()
+                .is_some_and(|plan| plan.iter().all(|field| !field.spec.is_passthrough())),
+            "classified in-flight rows must not see the rebound all-passthrough plan"
+        );
+
+        state.execute(&name("p"));
+        assert_eq!(
+            state.result_owner().as_deref(),
+            Some(&b"p"[..]),
+            "the first Execute still owns the stream"
+        );
+        assert_eq!(streaming_oid(&state), Some(2));
+
+        state.finish_result_set();
+        assert_eq!(
+            streaming_oid(&state),
+            Some(1),
+            "the second Execute owns the next result set with its own plan"
+        );
+    }
+
+    /// Unnamed portal `""` is the JDBC/psycopg reuse pattern.
+    #[test]
+    fn rebinding_the_unnamed_portal_does_not_release_inflight_classified_rows() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+        state.parse(name("s2"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+
+        state.bind(name(""), name("s1"), None);
+        state.execute(&name(""));
+        state.bind(name(""), name("s2"), None);
+        state.execute(&name(""));
+        assert_eq!(streaming_oid(&state), Some(2));
+        state.finish_result_set();
+        assert_eq!(streaming_oid(&state), Some(1));
+    }
+
+    /// Binary Bind of the passthrough rebind is the same leak.
+    #[test]
+    fn rebinding_the_same_portal_with_binary_formats_does_not_release() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+        state.parse(name("s2"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+
+        state.bind(name("p"), name("s1"), Some(vec![1]));
+        state.execute(&name("p"));
+        state.bind(name("p"), name("s2"), Some(vec![1]));
+        state.execute(&name("p"));
+        assert_eq!(streaming_oid(&state), Some(2));
+        let streaming = state.streaming_plan().expect("classified snapshot");
+        assert!(streaming.iter().all(|field| !field.spec.is_passthrough()));
+        assert_eq!(streaming.first().map(|field| field.format), Some(1));
+    }
+
+    /// Two different portal names in one Sync keep their own plans. Control
+    /// for the same-name rebind leak.
+    #[test]
+    fn different_portal_names_in_one_sync_keep_their_own_plans() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+        state.parse(name("s2"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+
+        state.bind(name("p1"), name("s1"), None);
+        state.execute(&name("p1"));
+        state.bind(name("p2"), name("s2"), None);
+        state.execute(&name("p2"));
+        assert_eq!(streaming_oid(&state), Some(2));
+        state.finish_result_set();
+        assert_eq!(streaming_oid(&state), Some(1));
+    }
+
+    /// Pass-then-class on the same name is fail-closed: classified rows
+    /// must not inherit the passthrough plan. Over-mask of the first
+    /// result is acceptable.
+    #[test]
+    fn rebinding_passthrough_then_classified_same_portal_is_fail_closed() {
+        let mut state = PlanState::default();
+        state.parse(name("s1"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s1")));
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+        state.parse(name("s2"), "SELECT email, name FROM t".into());
+        state.describe(DescribeTarget::Statement(name("s2")));
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+
+        state.bind(name("p"), name("s1"), None);
+        state.execute(&name("p"));
+        state.bind(name("p"), name("s2"), None);
+        state.execute(&name("p"));
+
+        let first = streaming_oid(&state);
+        assert!(
+            first == Some(1) || first == Some(2) || first.is_none(),
+            "in-flight passthrough rows may stay passthrough, over-mask, or refuse"
+        );
+
+        state.finish_result_set();
+        let second = streaming_oid(&state);
+        assert_ne!(
+            second,
+            Some(1),
+            "classified DataRows must not inherit the passthrough plan"
+        );
+        assert!(
+            second == Some(2) || second.is_none(),
+            "the rebound classified Execute owns its rows, or they are refused"
         );
     }
 }

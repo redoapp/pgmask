@@ -813,6 +813,36 @@ comment that asserted the case could not happen.
   in 0.1.96 by treating that list as incomplete. Not numbered in the tables
   above, because both are reachable only with lineage inverted from the
   default.
+- On 2026-08-25 a protocol disclosure, independent of lineage: after
+  `PortalSuspended`, DataRows for a *different* named portal were masked
+  with the suspended portal's plan. An all-passthrough first page
+  (`ship_city, id`) plus a same-arity classified second page (`email, name`)
+  took `Vetted::unmasked_row` and released the values. The comment that
+  Postgres refuses a second portal while one is suspended was wrong.
+  Closed in 0.1.97 by binding `streaming_plan` to the portal that is
+  actually producing rows. A sibling, found on the same day: resume of
+  that named portal after Sync, without `BEGIN`, fails `34000` (portal
+  gone with the implicit transaction) but left the passthrough plan as a
+  zombie `pending_executes` owner; the next same-arity classified portal
+  took `unmasked_row` again. Closed in the same release by discarding the
+  result owner when an ErrorResponse completes an Execute. The resume-only
+  epoch stamp missed every later-epoch error that is not A's own Execute:
+  simple Query `1/0` (H10a), Describe of the dead portal (H5b, 34000 on
+  Describe not resume), Parse `SELECT !!!`, Bind of a missing statement.
+  After `PortalSuspended`, `ReadyForQuery Idle` now discards the owner
+  (named portals of an implicit transaction are gone); InTxn does not.
+  `discard_failed_epoch` also drops older-epoch Executes while
+  `suspended`. Not numbered in the tables above.
+  A further sibling, still without PortalSuspended: two full Executes
+  (`max_rows=0`) that reuse one portal name. Bind of the second statement
+  overwrote `portal_plans` before the first DataRows were judged;
+  `execute` treated the second Execute as a resume, so `streaming_plan`
+  applied the new all-passthrough plan to the classified first result.
+  `unmasked_row` released the values. Unnamed portal `""` and binary Bind
+  leaked the same way. Closed in the same release by snapshotting the
+  plan onto the owner at Execute and treating a Bind in between as a new
+  result set. Pass-then-class over-masked (fail-closed); two different
+  portal names, and a Sync between the two PBEs, were already safe.
 - The 2026-08-11 diagnostic fixes are now exercised on **both engines**, for the
   channels each engine actually has. Measured on CockroachDB v25.4.14: `DO $$ …
   RAISE EXCEPTION $$` carries a value exactly as on Postgres, and so do

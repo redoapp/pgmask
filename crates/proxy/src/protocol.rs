@@ -32,6 +32,7 @@ pub const B_PARSE_COMPLETE: u8 = b'1';
 pub const B_BIND_COMPLETE: u8 = b'2';
 pub const B_COPY_DATA: u8 = b'd';
 pub const B_COPY_DONE: u8 = b'c';
+pub const B_PORTAL_SUSPENDED: u8 = b's';
 
 /// Backend messages that carry no row data and are safe to forward verbatim.
 ///
@@ -46,7 +47,6 @@ pub const BACKEND_CONTROL_TAGS: &[u8] = &[
     b'1', // ParseComplete
     b'2', // BindComplete
     b'3', // CloseComplete
-    b's', // PortalSuspended
     b't', // ParameterDescription
     b'G', // CopyInResponse — a write path, nothing flows outward
     b'v', // NegotiateProtocolVersion

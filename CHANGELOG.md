@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.1.97 — a different portal after PortalSuspended does not inherit the stale plan
+
+- **`PortalSuspended` is not completion, and Postgres will run another portal.**
+  After `Execute p_pass` with `max_rows=1` (`ship_city, id` — all passthrough),
+  `pending_executes` still named `p_pass`. The next `Execute` of a *different*
+  named portal (`email, name`, same arity) produced DataRows that
+  `streaming_plan` judged with that leftover plan. An all-passthrough plan
+  takes `Vetted::unmasked_row` and released the classified values in the
+  clear — email, salary, birth, uuid, phone, IP, notes, address. A mixed
+  plan leaked only the passthrough slots. Binary Bind and a same-Sync
+  pipeline leaked the same way.
+- The comment that PostgreSQL refuses a second portal while one is
+  suspended was wrong; we measured it. `CommandComplete` then popped the
+  *suspended* owner, so the rows were never bound to the portal that
+  produced them. A resume of the *same* portal still shares one owner.
+  Simple Query after suspend, unnamed-portal reuse, and `max_rows=0` then
+  classified were already safe.
+- Fail-closed: `suspend_result` drops the paused owner when a different
+  portal is already queued or is Executed next, so `streaming_plan` is that
+  portal's plan — or `None`, which refuses the DataRows. Over-refusal of
+  that rare interleaving would also have been acceptable; leaking is not.
+- **A failed resume after Sync is not a live owner.** Sync without `BEGIN`
+  ends the implicit transaction; Postgres destroys named portal A
+  (`SQLSTATE 34000`). Resume cleared `suspended` but left A on
+  `pending_executes`. `discard_failed_epoch` returned early — no pending
+  Parse/Bind/Describe — so Execute of `email, name` (same arity) queued
+  behind the zombie and `Vetted::unmasked_row` released the values. Ghost
+  Execute or Close+Execute then B already refused in some paths; A-then-B
+  with no failed resume, and resume inside `BEGIN`, were already safe.
+  Fail-closed: an ErrorResponse that completes an Execute discards that
+  owner, and `streaming_plan` does not keep pointing at a portal that no
+  longer exists.
+- **A later-epoch error after suspend+Idle is not a live owner.** The
+  resume-only epoch stamp closed only 34000 on A's own Execute. Any
+  later-epoch ErrorResponse that is not that Execute — simple Query
+  `SELECT 1/0` (H10a, 22012), Describe of the dead portal (H5b, 34000
+  on Describe), Parse `SELECT !!!` (42601), Bind of a missing statement
+  (26000), binary Bind of B after 1/0, a mixed plan's passthrough slot —
+  left A's all-passthrough plan on `pending_executes`. Execute B queued
+  behind it; same-arity classified DataRows took `Vetted::unmasked_row`.
+  Postgres destroys named portals of an implicit transaction at
+  transaction end: after `PortalSuspended`, `ReadyForQuery Idle` discards
+  the suspended owner. `ReadyForQuery InTxn` does not (`BEGIN; suspend;
+  Sync` keeps the portal). `discard_failed_epoch` also drops older-epoch
+  Executes while `suspended`, so a pipelined error before that Idle
+  cannot leave the zombie either. A-then-B with no intervening error,
+  and the 34000-resume path, stay closed.
+- **Rebinding the same portal before CommandComplete is not a resume.**
+  Pipelining two full Executes (`max_rows=0`) that reuse one portal name
+  let the second Bind overwrite `portal_plans` before the first DataRows
+  were judged. `execute` treated the second Execute as a resume (the
+  front already named that portal), so `streaming_plan` applied the new
+  all-passthrough plan to the classified first result.
+  `Vetted::unmasked_row` released the poison row — email, name, and the
+  rest of the same-arity classified fields. Unnamed portal `""` (the
+  JDBC/psycopg reuse pattern) and binary Bind leaked the same way.
+  Pass-then-class over-masked (fail-closed). Two different portal names
+  in one Sync, and a Sync between the two PBEs, were already safe. This
+  is a sibling of the PortalSuspended owner-queue leak, without a
+  suspend. Fail-closed: each Execute snapshots its plan onto the owner
+  slot, Bind bumps a per-portal generation so a later Execute of the
+  same name is a new result set, and unknown refuses DataRows rather
+  than unmasking.
+
 ## 0.1.96 — Guard 7 follows FROM/CTE aliases to the real expression
 
 - **A `ColumnRef` is not always a stored column.** Guard 7 judged closedness
