@@ -57,6 +57,18 @@ refute() {
   fi
 }
 
+check_match() {
+  local name="$1" expected="$2" actual="$3"
+  if [[ "$actual" =~ $expected ]]; then
+    printf '  \033[32mPASS\033[0m  %s\n' "$name"
+    ((pass++))
+  else
+    printf '  \033[31mFAIL\033[0m  %s\n        expected pattern: %s\n        got: %s\n' \
+      "$name" "$expected" "$actual"
+    ((fail++))
+  fi
+}
+
 echo "==> starting postgres"
 podman rm -f -v "$CONTAINER" >/dev/null 2>&1
 podman run -d --name "$CONTAINER" \
@@ -497,7 +509,7 @@ check  "16c. control: a NOTIFY payload really does carry it"   "user1@example.co
 # backend-message path is pinned non-vacuously in
 # `a_notification_response_is_dropped_whatever_its_payload`.
 check "16d. ...and the proxy refuses the notification setup" \
-  "read-only" "$(chan -c 'LISTEN c;' -c "$(printf "$notify" "'c'")" -c 'SELECT 1;')"
+  "42501" "$(chan -v VERBOSITY=verbose -c 'LISTEN c;' -c "$(printf "$notify" "'c'")" -c 'SELECT 1;')"
 
 # An error's message is chosen by SQL as often as a notice's. This was checked
 # in only one direction for four releases: 16a/16b covered RAISE NOTICE, and the
@@ -524,7 +536,9 @@ refute "16j. ...without the text, which SQL can choose"   "does not exist" "$(ch
 # It lives in `a_reportable_guc_cannot_carry_a_value` in the adversarial suite,
 # which reads the wire directly and has a positive control that fails the test
 # when the observation stops working.
-check  "16l. and ordinary masking is unaffected"   ".invalid" "$(chan -tAq -c 'SELECT email FROM demo.customers WHERE id = 1')"
+check_match "16l. and ordinary masking is unaffected" \
+  '^[0-9a-f]{16}@[0-9a-f]{8}\.invalid$' \
+  "$(chan -tAq -c 'SELECT email FROM demo.customers WHERE id = 1')"
 kill "$CHAN_PID" 2>/dev/null
 
 echo

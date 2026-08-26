@@ -263,7 +263,7 @@ check "an optional certificate warns at startup" \
 
 off_metrics="$(curl -s --max-time 5 http://127.0.0.1:$METRICS_PORT/metrics 2>&1)"
 check "an allowed plaintext session is still counted" \
-  "1" "$(printf '%s' "$off_metrics" | grep -oE 'plaintext_session[^0-9]*[0-9]+' | grep -oE '[0-9]+$')"
+  "1" "$(printf '%s' "$off_metrics" | grep -oE 'pgmask_plaintext_sessions_total [0-9]+' | grep -oE '[0-9]+$')"
 
 echo
 echo "------------"

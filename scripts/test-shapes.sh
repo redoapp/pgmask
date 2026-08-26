@@ -174,10 +174,15 @@ SQL
   # The catalog releases city and note, masks email. `id` is released so joins
   # and ORDER BY have something to work with.
   local cat="/tmp/pgmask-shapes-$engine.toml"
-  cat > "$cat" <<CFG
-listen = "127.0.0.1:$proxy_port"
-backend = "127.0.0.1:$port"
-catalog_dsn = "$dsn"
+  # Keep the body literal. An unquoted heredoc executes command substitutions
+  # hidden in comments, so only these four explicit placeholders may vary.
+  sed -e "s|@PROXY_PORT@|$proxy_port|g" \
+      -e "s|@BACKEND_PORT@|$port|g" \
+      -e "s|@CATALOG_DSN@|$dsn|g" \
+      -e "s|@EMAIL_MASK@|$EMAIL_MASK|g" > "$cat" <<'CFG'
+listen = "127.0.0.1:@PROXY_PORT@"
+backend = "127.0.0.1:@BACKEND_PORT@"
+catalog_dsn = "@CATALOG_DSN@"
 pseudonym_key = "shape-sweep-key-1"
 unclassified = "mask"
 opaque = "reject"
@@ -196,7 +201,7 @@ mask = "none"
 [[column]]
 relation = "sw.t"
 column = "email"
-mask = "$EMAIL_MASK"
+mask = "@EMAIL_MASK@"
 
 [[column]]
 relation = "sw.u"
@@ -213,14 +218,14 @@ relation = "sw.u"
 column = "note"
 mask = "none"
 
-# The trap. \`sw.v_union.v\` is one output column drawing from two source columns,
+# The trap. `sw.v_union.v` is one output column drawing from two source columns,
 # one released and one masked, and *both* engines report provenance for it —
 # Postgres names the view's own column, CockroachDB names the first branch's
 # base column. Either way a rule here is a rule on a field that is sometimes an
 # address, so releasing it releases addresses.
 #
-# This is the rule an operator would plausibly write: \`v\` looks like a city
-# column, \`classify\` would sample it and see cities. Without the view-taint
+# This is the rule an operator would plausibly write: `v` looks like a city
+# column, `classify` would sample it and see cities. Without the view-taint
 # check the proxy honours it and leaks on Postgres too, which is why that check
 # is not a CockroachDB concession.
 [[column]]

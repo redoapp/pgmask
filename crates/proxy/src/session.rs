@@ -1401,7 +1401,7 @@ pub async fn handle_connection(
     if !client_tls {
         // Allowed by policy, but never silent: this is the only signal that
         // tells "a certificate is configured" apart from "a certificate is used".
-        policy.metrics.record(Cause::PlaintextSession);
+        policy.metrics.record_plaintext_session();
     }
 
     // --- Backend connection -------------------------------------------------

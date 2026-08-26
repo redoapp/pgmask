@@ -127,6 +127,7 @@ opened by default.
 Useful metrics include:
 
 - `pgmask_rejections_total{cause="..."}`
+- `pgmask_plaintext_sessions_total`
 - `pgmask_values_masked_total`
 - `pgmask_fields_masked_total`
 - `pgmask_fields_rescued_total`

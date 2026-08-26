@@ -403,13 +403,18 @@ for cfg in "${CONFIGS[@]}"; do
     [[ "$status" == "0" ]] || bad=1
   done
 
-  # Independent count, from the proxy rather than from us. `plaintext_session`
-  # is an observation about an *accepted* connection, not a refused result set,
-  # but it shares this metric family so operators can alert on it. Counting it
-  # here made the proxy exceed the harness by exactly one per fuzz client and
-  # turned every plaintext campaign into a false failure.
-  scraped=$(curl -s --max-time 10 "http://127.0.0.1:$metrics/metrics" \
-    | awk -F' ' '/^pgmask_rejections_total\{/ && !/cause="plaintext_session"/ {t+=$2} END {print t+0}')
+  # Independent count, from the proxy rather than from us. Accepted plaintext
+  # connections have their own metric; every member of this family is now an
+  # actual refusal and can be summed without label-specific exceptions.
+  scrape=$(curl -fsS --max-time 10 "http://127.0.0.1:$metrics/metrics" 2>/dev/null)
+  if [[ "$scrape" != *"# HELP pgmask_rejections_total"* ]]; then
+    echo "  [$cfg] metrics exporter did not return the rejection metric family"
+    scraped=-1
+    bad=1
+  else
+    scraped=$(printf '%s' "$scrape" \
+      | awk -F' ' '/^pgmask_rejections_total\{/ {t+=$2} END {print t+0}')
+  fi
   agree="agree"
   if [[ "$c_ref" != "$scraped" ]]; then agree="DISAGREE (proxy says $scraped)"; bad=1; fi
 

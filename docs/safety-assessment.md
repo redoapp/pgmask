@@ -330,7 +330,8 @@ The fix is `require_client_tls`, defaulting to **true whenever `tls_cert` is
 set**. Configuring a certificate and not requiring it is the shape of a mistake
 rather than of a decision, so the default is fail-closed and the operator who
 genuinely wants mixed-mode writes `require_client_tls = false` — which now warns
-at startup and counts those sessions as `plaintext_session`. Setting it true
+at startup and counts those sessions as `pgmask_plaintext_sessions_total`.
+Setting it true
 without a certificate is refused at load: that refuses every connection, which
 is fail-closed and useless, and reads at a glance like the strictest setting
 rather than the broken one.
