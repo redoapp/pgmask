@@ -37,7 +37,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 49
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 50
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -609,6 +609,22 @@ pub fn describe_portal(name: &str) -> Message {
     body.put_slice(name.as_bytes());
     body.put_u8(0);
     Message::new(b'D', body.freeze())
+}
+
+pub fn close_statement(name: &str) -> Message {
+    let mut body = BytesMut::new();
+    body.put_u8(b'S');
+    body.put_slice(name.as_bytes());
+    body.put_u8(0);
+    Message::new(b'C', body.freeze())
+}
+
+pub fn close_portal(name: &str) -> Message {
+    let mut body = BytesMut::new();
+    body.put_u8(b'P');
+    body.put_slice(name.as_bytes());
+    body.put_u8(0);
+    Message::new(b'C', body.freeze())
 }
 
 pub fn execute_msg(portal: &str, max_rows: i32) -> Message {

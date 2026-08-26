@@ -843,6 +843,14 @@ comment that asserted the case could not happen.
   plan onto the owner at Execute and treating a Bind in between as a new
   result set. Pass-then-class over-masked (fail-closed); two different
   portal names, and a Sync between the two PBEs, were already safe.
+  A further sibling, found after that release: `Close` of the portal
+  (or of the classified statement) dropped the bind-generation counter,
+  so a later Bind of the same name started at `1` again and collided
+  with the unfinished Execute. In one Sync `pending.plan` is still
+  `None`; `streaming_plan` treated the rebound all-passthrough plan as
+  current and `unmasked_row` released the values. Closed in 0.1.98 by
+  keeping the name's generation for the life of in-flight Executes.
+  Without Close the 0.1.97 refuse still holds.
 - The 2026-08-11 diagnostic fixes are now exercised on **both engines**, for the
   channels each engine actually has. Measured on CockroachDB v25.4.14: `DO $$ …
   RAISE EXCEPTION $$` carries a value exactly as on Postgres, and so do

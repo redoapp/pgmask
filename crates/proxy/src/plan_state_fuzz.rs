@@ -172,6 +172,11 @@ pub struct ProtocolModel {
     /// Mirrors `Session::suppressing`, so `finish_suppressed_epoch` can be
     /// driven with the epoch the proxy would really pass it.
     suppressing: Option<u64>,
+
+    /// Statement each (portal, bind-generation) was bound to. Monotone:
+    /// Close of the portal must not make a later Bind look like the
+    /// Execute that is still in flight.
+    bind_owners: BTreeMap<(&'static str, u64), &'static str>,
 }
 
 impl Default for ProtocolModel {
@@ -194,6 +199,7 @@ impl ProtocolModel {
             plan_targets: BTreeMap::new(),
             plan_built: BTreeMap::new(),
             suppressing: None,
+            bind_owners: BTreeMap::new(),
         }
     }
 
@@ -227,6 +233,10 @@ impl ProtocolModel {
         self.bound_from.entry(portal).or_default().insert(statement);
         self.state
             .bind(bytes_of(portal), bytes_of(statement), formats);
+        let generation = self.state.bind_generation(&bytes_of(portal));
+        self.bind_owners
+            .entry((portal, generation))
+            .or_insert(statement);
         self.after_step();
     }
 
@@ -781,19 +791,39 @@ impl ProtocolModel {
                  must not replace that plan",
                 self.step, pending.name
             );
-        } else if pending.bind_generation != self.state.bind_generation(&pending.name) {
-            if let Some(streaming) = self.state.streaming_plan() {
-                let current = self.state.portal_plan(&pending.name);
-                let stream_id = streaming.first().map(|field| field.type_oid);
-                let current_id = current.and_then(|plan| plan.first().map(|field| field.type_oid));
-                assert_ne!(
-                    stream_id, current_id,
-                    "step {}: in-flight Execute of {:?} has no snapshot and a \
-                     stale bind generation, but streaming_plan is the rebound \
-                     portal's plan {stream_id:?} — those DataRows would take \
-                     unmasked_row under the new plan",
-                    self.step, pending.name
-                );
+        } else {
+            // No snapshot: fallback to portal_plans is only safe while this
+            // Execute's generation is still the portal's current one *and*
+            // that generation still names the same Bind. Close used to
+            // reset the counter so a rebind reused generation 1 and the
+            // fallback (or fill_pending_plan) served the new plan
+            // (`unmasked_row`).
+            let gen_stale = pending.bind_generation != self.state.bind_generation(&pending.name);
+            let original = self
+                .bind_owners
+                .get(&(static_name(&pending.name), pending.bind_generation))
+                .copied();
+            let current_stmt = self
+                .state
+                .portal_statement
+                .get(&pending.name)
+                .map(static_name);
+            let rebound = original.is_some() && current_stmt != original;
+            if gen_stale || rebound {
+                if let Some(streaming) = self.state.streaming_plan() {
+                    let current = self.state.portal_plan(&pending.name);
+                    let stream_id = streaming.first().map(|field| field.type_oid);
+                    let current_id =
+                        current.and_then(|plan| plan.first().map(|field| field.type_oid));
+                    assert_ne!(
+                        stream_id, current_id,
+                        "step {}: in-flight Execute of {:?} has no snapshot and a \
+                         stale bind generation or Close+rebind, but streaming_plan \
+                         is the rebound portal's plan {stream_id:?} — those \
+                         DataRows would take unmasked_row under the new plan",
+                        self.step, pending.name
+                    );
+                }
             }
         }
     }
@@ -1315,5 +1345,78 @@ mod tests {
             second, first,
             "classified in-flight rows must not leave the passthrough plan as owner"
         );
+    }
+
+    fn assert_inflight_not_rebound_plan(model: &ProtocolModel, portal: &'static str, what: &str) {
+        let Some(pending) = model.state.pending_executes.front() else {
+            panic!("{what}: expected an in-flight Execute");
+        };
+        assert_eq!(pending.name.as_ref(), portal.as_bytes(), "{what}");
+        let Some(streaming) = model.state.streaming_plan() else {
+            return;
+        };
+        let current = model.state.portal_plan(&bytes_of(portal));
+        let stream_id = streaming.first().map(|field| field.type_oid);
+        let current_id = current.and_then(|plan| plan.first().map(|field| field.type_oid));
+        assert_ne!(
+            stream_id, current_id,
+            "{what}: Close then Bind must not attach the rebound plan to in-flight DataRows"
+        );
+    }
+
+    /// Close P then Bind the same portal to a different statement in one
+    /// Sync must not Release the in-flight Execute's rows. The 0.1.98
+    /// sibling: Close reset bind generation so the rebind reused 1.
+    #[test]
+    fn close_then_rebind_same_portal_does_not_replace_the_inflight_plan() {
+        let mut model = ProtocolModel::new();
+        model.parse(1, 0);
+        model.parse(2, 1);
+        model.describe_statement(1);
+        model.describe_statement(2);
+        model.bind(1, 1, None);
+        model.execute(1);
+        model.close_portal(1);
+        model.bind(1, 2, None);
+        model.finish_description(1);
+        model.finish_description(1);
+        model.finish_bind();
+        assert_inflight_not_rebound_plan(&model, "a", "Close P then Bind of the same portal");
+    }
+
+    /// Close S of the classified statement implicitly closes its portals.
+    #[test]
+    fn close_statement_then_rebind_does_not_replace_the_inflight_plan() {
+        let mut model = ProtocolModel::new();
+        model.parse(1, 0);
+        model.parse(2, 1);
+        model.describe_statement(1);
+        model.describe_statement(2);
+        model.bind(1, 1, None);
+        model.execute(1);
+        model.close_statement(1);
+        model.bind(1, 2, None);
+        model.finish_description(1);
+        model.finish_description(1);
+        model.finish_bind();
+        assert_inflight_not_rebound_plan(&model, "a", "Close S then Bind of the same portal");
+    }
+
+    /// Unnamed portal `""` is the JDBC/psycopg reuse pattern.
+    #[test]
+    fn close_then_rebind_unnamed_portal_does_not_replace_the_inflight_plan() {
+        let mut model = ProtocolModel::new();
+        model.parse(1, 0);
+        model.parse(2, 1);
+        model.describe_statement(1);
+        model.describe_statement(2);
+        model.bind(0, 1, None);
+        model.execute(0);
+        model.close_portal(0);
+        model.bind(0, 2, None);
+        model.finish_description(1);
+        model.finish_description(1);
+        model.finish_bind();
+        assert_inflight_not_rebound_plan(&model, "", "Close P then Bind of the unnamed portal");
     }
 }

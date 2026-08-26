@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
+
+- **`Close` must not reset bind generation while an Execute of that name
+  is still in flight.** `PlanState::close` dropped
+  `portal_bind_generations`. A later `Bind` of the same portal name
+  started at generation `1` again and collided with the unfinished
+  `PendingExecute` (also `1`). In one Sync, Execute runs before Describe
+  is answered, so `pending.plan` is still `None`. `streaming_plan` then
+  treated the rebound all-passthrough plan as current, and same-arity
+  classified DataRows took `Vetted::unmasked_row` — email, name, and the
+  rest of the poison row. No second Execute required. Unnamed portal
+  `""`, `Close S` of the classified statement (implicitly closes its
+  portals), and binary Bind of the classified Execute leaked the same
+  way. Without Close the second Bind bumps to `2` and the proxy refuses
+  (0.1.97). Two different portal names still serve.
+- Fail-closed: bind generation is how many times the *name* has been
+  Bound, not a Close-able resource. A Bind never reuses a generation an
+  unfinished `PendingExecute` still holds. Unknown (no snapshot,
+  generation no longer current) refuses DataRows rather than unmasking.
+  Class-then-pass without Close stays fail-closed.
+- **Defense-in-depth: ErrorResponse field `s` (SCHEMA) is now scrubbed.**
+  `LEAKY_FIELDS` was `DHncdtqW` and omitted it. `RAISE … USING SCHEMA =
+  email` puts the address in `s` — measured on a direct connection.
+  `DO` / `CALL` / `CREATE FUNCTION` are frontend-refused, so `scrub_error`
+  never sees that channel today. Kept dropped anyway so opening those
+  gates cannot start forwarding it. Not a live disclosure.
+
 ## 0.1.97 — a different portal after PortalSuspended does not inherit the stale plan
 
 - **`PortalSuspended` is not completion, and Postgres will run another portal.**

@@ -643,7 +643,20 @@ pub fn build_error(sqlstate: &str, message: &str, hint: Option<&str>) -> Message
 ///
 /// returned `CONTEXT: SQL statement "SELECT 1/0 -- alice@example.com"` through
 /// the proxy. Same shape as `q`, which was already here.
-const LEAKY_FIELDS: &[u8] = b"DHncdtqW";
+///
+/// `s` is SCHEMA. Measured on a direct connection:
+///
+/// ```sql
+/// DO $$ BEGIN RAISE EXCEPTION 'boom'
+///   USING SCHEMA = (SELECT email FROM demo.customers LIMIT 1);
+/// END $$;
+/// ```
+///
+/// puts `user1@example.com` in ErrorResponse field `s`. Unreachable through
+/// the proxy today — `DO` / `CALL` / `CREATE FUNCTION` are frontend-refused,
+/// so `scrub_error` never sees a client-chosen SCHEMA. Kept scrubbed anyway:
+/// opening those gates must not start forwarding it.
+const LEAKY_FIELDS: &[u8] = b"DHncdtsqW";
 
 /// A `NoticeResponse`'s primary message is written by SQL, so it is dropped too.
 ///
@@ -1432,6 +1445,34 @@ mod tests {
             "the CONTEXT itself goes as well"
         );
         assert!(text.contains(ERROR_WITHHELD_WITH_CODE));
+    }
+
+    /// `s` is SCHEMA. Crafted because `DO` is frontend-refused, so a live
+    /// `RAISE … USING SCHEMA` never reaches `scrub_error` today. The field
+    /// is still dropped: opening that gate must not start forwarding it.
+    #[test]
+    fn scrubs_the_schema_field_even_though_raise_is_currently_unreachable() {
+        let mut body = BytesMut::new();
+        for (tag, value) in [
+            (b'S', "ERROR"),
+            (b'C', "P0001"),
+            (b'M', "boom"),
+            (b's', "user1@example.com"),
+        ] {
+            body.put_u8(tag);
+            body.put_slice(value.as_bytes());
+            body.put_u8(0);
+        }
+        body.put_u8(0);
+        let scrubbed = scrub_error(&body.freeze()).expect("should have changed");
+        let text = String::from_utf8_lossy(&scrubbed);
+        assert!(
+            !text.contains("user1@example.com"),
+            "SCHEMA is a client-chosen object name, same as COLUMN and TABLE"
+        );
+        assert!(text.contains("ERROR"), "Severity (`S`) is not SCHEMA (`s`)");
+        assert!(text.contains("P0001"), "no CONTEXT, so the SQLSTATE stays");
+        assert!(text.contains(ERROR_WITHHELD));
     }
 
     #[test]
