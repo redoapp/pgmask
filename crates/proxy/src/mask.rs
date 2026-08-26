@@ -383,6 +383,15 @@ pub struct JsonFieldSpec {
     pub spec: MaskSpec,
 }
 
+#[derive(Debug)]
+struct JsonPathSegment {
+    value: String,
+    /// `*` is a wildcard only here. In an object it remains the literal key
+    /// `"*"`, so adding array policies does not make any object key
+    /// unaddressable.
+    array_index: bool,
+}
+
 impl JsonFieldSpec {
     pub fn new(pointer: impl Into<Arc<str>>, spec: MaskSpec) -> Result<Self, &'static str> {
         let pointer = pointer.into();
@@ -415,6 +424,20 @@ impl JsonFieldSpec {
             spec,
         })
     }
+
+    fn matches(&self, path: &[JsonPathSegment]) -> bool {
+        self.segments.len() == path.len()
+            && self.segments.iter().zip(path).all(|(configured, actual)| {
+                (actual.array_index && configured == "*") || configured == &actual.value
+            })
+    }
+
+    fn wildcard_count(&self) -> usize {
+        self.segments
+            .iter()
+            .filter(|segment| segment.as_str() == "*")
+            .count()
+    }
 }
 
 /// A mask plus its parameters and pseudonym domain.
@@ -445,6 +468,9 @@ pub struct MaskSpec {
     /// Policy for every JSON leaf with no exact path override. `None` means
     /// NULL, the fail-closed default.
     pub json_default: Option<Arc<MaskSpec>>,
+    /// Replace unmatched scalar leaves with same-type placeholders (`""`, `0`,
+    /// `false`) instead of JSON null. Explicit path policies still win.
+    pub json_type_placeholders: bool,
 }
 
 impl Default for MaskSpec {
@@ -459,6 +485,7 @@ impl Default for MaskSpec {
             domain: None,
             json: Arc::default(),
             json_default: None,
+            json_type_placeholders: false,
         }
     }
 }
@@ -769,21 +796,28 @@ impl Masker {
     fn mask_json_node(
         &self,
         json_spec: &MaskSpec,
-        path: &mut Vec<String>,
+        path: &mut Vec<JsonPathSegment>,
         inherited: Option<&MaskSpec>,
         value: &mut JsonValue,
     ) -> Result<(), MaskError> {
         let policy = json_spec
             .json
             .iter()
-            .find(|field| field.segments.as_ref() == path.as_slice())
+            .filter(|field| field.matches(path))
+            // An exact index beats `*`; among wildcard paths, fewer
+            // wildcards is more specific. Catalog validation rejects
+            // overlapping ties, so config order cannot choose disclosure.
+            .min_by_key(|field| field.wildcard_count())
             .map(|field| &field.spec)
             .or(inherited);
 
         match value {
             JsonValue::Object(map) => {
                 for (key, child) in map {
-                    path.push(key.clone());
+                    path.push(JsonPathSegment {
+                        value: key.clone(),
+                        array_index: false,
+                    });
                     self.mask_json_node(json_spec, path, policy, child)?;
                     path.pop();
                 }
@@ -791,7 +825,10 @@ impl Masker {
             }
             JsonValue::Array(values) => {
                 for (index, child) in values.iter_mut().enumerate() {
-                    path.push(index.to_string());
+                    path.push(JsonPathSegment {
+                        value: index.to_string(),
+                        array_index: true,
+                    });
                     self.mask_json_node(json_spec, path, policy, child)?;
                     path.pop();
                 }
@@ -800,6 +837,15 @@ impl Masker {
             _ => {
                 *value = match policy {
                     Some(policy) => self.mask_json_value(policy, value)?,
+                    None if json_spec.json_type_placeholders => match value {
+                        JsonValue::String(_) => JsonValue::String(String::new()),
+                        JsonValue::Number(_) => JsonValue::Number(0.into()),
+                        JsonValue::Bool(_) => JsonValue::Bool(false),
+                        JsonValue::Null => JsonValue::Null,
+                        JsonValue::Array(_) | JsonValue::Object(_) => {
+                            unreachable!("containers recurse above")
+                        }
+                    },
                     None => JsonValue::Null,
                 };
                 Ok(())
@@ -1650,6 +1696,74 @@ mod tests {
                     "private": {"token": "***", "note": "also kept"}
                 },
                 "outside": {"secret": null}
+            })
+        );
+    }
+
+    #[test]
+    fn json_array_wildcard_masks_every_element_and_exact_index_wins() {
+        let spec = json_spec(
+            Mask::Null,
+            vec![
+                ("/items/*/city", MaskSpec::new(Mask::None)),
+                ("/items/*/token", MaskSpec::new(Mask::Redact)),
+                ("/items/1/city", MaskSpec::new(Mask::Redact)),
+                ("/*", MaskSpec::new(Mask::None)),
+            ],
+        );
+        let output = apply_json(
+            &spec,
+            OID_JSONB,
+            FORMAT_TEXT,
+            br#"{
+                "items": [
+                    {"city":"Denver","token":"one","unknown":"hidden"},
+                    {"city":"Seattle","token":"two","unknown":"hidden"}
+                ],
+                "*":"literal object key",
+                "other":"hidden"
+            }"#,
+        );
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "items": [
+                    {"city":"Denver","token":"***","unknown":null},
+                    {"city":"***","token":"***","unknown":null}
+                ],
+                "*":"literal object key",
+                "other":null
+            })
+        );
+    }
+
+    #[test]
+    fn json_type_placeholders_keep_shape_without_leaf_values() {
+        let mut spec = json_spec(Mask::Null, Vec::new());
+        spec.json_default = None;
+        spec.json_type_placeholders = true;
+        let output = apply_json(
+            &spec,
+            OID_JSONB,
+            FORMAT_TEXT,
+            br#"{
+                "string":"secret",
+                "integer":42,
+                "decimal":3.14,
+                "boolean":true,
+                "nothing":null,
+                "nested":[{"value":"secret"},7,false]
+            }"#,
+        );
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "string":"",
+                "integer":0,
+                "decimal":0,
+                "boolean":false,
+                "nothing":null,
+                "nested":[{"value":""},0,false]
             })
         );
     }

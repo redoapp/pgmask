@@ -142,8 +142,13 @@ pub struct MaskParams {
     pub domain: Option<String>,
     /// Policy for JSON leaves with no exact path override. Defaults to `null`.
     pub json_default: Option<Mask>,
+    /// Keep unmatched JSON scalar types visible without preserving values:
+    /// strings become `""`, numbers `0`, booleans `false`, and null stays null.
+    /// Mutually exclusive with `json_default`.
+    pub json_type_placeholders: Option<bool>,
     /// Inheritable JSON Pointer policies at arbitrary nesting depths. A more
-    /// specific pointer overrides its parent.
+    /// specific pointer overrides its parent. `*` matches every element of an
+    /// array and remains a literal `*` when traversing an object.
     pub json: Option<Vec<JsonFieldRule>>,
 }
 
@@ -169,6 +174,9 @@ impl MaskParams {
         }
         if let Some(kind) = self.json_default {
             spec.json_default = Some(Arc::new(MaskSpec::new(kind)));
+        }
+        if let Some(enabled) = self.json_type_placeholders {
+            spec.json_type_placeholders = enabled;
         }
         if let Some(fields) = &self.json {
             let mut compiled = Vec::with_capacity(fields.len());
@@ -1452,6 +1460,9 @@ fn catalog_dsn_verifies_server(dsn: &str) -> bool {
 /// Reject parameter combinations that silently do nothing.
 fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
     match spec.kind {
+        _ if spec.json_type_placeholders && spec.kind != Mask::Json => {
+            bail!("{what}: json_type_placeholders is valid only with mask `json`")
+        }
         Mask::NumericBucket if spec.bucket < 2 => bail!(
             "{what}: numeric-bucket needs `bucket` >= 2, got {}. A bucket of 1 \
              floors every value to itself and masks nothing.",
@@ -1471,6 +1482,9 @@ fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
              the surviving middle, so nothing is masked."
         ),
         Mask::Json => {
+            if spec.json_type_placeholders && spec.json_default.is_some() {
+                bail!("{what}: json_type_placeholders and json_default are mutually exclusive");
+            }
             if spec
                 .json_default
                 .as_deref()
@@ -1500,11 +1514,41 @@ fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
                 {
                     bail!("{what}: duplicate JSON pointer {:?}", field.pointer);
                 }
+                if spec.json.iter().take(index).any(|earlier| {
+                    json_pointer_patterns_overlap(earlier, field)
+                        && json_pointer_wildcards(earlier) == json_pointer_wildcards(field)
+                }) {
+                    bail!(
+                        "{what}: JSON pointer {:?} ambiguously overlaps another equally-specific \
+                         wildcard pointer",
+                        field.pointer
+                    );
+                }
             }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+fn json_pointer_wildcards(field: &JsonFieldSpec) -> usize {
+    field
+        .segments
+        .iter()
+        .filter(|segment| segment.as_str() == "*")
+        .count()
+}
+
+/// Whether one path can match both patterns. Equal-specificity overlaps would
+/// otherwise make config order decide which mask wins for that path — a release
+/// direction hidden in TOML ordering — so validation refuses them.
+fn json_pointer_patterns_overlap(left: &JsonFieldSpec, right: &JsonFieldSpec) -> bool {
+    left.segments.len() == right.segments.len()
+        && left
+            .segments
+            .iter()
+            .zip(right.segments.iter())
+            .all(|(a, b)| a == b || a == "*" || b == "*")
 }
 
 /// Whether a catalog-resolution failure is a concurrent-DDL race rather than a
@@ -2385,6 +2429,37 @@ json = [
     }
 
     #[test]
+    fn config_builds_json_wildcards_and_type_placeholders() {
+        let toml_src = r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "k"
+
+[[column]]
+relation = "s.documents"
+column = "payload"
+mask = "json"
+json_type_placeholders = true
+json = [
+  { pointer = "/items/*/account_id", mask = "pseudonym", domain = "account" },
+  { pointer = "/items/0/account_id", mask = "redact" },
+]
+"#;
+        let cfg: crate::catalog::Config = toml::from_str(toml_src).expect("should parse");
+        let classification =
+            classify(&cfg.column[0], &HashMap::new()).expect("JSON policy should compile");
+        assert!(classification.default.json_type_placeholders);
+        assert!(
+            classification.default.json_default.is_none(),
+            "type placeholders replace the ordinary default"
+        );
+        assert_eq!(
+            classification.default.json[0].segments.as_ref(),
+            ["items", "*", "account_id"]
+        );
+    }
+
+    #[test]
     fn invalid_or_duplicate_json_pointers_fail_catalog_compilation() {
         let mut rule = ColumnRule {
             relation: "s.documents".into(),
@@ -2418,6 +2493,38 @@ json = [
         assert!(
             classify(&rule, &HashMap::new()).is_err(),
             "duplicate policies are ambiguous"
+        );
+
+        rule.params.json = Some(vec![
+            JsonFieldRule {
+                pointer: "/items/*/account_id".into(),
+                mask: Mask::Null,
+                params: MaskParams::default(),
+            },
+            JsonFieldRule {
+                pointer: "/items/0/*".into(),
+                mask: Mask::Redact,
+                params: MaskParams::default(),
+            },
+        ]);
+        assert!(
+            classify(&rule, &HashMap::new()).is_err(),
+            "overlapping wildcard policies with equal specificity are ambiguous"
+        );
+
+        rule.params.json = None;
+        rule.params.json_default = Some(Mask::Null);
+        rule.params.json_type_placeholders = Some(true);
+        assert!(
+            classify(&rule, &HashMap::new()).is_err(),
+            "two JSON defaults must not silently override one another"
+        );
+
+        rule.mask = Some(Mask::Redact);
+        rule.params.json_default = None;
+        assert!(
+            classify(&rule, &HashMap::new()).is_err(),
+            "JSON-only parameters on an ordinary mask must be refused"
         );
     }
 

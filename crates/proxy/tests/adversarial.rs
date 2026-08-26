@@ -25,7 +25,7 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
     let document_rule = |relation: &str, column: &str| {
         let mut email = json_field("/profile/email", pgmask::mask::Mask::Partial);
         email.params.keep = Some(4);
-        json_rule(
+        let mut rule = json_rule(
             relation,
             column,
             pgmask::mask::Mask::Null,
@@ -34,10 +34,16 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
                 email,
                 json_field("/profile/name", pgmask::mask::Mask::Redact),
                 json_field("/public", pgmask::mask::Mask::None),
-                json_field("/items/0", pgmask::mask::Mask::None),
-                json_field("/items/0/token", pgmask::mask::Mask::Redact),
+                json_field("/items/*", pgmask::mask::Mask::None),
+                json_field("/items/*/token", pgmask::mask::Mask::Redact),
             ],
-        )
+        );
+        // Debugging policy: retain the scalar type of every unmentioned leaf
+        // without retaining its value. The explicit pointer policies above
+        // still override these placeholders.
+        rule.params.json_default = None;
+        rule.params.json_type_placeholders = Some(true);
+        rule
     };
     let mut rules = default_rules();
     for relation in ["canary.documents", "canary.documents_view"] {
@@ -140,10 +146,10 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
     assert!(text.contains(r#""name":"***""#), "{text}");
     assert!(text.contains(r#""public":"Portland""#), "{text}");
     assert!(text.contains(r#""city":"Denver""#), "{text}");
-    assert!(
-        !text.contains("Seattle"),
-        "unconfigured nested value passed: {text}"
-    );
+    assert!(text.contains(r#""city":"Seattle""#), "{text}");
+    assert!(text.contains(r#""unknown":"""#), "{text}");
+    assert!(text.contains(r#""n":0"#), "{text}");
+    assert!(text.contains(r#""enabled":false"#), "{text}");
 
     let mut binary_client = RawClient::connect(masked.addr, DB).await?;
     binary_client

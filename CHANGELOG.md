@@ -10,6 +10,12 @@
   choose another `json_default`, including `none` when unmentioned values are
   intentionally public. A configured mask/type mismatch, malformed JSON, or
   unknown binary-jsonb version refuses the result set.
+- Add `*` array-element policies, so `/items/*/account_id` masks every item
+  without enumerating indices; an exact index wins over the wildcard. Add the
+  opt-in `json_type_placeholders = true` debugging default, which retains
+  scalar types as `""`, `0`, `false`, and `null` while withholding values.
+  Equally-specific overlapping wildcard policies and conflicting defaults are
+  rejected at config load rather than resolved by TOML order.
 - Support both pgwire formats. Text values are parsed directly; binary `jsonb`
   validates and preserves PostgreSQL's version byte. Real-Postgres poison
   controls prove the same text and binary rows expose canaries when released,

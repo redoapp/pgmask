@@ -125,7 +125,8 @@ INSERT INTO canary.documents VALUES (
       {"token":"CANARY_TEMP_j0k1l2","city":"Denver"},
       {"token":"CANARY_TEMP_j0k1l2","city":"Seattle"}
     ],
-    "n": 99
+    "n": 99,
+    "enabled": true
   }',
   '{
     "profile":{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6"},
