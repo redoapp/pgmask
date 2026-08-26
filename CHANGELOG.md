@@ -16,6 +16,8 @@
   scalar types as `""`, `0`, `false`, and `null` while withholding values.
   Equally-specific overlapping wildcard policies and conflicting defaults are
   rejected at config load rather than resolved by TOML order.
+- Document JSON pointer inheritance, array wildcards, type placeholders, and
+  which SQL shapes are served versus refused in `docs/json-masking.md`.
 - Support both pgwire formats. Text values are parsed directly; binary `jsonb`
   validates and preserves PostgreSQL's version byte. Real-Postgres poison
   controls prove the same text and binary rows expose canaries when released,

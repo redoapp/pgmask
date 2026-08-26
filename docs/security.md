@@ -97,7 +97,10 @@ masking policy during the session.
   the backend) can decode a low-cardinality column's handles in a few queries.
   `posture = "hostile"` closes the predicate route; `unclassified_mask =
   "null"` opts out of the disclosure entirely.
-- Review `mask = "none"` like an access-control grant.
+- Review `mask = "none"` like an access-control grant. A JSON pointer
+  `{ pointer = "/profile", mask = "none" }` is the same grant for every
+  current and future leaf under that path unless a narrower pointer
+  overrides it. See [JSON and JSONB masking](json-masking.md).
 - Use semantic types to keep repeated policy consistent.
 - Give unrelated identifiers different pseudonym domains.
 - Restart pgmask after changing the catalog file.

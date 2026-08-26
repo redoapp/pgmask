@@ -73,6 +73,15 @@ resolving, pgmask logs a coverage warning and applies the unclassified policy.
 
 The policy file is not reloaded. Restart pgmask after changing it.
 
+## JSON columns
+
+Classify stored `json` / `jsonb` columns with `mask = "json"` and JSON Pointer
+rules. Array policies use `/items/*/field` rather than one rule per index.
+Analysts should `SELECT` the column and inspect the masked document in the
+client; `payload->>'…'` and `jsonb_pretty(payload)` are refused as opaque
+expressions. Views need their own JSON rules. See
+[JSON and JSONB masking](json-masking.md).
+
 ## Rolling restart
 
 `SIGTERM` stops new connections and closes existing sessions without draining.

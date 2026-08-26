@@ -223,24 +223,11 @@ rejects catalog relations that may contain user values or SQL text. See
 names, street addresses, or obfuscated identifiers. Use it only when readable
 free text is required and partial disclosure is acceptable.
 
-`json` preserves arbitrary object keys, arrays, and nesting while applying
-ordinary masks at RFC 6901 JSON Pointers. pgmask extends pointer matching with
-`*` for every element of an array (`/items/*/account_id`); in an object, `*`
-still addresses the literal key `"*"`. An exact array index beats a wildcard,
-and a path's policy is inherited by its whole subtree until a more-specific
-path overrides it. This allows one short `none` rule to release an evolving
-public subtree while narrow child rules still redact sensitive fields.
-
-Unmatched scalar values become JSON `null` by default.
-`json_type_placeholders = true` instead keeps scalar types visible for
-debugging: strings become `""`, numbers `0`, booleans `false`, and JSON null
-stays null. It is mutually exclusive with `json_default`.
-`json_default = "none"` preserves unmatched values only when that
-document-wide release is explicit. A configured policy whose leaf cannot honor
-its mask refuses the result set; for example, `partial` requires JSON strings
-and `numeric-bucket` requires JSON numbers. Both text and binary pgwire formats
-are supported. Masks apply to stored `json`/`jsonb` columns with provenance;
-JSON constructed or extracted by a SQL expression remains opaque.
+`json` preserves object keys, arrays, and nesting while applying ordinary
+masks at JSON Pointers, including `/items/*` for every array element.
+Unmatched scalars become JSON `null` unless `json_type_placeholders` or an
+explicit `json_default` is set. Extraction and construction in SQL stay
+opaque. See [JSON and JSONB masking](docs/json-masking.md).
 
 Pseudonyms preserve equality. This keeps joins useful, but also exposes
 frequency and repeated identity. Semantic types act as pseudonym domains:
@@ -273,7 +260,10 @@ mapping.
 - Safe scalar values such as literals, `now()`, and `count(*)` pass through.
 - Expressions over masked columns, value-returning aggregates such as `max`,
   set operations, recursive common table expressions, and set-returning
-  functions are rejected unless a conservative rule proves them safe.
+  functions are rejected unless a conservative rule proves them safe. JSON
+  operators (`->`, `->>`, JSONPath), constructors, and aggregates over a
+  classified JSON column are in this set: select the stored column and inspect
+  the masked document in the client. See [JSON and JSONB masking](docs/json-masking.md).
 - Supported one-column reductions such as `sum`, `avg`, variance, and boolean
   reductions inherit the source policy only for a bare column over explicitly
   schema-qualified named relations. Other shapes remain opaque unless lineage
@@ -351,6 +341,7 @@ Start with the [documentation index](docs/README.md).
 
 - [Security model](docs/security.md)
 - [Operations](docs/operations.md)
+- [JSON and JSONB masking](docs/json-masking.md)
 - [Policy ownership and catalog workflow](docs/responsibilities.md)
 - [GUI clients](docs/gui-clients.md)
 - [PostgreSQL and CockroachDB](docs/engines.md)

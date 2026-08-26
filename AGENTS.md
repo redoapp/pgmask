@@ -40,6 +40,8 @@ disclosure record before changing anything in `crates/proxy/src`.
   `Snapshot::names` is classified-only; `Snapshot::all_columns` is every live
   column (pseudonym-domain identity). Keep them separate.
 - `mask.rs` — masking algorithms. Masks must preserve wire type and format.
+  JSON pointer policy, array `*`, and type placeholders are documented in
+  `docs/json-masking.md`.
 - `analysis/` — SQL allowlisting; rules are allowlists of shapes, not
   searches for column refs.
 
