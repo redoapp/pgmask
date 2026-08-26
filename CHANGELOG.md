@@ -67,7 +67,9 @@
   diagnostics to the bytes received for that query, while retaining the full
   connection transcript for the canary audit. JSON and COPY matrices reuse one
   proxy instead of paying setup cost per row. Ordinary and CI `cargo nextest`
-  runs now share the serial Postgres test group.
+  runs now share the serial Postgres test group. This exposed and fixes a
+  vacuous dynamic-key case whose nonexistent column produced PostgreSQL 42703;
+  the old cumulative buffer mistook an earlier `pgmask:` refusal for its own.
 
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 

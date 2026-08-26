@@ -545,7 +545,11 @@ async fn json_sql_surface_is_useful_without_guessing_provenance_or_shape() -> Re
             ),
             SqlCase::refused(
                 "dynamic key",
-                "SELECT payload->column_name FROM canary.documents",
+                // This must name a real expression. The old `column_name` did
+                // not exist, so PostgreSQL returned 42703; a refusal from an
+                // earlier matrix row in the cumulative receive buffer made
+                // that vacuous case pass until diagnostics became per-query.
+                "SELECT payload->(id::text) FROM canary.documents",
             ),
             // PostgreSQL text paths decide object-vs-array from the runtime value.
             // They cannot enter an array-only wildcard at plan time.
