@@ -220,10 +220,6 @@ async fn json_extracts_constructors_and_set_operations_cannot_leak() -> Result<(
     // rather than serve the inner canary, or serve a whole-column JSON plan
     // against a scalar that is not the document.
     for sql in [
-        "SELECT payload->>'profile' FROM canary.documents",
-        "SELECT payload->'profile' FROM canary.documents",
-        "SELECT payload #>> '{profile,email}' FROM canary.documents",
-        "SELECT payload #> '{profile}' FROM canary.documents",
         "SELECT jsonb_path_query(payload, '$.profile.email') FROM canary.documents",
         "SELECT payload::text FROM canary.documents",
         "SELECT legacy::jsonb FROM canary.documents",
@@ -240,11 +236,103 @@ async fn json_extracts_constructors_and_set_operations_cannot_leak() -> Result<(
         "SELECT * FROM canary.documents, LATERAL jsonb_array_elements(payload->'items') AS elem",
         "SELECT jsonb_each(payload) FROM canary.documents",
         "SELECT jsonb_array_elements(payload->'items') FROM canary.documents",
+        // Text extract of a node that still has child pointer policies: the
+        // backend serializes the object, so child masks cannot be applied.
+        "SELECT payload->>'profile' FROM canary.documents",
+        "SELECT payload #>> '{profile}' FROM canary.documents",
     ] {
         client.simple_query(sql).await?;
         assert_refused(&client, sql);
         assert_no_canary(&client, sql);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_extracts_with_literal_paths_are_masked() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+
+    // Poison control: the same extract exposes the canary when the document
+    // column is released. Without this, a refusal of every extract would pass.
+    let mut released_rules = default_rules();
+    released_rules.push(rule(
+        "canary.documents",
+        "payload",
+        pgmask::mask::Mask::None,
+    ));
+    let released = start_proxy(DB, released_rules).await?;
+    let mut control = RawClient::connect(released.addr, DB).await?;
+    control
+        .simple_query("SELECT payload->>'profile' FROM canary.documents")
+        .await?;
+    assert_canary_present(&control, CANARY_EMAIL);
+
+    let proxy = start_proxy(DB, classified_json_document_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    let public = client
+        .simple_query("SELECT payload->>'public' FROM canary.documents")
+        .await?;
+    assert_served(&public, "text extract of a released leaf");
+    assert!(
+        client.received_text().contains("Portland"),
+        "{}",
+        client.received_text()
+    );
+    assert_no_canary(&client, "released JSON leaf extract");
+
+    let email = client
+        .simple_query("SELECT payload->'profile'->>'email' FROM canary.documents")
+        .await?;
+    assert_served(&email, "chained text extract");
+    let email_text = client.received_text();
+    assert!(
+        email_text.contains("***************b2c3"),
+        "partial email extract: {email_text}"
+    );
+    assert_no_canary(&client, "chained JSON email extract");
+
+    let hash = client
+        .simple_query("SELECT payload #>> '{profile,email}' FROM canary.documents")
+        .await?;
+    assert_served(&hash, "hash-path text extract");
+    assert_no_canary(&client, "#>> email extract");
+
+    let profile = client
+        .simple_query("SELECT payload->'profile' FROM canary.documents")
+        .await?;
+    assert_served(&profile, "json extract of an object");
+    let profile_text = client.received_text();
+    assert!(
+        profile_text.contains(r#""email":"***************b2c3""#),
+        "{profile_text}"
+    );
+    assert!(profile_text.contains(r#""name":"***""#), "{profile_text}");
+    assert_no_canary(&client, "json object extract");
+
+    let func = client
+        .simple_query(
+            "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents",
+        )
+        .await?;
+    assert_served(&func, "jsonb_extract_path_text");
+    assert_no_canary(&client, "extract_path_text");
+
+    let joined = client
+        .simple_query(
+            "SELECT d.payload->>'public' FROM canary.documents d \
+             JOIN canary.subjects s ON s.id = d.id",
+        )
+        .await?;
+    assert_served(&joined, "extract through a join");
+    assert_no_canary(&client, "joined JSON extract");
+
+    let unknown = client
+        .simple_query("SELECT payload->>'unknown' FROM canary.documents")
+        .await?;
+    assert_served(&unknown, "unmatched text extract is SQL NULL");
+    assert_no_canary(&client, "unmatched JSON extract");
     Ok(())
 }
 

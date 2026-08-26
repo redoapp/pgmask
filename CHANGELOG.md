@@ -16,6 +16,12 @@
   scalar types as `""`, `0`, `false`, and `null` while withholding values.
   Equally-specific overlapping wildcard policies and conflicting defaults are
   rejected at config load rather than resolved by TOML order.
+- Attribute literal JSON extracts (`->`, `->>`, `#>`/`#>>`,
+  `json[b]_extract_path[_text]`) of a schema-qualified classified column.
+  The stored column's pointer policy is applied to the extract; a text extract
+  of a node that still has child pointer policies is refused because the
+  backend has already serialized the subtree. JSONPath, constructors,
+  aggregates, and dynamic keys stay opaque.
 - Document JSON pointer inheritance, array wildcards, type placeholders, and
   which SQL shapes are served versus refused in `docs/json-masking.md`.
 - Support both pgwire formats. Text values are parsed directly; binary `jsonb`

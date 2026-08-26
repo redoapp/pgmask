@@ -92,6 +92,7 @@ mod catalog_surface;
 mod catalogs;
 mod frontend;
 mod hostile;
+mod json_extract;
 mod lineage_shape;
 mod names;
 mod safety;
@@ -109,6 +110,10 @@ pub use frontend::{
 };
 pub use hostile::{
     hostile_join_or_rename_masked, hostile_uses_whole_row, masked_exceeds_outer_projection,
+};
+pub use json_extract::{
+    JsonExtract, JsonExtractArgument, JsonExtractColumn, JsonExtractPathSegment,
+    JsonExtractResolution, QualifiedFrom,
 };
 pub use safety::{analyze, Relaxations, Safety};
 

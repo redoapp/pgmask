@@ -262,8 +262,11 @@ mapping.
   set operations, recursive common table expressions, and set-returning
   functions are rejected unless a conservative rule proves them safe. JSON
   operators (`->`, `->>`, JSONPath), constructors, and aggregates over a
-  classified JSON column are in this set: select the stored column and inspect
-  the masked document in the client. See [JSON and JSONB masking](docs/json-masking.md).
+  classified JSON column are refused unless they are a **literal extract**
+  (`->`, `->>`, `#>`/`#>>`, `json[b]_extract_path[_text]`) of one
+  schema-qualified column, in which case that column's pointer policy is
+  applied to the result. JSONPath, constructors, and aggregates stay refused.
+  See [JSON and JSONB masking](docs/json-masking.md).
 - Supported one-column reductions such as `sum`, `avg`, variance, and boolean
   reductions inherit the source policy only for a bare column over explicitly
   schema-qualified named relations. Other shapes remain opaque unless lineage

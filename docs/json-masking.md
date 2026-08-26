@@ -2,8 +2,10 @@
 
 This is the operator and analyst guide for `mask = "json"` on stored `json` and
 `jsonb` columns. The [README](../README.md) shows a short configuration
-example. Policy still binds to PostgreSQL `RowDescription` provenance (table
-OID + column number), never to SQL text.
+example. Policy still binds stored columns to the `RowDescription` (table OID +
+column number). Literal JSON extracts are attributed from an allowlist of SQL
+shapes the same way reducing aggregates are: the statement names a path, it
+does not release on its own.
 
 ## What it does
 
@@ -12,11 +14,12 @@ applies ordinary masks at RFC 6901 JSON Pointers. A pointer's policy is
 inherited by its whole subtree until a more-specific pointer overrides it.
 
 Masks apply only to a stored classified column that still has provenance in
-the result. `SELECT payload FROM app.events` is the intended path. JSON that
-Postgres constructs or extracts (`payload->>'email'`, `json_agg(payload)`,
-`to_jsonb(t)`) is opaque: pgmask refuses it under the default `opaque =
-"reject"` policy. That is the same rule as `lower(email)`, not a JSON-only
-restriction.
+the result, and to **literal JSON extracts** of that column. `SELECT payload
+FROM app.events` is the stored-column path. `SELECT payload->>'email'` and
+`payload->'profile'` are attributed from the statement: the extract path must
+be literals, the relation must be schema-qualified, and the pointer policy of
+the stored column is applied to the result. JSON that Postgres constructs
+(`json_agg(payload)`, `to_jsonb(t)`, `jsonb_path_query`) stays opaque.
 
 ## Configuration
 
@@ -88,36 +91,47 @@ the leaf rule above applies to each scalar.
 
 ## How to inspect a large document
 
-SQL extraction is refused, so drill in after the result leaves pgmask.
+Literal extracts are served when the path can be mapped to a pointer:
 
 ```sql
--- Served, masked. Use this.
+-- Served, masked with the pointer policy.
+SELECT payload->>'public' FROM app.events;
+SELECT payload->'profile' FROM app.events;
+SELECT payload->'profile'->>'email' FROM app.events;
+SELECT payload #>> '{profile,email}' FROM app.events;
+SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM app.events;
+
+-- Also served when provenance survives: aliases, joins of named ranges, CTEs,
+-- subqueries, views with their own rules, and a same-type no-op `payload::jsonb`.
 SELECT payload
 FROM app.events
 WHERE payload @> '{"kind":"checkout"}';
-
--- Also served when provenance survives: aliases, joins, CTEs, subqueries,
--- views with their own rules, and a same-type no-op `payload::jsonb`.
 ```
 
-Then inspect the masked JSON in the client (`jq`, the driver, a GUI). Typical
-refusals:
+A text extract (`->>`, `#>>`, `*_extract_path_text`) of a node that still has
+**child** pointer policies is refused: PostgreSQL has already serialized the
+object, so pgmask cannot apply `/profile/email` to `payload->>'profile'`. Use
+`->` so the result stays `json`/`jsonb` and can be walked, or extract the leaf.
+
+Inspect the masked JSON in the client (`jq`, the driver, a GUI) when you need
+the whole document. Typical refusals:
 
 ```sql
-SELECT payload->>'email' FROM app.events;
-SELECT payload #>> '{profile,email}' FROM app.events;
+SELECT payload->>'profile' FROM app.events; -- child policies under /profile
 SELECT jsonb_path_query(payload, '$.items[*].account_id') FROM app.events;
 SELECT jsonb_pretty(payload) FROM app.events;
 SELECT jsonb_each(payload) FROM app.events;
 SELECT json_agg(payload) FROM app.events;
 SELECT payload::text FROM app.events;
 SELECT payload FROM app.events UNION ALL SELECT payload FROM app.events;
+SELECT payload->>'email' FROM events; -- relation is not schema-qualified
 ```
 
 `WHERE` predicates still run on the backend. Containment filters such as `@>`
 do not mask the stored document; they only restrict which rows come back. That
 is the same accepted predicate-oracle limit as `WHERE email = '…'` on a text
-column. Hostile posture refuses masked-column use outside a bare projection.
+column. Hostile posture treats a literal JSON extract as a projection of the
+column; a second mention in `WHERE` still refuses.
 
 ## Fail-closed cases
 
@@ -126,6 +140,7 @@ pgmask refuses the result set rather than passing a value it cannot honour:
 - Malformed JSON text, or binary `jsonb` with a version byte other than `1`.
 - A leaf mask that cannot apply to the JSON type (`partial` on a number,
   `numeric-bucket` on a string).
+- A `->>` / `#>>` extract of a path that still has child pointer policies.
 - `mask = "json"` on a non-json column (plan-time type mismatch).
 - Recursive `json` as `json_default` or as a nested pointer mask.
 

@@ -77,8 +77,9 @@ The policy file is not reloaded. Restart pgmask after changing it.
 
 Classify stored `json` / `jsonb` columns with `mask = "json"` and JSON Pointer
 rules. Array policies use `/items/*/field` rather than one rule per index.
-Analysts should `SELECT` the column and inspect the masked document in the
-client; `payload->>'…'` and `jsonb_pretty(payload)` are refused as opaque
+Literal extracts (`payload->>'email'`, `payload->'profile'`) are masked with
+the same pointer policy when the path is a literal and the relation is
+schema-qualified. `jsonb_pretty(payload)` and JSONPath stay refused as opaque
 expressions. Views need their own JSON rules. See
 [JSON and JSONB masking](json-masking.md).
 

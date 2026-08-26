@@ -383,8 +383,8 @@ pub struct JsonFieldSpec {
     pub spec: MaskSpec,
 }
 
-#[derive(Debug)]
-struct JsonPathSegment {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JsonPathSegment {
     value: String,
     /// `*` is a wildcard only here. In an object it remains the literal key
     /// `"*"`, so adding array policies does not make any object key
@@ -471,6 +471,10 @@ pub struct MaskSpec {
     /// Replace unmatched scalar leaves with same-type placeholders (`""`, `0`,
     /// `false`) instead of JSON null. Explicit path policies still win.
     pub json_type_placeholders: bool,
+    /// When this spec masks a JSON *extract* (`payload->'profile'`), the walk
+    /// starts at this path in the original pointer policy rather than at the
+    /// document root. Empty means the value is the stored column.
+    pub(crate) json_path_prefix: Arc<[JsonPathSegment]>,
 }
 
 impl Default for MaskSpec {
@@ -486,6 +490,7 @@ impl Default for MaskSpec {
             json: Arc::default(),
             json_default: None,
             json_type_placeholders: false,
+            json_path_prefix: Arc::from([]),
         }
     }
 }
@@ -556,6 +561,66 @@ impl MaskSpec {
 
     pub fn is_passthrough(&self) -> bool {
         self.kind == Mask::None
+    }
+
+    /// Bind this JSON column policy to an extracted subtree (`payload->'a'`).
+    ///
+    /// The stored document's pointer table is kept; the walk starts at `path`
+    /// so child overrides still apply. `path` must not be empty — the full
+    /// column is the ordinary `Mask::Json` plan.
+    pub(crate) fn for_json_document_extract(&self, path: &[(String, bool)]) -> Option<Self> {
+        if self.kind != Mask::Json || path.is_empty() {
+            return None;
+        }
+        let mut spec = self.clone();
+        spec.json_path_prefix = path_segments(path);
+        Some(spec)
+    }
+
+    /// Bind this JSON column policy to a text extract (`payload->>'email'`).
+    ///
+    /// Text extracts cannot walk children: the backend has already serialized
+    /// the node. A path with any more-specific pointer therefore refuses
+    /// rather than apply `none` to a blob that still contains masked leaves.
+    /// Unmatched paths become SQL NULL, matching the default JSON leaf.
+    pub(crate) fn for_json_text_extract(&self, path: &[(String, bool)]) -> Option<Self> {
+        if self.kind != Mask::Json || path.is_empty() {
+            return None;
+        }
+        let segments = path_segments(path);
+        if self.json_extract_has_child_policies(&segments) {
+            return None;
+        }
+        match self.policy_along(&segments) {
+            Some(spec) if spec.kind == Mask::Json => None,
+            Some(spec) => Some(spec.clone()),
+            None => Some(Self::new(Mask::Null)),
+        }
+    }
+
+    fn json_extract_has_child_policies(&self, path: &[JsonPathSegment]) -> bool {
+        self.json.iter().any(|field| {
+            field.segments.len() > path.len()
+                && field.segments.iter().zip(path).all(|(configured, actual)| {
+                    (actual.array_index && configured == "*") || configured == &actual.value
+                })
+        })
+    }
+
+    fn policy_along(&self, path: &[JsonPathSegment]) -> Option<&MaskSpec> {
+        let mut inherited = self.json_default.as_deref();
+        let mut walked = Vec::with_capacity(path.len());
+        for segment in path {
+            walked.push(segment.clone());
+            inherited = self
+                .json
+                .iter()
+                .filter(|field| field.matches(&walked))
+                .min_by_key(|field| field.wildcard_count())
+                .map(|field| &field.spec)
+                .or(inherited);
+        }
+        inherited
     }
 
     /// Whether every rendering of a pseudonym fits the column's declared width.
@@ -774,12 +839,9 @@ impl Masker {
         };
         let mut value: JsonValue = serde_json::from_slice(payload)
             .map_err(|_| MaskError::Undecodable { type_oid, format })?;
-        self.mask_json_node(
-            spec,
-            &mut Vec::new(),
-            spec.json_default.as_deref(),
-            &mut value,
-        )?;
+        let mut path: Vec<JsonPathSegment> = spec.json_path_prefix.iter().cloned().collect();
+        let inherited = spec.policy_along(&path);
+        self.mask_json_node(spec, &mut path, inherited, &mut value)?;
 
         let encoded =
             serde_json::to_vec(&value).map_err(|_| MaskError::Undecodable { type_oid, format })?;
@@ -1046,6 +1108,16 @@ impl Masker {
 }
 
 // --- String masks -----------------------------------------------------------
+
+fn path_segments(path: &[(String, bool)]) -> Arc<[JsonPathSegment]> {
+    path.iter()
+        .map(|(value, array_index)| JsonPathSegment {
+            value: value.clone(),
+            array_index: *array_index,
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
 
 fn text_op(bytes: &Bytes, f: impl Fn(&str) -> String) -> Bytes {
     Bytes::from(f(&String::from_utf8_lossy(bytes)))
@@ -1766,6 +1838,54 @@ mod tests {
                 "nested":[{"value":""},0,false]
             })
         );
+    }
+
+    #[test]
+    fn json_document_extract_starts_the_walk_at_the_extracted_path() {
+        let mut email = MaskSpec::new(Mask::Partial);
+        email.keep = 4;
+        let spec = json_spec(
+            Mask::Null,
+            vec![
+                ("/profile", MaskSpec::new(Mask::None)),
+                ("/profile/email", email),
+                ("/profile/name", MaskSpec::new(Mask::Redact)),
+            ],
+        )
+        .for_json_document_extract(&[("profile".into(), false)])
+        .unwrap();
+        let output = apply_json(
+            &spec,
+            OID_JSONB,
+            FORMAT_TEXT,
+            br#"{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6","extra":"secret"}"#,
+        );
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "email":"***************b2c3",
+                "name":"***",
+                "extra":"secret"
+            })
+        );
+    }
+
+    #[test]
+    fn json_text_extract_refuses_a_path_that_still_has_child_policies() {
+        let spec = json_spec(
+            Mask::Null,
+            vec![
+                ("/profile", MaskSpec::new(Mask::None)),
+                ("/profile/email", MaskSpec::new(Mask::Redact)),
+            ],
+        );
+        assert!(spec
+            .for_json_text_extract(&[("profile".into(), false)])
+            .is_none());
+        let leaf = spec
+            .for_json_text_extract(&[("profile".into(), false), ("email".into(), false)])
+            .unwrap();
+        assert_eq!(leaf.kind, Mask::Redact);
     }
 
     #[test]

@@ -33,7 +33,9 @@ use crate::lineage::{self, Verdict};
 use crate::mask::{Mask, MaskSpec};
 use crate::metrics::Cause;
 use crate::plan_state::{FieldPlan, PlanState};
-use crate::policy::{resolve_summary_policies, FieldAnalysis, Policy, Rejection};
+use crate::policy::{
+    resolve_json_extract_policies, resolve_summary_policies, FieldAnalysis, Policy, Rejection,
+};
 use crate::protocol::{self, FrameReader, Message};
 use crate::tls::{BackendTls, BoxStream};
 
@@ -1020,6 +1022,13 @@ impl Session {
             &snapshot,
             &self.roles,
         );
+        let json_extract_policies = resolve_json_extract_policies(
+            inspection.as_ref(),
+            fields.len(),
+            &safety,
+            &snapshot,
+            &self.roles,
+        );
 
         let planned = if system_catalog {
             Ok(Arc::new(
@@ -1043,6 +1052,7 @@ impl Session {
                     safety: &safety,
                     lineage: &lineage_verdicts,
                     summary: &summary_policies,
+                    json_extract: &json_extract_policies,
                     trust_provenance,
                 },
             )
