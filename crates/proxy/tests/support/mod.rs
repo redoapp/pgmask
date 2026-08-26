@@ -709,7 +709,6 @@ pub async fn simple_query_round(client: &mut RawClient, sql: &str) -> Result<Que
 /// every byte for the connection-wide canary audit; each row's assertions use
 /// only the bytes received during that query, so a failure does not dump all
 /// preceding responses or mistake an earlier refusal for this row's outcome.
-#[track_caller]
 pub async fn assert_sql_cases(client: &mut RawClient, cases: &[SqlCase<'_>]) -> Result<()> {
     for case in cases {
         let round = simple_query_round(client, case.sql)
