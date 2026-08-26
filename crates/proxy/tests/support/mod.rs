@@ -641,6 +641,9 @@ impl RawClient {
 pub enum SqlExpectation {
     Served,
     Refused,
+    /// Served or refused, never silent. Use when either outcome is policy, but
+    /// a no-canary check would pass if the statement was never exercised.
+    Exercised,
 }
 
 pub struct SqlCase<'a> {
@@ -665,6 +668,38 @@ impl<'a> SqlCase<'a> {
             expectation: SqlExpectation::Refused,
         }
     }
+
+    pub const fn exercised(name: &'a str, sql: &'a str) -> Self {
+        Self {
+            name,
+            sql,
+            expectation: SqlExpectation::Exercised,
+        }
+    }
+}
+
+/// One simple-query round-trip and the bytes received during it.
+pub struct QueryRound {
+    pub messages: Vec<Message>,
+    pub received: Vec<u8>,
+}
+
+impl QueryRound {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.received).into_owned()
+    }
+}
+
+/// Run a simple query and return only the bytes this round added.
+pub async fn simple_query_round(client: &mut RawClient, sql: &str) -> Result<QueryRound> {
+    let received_before = client.received.len();
+    let messages = client.simple_query(sql).await?;
+    let received = client
+        .received
+        .get(received_before..)
+        .context("raw client receive buffer shrank during simple query")?
+        .to_vec();
+    Ok(QueryRound { messages, received })
 }
 
 /// Run related SQL shapes through one proxy while keeping each failure local.
@@ -674,24 +709,22 @@ impl<'a> SqlCase<'a> {
 /// every byte for the connection-wide canary audit; each row's assertions use
 /// only the bytes received during that query, so a failure does not dump all
 /// preceding responses or mistake an earlier refusal for this row's outcome.
+#[track_caller]
 pub async fn assert_sql_cases(client: &mut RawClient, cases: &[SqlCase<'_>]) -> Result<()> {
     for case in cases {
-        let received_before = client.received.len();
-        let messages = client
-            .simple_query(case.sql)
+        let round = simple_query_round(client, case.sql)
             .await
             .with_context(|| format!("SQL matrix case {:?}: {}", case.name, case.sql))?;
-        let received = client
-            .received
-            .get(received_before..)
-            .context("raw client receive buffer shrank during SQL matrix case")?;
         let context = format!("{} ({})", case.name, case.sql);
 
         match case.expectation {
-            SqlExpectation::Served => assert_served(&messages, &context),
-            SqlExpectation::Refused => assert_refused_bytes(received, &context),
+            SqlExpectation::Served => assert_served(&round.messages, &context),
+            SqlExpectation::Refused => assert_refused_bytes(&round.received, &context),
+            SqlExpectation::Exercised => {
+                assert_exercised_bytes(&round.messages, &round.received, &context);
+            }
         }
-        assert_no_canary_bytes(received, &context);
+        assert_no_canary_bytes(&round.received, &context);
     }
     Ok(())
 }
@@ -801,8 +834,13 @@ pub fn function_call_msg(oid: u32) -> Message {
 /// floor — an error carries no canary. Pairing it with this turns "no canary
 /// crossed" into "the proxy handled this statement and no canary crossed".
 pub fn assert_exercised(msgs: &[Message], client: &RawClient, context: &str) {
+    assert_exercised_bytes(msgs, &client.received, context);
+}
+
+#[track_caller]
+fn assert_exercised_bytes(msgs: &[Message], received: &[u8], context: &str) {
     let served = msgs.iter().any(|m| m.tag == b'D');
-    let refused = client.received_text().contains("pgmask:");
+    let refused = String::from_utf8_lossy(received).contains("pgmask:");
     assert!(
         served || refused,
         "{context}: the proxy neither served a row nor refused with a pgmask \
@@ -814,6 +852,7 @@ pub fn assert_exercised(msgs: &[Message], client: &RawClient, context: &str) {
 /// The proxy served data rows: a masking test that must SUCCEED, not be refused.
 /// A refusal carries no canary, so without this a "stays masked" test passes
 /// even when the path stopped running.
+#[track_caller]
 pub fn assert_served(msgs: &[Message], context: &str) {
     assert!(
         msgs.iter().any(|m| m.tag == b'D'),
@@ -824,10 +863,12 @@ pub fn assert_served(msgs: &[Message], context: &str) {
 /// The proxy refused the statement with its own message. A "cannot leak by
 /// refusal" test that only checks for a canary passes if the refusal quietly
 /// stops happening; this pins that the refusal is what closed the path.
+#[track_caller]
 pub fn assert_refused(client: &RawClient, context: &str) {
     assert_refused_bytes(&client.received, context);
 }
 
+#[track_caller]
 fn assert_refused_bytes(received: &[u8], context: &str) {
     let text = String::from_utf8_lossy(received);
     assert!(
@@ -836,11 +877,13 @@ fn assert_refused_bytes(received: &[u8], context: &str) {
     );
 }
 
+#[track_caller]
 pub fn assert_no_canary(client: &RawClient, context: &str) {
     assert_no_canary_bytes(&client.received, context);
 }
 
-fn assert_no_canary_bytes(received: &[u8], context: &str) {
+#[track_caller]
+pub fn assert_no_canary_bytes(received: &[u8], context: &str) {
     let text = String::from_utf8_lossy(received);
     for canary in CANARIES {
         assert!(

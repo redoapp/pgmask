@@ -330,79 +330,83 @@ async fn json_extracts_with_literal_paths_are_masked() -> Result<()> {
     let proxy = start_proxy(DB, classified_json_document_rules()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
 
-    let public = client
-        .simple_query("SELECT payload->>'public' FROM canary.documents")
-        .await?;
-    assert_served(&public, "text extract of a released leaf");
-    assert!(
-        client.received_text().contains("Portland"),
-        "{}",
-        client.received_text()
-    );
-    assert_no_canary(&client, "released JSON leaf extract");
+    let public = simple_query_round(
+        &mut client,
+        "SELECT payload->>'public' FROM canary.documents",
+    )
+    .await?;
+    assert_served(&public.messages, "text extract of a released leaf");
+    assert!(public.text().contains("Portland"), "{}", public.text());
+    assert_no_canary_bytes(&public.received, "released JSON leaf extract");
 
-    let email = client
-        .simple_query("SELECT payload->'profile'->>'email' FROM canary.documents")
-        .await?;
-    assert_served(&email, "chained text extract");
-    let email_text = client.received_text();
+    let email = simple_query_round(
+        &mut client,
+        "SELECT payload->'profile'->>'email' FROM canary.documents",
+    )
+    .await?;
+    assert_served(&email.messages, "chained text extract");
+    let email_text = email.text();
     assert!(
         email_text.contains("***************b2c3"),
         "partial email extract: {email_text}"
     );
-    assert_no_canary(&client, "chained JSON email extract");
+    assert_no_canary_bytes(&email.received, "chained JSON email extract");
 
-    let array_token = client
-        .simple_query("SELECT payload->'items'->0->>'token' FROM canary.documents")
-        .await?;
-    assert_served(&array_token, "integer array extract");
-    assert!(
-        client.received_text().contains("***"),
-        "{}",
-        client.received_text()
-    );
-    assert_no_canary(&client, "proven array wildcard extract");
+    let array_token = simple_query_round(
+        &mut client,
+        "SELECT payload->'items'->0->>'token' FROM canary.documents",
+    )
+    .await?;
+    assert_served(&array_token.messages, "integer array extract");
+    assert!(array_token.text().contains("***"), "{}", array_token.text());
+    assert_no_canary_bytes(&array_token.received, "proven array wildcard extract");
 
-    let hash = client
-        .simple_query("SELECT payload #>> '{profile,email}' FROM canary.documents")
-        .await?;
-    assert_served(&hash, "hash-path text extract");
-    assert_no_canary(&client, "#>> email extract");
+    let hash = simple_query_round(
+        &mut client,
+        "SELECT payload #>> '{profile,email}' FROM canary.documents",
+    )
+    .await?;
+    assert_served(&hash.messages, "hash-path text extract");
+    assert_no_canary_bytes(&hash.received, "#>> email extract");
 
-    let profile = client
-        .simple_query("SELECT payload->'profile' FROM canary.documents")
-        .await?;
-    assert_served(&profile, "json extract of an object");
-    let profile_text = client.received_text();
+    let profile = simple_query_round(
+        &mut client,
+        "SELECT payload->'profile' FROM canary.documents",
+    )
+    .await?;
+    assert_served(&profile.messages, "json extract of an object");
+    let profile_text = profile.text();
     assert!(
         profile_text.contains(r#""email":"***************b2c3""#),
         "{profile_text}"
     );
     assert!(profile_text.contains(r#""name":"***""#), "{profile_text}");
-    assert_no_canary(&client, "json object extract");
+    assert_no_canary_bytes(&profile.received, "json object extract");
 
-    let func = client
-        .simple_query(
-            "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents",
-        )
-        .await?;
-    assert_served(&func, "jsonb_extract_path_text");
-    assert_no_canary(&client, "extract_path_text");
+    let func = simple_query_round(
+        &mut client,
+        "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents",
+    )
+    .await?;
+    assert_served(&func.messages, "jsonb_extract_path_text");
+    assert_no_canary_bytes(&func.received, "extract_path_text");
 
-    let joined = client
-        .simple_query(
-            "SELECT d.payload->>'public' FROM canary.documents d \
-             JOIN canary.subjects s ON s.id = d.id",
-        )
-        .await?;
-    assert_served(&joined, "extract through a join");
-    assert_no_canary(&client, "joined JSON extract");
+    let joined = simple_query_round(
+        &mut client,
+        "SELECT d.payload->>'public' FROM canary.documents d \
+         JOIN canary.subjects s ON s.id = d.id",
+    )
+    .await?;
+    assert_served(&joined.messages, "extract through a join");
+    assert_no_canary_bytes(&joined.received, "joined JSON extract");
 
-    let unknown = client
-        .simple_query("SELECT payload->>'unknown' FROM canary.documents")
-        .await?;
-    assert_served(&unknown, "unmatched text extract is SQL NULL");
-    assert_no_canary(&client, "unmatched JSON extract");
+    let unknown = simple_query_round(
+        &mut client,
+        "SELECT payload->>'unknown' FROM canary.documents",
+    )
+    .await?;
+    assert_served(&unknown.messages, "unmatched text extract is SQL NULL");
+    assert_no_canary_bytes(&unknown.received, "unmatched JSON extract");
     Ok(())
 }
 
@@ -645,6 +649,31 @@ async fn json_sql_surface_is_useful_without_guessing_provenance_or_shape() -> Re
     let messages = binary.read_until_ready().await?;
     assert_served(&messages, "binary JSON text extract");
     assert_no_canary(&binary, "binary JSON text extract");
+
+    let mut binary_document = RawClient::connect(proxy.addr, DB).await?;
+    binary_document
+        .send(parse_msg(
+            "json_document",
+            "SELECT payload->'profile' FROM canary.documents",
+        ))
+        .await?;
+    binary_document
+        .send(describe_statement("json_document"))
+        .await?;
+    binary_document
+        .send(bind_msg_with_result_format(
+            "json_document_portal",
+            "json_document",
+            1,
+        ))
+        .await?;
+    binary_document
+        .send(execute_msg("json_document_portal", 0))
+        .await?;
+    binary_document.send(sync_msg()).await?;
+    let messages = binary_document.read_until_ready().await?;
+    assert_served(&messages, "binary JSON document extract");
+    assert_no_canary(&binary_document, "binary JSON document extract");
 
     // Hostile posture still credits one literal extract as the projection, but
     // rejects a second mention of the masked document in a predicate.
@@ -1555,25 +1584,51 @@ async fn expressions_and_set_operations_cannot_leak() -> Result<()> {
     load_schema(DB).await?;
     let proxy = start_proxy(DB, default_rules()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
-    for sql in [
-        "SELECT lower(email) FROM canary.subjects",
-        "SELECT email || '' FROM canary.subjects",
-        "SELECT COALESCE(email, '') FROM canary.subjects",
-        "SELECT CASE WHEN id > 0 THEN email END FROM canary.subjects",
-        "SELECT string_agg(email, ',') FROM canary.subjects",
-        "SELECT email FROM canary.subjects UNION ALL SELECT email FROM canary.subjects",
-        "SELECT email FROM canary.subjects INTERSECT SELECT email FROM canary.subjects",
-        "WITH RECURSIVE r(e) AS (SELECT email FROM canary.subjects WHERE id = 1 \
-         UNION ALL SELECT email FROM canary.subjects WHERE id = 2) SELECT e FROM r",
-        "SELECT (SELECT email FROM canary.subjects LIMIT 1)",
-        "SELECT to_json(s) FROM canary.subjects s",
-        "SELECT row_to_json(s) FROM canary.subjects s",
-        "SELECT array_agg(email) FROM canary.subjects",
-    ] {
-        client.simple_query(sql).await?;
-        assert_refused(&client, sql); // every one is an expression/set-op: opaque, refused
-        assert_no_canary(&client, sql);
-    }
+    assert_sql_cases(
+        &mut client,
+        &[
+            SqlCase::refused("lower", "SELECT lower(email) FROM canary.subjects"),
+            SqlCase::refused("concat", "SELECT email || '' FROM canary.subjects"),
+            SqlCase::refused(
+                "coalesce",
+                "SELECT COALESCE(email, '') FROM canary.subjects",
+            ),
+            SqlCase::refused(
+                "case",
+                "SELECT CASE WHEN id > 0 THEN email END FROM canary.subjects",
+            ),
+            SqlCase::refused(
+                "string_agg",
+                "SELECT string_agg(email, ',') FROM canary.subjects",
+            ),
+            SqlCase::refused(
+                "union",
+                "SELECT email FROM canary.subjects UNION ALL \
+                 SELECT email FROM canary.subjects",
+            ),
+            SqlCase::refused(
+                "intersect",
+                "SELECT email FROM canary.subjects INTERSECT \
+                 SELECT email FROM canary.subjects",
+            ),
+            SqlCase::refused(
+                "recursive CTE",
+                "WITH RECURSIVE r(e) AS (SELECT email FROM canary.subjects WHERE id = 1 \
+                 UNION ALL SELECT email FROM canary.subjects WHERE id = 2) SELECT e FROM r",
+            ),
+            SqlCase::refused(
+                "scalar subquery",
+                "SELECT (SELECT email FROM canary.subjects LIMIT 1)",
+            ),
+            SqlCase::refused("to_json", "SELECT to_json(s) FROM canary.subjects s"),
+            SqlCase::refused(
+                "row_to_json",
+                "SELECT row_to_json(s) FROM canary.subjects s",
+            ),
+            SqlCase::refused("array_agg", "SELECT array_agg(email) FROM canary.subjects"),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -1803,50 +1858,36 @@ async fn relations_that_are_not_plain_tables_behave_as_documented() -> Result<()
     let proxy = start_proxy(DB, default_rules()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
 
-    #[derive(Debug, PartialEq)]
-    enum Outcome {
-        Served,
-        Refused,
-    }
-
-    for (sql, want) in [
-        // Classified through the parent: served, masked.
-        ("SELECT * FROM canary.events", Outcome::Served),
-        ("SELECT email FROM canary.events", Outcome::Served),
-        // The partition by name is not in the catalog. Default-deny still
-        // serves the row; the classified column comes back masked.
-        ("SELECT email FROM canary.events_2024", Outcome::Served),
-        // Inheritance, including the child's row through the parent.
-        ("SELECT email FROM canary.people", Outcome::Served),
-        ("SELECT email FROM ONLY canary.people", Outcome::Served),
-        ("SELECT email FROM canary.staff", Outcome::Served),
-        // A domain-typed column: masked like any other text column.
-        ("SELECT email FROM canary.contacts", Outcome::Served),
-        // A cast loses provenance, and that is refused — the general rule.
-        ("SELECT email::text FROM canary.contacts", Outcome::Refused),
-        // A generated column is a second copy of a classified value under an
-        // unclassified name. Default-deny is the only thing covering it.
-        ("SELECT email_copy FROM canary.derived", Outcome::Served),
-        (
-            "SELECT email, email_copy FROM canary.derived",
-            Outcome::Served,
-        ),
-    ] {
-        let before = client.received_text().len();
-        client.simple_query(sql).await?;
-        let text = client.received_text();
-        let reply = text.get(before..).unwrap_or_default();
-        let got = if reply.contains("pgmask:") {
-            Outcome::Refused
-        } else {
-            Outcome::Served
-        };
-        assert_eq!(got, want, "{sql}\n{reply}");
-        assert_no_canary(&client, sql);
-        if got == Outcome::Refused {
-            client = RawClient::connect(proxy.addr, DB).await?;
-        }
-    }
+    assert_sql_cases(
+        &mut client,
+        &[
+            // Classified through the parent: served, masked.
+            SqlCase::served("partition parent star", "SELECT * FROM canary.events"),
+            SqlCase::served("partition parent email", "SELECT email FROM canary.events"),
+            // The partition by name is not in the catalog. Default-deny still
+            // serves the row; the classified column comes back masked.
+            SqlCase::served("named partition", "SELECT email FROM canary.events_2024"),
+            // Inheritance, including the child's row through the parent.
+            SqlCase::served("inheritance parent", "SELECT email FROM canary.people"),
+            SqlCase::served(
+                "inheritance ONLY parent",
+                "SELECT email FROM ONLY canary.people",
+            ),
+            SqlCase::served("inheritance child", "SELECT email FROM canary.staff"),
+            // A domain-typed column: masked like any other text column.
+            SqlCase::served("domain column", "SELECT email FROM canary.contacts"),
+            // A cast loses provenance, and that is refused — the general rule.
+            SqlCase::refused("domain cast", "SELECT email::text FROM canary.contacts"),
+            // A generated column is a second copy of a classified value under an
+            // unclassified name. Default-deny is the only thing covering it.
+            SqlCase::served("generated column", "SELECT email_copy FROM canary.derived"),
+            SqlCase::served(
+                "base and generated columns",
+                "SELECT email, email_copy FROM canary.derived",
+            ),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -2628,20 +2669,20 @@ async fn provably_column_free_expressions_are_served() -> Result<()> {
     let proxy = start_proxy(DB, default_rules()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
 
-    for sql in [
-        "SELECT 1",
-        "SELECT now()",
-        "SELECT current_database()",
-        "SELECT count(*) FROM canary.subjects",
-        "SELECT city, count(*) FROM canary.subjects GROUP BY city",
-    ] {
-        let msgs = client.simple_query(sql).await?;
-        assert!(
-            msgs.iter().any(|m| m.tag == b'D'),
-            "{sql} should now be served, not refused"
-        );
-        assert_no_canary(&client, sql);
-    }
+    assert_sql_cases(
+        &mut client,
+        &[
+            SqlCase::served("integer literal", "SELECT 1"),
+            SqlCase::served("now()", "SELECT now()"),
+            SqlCase::served("current_database()", "SELECT current_database()"),
+            SqlCase::served("count(*)", "SELECT count(*) FROM canary.subjects"),
+            SqlCase::served(
+                "count grouped by released column",
+                "SELECT city, count(*) FROM canary.subjects GROUP BY city",
+            ),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -2654,26 +2695,53 @@ async fn the_rescue_path_cannot_be_tricked() -> Result<()> {
 
     // Every one of these is an expression that either emits a stored value or
     // reveals something about one. None may be rescued.
-    for sql in [
-        "SELECT max(email) FROM canary.subjects",
-        "SELECT min(email) FROM canary.subjects",
-        "SELECT string_agg(email, ',') FROM canary.subjects",
-        "SELECT array_agg(email) FROM canary.subjects",
-        "SELECT json_agg(email) FROM canary.subjects",
-        "SELECT first_value(email) OVER (ORDER BY id) FROM canary.subjects",
-        "SELECT last_value(email) OVER (ORDER BY id) FROM canary.subjects",
-        "SELECT lag(email) OVER (ORDER BY id) FROM canary.subjects",
-        "SELECT nth_value(email, 1) OVER (ORDER BY id) FROM canary.subjects",
-        "SELECT mode() WITHIN GROUP (ORDER BY email) FROM canary.subjects",
-        "SELECT (SELECT email FROM canary.subjects LIMIT 1)",
-        "SELECT coalesce(email, '') FROM canary.subjects",
-        "SELECT 1, email FROM canary.subjects",
-        "SELECT 1 UNION ALL SELECT 1",
-    ] {
-        let msgs = client.simple_query(sql).await?;
-        assert_exercised(&msgs, &client, sql); // rescued-and-served or refused, never silent
-        assert_no_canary(&client, sql);
-    }
+    assert_sql_cases(
+        &mut client,
+        &[
+            SqlCase::exercised("max", "SELECT max(email) FROM canary.subjects"),
+            SqlCase::exercised("min", "SELECT min(email) FROM canary.subjects"),
+            SqlCase::exercised(
+                "string_agg",
+                "SELECT string_agg(email, ',') FROM canary.subjects",
+            ),
+            SqlCase::exercised("array_agg", "SELECT array_agg(email) FROM canary.subjects"),
+            SqlCase::exercised("json_agg", "SELECT json_agg(email) FROM canary.subjects"),
+            SqlCase::exercised(
+                "first_value",
+                "SELECT first_value(email) OVER (ORDER BY id) FROM canary.subjects",
+            ),
+            SqlCase::exercised(
+                "last_value",
+                "SELECT last_value(email) OVER (ORDER BY id) FROM canary.subjects",
+            ),
+            SqlCase::exercised(
+                "lag",
+                "SELECT lag(email) OVER (ORDER BY id) FROM canary.subjects",
+            ),
+            SqlCase::exercised(
+                "nth_value",
+                "SELECT nth_value(email, 1) OVER (ORDER BY id) FROM canary.subjects",
+            ),
+            SqlCase::exercised(
+                "mode",
+                "SELECT mode() WITHIN GROUP (ORDER BY email) FROM canary.subjects",
+            ),
+            SqlCase::exercised(
+                "scalar subquery",
+                "SELECT (SELECT email FROM canary.subjects LIMIT 1)",
+            ),
+            SqlCase::exercised(
+                "coalesce",
+                "SELECT coalesce(email, '') FROM canary.subjects",
+            ),
+            SqlCase::exercised(
+                "literal beside classified column",
+                "SELECT 1, email FROM canary.subjects",
+            ),
+            SqlCase::exercised("literal union", "SELECT 1 UNION ALL SELECT 1"),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -2685,15 +2753,18 @@ async fn a_star_expansion_cannot_shift_a_literal_onto_a_column() -> Result<()> {
     load_schema(DB).await?;
     let proxy = start_proxy(DB, default_rules()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
-    for sql in [
-        "SELECT *, 1 FROM canary.subjects",
-        "SELECT 1, * FROM canary.subjects",
-        "SELECT s.*, count(*) OVER () FROM canary.subjects s",
-    ] {
-        let msgs = client.simple_query(sql).await?;
-        assert_exercised(&msgs, &client, sql); // served-masked or refused, never silent
-        assert_no_canary(&client, sql);
-    }
+    assert_sql_cases(
+        &mut client,
+        &[
+            SqlCase::exercised("star then literal", "SELECT *, 1 FROM canary.subjects"),
+            SqlCase::exercised("literal then star", "SELECT 1, * FROM canary.subjects"),
+            SqlCase::exercised(
+                "qualified star with window",
+                "SELECT s.*, count(*) OVER () FROM canary.subjects s",
+            ),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -2744,18 +2815,34 @@ async fn summaries_are_served_without_leaking() -> Result<()> {
     let proxy = start_proxy(DB, default_rules()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
 
-    for sql in [
-        "SELECT count(email) FROM canary.subjects",
-        "SELECT count(DISTINCT email) FROM canary.subjects",
-        "SELECT city, count(*) FROM canary.subjects GROUP BY city",
-        "SELECT count(*) FILTER (WHERE email = 'CANARY_EMAIL_a1b2c3') FROM canary.subjects",
-        "SELECT row_number() OVER (ORDER BY email) FROM canary.subjects",
-        "SELECT rank() OVER (ORDER BY name) FROM canary.subjects",
-    ] {
-        let msgs = client.simple_query(sql).await?;
-        assert!(msgs.iter().any(|m| m.tag == b'D'), "{sql} should be served");
-        assert_no_canary(&client, sql);
-    }
+    assert_sql_cases(
+        &mut client,
+        &[
+            SqlCase::served("count", "SELECT count(email) FROM canary.subjects"),
+            SqlCase::served(
+                "count distinct",
+                "SELECT count(DISTINCT email) FROM canary.subjects",
+            ),
+            SqlCase::served(
+                "count grouped by city",
+                "SELECT city, count(*) FROM canary.subjects GROUP BY city",
+            ),
+            SqlCase::served(
+                "count filter",
+                "SELECT count(*) FILTER (WHERE email = 'CANARY_EMAIL_a1b2c3') \
+                 FROM canary.subjects",
+            ),
+            SqlCase::served(
+                "row_number over classified order",
+                "SELECT row_number() OVER (ORDER BY email) FROM canary.subjects",
+            ),
+            SqlCase::served(
+                "rank over classified order",
+                "SELECT rank() OVER (ORDER BY name) FROM canary.subjects",
+            ),
+        ],
+    )
+    .await?;
 
     // A boolean reduction is the identity over one row. Before the summary
     // partition was tightened, this returned `true` through a column whose
