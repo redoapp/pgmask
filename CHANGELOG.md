@@ -78,6 +78,12 @@
   tables: exact beats `*`, object keys never take array wildcards, ambiguous
   text steps refuse at a `*` edge, nested wildcards need a proven array index
   at each `*`, and equal-specificity overlaps stay a load-time error.
+- Add a property test that generates random accepted pointer sets and paths
+  and cross-checks the compiled trie against a brute-force scan over the
+  rule list. Any equivalence-preserving mutant on `compile`, `next_states`,
+  `policy_at`, `has_ambiguous_wildcard`, or `has_descendants_at` diverges on
+  some generated case; a temporary mutation was caught in seventeen cases
+  before this landed.
 
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 

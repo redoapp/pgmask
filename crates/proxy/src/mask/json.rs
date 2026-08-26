@@ -1204,4 +1204,177 @@ mod tests {
             );
         }
     }
+
+    /// Random pointer sets × random paths, trie output cross-checked against a
+    /// brute-force scan over the rule list.
+    ///
+    /// The named table above pins understood edges. This one is a stronger
+    /// contract: any equivalent mutant on `compile`, `next_states`,
+    /// `policy_at`, `has_ambiguous_wildcard`, or `has_descendants_at` diverges
+    /// from the specification on some generated case.
+    mod proptests {
+        use super::{
+            path_segments, JsonFieldSpec, JsonPathNavigation, JsonPolicyTrie, Mask, MaskSpec,
+        };
+        use proptest::prelude::*;
+
+        /// Alphabet: `*` is the only wildcard segment; other segments are
+        /// literal keys or numeric-looking strings. The path alphabet includes
+        /// `c`, which no rule uses, so most paths must miss.
+        fn rule_segments() -> impl Strategy<Value = Vec<String>> {
+            prop::collection::vec(
+                prop_oneof![Just("a"), Just("b"), Just("*")].prop_map(str::to_string),
+                1..=4,
+            )
+        }
+
+        fn path_value() -> impl Strategy<Value = String> {
+            prop_oneof![Just("a"), Just("b"), Just("0"), Just("c")].prop_map(str::to_string)
+        }
+
+        fn navigation() -> impl Strategy<Value = JsonPathNavigation> {
+            prop_oneof![
+                Just(JsonPathNavigation::ObjectKey),
+                Just(JsonPathNavigation::ArrayIndex),
+                Just(JsonPathNavigation::Ambiguous),
+            ]
+        }
+
+        /// Rule sets that pass catalog load, computed inline rather than
+        /// calling the validator so the strategy always yields something.
+        ///
+        /// Refuses equal-specificity overlaps the same way `catalog::json`
+        /// does: same segment length, same `*` count, and every pair equal or
+        /// one side wildcard. A duplicate is the degenerate equal-specificity
+        /// overlap, so this covers it too.
+        fn accepted_rule_set() -> impl Strategy<Value = Vec<Vec<String>>> {
+            prop::collection::vec(rule_segments(), 0..=6).prop_map(|pointers| {
+                let mut accepted: Vec<Vec<String>> = Vec::new();
+                for candidate in pointers {
+                    let wildcards = candidate.iter().filter(|s| s.as_str() == "*").count();
+                    let overlaps = accepted.iter().any(|earlier| {
+                        earlier.len() == candidate.len()
+                            && earlier.iter().filter(|s| s.as_str() == "*").count() == wildcards
+                            && earlier
+                                .iter()
+                                .zip(candidate.iter())
+                                .all(|(a, b)| a == b || a == "*" || b == "*")
+                    });
+                    if !overlaps {
+                        accepted.push(candidate);
+                    }
+                }
+                accepted
+            })
+        }
+
+        fn path_strategy() -> impl Strategy<Value = Vec<(String, JsonPathNavigation)>> {
+            prop::collection::vec((path_value(), navigation()), 0..=5)
+        }
+
+        /// A pointer segment matches a path step by exact key, or by array
+        /// wildcard only when the path step actually proves array navigation.
+        fn step_matches(rule: &str, step: &(String, JsonPathNavigation)) -> bool {
+            rule == step.0 || (rule == "*" && step.1 == JsonPathNavigation::ArrayIndex)
+        }
+
+        fn spec_policy_at(
+            pointers: &[(Vec<String>, Mask)],
+            path: &[(String, JsonPathNavigation)],
+        ) -> Option<Mask> {
+            pointers
+                .iter()
+                .filter(|(segments, _)| {
+                    segments.len() == path.len()
+                        && segments
+                            .iter()
+                            .zip(path.iter())
+                            .all(|(rule, step)| step_matches(rule, step))
+                })
+                .min_by_key(|(segments, _)| segments.iter().filter(|s| s.as_str() == "*").count())
+                .map(|(_, kind)| *kind)
+        }
+
+        fn spec_has_ambiguous_wildcard(
+            pointers: &[(Vec<String>, Mask)],
+            path: &[(String, JsonPathNavigation)],
+        ) -> bool {
+            path.iter().enumerate().any(|(depth, (_, nav))| {
+                *nav == JsonPathNavigation::Ambiguous
+                    && pointers.iter().any(|(segments, _)| {
+                        segments.len() > depth
+                            && segments[depth] == "*"
+                            && segments[..depth]
+                                .iter()
+                                .zip(path[..depth].iter())
+                                .all(|(rule, step)| step_matches(rule, step))
+                    })
+            })
+        }
+
+        fn spec_has_descendants_at(
+            pointers: &[(Vec<String>, Mask)],
+            path: &[(String, JsonPathNavigation)],
+        ) -> bool {
+            pointers.iter().any(|(segments, _)| {
+                segments.len() > path.len()
+                    && segments[..path.len()]
+                        .iter()
+                        .zip(path.iter())
+                        .all(|(rule, step)| step_matches(rule, step))
+            })
+        }
+
+        proptest! {
+            // A wider net than the default 256: the alphabet is small and the
+            // filter drops occasionally, so more cases give more genuine
+            // coverage without slowing the release gate meaningfully.
+            #![proptest_config(ProptestConfig::with_cases(1024))]
+
+            #[test]
+            fn compiled_trie_matches_brute_force_lookup(
+                rule_set in accepted_rule_set(),
+                path in path_strategy(),
+            ) {
+                // Distinct kinds per rule so a wrong tie-break shows as a wrong
+                // kind, not the same kind coincidentally being right.
+                let kinds = [Mask::Redact, Mask::None, Mask::Null, Mask::Hash];
+                let with_kinds: Vec<(Vec<String>, Mask)> = rule_set
+                    .iter()
+                    .enumerate()
+                    .map(|(index, segments)| {
+                        (segments.clone(), kinds[index % kinds.len()])
+                    })
+                    .collect();
+                let fields: Vec<JsonFieldSpec> = with_kinds
+                    .iter()
+                    .map(|(segments, kind)| {
+                        JsonFieldSpec::new(
+                            format!("/{}", segments.join("/")),
+                            MaskSpec::new(*kind),
+                        )
+                        .expect("catalog-passing pointer")
+                    })
+                    .collect();
+                let trie = JsonPolicyTrie::compile(&fields);
+                let segments = path_segments(&path);
+
+                prop_assert_eq!(
+                    trie.policy_at(&segments).map(|spec| spec.kind),
+                    spec_policy_at(&with_kinds, &path),
+                    "policy_at mismatch"
+                );
+                prop_assert_eq!(
+                    trie.has_ambiguous_wildcard(&segments),
+                    spec_has_ambiguous_wildcard(&with_kinds, &path),
+                    "has_ambiguous_wildcard mismatch"
+                );
+                prop_assert_eq!(
+                    trie.has_descendants_at(&segments),
+                    spec_has_descendants_at(&with_kinds, &path),
+                    "has_descendants_at mismatch"
+                );
+            }
+        }
+    }
 }
