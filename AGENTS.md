@@ -47,7 +47,7 @@ disclosure record before changing anything in `crates/proxy/src`.
 
 ```bash
 PGMASK_ALLOW_SKIP=1 cargo test --workspace   # unit suites
-./scripts/test-integration.sh                # adversarial + resilience vs real Postgres (podman)
+./scripts/test-integration.sh                # adversarial + resilience vs real Postgres
 cargo clippy --workspace --all-targets       # zero warnings; unwrap/panic denied
 cargo fmt --all --check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
@@ -60,6 +60,10 @@ also update the `pgmask` entry there or CI fails on staleness.
 
 Database-backed tests panic without `PGMASK_TEST_PG` unless
 `PGMASK_ALLOW_SKIP=1`; that is deliberate (they once passed vacuously).
+`./scripts/test-integration.sh` prefers an existing `PGMASK_TEST_PG`, then
+podman, then a host `postgresql` install (unix sockets in `/tmp`). Cloud
+Agent images typically have no podman; install `postgresql` and
+`postgresql-client` and that script is enough.
 
 ## Release discipline
 

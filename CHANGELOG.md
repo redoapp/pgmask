@@ -14,6 +14,9 @@
   validates and preserves PostgreSQL's version byte. Real-Postgres poison
   controls prove the same text and binary rows expose canaries when released,
   and that no canary crosses under the JSON policy.
+- `scripts/test-integration.sh` starts a local trust Postgres when `podman`
+  is absent, so the adversarial and resilience suites run on Cloud Agent
+  VMs that have host `postgresql` packages but no container runtime.
 
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 
