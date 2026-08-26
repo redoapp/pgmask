@@ -87,3 +87,10 @@ local_pg_stop() {
   [[ -d "$data" && -x "$bin/pg_ctl" ]] || return 0
   "$bin/pg_ctl" -D "$data" -m fast stop >/dev/null 2>&1 || true
 }
+
+# Direct invocation (Cloud Agent `start`): same cluster the integration
+# script uses. Sourced use is unchanged — test-integration.sh still calls
+# local_pg_start after choosing a backend.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  local_pg_start "${1:-55433}"
+fi

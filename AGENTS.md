@@ -62,8 +62,9 @@ Database-backed tests panic without `PGMASK_TEST_PG` unless
 `PGMASK_ALLOW_SKIP=1`; that is deliberate (they once passed vacuously).
 `./scripts/test-integration.sh` prefers an existing `PGMASK_TEST_PG`, then
 podman, then a host `postgresql` install (unix sockets in `/tmp`). Cloud
-Agent images typically have no podman; install `postgresql` and
-`postgresql-client` and that script is enough.
+Agent images typically have no podman. `.cursor/environment.json` installs
+`postgresql` / `postgresql-client`, fetches crates, and starts the same
+trust cluster on `127.0.0.1:55433` that the integration script reuses.
 
 ## Release discipline
 
