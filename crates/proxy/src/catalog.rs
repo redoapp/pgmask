@@ -1492,8 +1492,10 @@ fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
                     &field.spec,
                     &format!("{what} JSON pointer {:?}", field.pointer),
                 )?;
-                if spec.json[..index]
+                if spec
+                    .json
                     .iter()
+                    .take(index)
                     .any(|earlier| earlier.segments == field.segments)
                 {
                     bail!("{what}: duplicate JSON pointer {:?}", field.pointer);
