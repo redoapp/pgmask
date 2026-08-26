@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.99 — structure-aware JSON and JSONB masking
+
+- Add `mask = "json"` for classified `json` and `jsonb` columns. Exact RFC
+  6901 JSON Pointer policies can use the existing scalar masks at arbitrary
+  object and array depths while preserving the document's structure.
+- Every unmatched scalar defaults to JSON `null`; an operator may explicitly
+  choose another `json_default`, including `none` when unmentioned values are
+  intentionally public. A configured mask/type mismatch, malformed JSON, or
+  unknown binary-jsonb version refuses the result set.
+- Support both pgwire formats. Text values are parsed directly; binary `jsonb`
+  validates and preserves PostgreSQL's version byte. Real-Postgres poison
+  controls prove the same text and binary rows expose canaries when released,
+  and that no canary crosses under the JSON policy.
+
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 
 - **`Close` must not reset bind generation while an Execute of that name

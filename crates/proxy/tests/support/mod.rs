@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
-use pgmask::catalog::{ColumnRule, Config, Lineage, Opaque, SystemCatalogs, Unclassified};
+use pgmask::catalog::{
+    ColumnRule, Config, JsonFieldRule, Lineage, MaskParams, Opaque, SystemCatalogs, Unclassified,
+};
 use pgmask::mask::Mask;
 use pgmask::protocol::{FrameReader, Message, StartupPacket};
 use pgmask::{Catalog, Policy};
@@ -107,6 +109,29 @@ CREATE TABLE canary.subjects (
 INSERT INTO canary.subjects VALUES
   (1, 'CANARY_EMAIL_a1b2c3', 'CANARY_NAME_d4e5f6', 'CANARY_NOTE_97h8i9', 'Portland'),
   (2, 'CANARY_EMAIL_a1b2c3', 'CANARY_NAME_d4e5f6', 'CANARY_NOTE_97h8i9', 'Denver');
+
+CREATE TABLE canary.documents (
+  id      int PRIMARY KEY,
+  payload jsonb NOT NULL,
+  legacy  json NOT NULL
+);
+INSERT INTO canary.documents VALUES (
+  1,
+  '{
+    "profile":{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6"},
+    "public":"Portland",
+    "unknown":"CANARY_NOTE_97h8i9",
+    "items":[
+      {"token":"CANARY_TEMP_j0k1l2","city":"Denver"},
+      {"token":"CANARY_TEMP_j0k1l2","city":"Seattle"}
+    ]
+  }',
+  '{
+    "profile":{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6"},
+    "public":"Portland",
+    "unknown":"CANARY_NOTE_97h8i9"
+  }'
+);
 
 CREATE VIEW canary.subject_view AS SELECT id, email, name, city FROM canary.subjects;
 
@@ -289,6 +314,26 @@ pub fn rule(relation: &str, column: &str, mask: Mask) -> ColumnRule {
         params: Default::default(),
         by_role: Default::default(),
     }
+}
+
+pub fn json_field(pointer: &str, mask: Mask) -> JsonFieldRule {
+    JsonFieldRule {
+        pointer: pointer.into(),
+        mask,
+        params: MaskParams::default(),
+    }
+}
+
+pub fn json_rule(
+    relation: &str,
+    column: &str,
+    default: Mask,
+    fields: Vec<JsonFieldRule>,
+) -> ColumnRule {
+    let mut rule = rule(relation, column, Mask::Json);
+    rule.params.json_default = Some(default);
+    rule.params.json = Some(fields);
+    rule
 }
 
 // --- In-process proxy -------------------------------------------------------

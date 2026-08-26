@@ -49,6 +49,7 @@ iban_validate = "5.0.1"
 rustls-pki-types = "1.15.1"
 webpki-roots.workspace = true
 governor.workspace = true
+serde_json = "1.0.151"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

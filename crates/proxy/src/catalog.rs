@@ -22,7 +22,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::mask::{Mask, MaskSpec};
+use crate::mask::{JsonFieldSpec, Mask, MaskSpec};
 
 /// Whether summarising aggregates over classified columns may be released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -140,10 +140,14 @@ pub struct MaskParams {
     /// different domains cannot be linked by comparing masked values. Defaults
     /// to the semantic type's name.
     pub domain: Option<String>,
+    /// Policy for JSON leaves with no exact path override. Defaults to `null`.
+    pub json_default: Option<Mask>,
+    /// Exact JSON Pointer policy overrides at arbitrary nesting depths.
+    pub json: Option<Vec<JsonFieldRule>>,
 }
 
 impl MaskParams {
-    fn apply_to(&self, spec: &mut MaskSpec) {
+    fn apply_to(&self, spec: &mut MaskSpec) -> Result<()> {
         if let Some(v) = self.keep {
             spec.keep = v;
         }
@@ -162,7 +166,34 @@ impl MaskParams {
         if let Some(v) = &self.domain {
             spec.domain = Some(v.as_str().into());
         }
+        if let Some(kind) = self.json_default {
+            spec.json_default = Some(Arc::new(MaskSpec::new(kind)));
+        }
+        if let Some(fields) = &self.json {
+            let mut compiled = Vec::with_capacity(fields.len());
+            for field in fields {
+                let mut field_spec = MaskSpec::new(field.mask);
+                field.params.apply_to(&mut field_spec)?;
+                compiled.push(
+                    JsonFieldSpec::new(field.pointer.as_str(), field_spec).map_err(|reason| {
+                        anyhow::anyhow!("JSON pointer {:?}: {reason}", field.pointer)
+                    })?,
+                );
+            }
+            spec.json = compiled.into();
+        }
+        Ok(())
     }
+}
+
+/// One exact JSON Pointer override inside a structure-aware JSON mask.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonFieldRule {
+    pub pointer: String,
+    pub mask: Mask,
+    #[serde(flatten)]
+    pub params: MaskParams,
 }
 
 /// A named classification with a default mask, so `email` is described once and
@@ -273,7 +304,7 @@ fn restrictiveness(mask: Mask) -> u8 {
         // restrictive than passing the value through. Ranked here deliberately:
         // if one of a principal's roles says `scrub` and another says `redact`,
         // redact has to win.
-        Mask::Scrub => 1,
+        Mask::Scrub | Mask::Json => 1,
         Mask::Partial | Mask::Inner | Mask::Outer | Mask::Range => 2,
         Mask::DateMonth | Mask::IpPrefix | Mask::NumericBucket => 3,
         Mask::DateYear => 4,
@@ -1278,30 +1309,30 @@ fn classify(rule: &ColumnRule, types: &HashMap<String, SemanticType>) -> Result<
     };
 
     // Build the default spec: semantic parameters first, column parameters win.
-    let build = |kind: Mask| {
+    let build = |kind: Mask| -> Result<MaskSpec> {
         let mut spec = MaskSpec::new(kind);
         if let Some(t) = semantic {
             // A semantic type names its own pseudonym domain, so every column
             // of that type stays joinable without anyone configuring it.
             spec.domain = Some(t.name.as_str().into());
-            t.params.apply_to(&mut spec);
+            t.params.apply_to(&mut spec)?;
         }
-        rule.params.apply_to(&mut spec);
-        spec
+        rule.params.apply_to(&mut spec)?;
+        Ok(spec)
     };
 
     let mut by_role: HashMap<String, MaskSpec> = HashMap::new();
     if let Some(t) = semantic {
         for (role, kind) in &t.by_role {
-            by_role.insert(role.clone(), build(*kind));
+            by_role.insert(role.clone(), build(*kind)?);
         }
     }
     for (role, kind) in &rule.by_role {
-        by_role.insert(role.clone(), build(*kind));
+        by_role.insert(role.clone(), build(*kind)?);
     }
 
     let classification = Classification {
-        default: build(base_kind),
+        default: build(base_kind)?,
         by_role,
     };
     // A mask whose parameters leave the value unchanged is worse than no mask:
@@ -1438,6 +1469,46 @@ fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
             "{what}: outer needs `keep` >= 1. With keep = 0 the whole value is \
              the surviving middle, so nothing is masked."
         ),
+        Mask::Json => {
+            if spec
+                .json_default
+                .as_deref()
+                .is_some_and(|default| default.kind == Mask::Json)
+            {
+                bail!("{what}: json_default cannot recursively be `json`");
+            }
+            if let Some(default) = spec.json_default.as_deref() {
+                validate_spec(default, &format!("{what} json_default"))?;
+            }
+            for (index, field) in spec.json.iter().enumerate() {
+                if field.spec.kind == Mask::Json {
+                    bail!(
+                        "{what}: JSON pointer {:?} cannot recursively use mask `json`",
+                        field.pointer
+                    );
+                }
+                validate_spec(
+                    &field.spec,
+                    &format!("{what} JSON pointer {:?}", field.pointer),
+                )?;
+                if spec.json[..index]
+                    .iter()
+                    .any(|earlier| earlier.segments == field.segments)
+                {
+                    bail!("{what}: duplicate JSON pointer {:?}", field.pointer);
+                }
+                if spec.json[..index].iter().any(|earlier| {
+                    earlier.segments.starts_with(&field.segments)
+                        || field.segments.starts_with(&earlier.segments)
+                }) {
+                    bail!(
+                        "{what}: overlapping JSON pointer {:?}; a parent policy would make one override unreachable",
+                        field.pointer
+                    );
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -2272,6 +2343,82 @@ by_role = { analyst = "partial" }
             "by_role on column"
         );
         assert_eq!(cfg.column[0].semantic_type.as_deref(), Some("email"));
+    }
+
+    #[test]
+    fn config_builds_nested_json_policies_with_an_explicit_default() {
+        let toml_src = r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "k"
+
+[[column]]
+relation = "s.documents"
+column = "payload"
+mask = "json"
+json_default = "none"
+json = [
+  { pointer = "/profile/email", mask = "partial", keep = 4 },
+  { pointer = "/profile/age", mask = "numeric-bucket", bucket = 10 },
+  { pointer = "/flags/0", mask = "null" },
+]
+"#;
+        let cfg: crate::catalog::Config = toml::from_str(toml_src).expect("should parse");
+        let classification =
+            classify(&cfg.column[0], &HashMap::new()).expect("JSON policy should compile");
+        assert_eq!(classification.default.kind, Mask::Json);
+        assert_eq!(
+            classification
+                .default
+                .json_default
+                .as_deref()
+                .map(|spec| spec.kind),
+            Some(Mask::None)
+        );
+        assert_eq!(classification.default.json.len(), 3);
+        assert_eq!(
+            classification.default.json[0].segments.as_ref(),
+            ["profile", "email"]
+        );
+        assert_eq!(classification.default.json[0].spec.keep, 4);
+        assert_eq!(classification.default.json[1].spec.bucket, 10);
+    }
+
+    #[test]
+    fn invalid_or_overlapping_json_pointers_fail_catalog_compilation() {
+        let mut rule = ColumnRule {
+            relation: "s.documents".into(),
+            column: "payload".into(),
+            semantic_type: None,
+            mask: Some(Mask::Json),
+            params: MaskParams {
+                json: Some(vec![JsonFieldRule {
+                    pointer: "missing-slash".into(),
+                    mask: Mask::Redact,
+                    params: MaskParams::default(),
+                }]),
+                ..MaskParams::default()
+            },
+            by_role: HashMap::new(),
+        };
+        assert!(classify(&rule, &HashMap::new()).is_err());
+
+        rule.params.json = Some(vec![
+            JsonFieldRule {
+                pointer: "/profile".into(),
+                mask: Mask::Null,
+                params: MaskParams::default(),
+            },
+            JsonFieldRule {
+                pointer: "/profile/email".into(),
+                mask: Mask::Redact,
+                params: MaskParams::default(),
+            },
+        ]);
+        assert!(
+            classify(&rule, &HashMap::new()).is_err(),
+            "a parent override makes its child unreachable"
+        );
     }
 
     #[test]

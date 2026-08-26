@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.1.98**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.1.99**. Licensed under the [MIT License](LICENSE).
 
 ## What pgmask provides
 
@@ -159,6 +159,19 @@ type = "email"
 relation = "app.customers"
 column = "id"
 mask = "none"
+
+[[column]]
+relation = "app.events"
+column = "payload"
+mask = "json"
+# Every unmentioned scalar is JSON null. Set this explicitly to "none" only
+# when arbitrary unmentioned values are intended to remain visible.
+json_default = "null"
+json = [
+  { pointer = "/profile/email", mask = "partial", keep = 4 },
+  { pointer = "/profile/name", mask = "redact" },
+  { pointer = "/items/0/account_id", mask = "pseudonym", domain = "account" },
+]
 ```
 
 Unknown configuration keys, invalid mask parameters, duplicate column rules,
@@ -200,10 +213,20 @@ rejects catalog relations that may contain user values or SQL text. See
 | `numeric-bucket` | Floor to a configured bucket | Integers, floats, and text-format `numeric` |
 | `ip-prefix` | Remove the host portion | Text and text-format `inet` or `cidr` |
 | `scrub` | Replace recognized identifiers in free text | Text |
+| `json` | Recursively mask JSON Pointer policies and every unmatched leaf | `json`, `jsonb` |
 
 `scrub` reveals all text it does not recognize. It does not reliably identify
 names, street addresses, or obfuscated identifiers. Use it only when readable
 free text is required and partial disclosure is acceptable.
+
+`json` preserves arbitrary object keys, arrays, and nesting while applying
+ordinary masks at exact RFC 6901 JSON Pointers. Unmatched scalar values become
+JSON `null` by default. `json_default = "none"` preserves them only when that
+release is explicit. A configured path whose value cannot honor its mask
+refuses the result set; for example, `partial` requires a JSON string and
+`numeric-bucket` requires a JSON number. Both text and binary pgwire formats
+are supported. Masks apply to stored `json`/`jsonb` columns with provenance;
+JSON constructed or extracted by a SQL expression remains opaque.
 
 Pseudonyms preserve equality. This keeps joins useful, but also exposes
 frequency and repeated identity. Semantic types act as pseudonym domains:

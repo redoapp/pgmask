@@ -55,6 +55,102 @@ async fn masks_a_plain_select() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+
+    // Poison controls for both formats: the same rows and clients must expose
+    // the canary when the whole JSON column is explicitly released.
+    let mut released_rules = default_rules();
+    released_rules.push(rule(
+        "canary.documents",
+        "payload",
+        pgmask::mask::Mask::None,
+    ));
+    released_rules.push(rule("canary.documents", "legacy", pgmask::mask::Mask::None));
+    let released = start_proxy(DB, released_rules).await?;
+    let mut text_control = RawClient::connect(released.addr, DB).await?;
+    text_control
+        .simple_query("SELECT payload, legacy FROM canary.documents")
+        .await?;
+    assert_canary_present(&text_control, CANARY_EMAIL);
+
+    let mut binary_control = RawClient::connect(released.addr, DB).await?;
+    binary_control
+        .send(parse_msg(
+            "s",
+            "SELECT payload FROM canary.documents WHERE id = 1",
+        ))
+        .await?;
+    binary_control.send(describe_statement("s")).await?;
+    binary_control
+        .send(bind_msg_with_result_format("p", "s", 1))
+        .await?;
+    binary_control.send(execute_msg("p", 0)).await?;
+    binary_control.send(sync_msg()).await?;
+    let control_msgs = binary_control.read_until_ready().await?;
+    assert_served(&control_msgs, "binary JSON poison control");
+    assert_canary_present(&binary_control, CANARY_EMAIL);
+
+    let document_rule = |column: &str| {
+        let mut email = json_field("/profile/email", pgmask::mask::Mask::Partial);
+        email.params.keep = Some(4);
+        json_rule(
+            "canary.documents",
+            column,
+            pgmask::mask::Mask::Null,
+            vec![
+                email,
+                json_field("/profile/name", pgmask::mask::Mask::Redact),
+                json_field("/public", pgmask::mask::Mask::None),
+                json_field("/items/0/city", pgmask::mask::Mask::None),
+            ],
+        )
+    };
+    let mut masked_rules = default_rules();
+    masked_rules.push(document_rule("payload"));
+    masked_rules.push(document_rule("legacy"));
+    let masked = start_proxy(DB, masked_rules).await?;
+
+    let mut text_client = RawClient::connect(masked.addr, DB).await?;
+    let text_msgs = text_client
+        .simple_query("SELECT payload, legacy FROM canary.documents")
+        .await?;
+    assert_served(&text_msgs, "text json and jsonb");
+    assert_no_canary(&text_client, "structure-aware JSON text formats");
+    let text = text_client.received_text();
+    assert!(text.contains(r#""email":"****************b2c3""#), "{text}");
+    assert!(text.contains(r#""name":"***""#), "{text}");
+    assert!(text.contains(r#""public":"Portland""#), "{text}");
+    assert!(text.contains(r#""city":"Denver""#), "{text}");
+    assert!(
+        !text.contains("Seattle"),
+        "unconfigured nested value passed: {text}"
+    );
+
+    let mut binary_client = RawClient::connect(masked.addr, DB).await?;
+    binary_client
+        .send(parse_msg(
+            "s",
+            "SELECT payload FROM canary.documents WHERE id = 1",
+        ))
+        .await?;
+    binary_client.send(describe_statement("s")).await?;
+    binary_client
+        .send(bind_msg_with_result_format("p", "s", 1))
+        .await?;
+    binary_client.send(execute_msg("p", 0)).await?;
+    binary_client.send(sync_msg()).await?;
+    let binary_msgs = binary_client.read_until_ready().await?;
+    assert_served(&binary_msgs, "binary jsonb");
+    assert_no_canary(&binary_client, "structure-aware binary jsonb");
+    let binary = binary_client.received_text();
+    assert!(binary.contains(r#""public":"Portland""#), "{binary}");
+    assert!(binary.contains(r#""city":"Denver""#), "{binary}");
+    Ok(())
+}
+
 // --- Bypass: paths that emit rows without a RowDescription ------------------
 
 #[tokio::test]

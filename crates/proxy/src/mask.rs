@@ -23,6 +23,7 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use sha2::Sha256;
 
 use crate::protocol::is_text_family;
@@ -44,6 +45,9 @@ pub const OID_INET: u32 = 869;
 pub const OID_CIDR: u32 = 650;
 pub const OID_VARCHAR: u32 = 1043;
 pub const OID_BPCHAR: u32 = 1042;
+pub const OID_BOOL: u32 = 16;
+pub const OID_JSON: u32 = 114;
+pub const OID_JSONB: u32 = 3802;
 
 /// Structured identifiers, and the placeholder each becomes.
 ///
@@ -363,6 +367,54 @@ pub enum Mask {
     Scrub,
     /// Keep the network prefix of an IP: `203.0.113.7` -> `203.0.113.0`.
     IpPrefix,
+    /// Walk a JSON document and apply ordinary masks at exact JSON Pointer
+    /// paths. Every unmatched leaf receives the configured default policy.
+    Json,
+}
+
+/// One exact, pre-parsed JSON Pointer and the mask applied at that location.
+///
+/// Kept on [`MaskSpec`] rather than in the catalog module because plans clone
+/// specs and apply them without consulting mutable configuration state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonFieldSpec {
+    pub pointer: Arc<str>,
+    pub segments: Arc<[String]>,
+    pub spec: MaskSpec,
+}
+
+impl JsonFieldSpec {
+    pub fn new(pointer: impl Into<Arc<str>>, spec: MaskSpec) -> Result<Self, &'static str> {
+        let pointer = pointer.into();
+        if pointer.is_empty() {
+            return Err("the root pointer is not allowed; configure exact fields");
+        }
+        let Some(encoded) = pointer.strip_prefix('/') else {
+            return Err("a JSON Pointer must start with `/`");
+        };
+        let mut segments = Vec::new();
+        for segment in encoded.split('/') {
+            let mut decoded = String::with_capacity(segment.len());
+            let mut chars = segment.chars();
+            while let Some(ch) = chars.next() {
+                if ch != '~' {
+                    decoded.push(ch);
+                    continue;
+                }
+                match chars.next() {
+                    Some('0') => decoded.push('~'),
+                    Some('1') => decoded.push('/'),
+                    _ => return Err("a JSON Pointer may escape only `~0` and `~1`"),
+                }
+            }
+            segments.push(decoded);
+        }
+        Ok(Self {
+            pointer,
+            segments: segments.into(),
+            spec,
+        })
+    }
 }
 
 /// A mask plus its parameters and pseudonym domain.
@@ -388,6 +440,11 @@ pub struct MaskSpec {
     /// number that happens to equal an account number cannot be used to link
     /// them. Defaults to the semantic type name, which is usually what you want.
     pub domain: Option<Arc<str>>,
+    /// Exact path policy overrides used by [`Mask::Json`].
+    pub json: Arc<[JsonFieldSpec]>,
+    /// Policy for every JSON leaf with no exact path override. `None` means
+    /// NULL, the fail-closed default.
+    pub json_default: Option<Arc<MaskSpec>>,
 }
 
 impl Default for MaskSpec {
@@ -400,6 +457,8 @@ impl Default for MaskSpec {
             bucket: 1,
             keep_domain: false,
             domain: None,
+            json: Arc::default(),
+            json_default: None,
         }
     }
 }
@@ -528,6 +587,11 @@ impl MaskSpec {
                 is_text_family(type_oid)
                     || (matches!(type_oid, OID_INET | OID_CIDR) && format == FORMAT_TEXT)
             }
+
+            // PostgreSQL's binary jsonb representation on the wire is a
+            // version byte followed by JSON text. `json` is JSON text in both
+            // formats. The decoder below handles that distinction explicitly.
+            Mask::Json => matches!(type_oid, OID_JSON | OID_JSONB),
         }
     }
 
@@ -548,6 +612,9 @@ impl MaskSpec {
             }
             Mask::Pseudonym => {
                 "pseudonym handles text-family types and uuid. Use mask = \"null\" otherwise."
+            }
+            Mask::Json => {
+                "json handles PostgreSQL json and jsonb columns. Use mask = \"null\" otherwise."
             }
             _ => "This mask rewrites values as text. Use mask = \"null\" for non-text types.",
         }
@@ -650,9 +717,156 @@ impl Masker {
             Mask::NumericBucket => bucket_number(&bytes, type_oid, format, spec.bucket)?,
             Mask::IpPrefix => text_op(&bytes, ip_prefix),
             Mask::Scrub => text_op(&bytes, scrub_free_text),
+            Mask::Json => self.mask_json(spec, type_oid, format, &bytes)?,
             Mask::None | Mask::Null => unreachable!("handled above"),
         };
         Ok(Some(out))
+    }
+
+    /// Decode one JSON document, walk arbitrary objects and arrays, and apply
+    /// exact path policies plus a default policy to all remaining leaves.
+    ///
+    /// Object keys and array shape are preserved. Values are not: an
+    /// unconfigured leaf is JSON NULL unless the operator explicitly selects a
+    /// different `json_default`, including `none` when preserving it is
+    /// intentional.
+    fn mask_json(
+        &self,
+        spec: &MaskSpec,
+        type_oid: u32,
+        format: i16,
+        bytes: &[u8],
+    ) -> Result<Bytes, MaskError> {
+        let payload = if type_oid == OID_JSONB && format == FORMAT_BINARY {
+            match bytes.split_first() {
+                Some((1, payload)) => payload,
+                _ => return Err(MaskError::Undecodable { type_oid, format }),
+            }
+        } else {
+            bytes
+        };
+        let mut value: JsonValue = serde_json::from_slice(payload)
+            .map_err(|_| MaskError::Undecodable { type_oid, format })?;
+        self.mask_json_node(spec, &mut Vec::new(), &mut value)?;
+
+        let encoded =
+            serde_json::to_vec(&value).map_err(|_| MaskError::Undecodable { type_oid, format })?;
+        if type_oid == OID_JSONB && format == FORMAT_BINARY {
+            let mut out = BytesMut::with_capacity(encoded.len().saturating_add(1));
+            out.extend_from_slice(&[1]);
+            out.extend_from_slice(&encoded);
+            Ok(out.freeze())
+        } else {
+            Ok(Bytes::from(encoded))
+        }
+    }
+
+    fn mask_json_node(
+        &self,
+        json_spec: &MaskSpec,
+        path: &mut Vec<String>,
+        value: &mut JsonValue,
+    ) -> Result<(), MaskError> {
+        if let Some(field) = json_spec
+            .json
+            .iter()
+            .find(|field| field.segments.as_ref() == path.as_slice())
+        {
+            *value = self.mask_json_value(&field.spec, value)?;
+            return Ok(());
+        }
+
+        match value {
+            JsonValue::Object(map) => {
+                for (key, child) in map {
+                    path.push(key.clone());
+                    self.mask_json_node(json_spec, path, child)?;
+                    path.pop();
+                }
+                Ok(())
+            }
+            JsonValue::Array(values) => {
+                for (index, child) in values.iter_mut().enumerate() {
+                    path.push(index.to_string());
+                    self.mask_json_node(json_spec, path, child)?;
+                    path.pop();
+                }
+                Ok(())
+            }
+            _ => {
+                *value = match json_spec.json_default.as_deref() {
+                    Some(default) => self.mask_json_value(default, value)?,
+                    None => JsonValue::Null,
+                };
+                Ok(())
+            }
+        }
+    }
+
+    fn mask_json_value(&self, spec: &MaskSpec, value: &JsonValue) -> Result<JsonValue, MaskError> {
+        if value.is_null() || spec.kind == Mask::Null {
+            return Ok(JsonValue::Null);
+        }
+        if spec.kind == Mask::None {
+            return Ok(value.clone());
+        }
+        if matches!(value, JsonValue::Array(_) | JsonValue::Object(_)) {
+            return Err(MaskError::Unsupported {
+                type_oid: OID_JSONB,
+                format: FORMAT_TEXT,
+                kind: spec.kind,
+            });
+        }
+        if spec.kind == Mask::Json {
+            return Err(MaskError::Unsupported {
+                type_oid: OID_JSONB,
+                format: FORMAT_TEXT,
+                kind: spec.kind,
+            });
+        }
+
+        let (type_oid, input) = match value {
+            JsonValue::String(text) => (25, Bytes::copy_from_slice(text.as_bytes())),
+            JsonValue::Number(number) => {
+                (OID_NUMERIC, Bytes::from(number.to_string().into_bytes()))
+            }
+            JsonValue::Bool(value) => (
+                OID_BOOL,
+                Bytes::from_static(if *value { b"true" } else { b"false" }),
+            ),
+            JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => {
+                unreachable!("handled above")
+            }
+        };
+        let masked = self.apply(spec, type_oid, FORMAT_TEXT, Some(input))?;
+        let Some(masked) = masked else {
+            return Ok(JsonValue::Null);
+        };
+        match value {
+            JsonValue::String(_) => String::from_utf8(masked.to_vec())
+                .map(JsonValue::String)
+                .map_err(|_| MaskError::Undecodable {
+                    type_oid,
+                    format: FORMAT_TEXT,
+                }),
+            JsonValue::Number(_) => serde_json::from_slice::<JsonValue>(&masked)
+                .ok()
+                .filter(JsonValue::is_number)
+                .ok_or(MaskError::Undecodable {
+                    type_oid,
+                    format: FORMAT_TEXT,
+                }),
+            JsonValue::Bool(_) => serde_json::from_slice::<JsonValue>(&masked)
+                .ok()
+                .filter(JsonValue::is_boolean)
+                .ok_or(MaskError::Undecodable {
+                    type_oid,
+                    format: FORMAT_TEXT,
+                }),
+            JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => {
+                unreachable!("handled above")
+            }
+        }
     }
 
     /// Absorb a spec's domain separator once, for cloning per row.
@@ -1311,6 +1525,138 @@ mod tests {
             .unwrap()
             .unwrap();
         String::from_utf8(out.to_vec()).unwrap()
+    }
+
+    fn json_spec(default: Mask, fields: Vec<(&str, MaskSpec)>) -> MaskSpec {
+        let mut spec = MaskSpec::new(Mask::Json);
+        spec.json_default = Some(Arc::new(MaskSpec::new(default)));
+        spec.json = fields
+            .into_iter()
+            .map(|(pointer, field)| JsonFieldSpec::new(pointer, field).unwrap())
+            .collect::<Vec<_>>()
+            .into();
+        spec
+    }
+
+    fn apply_json(spec: &MaskSpec, oid: u32, format: i16, value: &[u8]) -> JsonValue {
+        let out = masker()
+            .apply(spec, oid, format, Some(Bytes::copy_from_slice(value)))
+            .unwrap()
+            .unwrap();
+        let payload = if oid == OID_JSONB && format == FORMAT_BINARY {
+            assert_eq!(out[0], 1, "jsonb binary version");
+            &out[1..]
+        } else {
+            &out[..]
+        };
+        serde_json::from_slice(payload).unwrap()
+    }
+
+    #[test]
+    fn json_masks_arbitrary_nested_fields_and_defaults_every_other_leaf_to_null() {
+        let mut email = MaskSpec::new(Mask::Partial);
+        email.keep = 4;
+        let mut age = MaskSpec::new(Mask::NumericBucket);
+        age.bucket = 10;
+        let spec = json_spec(
+            Mask::Null,
+            vec![
+                ("/profile/email", email),
+                ("/profile/age", age),
+                ("/profile/flags/0", MaskSpec::new(Mask::None)),
+                ("/public", MaskSpec::new(Mask::None)),
+            ],
+        );
+        let output = apply_json(
+            &spec,
+            OID_JSONB,
+            FORMAT_TEXT,
+            br#"{
+                "profile": {
+                    "email": "secret@example.com",
+                    "name": "Alice",
+                    "age": 27,
+                    "flags": [true, false]
+                },
+                "public": "Portland",
+                "new_field": {"secret": "must not pass"}
+            }"#,
+        );
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "profile": {
+                    "email": "**************.com",
+                    "name": null,
+                    "age": 20,
+                    "flags": [true, null]
+                },
+                "public": "Portland",
+                "new_field": {"secret": null}
+            })
+        );
+    }
+
+    #[test]
+    fn json_default_none_preserves_unmentioned_nested_values_only_when_explicit() {
+        let spec = json_spec(Mask::None, vec![("/private", MaskSpec::new(Mask::Redact))]);
+        let output = apply_json(
+            &spec,
+            OID_JSON,
+            FORMAT_TEXT,
+            br#"{"private":"secret","arbitrary":{"nested":[1,true,"kept"]}}"#,
+        );
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "private": "***",
+                "arbitrary": {"nested": [1, true, "kept"]}
+            })
+        );
+    }
+
+    #[test]
+    fn jsonb_binary_version_and_nested_policy_round_trip() {
+        let spec = json_spec(Mask::Null, vec![("/email", MaskSpec::new(Mask::Redact))]);
+        let mut input = vec![1];
+        input.extend_from_slice(br#"{"email":"secret","other":"hidden"}"#);
+        let output = apply_json(&spec, OID_JSONB, FORMAT_BINARY, &input);
+        assert_eq!(output, serde_json::json!({"email": "***", "other": null}));
+
+        let malformed = masker().apply(
+            &spec,
+            OID_JSONB,
+            FORMAT_BINARY,
+            Some(Bytes::from_static(b"\x02{}")),
+        );
+        assert!(malformed.is_err(), "an unknown jsonb version must refuse");
+    }
+
+    #[test]
+    fn json_leaf_type_mismatch_refuses_instead_of_passing_the_value() {
+        let spec = json_spec(Mask::Null, vec![("/email", MaskSpec::new(Mask::Partial))]);
+        let result = masker().apply(
+            &spec,
+            OID_JSONB,
+            FORMAT_TEXT,
+            Some(Bytes::from_static(br#"{"email":12345}"#)),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn json_pointer_escapes_address_literal_key_characters() {
+        let spec = json_spec(Mask::Null, vec![("/a~1b/~0key", MaskSpec::new(Mask::None))]);
+        let output = apply_json(
+            &spec,
+            OID_JSON,
+            FORMAT_TEXT,
+            br#"{"a/b":{"~key":"visible","other":"hidden"}}"#,
+        );
+        assert_eq!(
+            output,
+            serde_json::json!({"a/b": {"~key": "visible", "other": null}})
+        );
     }
 
     // --- Invariants that hold for every mask --------------------------------
