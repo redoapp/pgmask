@@ -1,6 +1,10 @@
 [test-groups.postgres]
 max-threads = 1
 
+[[profile.default.overrides]]
+filter = "binary(adversarial) | binary(resilience)"
+test-group = "postgres"
+
 [profile.ci]
 fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 2 }

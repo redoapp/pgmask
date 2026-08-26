@@ -637,6 +637,65 @@ impl RawClient {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum SqlExpectation {
+    Served,
+    Refused,
+}
+
+pub struct SqlCase<'a> {
+    pub name: &'a str,
+    pub sql: &'a str,
+    pub expectation: SqlExpectation,
+}
+
+impl<'a> SqlCase<'a> {
+    pub const fn served(name: &'a str, sql: &'a str) -> Self {
+        Self {
+            name,
+            sql,
+            expectation: SqlExpectation::Served,
+        }
+    }
+
+    pub const fn refused(name: &'a str, sql: &'a str) -> Self {
+        Self {
+            name,
+            sql,
+            expectation: SqlExpectation::Refused,
+        }
+    }
+}
+
+/// Run related SQL shapes through one proxy while keeping each failure local.
+///
+/// Starting a proxy per row makes the already-serial live-Postgres suite much
+/// slower and introduces more catalog-refresh races. The client still retains
+/// every byte for the connection-wide canary audit; each row's assertions use
+/// only the bytes received during that query, so a failure does not dump all
+/// preceding responses or mistake an earlier refusal for this row's outcome.
+pub async fn assert_sql_cases(client: &mut RawClient, cases: &[SqlCase<'_>]) -> Result<()> {
+    for case in cases {
+        let received_before = client.received.len();
+        let messages = client
+            .simple_query(case.sql)
+            .await
+            .with_context(|| format!("SQL matrix case {:?}: {}", case.name, case.sql))?;
+        let received = client
+            .received
+            .get(received_before..)
+            .context("raw client receive buffer shrank during SQL matrix case")?;
+        let context = format!("{} ({})", case.name, case.sql);
+
+        match case.expectation {
+            SqlExpectation::Served => assert_served(&messages, &context),
+            SqlExpectation::Refused => assert_refused_bytes(received, &context),
+        }
+        assert_no_canary_bytes(received, &context);
+    }
+    Ok(())
+}
+
 // --- Extended-protocol message builders -------------------------------------
 
 pub fn parse_msg(name: &str, sql: &str) -> Message {
@@ -766,7 +825,11 @@ pub fn assert_served(msgs: &[Message], context: &str) {
 /// refusal" test that only checks for a canary passes if the refusal quietly
 /// stops happening; this pins that the refusal is what closed the path.
 pub fn assert_refused(client: &RawClient, context: &str) {
-    let text = client.received_text();
+    assert_refused_bytes(&client.received, context);
+}
+
+fn assert_refused_bytes(received: &[u8], context: &str) {
+    let text = String::from_utf8_lossy(received);
     assert!(
         text.contains("pgmask:"),
         "{context}: expected a pgmask refusal, got:\n{text}"
@@ -774,13 +837,17 @@ pub fn assert_refused(client: &RawClient, context: &str) {
 }
 
 pub fn assert_no_canary(client: &RawClient, context: &str) {
-    let text = client.received_text();
+    assert_no_canary_bytes(&client.received, context);
+}
+
+fn assert_no_canary_bytes(received: &[u8], context: &str) {
+    let text = String::from_utf8_lossy(received);
     for canary in CANARIES {
         assert!(
             !text.contains(canary),
             "LEAK via {context}: {canary} crossed the boundary\n\
              received {} bytes",
-            client.received.len(),
+            received.len(),
         );
     }
 }
