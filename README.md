@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.2.5**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.2.6**. Licensed under the [MIT License](LICENSE).
 
 ## Install
 
@@ -23,7 +23,7 @@ Pin the tag, then confirm the binary:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/redoapp/pgmask/releases/download/v0.2.5/pgmask-installer.sh | sh
+  https://github.com/redoapp/pgmask/releases/download/v0.2.6/pgmask-installer.sh | sh
 pgmask --version
 ```
 

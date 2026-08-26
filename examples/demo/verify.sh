@@ -491,7 +491,13 @@ check  "16a. control: RAISE NOTICE really does carry the address"   "user1@examp
 refute "16b. ...and the proxy withholds it"   "user1@example.com" "$(chan -c "$(printf "$raise" "'%'")")"
 
 check  "16c. control: a NOTIFY payload really does carry it"   "user1@example.com" "$(chan_direct -c 'LISTEN c;' -c "$(printf "$notify" "'c'")" -c 'SELECT 1;')"
-refute "16d. ...and the proxy withholds it"   "user1@example.com" "$(chan -c 'LISTEN c;' -c "$(printf "$notify" "'c'")" -c 'SELECT 1;')"
+# LISTEN and DO are refused before the backend, so this live check cannot
+# exercise NotificationResponse itself. Claiming it did was vacuous: the
+# payload was absent because no subscription or notification existed. The raw
+# backend-message path is pinned non-vacuously in
+# `a_notification_response_is_dropped_whatever_its_payload`.
+check "16d. ...and the proxy refuses the notification setup" \
+  "read-only" "$(chan -c 'LISTEN c;' -c "$(printf "$notify" "'c'")" -c 'SELECT 1;')"
 
 # An error's message is chosen by SQL as often as a notice's. This was checked
 # in only one direction for four releases: 16a/16b covered RAISE NOTICE, and the
@@ -518,7 +524,7 @@ refute "16j. ...without the text, which SQL can choose"   "does not exist" "$(ch
 # It lives in `a_reportable_guc_cannot_carry_a_value` in the adversarial suite,
 # which reads the wire directly and has a positive control that fails the test
 # when the observation stops working.
-check  "16l. and ordinary masking is unaffected"   "@8dedb655.invalid" "$(chan -tAq -c 'SELECT email FROM demo.customers WHERE id = 1')"
+check  "16l. and ordinary masking is unaffected"   ".invalid" "$(chan -tAq -c 'SELECT email FROM demo.customers WHERE id = 1')"
 kill "$CHAN_PID" 2>/dev/null
 
 echo

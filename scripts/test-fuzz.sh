@@ -403,14 +403,26 @@ for cfg in "${CONFIGS[@]}"; do
     [[ "$status" == "0" ]] || bad=1
   done
 
-  # Independent count, from the proxy rather than from us.
+  # Independent count, from the proxy rather than from us. `plaintext_session`
+  # is an observation about an *accepted* connection, not a refused result set,
+  # but it shares this metric family so operators can alert on it. Counting it
+  # here made the proxy exceed the harness by exactly one per fuzz client and
+  # turned every plaintext campaign into a false failure.
   scraped=$(curl -s --max-time 10 "http://127.0.0.1:$metrics/metrics" \
-    | awk -F' ' '/^pgmask_rejections_total\{/ {t+=$2} END {print t+0}')
+    | awk -F' ' '/^pgmask_rejections_total\{/ && !/cause="plaintext_session"/ {t+=$2} END {print t+0}')
   agree="agree"
   if [[ "$c_ref" != "$scraped" ]]; then agree="DISAGREE (proxy says $scraped)"; bad=1; fi
 
   if [[ "$cfg" == "mirror" ]]; then
-    cmp=$(grep -h 'compared to direct' /tmp/pgmask-fuzz-c$cfg_index-*.out | awk '{s+=$4} END {print s+0}')
+    # Read exactly this run's seeds. A glob also picked up seed 2 from an older
+    # two-seed run when the next invocation requested only seed 1, inflating the
+    # comparison count while every actual assertion still passed.
+    cmp=0
+    for s in $(seq 1 "$SEEDS"); do
+      seed_cmp=$(awk '/compared to direct/ {s+=$4} END {print s+0}' \
+        "/tmp/pgmask-fuzz-c$cfg_index-$s.out")
+      cmp=$((cmp + seed_cmp))
+    done
     printf '  %-28s compared %5d  divergences %3d  [%s]\n' "$cfg (masks nothing)" "$cmp" "$c_leak" "$agree"
   else
     printf '  %-28s served %5d  refused %5d  leaks %3d  [%s]\n' "$cfg" "$c_served" "$c_ref" "$c_leak" "$agree"
@@ -432,9 +444,11 @@ printf '  LEAKED                %8d\n' "$tot_leaks"
 
 rows=$(psql -h localhost -p "$PG_PORT" -U postgres -d fuzzdb -tAc 'SELECT count(*) FROM fz.t1')
 [[ "$rows" == "40" ]] || { echo "FAIL: fixture changed during the run (fz.t1 = $rows, expected 40)"; exit 1; }
-echo "  fixture intact, harness and proxy agree"
+echo "  fixture intact"
 
-[[ "$tot_leaks" -eq 0 && "$bad" -eq 0 ]] || exit 1
+[[ "$tot_leaks" -eq 0 && "$bad" -eq 0 ]] \
+  || { echo "FAIL: leak, replay failure, or harness/proxy disagreement"; exit 1; }
 [[ "$tot_control" -gt 0 ]] || { echo "VACUOUS: never reached a masked value"; exit 2; }
+echo "  harness and proxy agree"
 echo
 echo "$tot_control masked values were readable without the proxy and none through it."

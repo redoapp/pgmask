@@ -213,14 +213,14 @@ relation = "sw.u"
 column = "note"
 mask = "none"
 
-# The trap. `sw.v_union.v` is one output column drawing from two source columns,
+# The trap. \`sw.v_union.v\` is one output column drawing from two source columns,
 # one released and one masked, and *both* engines report provenance for it —
 # Postgres names the view's own column, CockroachDB names the first branch's
 # base column. Either way a rule here is a rule on a field that is sometimes an
 # address, so releasing it releases addresses.
 #
-# This is the rule an operator would plausibly write: `v` looks like a city
-# column, `classify` would sample it and see cities. Without the view-taint
+# This is the rule an operator would plausibly write: \`v\` looks like a city
+# column, \`classify\` would sample it and see cities. Without the view-taint
 # check the proxy honours it and leaks on Postgres too, which is why that check
 # is not a CockroachDB concession.
 [[column]]

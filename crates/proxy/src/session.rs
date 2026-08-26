@@ -1668,6 +1668,36 @@ mod tests {
         Message::new(protocol::B_NOTICE_RESPONSE, body.freeze())
     }
 
+    /// The live demo cannot reach this backend-message path: `LISTEN` and
+    /// `DO`/`NOTIFY` are refused before Postgres, so absence of a payload there
+    /// only proves that no notification was generated. Drive the real dispatch
+    /// directly so removing the `B_NOTIFICATION_RESPONSE` arm's drop would
+    /// make this test fail with the client-chosen payload in `to_client`.
+    #[test]
+    fn a_notification_response_is_dropped_whatever_its_payload() {
+        let mut body = bytes::BytesMut::new();
+        bytes::BufMut::put_i32(&mut body, 42);
+        bytes::BufMut::put_slice(&mut body, b"updates\0");
+        bytes::BufMut::put_slice(&mut body, b"user1@example.com\0");
+
+        let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
+        let mut out = Batch::default();
+        session.handle_backend(
+            Message::new(protocol::B_NOTIFICATION_RESPONSE, body.freeze()),
+            &mut out,
+        );
+
+        assert!(
+            out.to_client.is_empty(),
+            "notification payload reached client"
+        );
+        assert!(out.to_backend.is_empty());
+        assert!(
+            !out.close,
+            "dropping an async notification keeps the session usable"
+        );
+    }
+
     #[test]
     fn simple_query_rate_limit_refuses_after_burst() {
         let mut session = Session::new(policy_with_rate_limit(60, 2)).with_principal("alice");
