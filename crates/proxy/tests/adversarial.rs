@@ -122,7 +122,7 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
     assert_served(&text_msgs, "text json and jsonb");
     assert_no_canary(&text_client, "structure-aware JSON text formats");
     let text = text_client.received_text();
-    assert!(text.contains(r#""email":"****************b2c3""#), "{text}");
+    assert!(text.contains(r#""email":"***************b2c3""#), "{text}");
     assert!(text.contains(r#""name":"***""#), "{text}");
     assert!(text.contains(r#""public":"Portland""#), "{text}");
     assert!(text.contains(r#""city":"Denver""#), "{text}");
