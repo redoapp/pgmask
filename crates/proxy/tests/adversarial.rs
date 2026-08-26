@@ -515,6 +515,118 @@ async fn rebinding_the_same_portal_before_complete_does_not_leak() -> Result<()>
     Ok(())
 }
 
+/// Close then Bind of the same portal must not leak the in-flight
+/// Execute's rows.
+///
+/// Sibling of the 0.1.97 same-name rebind. `Close P p` dropped
+/// `portal_bind_generations`, so `Bind p s_pass` started at generation 1
+/// again and collided with the unfinished `PendingExecute`. In one Sync,
+/// Execute runs before Describe is answered, so `pending.plan` is still
+/// `None`. `streaming_plan` treated the rebound all-passthrough plan as
+/// current; `Vetted::unmasked_row` released the canaries. No second
+/// Execute required. Close S of the classified statement, unnamed
+/// portal `""`, and binary Bind of the classified Execute leaked the
+/// same way. Without Close the second Bind bumps to 2 and the proxy
+/// refuses (existing 0.1.97 test).
+///
+/// Either a masked row or a `pgmask:` refusal is fail-closed. Cleartext
+/// canaries are not.
+#[tokio::test]
+async fn close_then_rebind_same_portal_does_not_leak() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    // Close P then Bind passthrough, one Sync. No second Execute.
+    let mut buf = Vec::new();
+    for msg in [
+        parse_msg("sc", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        parse_msg("sp", "SELECT city, id FROM canary.subjects WHERE id = 1"),
+        describe_statement("sc"),
+        describe_statement("sp"),
+        bind_msg("p", "sc"),
+        execute_msg("p", 0),
+        close_portal("p"),
+        bind_msg("p", "sp"),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "Close P then Bind same portal");
+    assert_no_canary(&client, "Close P then Bind same portal");
+
+    // Unnamed portal.
+    client = RawClient::connect(proxy.addr, DB).await?;
+    buf.clear();
+    for msg in [
+        parse_msg("sc", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        parse_msg("sp", "SELECT city, id FROM canary.subjects WHERE id = 1"),
+        describe_statement("sc"),
+        describe_statement("sp"),
+        bind_msg("", "sc"),
+        execute_msg("", 0),
+        close_portal(""),
+        bind_msg("", "sp"),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "Close P then Bind unnamed portal");
+    assert_no_canary(&client, "Close P then Bind unnamed portal");
+
+    // Close S of the classified statement implicitly closes its portals.
+    client = RawClient::connect(proxy.addr, DB).await?;
+    buf.clear();
+    for msg in [
+        parse_msg("sc", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        parse_msg("sp", "SELECT city, id FROM canary.subjects WHERE id = 1"),
+        describe_statement("sc"),
+        describe_statement("sp"),
+        bind_msg("p", "sc"),
+        execute_msg("p", 0),
+        close_statement("sc"),
+        bind_msg("p", "sp"),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "Close S then Bind same portal");
+    assert_no_canary(&client, "Close S then Bind same portal");
+
+    // Binary Bind of the classified Execute, then Close and text rebind.
+    client = RawClient::connect(proxy.addr, DB).await?;
+    buf.clear();
+    for msg in [
+        parse_msg("sc", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        parse_msg("sp", "SELECT city, id FROM canary.subjects WHERE id = 1"),
+        describe_statement("sc"),
+        describe_statement("sp"),
+        bind_msg_with_result_format("p", "sc", 1),
+        execute_msg("p", 0),
+        close_portal("p"),
+        bind_msg("p", "sp"),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(
+        &msgs,
+        &client,
+        "binary classified Execute then Close+rebind",
+    );
+    assert_no_canary(&client, "binary classified Execute then Close+rebind");
+    Ok(())
+}
+
 #[tokio::test]
 async fn pipelined_interleaved_portals_stay_masked() -> Result<()> {
     require_pg!();
@@ -988,6 +1100,8 @@ async fn an_error_message_chosen_by_sql_cannot_carry_a_value() -> Result<()> {
         // The fields RAISE also accepts expressions for, which were already
         // covered — kept so a change to LEAKY_FIELDS shows up here.
         "DO $$ BEGIN RAISE EXCEPTION 'boom' USING COLUMN = \
+         (SELECT email FROM canary.subjects LIMIT 1); END $$;",
+        "DO $$ BEGIN RAISE EXCEPTION 'boom' USING SCHEMA = \
          (SELECT email FROM canary.subjects LIMIT 1); END $$;",
         // A unique violation, the channel LEAKY_FIELDS was written for.
         "INSERT INTO canary.subjects VALUES \

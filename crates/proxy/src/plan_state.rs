@@ -160,6 +160,20 @@ pub(crate) struct PlanState {
     /// this counter the second Execute of a reused name skipped the queue,
     /// `portal_plans[p]` already held the new plan, and in-flight DataRows
     /// were judged with it. See [`PendingExecute::bind_generation`].
+    ///
+    /// Close must not reset this counter. `Close P p` dropped the map
+    /// entry; a later Bind of the same name started at generation 1 again
+    /// and collided with an in-flight `PendingExecute` that still held 1.
+    /// In one Sync, Execute runs before Describe is answered, so
+    /// `pending.plan` is still `None`. `streaming_plan` saw a matching
+    /// generation and fell back to the rebound all-passthrough plan;
+    /// same-arity classified DataRows took `Vetted::unmasked_row`. Without
+    /// Close the second Bind bumps to 2 and the proxy refuses. Close S of
+    /// the statement implicitly closes its portals and leaked the same
+    /// way. Unnamed portal `""` and binary Bind too. The generation is
+    /// how many times the *name* has been Bound, not a Close-able
+    /// resource. A Bind never reuses a generation an unfinished
+    /// `PendingExecute` still holds.
     portal_bind_generations: HashMap<Bytes, u64>,
     active_plan: Option<Plan>,
     /// Portal named by the most recent Execute, so a plan that only becomes
@@ -196,6 +210,13 @@ pub(crate) struct PlanState {
     /// generation so a later Execute of the same name after a rebind is a
     /// new result set, not a resume. Unknown (no snapshot, generation no
     /// longer current) refuses DataRows rather than unmasking.
+    ///
+    /// A sibling of that rebind: `Close` of the portal (or of the
+    /// statement that created it) used to drop the generation, so the
+    /// next Bind of the same name started at 1 again and aliased the
+    /// unfinished Execute. Same leak, same Sync, no second Execute
+    /// required. Close must not reset a generation an unfinished
+    /// owner still holds.
     pending_executes: VecDeque<PendingExecute>,
     /// The front of `pending_executes` is a portal that has emitted
     /// `PortalSuspended` and is not the result currently streaming.
@@ -393,6 +414,13 @@ impl PlanState {
         // between the two PBEs, were already safe. Resume still shares an
         // owner only when the name *and* bind generation match; the owner's
         // plan is snapshotted at Execute. Unknown refuses DataRows.
+        //
+        // A sibling of that rebind: Close of the portal (or of its
+        // statement) reset the generation. The next Bind of the same name
+        // started at 1 again and collided with this Execute. In one Sync
+        // `pending.plan` is still `None` (Describe unanswered), so
+        // `streaming_plan` treated the rebound all-passthrough plan as
+        // current. Close must not alias an unfinished owner.
         if self.suspended {
             self.suspended = false;
             if self.is_resume(portal) {
@@ -512,7 +540,21 @@ impl PlanState {
     }
 
     fn bump_bind_generation(&mut self, portal: &Bytes) {
-        let next = self.bind_generation(portal).saturating_add(1);
+        let mut next = self.bind_generation(portal).saturating_add(1);
+        // Close of this name used to drop the map entry so `next` became 1
+        // again and collided with an unfinished Execute that still held 1.
+        // Never reuse a generation a pending owner still names.
+        while self
+            .pending_executes
+            .iter()
+            .any(|pending| pending.name == *portal && pending.bind_generation == next)
+        {
+            let bumped = next.saturating_add(1);
+            if bumped == next {
+                break;
+            }
+            next = bumped;
+        }
         self.portal_bind_generations.insert(portal.clone(), next);
     }
 
@@ -554,7 +596,8 @@ impl PlanState {
     /// later all-passthrough plan to a classified result (`unmasked_row`).
     /// A missing snapshot falls back to the map only while this Execute's
     /// bind generation is still current — otherwise unknown, and the caller
-    /// refuses rather than unmasking.
+    /// refuses rather than unmasking. Close must not make a later Bind look
+    /// current by resetting that counter.
     pub(crate) fn streaming_plan(&self) -> Option<Plan> {
         if self.streaming_simple_result {
             return self.active_plan();
@@ -654,6 +697,14 @@ impl PlanState {
     ///
     /// The active plan deliberately survives: an Execute may precede its Close
     /// in the same pipeline, and those rows arrive before `CloseComplete`.
+    ///
+    /// Bind generation also survives. It is how many times this *name*
+    /// has been Bound, not a Postgres resource. Removing it here reset
+    /// the counter so a later Bind reused generation 1 and
+    /// `streaming_plan` attached the rebound all-passthrough plan to
+    /// classified DataRows still owed (`unmasked_row`). Close S of the
+    /// classified statement leaked the same way. The map entry for the
+    /// portal is dropped; the name's generation is not.
     pub(crate) fn close(&mut self, target: DescribeTarget) {
         match target {
             DescribeTarget::Statement(statement) => {
@@ -670,14 +721,14 @@ impl PlanState {
                     self.portal_statement.remove(&portal);
                     self.portal_plans.remove(&portal);
                     self.portal_formats.remove(&portal);
-                    self.portal_bind_generations.remove(&portal);
+                    // Not portal_bind_generations: see the comment above.
                 }
             }
             DescribeTarget::Portal(portal) => {
                 self.portal_statement.remove(&portal);
                 self.portal_plans.remove(&portal);
                 self.portal_formats.remove(&portal);
-                self.portal_bind_generations.remove(&portal);
+                // Not portal_bind_generations: see the comment above.
             }
         }
     }
@@ -1094,6 +1145,41 @@ mod tests {
         assert!(
             state.active_plan().is_some(),
             "re-describing must restore it"
+        );
+    }
+
+    /// A refresh must not unmask an in-flight result.
+    ///
+    /// `invalidate_if_stale` drops cached statement/portal plans so the next
+    /// Bind/Execute fails closed until re-Describe. The rows already streaming
+    /// keep the plan their RowDescription armed — including a masked plan that
+    /// a new snapshot would now pass through. Switching those rows to
+    /// `Vetted::unmasked_row` mid-result would be a leak.
+    #[test]
+    fn a_catalog_refresh_does_not_unmask_in_flight_rows() {
+        let mut state = PlanState::default();
+        state.begin_simple_query(Some("SELECT secret FROM t".into()));
+        let masked = marked_plan(25, Mask::Redact);
+        state.finish_description(masked.clone()).unwrap();
+        assert!(
+            state
+                .streaming_plan()
+                .is_some_and(|plan| plan.iter().all(|field| !field.spec.is_passthrough())),
+            "the result started masked"
+        );
+
+        state.invalidate_if_stale(1);
+        let streaming = state
+            .streaming_plan()
+            .expect("in-flight rows keep their plan across a refresh");
+        assert_eq!(
+            streaming.len(),
+            masked.len(),
+            "the in-flight plan is the one the RowDescription armed"
+        );
+        assert!(
+            streaming.iter().all(|field| !field.spec.is_passthrough()),
+            "a refresh must not switch in-flight rows to passthrough"
         );
     }
 
@@ -2095,6 +2181,120 @@ mod tests {
         assert!(
             second == Some(2) || second.is_none(),
             "the rebound classified Execute owns its rows, or they are refused"
+        );
+    }
+
+    /// Close of a portal must not reset bind generation so a later Bind
+    /// of the same name aliases the in-flight Execute.
+    ///
+    /// Measured live: `Bind p sc; Execute p 0; Close P p; Bind p sp; Sync`
+    /// in one flush. Execute ran before Describe was answered, so
+    /// `pending.plan` was `None`. Close dropped generation 1; the rebind
+    /// started at 1 again. `streaming_plan` treated the rebound
+    /// all-passthrough plan as current; `Vetted::unmasked_row` released
+    /// email. No second Execute required. Without Close the second Bind
+    /// bumps to 2 and the proxy refuses (0.1.97).
+    fn assert_inflight_not_rebound_passthrough(state: &PlanState, what: &str) {
+        assert_ne!(
+            streaming_oid(state),
+            Some(1),
+            "{what}: must not judge in-flight rows with the rebound passthrough plan"
+        );
+        if let Some(plan) = state.streaming_plan() {
+            assert!(
+                plan.iter().all(|field| !field.spec.is_passthrough()),
+                "{what}: classified in-flight rows must not see an all-passthrough plan"
+            );
+        }
+    }
+
+    fn pipeline_class_then_pass_undescribed(state: &mut PlanState) {
+        state.parse(name("sc"), "SELECT email, name FROM t".into());
+        state.parse(name("sp"), "SELECT city, id FROM t".into());
+        state.describe(DescribeTarget::Statement(name("sc")));
+        state.describe(DescribeTarget::Statement(name("sp")));
+    }
+
+    fn answer_pipelined_class_then_pass(state: &mut PlanState) {
+        state
+            .finish_description(marked_plan(2, Mask::Redact))
+            .unwrap();
+        state
+            .finish_description(marked_plan(1, Mask::None))
+            .unwrap();
+        state.finish_bind();
+    }
+
+    #[test]
+    fn close_then_rebind_same_portal_does_not_release_inflight_classified_rows() {
+        let mut state = PlanState::default();
+        pipeline_class_then_pass_undescribed(&mut state);
+        state.bind(name("p"), name("sc"), None);
+        state.execute(&name("p"));
+        state.close(DescribeTarget::Portal(name("p")));
+        state.bind(name("p"), name("sp"), None);
+        answer_pipelined_class_then_pass(&mut state);
+        assert_inflight_not_rebound_passthrough(
+            &state,
+            "Close P then Bind of the same portal in one Sync",
+        );
+    }
+
+    #[test]
+    fn close_statement_then_rebind_portal_does_not_release_inflight_classified_rows() {
+        let mut state = PlanState::default();
+        pipeline_class_then_pass_undescribed(&mut state);
+        state.bind(name("p"), name("sc"), None);
+        state.execute(&name("p"));
+        state.close(DescribeTarget::Statement(name("sc")));
+        state.bind(name("p"), name("sp"), None);
+        answer_pipelined_class_then_pass(&mut state);
+        assert_inflight_not_rebound_passthrough(
+            &state,
+            "Close S of the classified statement then Bind of the same portal",
+        );
+    }
+
+    #[test]
+    fn close_then_rebind_unnamed_portal_does_not_release_inflight_classified_rows() {
+        let mut state = PlanState::default();
+        pipeline_class_then_pass_undescribed(&mut state);
+        state.bind(name(""), name("sc"), None);
+        state.execute(&name(""));
+        state.close(DescribeTarget::Portal(name("")));
+        state.bind(name(""), name("sp"), None);
+        answer_pipelined_class_then_pass(&mut state);
+        assert_inflight_not_rebound_passthrough(&state, "Close P then Bind of the unnamed portal");
+    }
+
+    #[test]
+    fn close_then_rebind_binary_classified_execute_does_not_release() {
+        let mut state = PlanState::default();
+        pipeline_class_then_pass_undescribed(&mut state);
+        state.bind(name("p"), name("sc"), Some(vec![1]));
+        state.execute(&name("p"));
+        state.close(DescribeTarget::Portal(name("p")));
+        state.bind(name("p"), name("sp"), Some(vec![1]));
+        answer_pipelined_class_then_pass(&mut state);
+        assert_inflight_not_rebound_passthrough(
+            &state,
+            "Close then binary Bind of the same portal",
+        );
+    }
+
+    /// Control: the same one-Sync pipeline without Close is still
+    /// fail-closed (0.1.97). Describe unanswered, so no snapshot.
+    #[test]
+    fn rebinding_same_portal_in_one_sync_without_close_is_still_fail_closed() {
+        let mut state = PlanState::default();
+        pipeline_class_then_pass_undescribed(&mut state);
+        state.bind(name("p"), name("sc"), None);
+        state.execute(&name("p"));
+        state.bind(name("p"), name("sp"), None);
+        answer_pipelined_class_then_pass(&mut state);
+        assert_inflight_not_rebound_passthrough(
+            &state,
+            "class-then-pass same portal without Close",
         );
     }
 }
