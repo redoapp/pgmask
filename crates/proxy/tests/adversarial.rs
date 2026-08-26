@@ -1295,6 +1295,64 @@ async fn lineage_does_not_release_a_unicode_escaped_masked_name() -> Result<()> 
         );
         assert_no_canary(&client, sql);
     }
+    // Following a FROM alias of a released column is still closed.
+    {
+        let sql = "SELECT upper(x) FROM (SELECT city AS x FROM canary.subjects) q";
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let msgs = client.simple_query(sql).await?;
+        assert_served(&msgs, sql);
+        assert!(
+            client.received_text().contains("PORTLAND"),
+            "{sql}: {}",
+            client.received_text()
+        );
+        assert_no_canary(&client, sql);
+    }
+    // A FROM colnames list remaps attnums by position. `city` here is
+    // email (attnum 2); Guard 6 never sees the word `email`. Must refuse
+    // and never contain the canary. A SELECT-list `AS` is not this list.
+    for sql in [
+        "SELECT upper(city) FROM canary.subjects AS t(id, city, n, note, c) \
+         WHERE id = 1",
+        "SELECT city || 'x' FROM canary.subjects AS t(id, city, n, note, c) \
+         WHERE id = 1",
+        "SELECT city FROM canary.subjects AS t(id, city, n, note, c) \
+         WHERE id = 1 UNION ALL SELECT city FROM canary.subjects \
+         WHERE id = 1",
+        "SELECT upper(city) FROM canary.subject_view AS v(id, city, n, c) \
+         WHERE id = 1",
+    ] {
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let msgs = client.simple_query(sql).await?;
+        assert_exercised(&msgs, &client, sql);
+        assert_refused(&client, sql);
+        assert_no_canary(&client, sql);
+    }
+    // The wrap that reopened the SubLink leak: outer field is ColumnRef
+    // `x`, Guard 6 never sees `email` because the FROM alias list renamed
+    // it, and sqllineage still reports only `city`.
+    for sql in [
+        "SELECT x FROM (SELECT city || (SELECT a FROM canary.subjects \
+            AS t(id, a, n, note, city) LIMIT 1) AS x FROM canary.subjects \
+            WHERE id = 1) q",
+        "SELECT q.x FROM (SELECT city || (SELECT a FROM canary.subjects \
+            AS t(id, a, n, note, city) LIMIT 1) AS x FROM canary.subjects \
+            WHERE id = 1) q",
+        "WITH q AS (SELECT city || (SELECT a FROM canary.subjects \
+            AS t(id, a, n, note, city) LIMIT 1) AS x FROM canary.subjects \
+            WHERE id = 1) SELECT x FROM q",
+        "SELECT x FROM (SELECT CONCAT(city, (SELECT a FROM canary.subjects \
+            AS t(id, a, n, note, city) LIMIT 1)) AS x FROM canary.subjects \
+            WHERE id = 1) q",
+        "SELECT x FROM (SELECT city || (SELECT city FROM canary.subjects \
+            LIMIT 1) AS x FROM canary.subjects) q",
+    ] {
+        let mut client = RawClient::connect(proxy.addr, DB).await?;
+        let msgs = client.simple_query(sql).await?;
+        assert_exercised(&msgs, &client, sql);
+        assert_refused(&client, sql);
+        assert_no_canary(&client, sql);
+    }
 
     for sql in [
         r#"SELECT city || (SELECT u&"email" FROM canary.subjects c2

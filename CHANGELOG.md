@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.96 — Guard 7 follows FROM/CTE aliases to the real expression
+
+- **A `ColumnRef` is not always a stored column.** Guard 7 judged closedness
+  from the outermost target list, so
+  `SELECT x FROM (SELECT city || (SELECT renamed_email) AS x)` looked like a
+  closed column while `sqllineage` still reported only `city`. A FROM alias
+  list (`AS t(id, a, …)`) hid the masked name from Guard 6. The same wrap
+  leaked `name` and `phone` through the shipped GUI catalog (`lineage =
+  "allow"`). Guard 7 now follows a subquery or CTE alias to the inner
+  expression; a `SubLink` underneath stays unresolved. `SELECT upper(x)
+  FROM (SELECT city AS x …)` still releases. Default posture was already
+  refusing these (no provenance).
+- **A FROM colnames list remaps attnums by position.** Independent of the
+  wrap above: `SELECT upper(city) FROM customers AS t(id, city, …)` binds
+  the released name `city` to email. Guard 6 never sees the word `email`;
+  sqllineage reports `customers.city`. Guard 7 now treats a `RangeVar`
+  with colnames as incomplete, the same inversion as `RangeFunction` and
+  join-with-colnames. `SELECT upper(city) FROM customers` (no list) still
+  releases. Default posture was already refusing (no provenance); hostile
+  already refuses these lists.
+
 ## 0.1.95 — lineage Release is an allowlist; unicode-escaped names are decoded
 
 - **A non-empty source list is not a complete source list.** `sqllineage`

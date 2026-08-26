@@ -121,7 +121,10 @@ never prints values, but the output still requires human review.
 - `lineage = "allow"` may release an expression when every resolved source is
   explicitly released *and* the output expression is a closed composition of
   columns and literals (no scalar subquery, window, or unlisted node). It is
-  off by default because incomplete lineage is a release risk. A masked name
+  off by default because incomplete lineage is a release risk. Output
+  expressions whose sources the resolver cannot finish — a `SubLink`,
+  including one hidden behind a FROM/CTE alias, or a FROM colnames list
+  that remaps attnums (`AS t(id, city, …)`) — stay refused. A masked name
   in any identifier encoding the engine accepts — including `u&"…"` unicode
   escapes — still blocks that release.
 - `system_catalogs = "allow"` releases approved metadata needed by GUI clients.

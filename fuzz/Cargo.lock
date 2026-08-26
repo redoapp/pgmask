@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "pgmask"
-version = "0.1.95"
+version = "0.1.96"
 dependencies = [
  "anyhow",
  "arc-swap",

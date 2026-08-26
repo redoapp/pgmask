@@ -801,8 +801,18 @@ comment that asserted the case could not happen.
   those encodings in the lexer (and failing the scan on `UESCAPE`) and by
   refusing to `Release` any output expression that contains a `SubLink` (or
   any node kind not on the allowlist), even when the subquery names only
-  released columns — not numbered in the tables above, because it is
-  reachable only with lineage inverted from the default.
+  released columns. The first shape-allowlist still stopped at the outermost
+  target list, so wrapping the concat as `SELECT x FROM (SELECT city ||
+  (SELECT a FROM t AS t(id, a, …)) AS x)` made the described field a
+  `ColumnRef` and the FROM alias list hid `email` from the backstop; that
+  wrap leaked through the GUI catalog until 0.1.96, which follows subquery
+  and CTE aliases to the inner expression. A FROM colnames list without a
+  SubLink is a second hole of the same family: `SELECT upper(city) FROM
+  customers AS t(id, city, …)` binds `city` to email, Guard 6 never sees
+  `email`, and a closed ColumnRef on the RangeVar used to Release. Closed
+  in 0.1.96 by treating that list as incomplete. Not numbered in the tables
+  above, because both are reachable only with lineage inverted from the
+  default.
 - The 2026-08-11 diagnostic fixes are now exercised on **both engines**, for the
   channels each engine actually has. Measured on CockroachDB v25.4.14: `DO $$ …
   RAISE EXCEPTION $$` carries a value exactly as on Postgres, and so do

@@ -77,8 +77,11 @@
 //! Guard 7 stops treating "we found some sources and they are released" as
 //! "we found every source". It does not try to teach the resolver about
 //! `SubLink`; it refuses to `Release` an expression the resolver is not
-//! trusted to have finished. FROM-clause subqueries and CTEs stay eligible:
-//! they are not `SubLink`s, and tracing through them is the resolver's job.
+//! trusted to have finished. A `ColumnRef` that is the output of a
+//! FROM-clause subquery or CTE is that inner expression: following the
+//! alias is how `SELECT x FROM (SELECT city || (SELECT …) AS x)` stays a
+//! `SubLink` instead of looking like a stored column. A subquery in WHERE
+//! is still a predicate, not a source of the field.
 //!
 //! Guard 6 does not ask about constructs. It asks whether a masked column is
 //! named in the statement at all — including in WHERE, which 7 does not
@@ -88,9 +91,16 @@
 //! tree** supplies names the token stream does not spell as words.
 //!
 //! A disclosure now needs the resolver to under-report, the shape to look
-//! closed, *and* the backstop to miss the name. The unicode-escaped concat
-//! that leaked under the GUI catalog failed 6 and would now fail 7 even if
-//! the subquery had named only released columns.
+//! closed after following FROM/CTE aliases, *and* the backstop to miss the
+//! name. The unicode-escaped concat that leaked under the GUI catalog
+//! failed 6 and would now fail 7 even if the subquery had named only
+//! released columns. Wrapping that concat as `SELECT x FROM (… AS x)`
+//! used to make the described field a `ColumnRef`; 7 follows the alias.
+//! A FROM colnames list on a `RangeVar` is a different hole with no
+//! SubLink: `SELECT upper(city) FROM customers AS t(id, city, …)` binds
+//! the released name to email. sqllineage and a closed ColumnRef both
+//! treat it as `customers.city`. That list is incomplete, the same
+//! inversion as `RangeFunction` / join-with-colnames.
 //!
 //! The premise — that the backstop sees everything the resolver can name — is
 //! asserted in `tests/lineage_superset.rs` rather than assumed. That test has
@@ -650,6 +660,15 @@ mod tests {
             "SELECT (SELECT shared FROM demo.t LIMIT 1) FROM demo.t",
             // One closed branch does not make the other complete.
             "SELECT shared FROM demo.t UNION SELECT (SELECT shared FROM demo.t LIMIT 1)",
+            // Wrapping the SubLink so the described field is a ColumnRef.
+            // Guard 7 used to stop at the outer `x` and Release; the
+            // FROM-alias list hides `secret` from Guard 6.
+            "SELECT x FROM (SELECT shared || (SELECT shared FROM demo.t LIMIT 1) AS x FROM demo.t) q",
+            "SELECT q.x FROM (SELECT shared || (SELECT shared FROM demo.t LIMIT 1) AS x FROM demo.t) q",
+            "WITH q AS (SELECT shared || (SELECT shared FROM demo.t LIMIT 1) AS x FROM demo.t) SELECT x FROM q",
+            "SELECT y FROM (SELECT x AS y FROM (SELECT shared || (SELECT shared FROM demo.t LIMIT 1) AS x FROM demo.t) q) r",
+            "SELECT x FROM (SELECT CONCAT(shared, (SELECT shared FROM demo.t LIMIT 1)) AS x FROM demo.t) q",
+            "SELECT x FROM (SELECT shared || (SELECT a FROM demo.t AS t(s, a) LIMIT 1) AS x FROM demo.t) q",
         ] {
             assert_ne!(
                 resolve(sql, 1, &snapshot, &HashSet::new())[0],
@@ -676,11 +695,72 @@ mod tests {
         for sql in [
             "SELECT upper(shared) FROM demo.t",
             "SELECT upper(shared) FROM demo.t WHERE shared IN (SELECT x FROM elsewhere)",
+            // Following a FROM alias of a stored column is still closed.
+            "SELECT upper(x) FROM (SELECT shared AS x FROM demo.t) q",
+            "SELECT x FROM (SELECT shared AS x FROM demo.t) q",
         ] {
             assert_eq!(
                 resolve(sql, 1, &snapshot, &HashSet::new())[0],
                 Verdict::Release,
                 "only released columns are named here: {sql}"
+            );
+        }
+    }
+
+    /// A FROM colnames list remaps attnums by position.
+    ///
+    /// `AS t(id, city, …)` binds the released name `city` to `email`.
+    /// Guard 6 never sees the word `email`; sqllineage reports
+    /// `demo.t.city`. Guard 7 treats the list as incomplete, the same
+    /// inversion as `RangeFunction` / join-with-colnames. A SELECT-list
+    /// `AS` is not that list and still releases (the 0.1.96 pin).
+    #[test]
+    fn a_from_colnames_list_that_hides_a_masked_column_is_not_released() {
+        let mut s = Snapshot::default();
+        s.insert_relation_for_test(
+            "demo.t",
+            &[
+                ("id", Mask::None),
+                ("email", Mask::Redact),
+                ("name", Mask::Redact),
+                ("note", Mask::Redact),
+                ("city", Mask::None),
+            ],
+        );
+        s.insert_relation_for_test(
+            "demo.v",
+            &[
+                ("id", Mask::None),
+                ("email", Mask::Redact),
+                ("name", Mask::Redact),
+                ("city", Mask::None),
+            ],
+        );
+        let snapshot = Arc::new(s);
+        for sql in [
+            "SELECT upper(city) FROM demo.t AS t(id, city, n, note, c)",
+            "SELECT city || 'x' FROM demo.t AS t(id, city, n, note, c)",
+            "SELECT city::text FROM demo.t AS t(id, city, n, note, c)",
+            "SELECT city FROM demo.t AS t(id, city, n, note, c) \
+             UNION ALL SELECT city FROM demo.t AS t(id, city, n, note, c)",
+            "SELECT city FROM demo.t AS t(id, city, n, note, c) \
+             EXCEPT SELECT city FROM demo.t",
+            "SELECT upper(city) FROM demo.v AS v(id, city, n, c)",
+        ] {
+            assert_ne!(
+                resolve(sql, 1, &snapshot, &HashSet::new())[0],
+                Verdict::Release,
+                "FROM colnames remapped a masked attnum onto a released name: {sql}"
+            );
+        }
+        for sql in [
+            "SELECT upper(city) FROM demo.t",
+            "SELECT upper(x) FROM (SELECT city AS x FROM demo.t) q",
+        ] {
+            assert_eq!(
+                resolve(sql, 1, &snapshot, &HashSet::new())[0],
+                Verdict::Release,
+                "a real city column, or a SELECT-list alias of one, still releases: {sql}"
             );
         }
     }
