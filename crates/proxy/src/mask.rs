@@ -1672,6 +1672,18 @@ mod tests {
     }
 
     #[test]
+    fn json_binary_format_is_json_text_without_a_version_byte() {
+        let spec = json_spec(Mask::Null, vec![("/email", MaskSpec::new(Mask::Redact))]);
+        let output = apply_json(
+            &spec,
+            OID_JSON,
+            FORMAT_BINARY,
+            br#"{"email":"secret","other":"hidden"}"#,
+        );
+        assert_eq!(output, serde_json::json!({"email": "***", "other": null}));
+    }
+
+    #[test]
     fn json_leaf_type_mismatch_refuses_instead_of_passing_the_value() {
         let spec = json_spec(Mask::Null, vec![("/email", MaskSpec::new(Mask::Partial))]);
         let result = masker().apply(

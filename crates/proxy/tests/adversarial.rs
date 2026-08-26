@@ -18,6 +18,35 @@ use support::*;
 
 const DB: &str = "postgres";
 
+/// Catalog rules for stored `json`/`jsonb` columns, including the view that
+/// reports its own OID. Pointer policy is shared so a provenance-preserving
+/// rewrite cannot pick a weaker JSON plan than the base table.
+fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
+    let document_rule = |relation: &str, column: &str| {
+        let mut email = json_field("/profile/email", pgmask::mask::Mask::Partial);
+        email.params.keep = Some(4);
+        json_rule(
+            relation,
+            column,
+            pgmask::mask::Mask::Null,
+            vec![
+                json_field("/profile", pgmask::mask::Mask::None),
+                email,
+                json_field("/profile/name", pgmask::mask::Mask::Redact),
+                json_field("/public", pgmask::mask::Mask::None),
+                json_field("/items/0", pgmask::mask::Mask::None),
+                json_field("/items/0/token", pgmask::mask::Mask::Redact),
+            ],
+        )
+    };
+    let mut rules = default_rules();
+    for relation in ["canary.documents", "canary.documents_view"] {
+        rules.push(document_rule(relation, "payload"));
+        rules.push(document_rule(relation, "legacy"));
+    }
+    rules
+}
+
 // --- Negative control -------------------------------------------------------
 
 /// If this fails, every other test in this file is meaningless.
@@ -93,27 +122,7 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
     assert_served(&control_msgs, "binary JSON poison control");
     assert_canary_present(&binary_control, CANARY_EMAIL);
 
-    let document_rule = |column: &str| {
-        let mut email = json_field("/profile/email", pgmask::mask::Mask::Partial);
-        email.params.keep = Some(4);
-        json_rule(
-            "canary.documents",
-            column,
-            pgmask::mask::Mask::Null,
-            vec![
-                json_field("/profile", pgmask::mask::Mask::None),
-                email,
-                json_field("/profile/name", pgmask::mask::Mask::Redact),
-                json_field("/public", pgmask::mask::Mask::None),
-                json_field("/items/0", pgmask::mask::Mask::None),
-                json_field("/items/0/token", pgmask::mask::Mask::Redact),
-            ],
-        )
-    };
-    let mut masked_rules = default_rules();
-    masked_rules.push(document_rule("payload"));
-    masked_rules.push(document_rule("legacy"));
-    let masked = start_proxy(DB, masked_rules).await?;
+    let masked = start_proxy(DB, classified_json_document_rules()).await?;
 
     let mut text_client = RawClient::connect(masked.addr, DB).await?;
     let text_msgs = text_client
@@ -150,6 +159,163 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
     let binary = binary_client.received_text();
     assert!(binary.contains(r#""public":"Portland""#), "{binary}");
     assert!(binary.contains(r#""city":"Denver""#), "{binary}");
+
+    // `json` binary is UTF-8 JSON text with no version byte. The jsonb path
+    // above must not be the only format the live server exercises.
+    let mut json_binary_control = RawClient::connect(released.addr, DB).await?;
+    json_binary_control
+        .send(parse_msg(
+            "s",
+            "SELECT legacy FROM canary.documents WHERE id = 1",
+        ))
+        .await?;
+    json_binary_control.send(describe_statement("s")).await?;
+    json_binary_control
+        .send(bind_msg_with_result_format("p", "s", 1))
+        .await?;
+    json_binary_control.send(execute_msg("p", 0)).await?;
+    json_binary_control.send(sync_msg()).await?;
+    let json_binary_control_msgs = json_binary_control.read_until_ready().await?;
+    assert_served(&json_binary_control_msgs, "binary json poison control");
+    assert_canary_present(&json_binary_control, CANARY_EMAIL);
+
+    let mut json_binary_client = RawClient::connect(masked.addr, DB).await?;
+    json_binary_client
+        .send(parse_msg(
+            "s",
+            "SELECT legacy FROM canary.documents WHERE id = 1",
+        ))
+        .await?;
+    json_binary_client.send(describe_statement("s")).await?;
+    json_binary_client
+        .send(bind_msg_with_result_format("p", "s", 1))
+        .await?;
+    json_binary_client.send(execute_msg("p", 0)).await?;
+    json_binary_client.send(sync_msg()).await?;
+    let json_binary_msgs = json_binary_client.read_until_ready().await?;
+    assert_served(&json_binary_msgs, "binary json");
+    assert_no_canary(&json_binary_client, "structure-aware binary json");
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_extracts_constructors_and_set_operations_cannot_leak() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, classified_json_document_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+    // Operators and constructors lose stored-column provenance. Structure-aware
+    // JSON masking must not apply to the extracted/constructed field — refuse
+    // rather than serve the inner canary, or serve a whole-column JSON plan
+    // against a scalar that is not the document.
+    for sql in [
+        "SELECT payload->>'profile' FROM canary.documents",
+        "SELECT payload->'profile' FROM canary.documents",
+        "SELECT payload #>> '{profile,email}' FROM canary.documents",
+        "SELECT payload #> '{profile}' FROM canary.documents",
+        "SELECT jsonb_path_query(payload, '$.profile.email') FROM canary.documents",
+        "SELECT payload::text FROM canary.documents",
+        "SELECT legacy::jsonb FROM canary.documents",
+        "SELECT payload FROM canary.documents UNION ALL SELECT payload FROM canary.documents",
+        "SELECT payload FROM canary.documents INTERSECT SELECT payload FROM canary.documents",
+        "SELECT json_agg(payload) FROM canary.documents",
+        "SELECT jsonb_agg(payload) FROM canary.documents",
+        "SELECT to_jsonb(payload) FROM canary.documents",
+        "SELECT to_json(d) FROM canary.documents d",
+        "SELECT row_to_json(d) FROM canary.documents d",
+        "SELECT jsonb_build_object('p', payload) FROM canary.documents",
+        "SELECT jsonb_pretty(payload) FROM canary.documents",
+        "SELECT payload || '{\"x\":1}'::jsonb FROM canary.documents",
+        "SELECT * FROM canary.documents, LATERAL jsonb_array_elements(payload->'items') AS elem",
+        "SELECT jsonb_each(payload) FROM canary.documents",
+        "SELECT jsonb_array_elements(payload->'items') FROM canary.documents",
+    ] {
+        client.simple_query(sql).await?;
+        assert_refused(&client, sql);
+        assert_no_canary(&client, sql);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_columns_stay_masked_through_joins_ctes_subqueries_and_views() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, classified_json_document_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+    // These shapes keep table OID + attnum on the described field. They must
+    // be served under the JSON pointer policy, not refused as opaque and not
+    // released as a blob.
+    for sql in [
+        "SELECT payload AS p FROM canary.documents",
+        "SELECT d.payload FROM canary.documents d",
+        "SELECT d.payload FROM canary.documents d JOIN canary.subjects s ON s.id = d.id",
+        "SELECT payload FROM (SELECT payload FROM canary.documents OFFSET 0) q",
+        "WITH c AS (SELECT payload FROM canary.documents) SELECT payload FROM c",
+        "SELECT payload::jsonb FROM canary.documents",
+        "SELECT * FROM canary.documents",
+        "SELECT payload, legacy FROM canary.documents_view",
+        "SELECT payload FROM canary.documents WHERE payload @> '{\"public\":\"Portland\"}'",
+    ] {
+        let msgs = client.simple_query(sql).await?;
+        assert_served(&msgs, sql);
+        assert_no_canary(&client, sql);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pipelined_json_portals_stay_masked() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, classified_json_document_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+    let mut buf = Vec::new();
+    for msg in [
+        parse_msg("a", "SELECT payload FROM canary.documents"),
+        parse_msg("b", "SELECT legacy FROM canary.documents"),
+        describe_statement("a"),
+        describe_statement("b"),
+        bind_msg("pa", "a"),
+        bind_msg("pb", "b"),
+        execute_msg("pa", 0),
+        execute_msg("pb", 0),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_served(&msgs, "pipelined json portals");
+    assert_no_canary(&client, "pipelined json portals");
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_leaf_type_mismatch_refuses_the_wire_result_set() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let mut email = json_field("/profile/email", pgmask::mask::Mask::Partial);
+    email.params.keep = Some(4);
+    let mut rules = default_rules();
+    rules.push(json_rule(
+        "canary.documents",
+        "payload",
+        pgmask::mask::Mask::Null,
+        vec![
+            json_field("/profile", pgmask::mask::Mask::None),
+            email,
+            json_field("/profile/name", pgmask::mask::Mask::Redact),
+            json_field("/n", pgmask::mask::Mask::Partial),
+        ],
+    ));
+    let proxy = start_proxy(DB, rules).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+    client
+        .simple_query("SELECT payload FROM canary.documents")
+        .await?;
+    assert_refused(&client, "partial mask on JSON number leaf");
+    assert_no_canary(&client, "partial mask on JSON number leaf");
     Ok(())
 }
 
@@ -164,6 +330,8 @@ async fn copy_to_stdout_cannot_leak() -> Result<()> {
         "COPY (SELECT email FROM canary.subjects) TO STDOUT",
         "COPY canary.subjects (email, name) TO STDOUT WITH CSV",
         "COPY canary.subjects TO STDOUT WITH (FORMAT binary)",
+        "COPY canary.documents TO STDOUT",
+        "COPY (SELECT payload FROM canary.documents) TO STDOUT",
     ] {
         let proxy = start_proxy(DB, default_rules()).await?;
         let mut client = RawClient::connect(proxy.addr, DB).await?;

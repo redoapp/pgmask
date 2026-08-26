@@ -13,7 +13,10 @@
 - Support both pgwire formats. Text values are parsed directly; binary `jsonb`
   validates and preserves PostgreSQL's version byte. Real-Postgres poison
   controls prove the same text and binary rows expose canaries when released,
-  and that no canary crosses under the JSON policy.
+  and that no canary crosses under the JSON policy. Extraction, construction,
+  aggregates, set operations, and COPY of classified JSON refuse; aliases,
+  joins, CTEs, subqueries, views, and pipelined portals stay masked on the
+  wire. Binary `json` (no version byte) is covered alongside `jsonb`.
 - `scripts/test-integration.sh` starts a local trust Postgres when `podman`
   is absent, so the adversarial and resilience suites run on Cloud Agent
   VMs that have host `postgresql` packages but no container runtime.

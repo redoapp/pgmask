@@ -39,7 +39,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 51
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 55
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -124,7 +124,8 @@ INSERT INTO canary.documents VALUES (
     "items":[
       {"token":"CANARY_TEMP_j0k1l2","city":"Denver"},
       {"token":"CANARY_TEMP_j0k1l2","city":"Seattle"}
-    ]
+    ],
+    "n": 99
   }',
   '{
     "profile":{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6"},
@@ -134,6 +135,7 @@ INSERT INTO canary.documents VALUES (
 );
 
 CREATE VIEW canary.subject_view AS SELECT id, email, name, city FROM canary.subjects;
+CREATE VIEW canary.documents_view AS SELECT id, payload, legacy FROM canary.documents;
 
 CREATE FUNCTION canary.all_subjects() RETURNS SETOF canary.subjects AS $$
   SELECT * FROM canary.subjects;
