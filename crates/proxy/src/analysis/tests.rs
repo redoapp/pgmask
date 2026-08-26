@@ -1059,12 +1059,37 @@ fn json_extract_resolution_requires_schema_and_literal_keys() {
         vec![JsonExtractArgument::Unattributable]
     );
     let inspection = StatementInspection::new(
-        "SELECT jsonb_path_query(payload, '$.email') FROM canary.documents",
+        "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents",
     );
     assert_eq!(
         inspection.output_safety(1, ALLOW_ALL),
+        vec![Safety::JsonExtract]
+    );
+    let resolution = inspection.json_extract_resolution(1).unwrap();
+    match &resolution.fields()[0] {
+        JsonExtractArgument::Extract(extract) => {
+            assert!(extract.as_text);
+            assert_eq!(
+                extract
+                    .path
+                    .iter()
+                    .map(|s| s.value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["profile", "email"]
+            );
+        }
+        JsonExtractArgument::Unattributable => panic!("expected extract_path_text"),
+    }
+    assert_eq!(
+        StatementInspection::new(
+            "SELECT jsonb_path_query(payload, '$.email') FROM canary.documents"
+        )
+        .output_safety(1, ALLOW_ALL),
         vec![Safety::Unknown]
     );
+    assert!(!calls_untrusted_function(
+        "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents"
+    ));
 }
 
 #[test]

@@ -12,7 +12,7 @@
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{AExpr, FuncCall, Node, SelectStmt};
 
-use super::names::function_name;
+use super::names::{function_name, JSON_EXTRACT_FUNCTIONS};
 use super::safety::unwrap_star_over_subquery;
 use super::StatementInspection;
 
@@ -236,11 +236,10 @@ fn parse_function_extract(call: &FuncCall, depth: usize) -> Option<JsonExtract> 
         return None;
     }
     let name = catalog_function_name(&call.funcname)?;
-    let as_text = match name.as_str() {
-        "json_extract_path" | "jsonb_extract_path" => false,
-        "json_extract_path_text" | "jsonb_extract_path_text" => true,
-        _ => return None,
-    };
+    if !JSON_EXTRACT_FUNCTIONS.contains(&name.as_str()) {
+        return None;
+    }
+    let as_text = name.ends_with("_text");
     let (first, rest) = call.args.split_first()?;
     if rest.is_empty() {
         return None;
@@ -248,16 +247,28 @@ fn parse_function_extract(call: &FuncCall, depth: usize) -> Option<JsonExtract> 
     let mut key_segments = Vec::with_capacity(rest.len());
     for arg in rest {
         // Function forms take text keys, never integer array indices.
-        let NodeEnum::AConst(constant) = arg.node.as_ref()? else {
-            return None;
-        };
-        let pg_query::protobuf::a_const::Val::Sval(s) = constant.val.as_ref()? else {
-            return None;
-        };
-        key_segments.push(JsonExtractPathSegment {
-            value: s.sval.clone(),
-            array_index: false,
-        });
+        let mut arg_expr = arg.node.as_ref()?;
+        loop {
+            match arg_expr {
+                NodeEnum::TypeCast(cast) => {
+                    arg_expr = cast.arg.as_ref()?.node.as_ref()?;
+                }
+                NodeEnum::CollateClause(collate) => {
+                    arg_expr = collate.arg.as_ref()?.node.as_ref()?;
+                }
+                NodeEnum::AConst(constant) => {
+                    let pg_query::protobuf::a_const::Val::Sval(s) = constant.val.as_ref()? else {
+                        return None;
+                    };
+                    key_segments.push(JsonExtractPathSegment {
+                        value: s.sval.clone(),
+                        array_index: false,
+                    });
+                    break;
+                }
+                _ => return None,
+            }
+        }
     }
     let left = first.node.as_ref()?;
     finish_extract(left, key_segments, as_text, depth)
@@ -445,7 +456,7 @@ fn catalog_function_name(parts: &[Node]) -> Option<String> {
             let NodeEnum::String(schema) = schema.node.as_ref()? else {
                 return None;
             };
-            if schema.sval.to_ascii_lowercase() != "pg_catalog" {
+            if !schema.sval.eq_ignore_ascii_case("pg_catalog") {
                 return None;
             }
             function_name(std::slice::from_ref(name))
