@@ -39,6 +39,13 @@
   numeric object key inherit an array-only release. Summaries and JSON extracts
   now enter `plan_for` through one resolved-expression policy slot rather than
   a feature-specific fallback ladder.
+- Keep extract provenance out of reusable column policy. `MaskSpec` no longer
+  carries a hidden `json_path_prefix`; `FieldPlan` carries an explicit
+  `JsonProjection` only for document extracts, and the masker receives it as
+  execution context. Add a live-Postgres SQL surface matrix covering scalar
+  and document operators, function forms, aliases, joins, views, wrappers,
+  binary results, ambiguous text paths, CTEs/subqueries, reshaping, set
+  operations, and hostile-posture predicate refusal.
 - Document JSON pointer inheritance, array wildcards, type placeholders, and
   which SQL shapes are served versus refused in `docs/json-masking.md`.
 - Support both pgwire formats. Text values are parsed directly; binary `jsonb`

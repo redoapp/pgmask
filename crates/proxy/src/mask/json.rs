@@ -52,6 +52,15 @@ pub(crate) struct JsonPathSegment {
     navigation: JsonPathNavigation,
 }
 
+/// Where a JSON value sits inside the classified stored document.
+///
+/// This is plan context, not mask configuration. A [`MaskSpec`] describes the
+/// column's policy independent of which SQL projection produced one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JsonProjection {
+    path: Arc<[JsonPathSegment]>,
+}
+
 impl JsonFieldSpec {
     pub fn new(pointer: impl Into<Arc<str>>, spec: MaskSpec) -> Result<Self, &'static str> {
         let pointer = pointer.into();
@@ -208,22 +217,18 @@ impl MaskSpec {
     /// The stored document's pointer table is kept; the walk starts at `path`
     /// so child overrides still apply. `path` must not be empty — the full
     /// column is the ordinary `Mask::Json` plan.
-    pub(crate) fn for_json_document_extract(
+    pub(crate) fn json_document_projection(
         &self,
         path: &[(String, JsonPathNavigation)],
-    ) -> Option<Self> {
+    ) -> Option<JsonProjection> {
         if self.kind != Mask::Json || path.is_empty() {
             return None;
         }
-        let mut spec = self.clone();
-        spec.json_path_prefix = path_segments(path);
-        if self
-            .json_trie
-            .has_ambiguous_wildcard(&spec.json_path_prefix)
-        {
+        let path = path_segments(path);
+        if self.json_trie.has_ambiguous_wildcard(&path) {
             return None;
         }
-        Some(spec)
+        Some(JsonProjection { path })
     }
 
     /// Bind this JSON column policy to a text extract (`payload->>'email'`).
@@ -232,7 +237,7 @@ impl MaskSpec {
     /// the node. A path with any more-specific pointer therefore refuses
     /// rather than apply `none` to a blob that still contains masked leaves.
     /// Unmatched paths become SQL NULL, matching the default JSON leaf.
-    pub(crate) fn for_json_text_extract(
+    pub(crate) fn json_text_extract_spec(
         &self,
         path: &[(String, JsonPathNavigation)],
     ) -> Option<Self> {
@@ -277,6 +282,7 @@ impl Masker {
     pub(super) fn mask_json(
         &self,
         spec: &MaskSpec,
+        projection: Option<&JsonProjection>,
         type_oid: u32,
         format: i16,
         bytes: &[u8],
@@ -303,7 +309,9 @@ impl Masker {
         }
         let mut value: JsonValue = serde_json::from_slice(payload)
             .map_err(|_| MaskError::Undecodable { type_oid, format })?;
-        let mut path: Vec<JsonPathSegment> = spec.json_path_prefix.iter().cloned().collect();
+        let mut path: Vec<JsonPathSegment> = projection
+            .map(|value| value.path.iter().cloned().collect())
+            .unwrap_or_default();
         let inherited = spec.policy_along(&path);
         self.mask_json_node(spec, &mut path, inherited, &mut value)?;
 
@@ -507,8 +515,8 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::{
-        json_nesting_exceeds, JsonFieldSpec, JsonLimit, JsonPathNavigation, JsonUnmatched, Mask,
-        MaskError, MaskSpec, Masker, FORMAT_BINARY, FORMAT_TEXT, OID_JSONB,
+        json_nesting_exceeds, JsonFieldSpec, JsonLimit, JsonPathNavigation, JsonProjection,
+        JsonUnmatched, Mask, MaskError, MaskSpec, Masker, FORMAT_BINARY, FORMAT_TEXT, OID_JSONB,
     };
     use crate::mask::OID_JSON;
     use bytes::Bytes;
@@ -534,8 +542,25 @@ mod tests {
     }
 
     fn apply_json(spec: &MaskSpec, oid: u32, format: i16, value: &[u8]) -> JsonValue {
+        apply_json_projection(spec, None, oid, format, value)
+    }
+
+    fn apply_json_projection(
+        spec: &MaskSpec,
+        projection: Option<&JsonProjection>,
+        oid: u32,
+        format: i16,
+        value: &[u8],
+    ) -> JsonValue {
         let out = masker()
-            .apply(spec, oid, format, Some(Bytes::copy_from_slice(value)))
+            .apply_planned(
+                spec,
+                None,
+                projection,
+                oid,
+                format,
+                Some(Bytes::copy_from_slice(value)),
+            )
             .unwrap()
             .unwrap();
         let payload = if oid == OID_JSONB && format == FORMAT_BINARY {
@@ -723,11 +748,13 @@ mod tests {
                 ("/profile/email", email),
                 ("/profile/name", MaskSpec::new(Mask::Redact)),
             ],
-        )
-        .for_json_document_extract(&[("profile".into(), JsonPathNavigation::ObjectKey)])
-        .unwrap();
-        let output = apply_json(
+        );
+        let projection = spec
+            .json_document_projection(&[("profile".into(), JsonPathNavigation::ObjectKey)])
+            .unwrap();
+        let output = apply_json_projection(
             &spec,
+            Some(&projection),
             OID_JSONB,
             FORMAT_TEXT,
             br#"{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6","extra":"secret"}"#,
@@ -752,10 +779,10 @@ mod tests {
             ],
         );
         assert!(spec
-            .for_json_text_extract(&[("profile".into(), JsonPathNavigation::ObjectKey)])
+            .json_text_extract_spec(&[("profile".into(), JsonPathNavigation::ObjectKey)])
             .is_none());
         let leaf = spec
-            .for_json_text_extract(&[
+            .json_text_extract_spec(&[
                 ("profile".into(), JsonPathNavigation::ObjectKey),
                 ("email".into(), JsonPathNavigation::ObjectKey),
             ])
@@ -775,11 +802,11 @@ mod tests {
             ("token".into(), JsonPathNavigation::Ambiguous),
         ];
         assert!(
-            spec.for_json_text_extract(&ambiguous).is_none(),
+            spec.json_text_extract_spec(&ambiguous).is_none(),
             "#> text paths cannot prove that numeric object keys are array indices"
         );
         assert!(
-            spec.for_json_document_extract(&ambiguous).is_none(),
+            spec.json_document_projection(&ambiguous).is_none(),
             "a document prefix must not guess which wildcard branch to inherit"
         );
 
@@ -789,7 +816,7 @@ mod tests {
             ("token".into(), JsonPathNavigation::ObjectKey),
         ];
         assert_eq!(
-            spec.for_json_text_extract(&proven).unwrap().kind,
+            spec.json_text_extract_spec(&proven).unwrap().kind,
             Mask::None
         );
     }

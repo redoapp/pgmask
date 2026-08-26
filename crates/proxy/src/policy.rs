@@ -23,7 +23,7 @@ use crate::catalog::{
     UnclassifiedMask,
 };
 use crate::lineage::Verdict;
-use crate::mask::{Mask, MaskSpec, Masker};
+use crate::mask::{JsonProjection, Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
 use crate::plan_state::{FieldPlan, Plan};
 use crate::protocol;
@@ -94,7 +94,10 @@ pub(crate) enum ExpressionPolicy {
     NotApplicable,
     Opaque,
     Released,
-    Masked(MaskSpec),
+    Masked {
+        spec: MaskSpec,
+        projection: Option<JsonProjection>,
+    },
 }
 
 impl FieldAnalysis<'_> {
@@ -211,6 +214,7 @@ impl Policy {
             // Operator-chosen masks stay fail-closed.
             let mut lenient = false;
             let mut type_aware_fallback = false;
+            let mut json_projection = None;
             // A set operation can put values from several columns into one
             // output field, and CockroachDB reports the first branch's OID for
             // the whole thing. Believing it applies one column's mask to
@@ -235,7 +239,10 @@ impl Policy {
                             self.metrics.record_rescued();
                             MaskSpec::new(Mask::None)
                         }
-                        ExpressionPolicy::Masked(spec) => spec,
+                        ExpressionPolicy::Masked { spec, projection } => {
+                            json_projection = projection;
+                            spec
+                        }
                         ExpressionPolicy::NotApplicable | ExpressionPolicy::Opaque => {
                             self.plan_opaque_field(snapshot, field, analysis.lineage.get(index))?
                         }
@@ -340,6 +347,7 @@ impl Policy {
             let primed = self.masker.prime(&spec);
             plan.push(FieldPlan {
                 spec,
+                json_projection,
                 type_oid: field.type_oid,
                 format: field.format,
                 lenient,
@@ -517,7 +525,10 @@ fn resolve_summary_source(
     if spec.is_passthrough() {
         ExpressionPolicy::Released
     } else {
-        ExpressionPolicy::Masked(spec)
+        ExpressionPolicy::Masked {
+            spec,
+            projection: None,
+        }
     }
 }
 
@@ -1066,7 +1077,10 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[Verdict::Blocked("demo.t.salary".into())],
-                    expression: &[ExpressionPolicy::Masked(MaskSpec::new(Mask::NumericBucket))],
+                    expression: &[ExpressionPolicy::Masked {
+                        spec: MaskSpec::new(Mask::NumericBucket),
+                        projection: None,
+                    }],
                     trust_provenance: true,
                 },
             )
@@ -1089,7 +1103,10 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[Verdict::Blocked("demo.t.salary".into())],
-                    expression: &[ExpressionPolicy::Masked(MaskSpec::new(Mask::NumericBucket))],
+                    expression: &[ExpressionPolicy::Masked {
+                        spec: MaskSpec::new(Mask::NumericBucket),
+                        projection: None,
+                    }],
                     trust_provenance: true,
                 },
             )
@@ -1225,7 +1242,10 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[],
-                    expression: &[ExpressionPolicy::Masked(MaskSpec::new(Mask::NumericBucket))],
+                    expression: &[ExpressionPolicy::Masked {
+                        spec: MaskSpec::new(Mask::NumericBucket),
+                        projection: None,
+                    }],
                     trust_provenance: true,
                 },
             )

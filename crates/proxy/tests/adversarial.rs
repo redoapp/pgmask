@@ -36,6 +36,8 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
                 json_field("/public", pgmask::mask::Mask::None),
                 json_field("/items/*", pgmask::mask::Mask::None),
                 json_field("/items/*/token", pgmask::mask::Mask::Redact),
+                json_field("/numeric_object/*", pgmask::mask::Mask::None),
+                json_field("/numeric_object/*/token", pgmask::mask::Mask::Redact),
             ],
         )
     };
@@ -341,6 +343,139 @@ async fn json_extracts_with_literal_paths_are_masked() -> Result<()> {
         .await?;
     assert_served(&unknown, "unmatched text extract is SQL NULL");
     assert_no_canary(&client, "unmatched JSON extract");
+    Ok(())
+}
+
+/// One live-server matrix for the JSON SQL surface.
+///
+/// Unit tests pin parser nodes and trie branches; this test asks PostgreSQL to
+/// parse, type, describe, and execute each form through pgwire. Every served
+/// case has a concrete analyst use, every refused case is a shape whose source
+/// or runtime navigation cannot be justified from RowDescription + catalog.
+#[tokio::test]
+async fn json_sql_surface_is_useful_without_guessing_provenance_or_shape() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let rules = classified_json_document_rules();
+    let proxy = start_proxy(DB, rules.clone()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    for sql in [
+        // Scalar leaves: released, masked, and unmatched.
+        "SELECT payload->>'public' FROM canary.documents",
+        "SELECT payload->'profile'->>'email' FROM canary.documents",
+        "SELECT payload->>'unknown' FROM canary.documents",
+        // Document subtrees retain child pointer policy.
+        "SELECT payload->'profile' FROM canary.documents",
+        "SELECT payload #> '{profile}' FROM canary.documents",
+        "SELECT jsonb_extract_path(payload, 'profile') FROM canary.documents",
+        // Exact text paths do not need an array wildcard.
+        "SELECT payload #>> '{profile,email}' FROM canary.documents",
+        "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents",
+        "SELECT pg_catalog.jsonb_extract_path_text(payload, 'profile', 'email') \
+         FROM canary.documents",
+        // Integer -> proves array navigation; both scalar and subtree forms
+        // may therefore enter /items/*.
+        "SELECT payload->'items'->0->>'token' FROM canary.documents",
+        "SELECT payload->'items'->0 FROM canary.documents",
+        // Quoted \"0\" is an object key, so it never inherits array-only `*`.
+        "SELECT payload->'numeric_object'->'0'->>'token' FROM canary.documents",
+        // Attribution variants that remain unique and schema-qualified.
+        "SELECT canary.documents.payload->>'public' FROM canary.documents",
+        "SELECT d.payload->>'public' FROM canary.documents AS d",
+        "SELECT d.payload->>'public' FROM canary.documents d \
+         JOIN canary.subjects s ON s.id = d.id",
+        "SELECT payload->>'public' FROM canary.documents_view",
+        "SELECT * FROM (SELECT payload->>'public' FROM canary.documents) q",
+        // Wrappers explicitly peeled by the allowlist.
+        "SELECT CAST(payload->>'public' AS text) FROM canary.documents",
+        "SELECT (payload->>'public') COLLATE \"C\" FROM canary.documents",
+        // Predicates do not change the projection policy in default posture.
+        "SELECT payload->>'public' FROM canary.documents \
+         WHERE payload @> '{\"public\":\"Portland\"}'",
+    ] {
+        let messages = client.simple_query(sql).await?;
+        assert_served(&messages, sql);
+        assert_no_canary(&client, sql);
+    }
+
+    for sql in [
+        // Source ownership is unresolved.
+        "SELECT payload->>'public' FROM documents",
+        "WITH c AS (SELECT payload FROM canary.documents) \
+         SELECT payload->>'public' FROM c",
+        "SELECT q.payload->>'public' \
+         FROM (SELECT payload FROM canary.documents) q",
+        "SELECT payload->column_name FROM canary.documents",
+        // PostgreSQL text paths decide object-vs-array from the runtime value.
+        // They cannot enter an array-only wildcard at plan time.
+        "SELECT payload #>> '{items,0,token}' FROM canary.documents",
+        "SELECT payload #> '{items,0}' FROM canary.documents",
+        "SELECT jsonb_extract_path_text(payload, 'items', '0', 'token') \
+         FROM canary.documents",
+        "SELECT payload #>> '{numeric_object,0,token}' FROM canary.documents",
+        // Unsupported path syntax and text serialization of protected subtrees.
+        "SELECT payload->-1 FROM canary.documents",
+        "SELECT payload->>'profile' FROM canary.documents",
+        "SELECT payload #>> '{profile}' FROM canary.documents",
+        "SELECT jsonb_path_query_first(payload, '$.profile.email') \
+         FROM canary.documents",
+        // Reshaping, construction, and set operations stay opaque.
+        "SELECT jsonb_pretty(payload) FROM canary.documents",
+        "SELECT jsonb_each(payload) FROM canary.documents",
+        "SELECT jsonb_array_elements(payload->'items') FROM canary.documents",
+        "SELECT jsonb_build_object('value', payload->>'public') \
+         FROM canary.documents",
+        "SELECT payload || '{\"public\":\"other\"}'::jsonb FROM canary.documents",
+        "SELECT payload::text FROM canary.documents",
+        "SELECT payload->>'public' FROM canary.documents \
+         UNION ALL SELECT payload->>'public' FROM canary.documents",
+    ] {
+        client.simple_query(sql).await?;
+        assert_refused(&client, sql);
+        assert_no_canary(&client, sql);
+    }
+
+    // Text-family binary results use the same bytes, but this goes through
+    // Parse/Describe/Bind so format planning is exercised on an extract.
+    let mut binary = RawClient::connect(proxy.addr, DB).await?;
+    binary
+        .send(parse_msg(
+            "json_extract",
+            "SELECT payload->'profile'->>'email' FROM canary.documents",
+        ))
+        .await?;
+    binary.send(describe_statement("json_extract")).await?;
+    binary
+        .send(bind_msg_with_result_format(
+            "json_portal",
+            "json_extract",
+            1,
+        ))
+        .await?;
+    binary.send(execute_msg("json_portal", 0)).await?;
+    binary.send(sync_msg()).await?;
+    let messages = binary.read_until_ready().await?;
+    assert_served(&messages, "binary JSON text extract");
+    assert_no_canary(&binary, "binary JSON text extract");
+
+    // Hostile posture still credits one literal extract as the projection, but
+    // rejects a second mention of the masked document in a predicate.
+    let hostile = start_proxy_hostile(DB, rules).await?;
+    let mut hostile_client = RawClient::connect(hostile.addr, DB).await?;
+    let messages = hostile_client
+        .simple_query("SELECT payload->>'public' FROM canary.documents")
+        .await?;
+    assert_served(&messages, "hostile literal JSON projection");
+    assert_no_canary(&hostile_client, "hostile literal JSON projection");
+    hostile_client
+        .simple_query(
+            "SELECT payload->>'public' FROM canary.documents \
+             WHERE payload @> '{\"public\":\"Portland\"}'",
+        )
+        .await?;
+    assert_refused(&hostile_client, "hostile JSON predicate oracle");
+    assert_no_canary(&hostile_client, "hostile JSON predicate oracle");
     Ok(())
 }
 

@@ -29,8 +29,8 @@ use crate::protocol::is_text_family;
 
 mod json;
 pub(crate) use crate::json_path::JsonPathNavigation;
-pub(crate) use json::JsonPathSegment;
 use json::JsonPolicyTrie;
+pub(crate) use json::JsonProjection;
 pub use json::{
     JsonFieldSpec, JsonLimit, JsonUnmatched, DEFAULT_JSON_MAX_BYTES, DEFAULT_JSON_MAX_DEPTH,
     MAX_JSON_MAX_DEPTH,
@@ -413,10 +413,6 @@ pub struct MaskSpec {
     pub json_max_bytes: usize,
     /// Maximum object/array nesting accepted before parsing.
     pub json_max_depth: usize,
-    /// When this spec masks a JSON *extract* (`payload->'profile'`), the walk
-    /// starts at this path in the original pointer policy rather than at the
-    /// document root. Empty means the value is the stored column.
-    pub(crate) json_path_prefix: Arc<[JsonPathSegment]>,
 }
 
 impl Default for MaskSpec {
@@ -434,7 +430,6 @@ impl Default for MaskSpec {
             json_unmatched: JsonUnmatched::Null,
             json_max_bytes: DEFAULT_JSON_MAX_BYTES,
             json_max_depth: DEFAULT_JSON_MAX_DEPTH,
-            json_path_prefix: Arc::from([]),
         }
     }
 }
@@ -661,6 +656,20 @@ impl Masker {
         format: i16,
         value: Option<Bytes>,
     ) -> Result<Option<Bytes>, MaskError> {
+        self.apply_planned(spec, primed, None, type_oid, format, value)
+    }
+
+    /// Apply one field plan, including JSON projection context kept outside the
+    /// reusable column policy.
+    pub(crate) fn apply_planned(
+        &self,
+        spec: &MaskSpec,
+        primed: Option<&PrimedMac>,
+        projection: Option<&JsonProjection>,
+        type_oid: u32,
+        format: i16,
+        value: Option<Bytes>,
+    ) -> Result<Option<Bytes>, MaskError> {
         if spec.kind == Mask::None {
             return Ok(value);
         }
@@ -693,7 +702,7 @@ impl Masker {
             Mask::NumericBucket => bucket_number(&bytes, type_oid, format, spec.bucket)?,
             Mask::IpPrefix => text_op(&bytes, ip_prefix),
             Mask::Scrub => text_op(&bytes, scrub_free_text),
-            Mask::Json => self.mask_json(spec, type_oid, format, &bytes)?,
+            Mask::Json => self.mask_json(spec, projection, type_oid, format, &bytes)?,
             Mask::None | Mask::Null => unreachable!("handled above"),
         };
         Ok(Some(out))

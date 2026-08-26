@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::mask::MaskSpec;
+use crate::mask::{JsonProjection, MaskSpec};
 use crate::protocol::{self, DescribeTarget};
 
 /// Protocol-sequence fuzz harness. See that module for why it is a child of
@@ -33,6 +33,9 @@ pub mod fuzz;
 #[derive(Debug, Clone)]
 pub(crate) struct FieldPlan {
     pub(crate) spec: MaskSpec,
+    /// Present only when this value is a JSON subtree extracted from the
+    /// classified document. This is value provenance, not mask configuration.
+    pub(crate) json_projection: Option<JsonProjection>,
     pub(crate) type_oid: u32,
     pub(crate) format: i16,
     /// The spec is the *type-aware fallback* for an unclassified nullable (or
@@ -1046,6 +1049,7 @@ mod tests {
     fn plan() -> Plan {
         Arc::new(vec![FieldPlan {
             spec: MaskSpec::new(Mask::None),
+            json_projection: None,
             type_oid: 25,
             format: 0,
             lenient: false,
@@ -1057,6 +1061,7 @@ mod tests {
         Arc::new(vec![
             FieldPlan {
                 spec: MaskSpec::new(spec),
+                json_projection: None,
                 type_oid: oid,
                 format: 0,
                 lenient: false,
@@ -1064,6 +1069,7 @@ mod tests {
             },
             FieldPlan {
                 spec: MaskSpec::new(spec),
+                json_projection: None,
                 type_oid: oid,
                 format: 0,
                 lenient: false,
@@ -1076,6 +1082,7 @@ mod tests {
         Arc::new(vec![
             FieldPlan {
                 spec: MaskSpec::new(Mask::None),
+                json_projection: None,
                 type_oid: oid,
                 format: 0,
                 lenient: false,
@@ -1083,6 +1090,7 @@ mod tests {
             },
             FieldPlan {
                 spec: MaskSpec::new(Mask::Redact),
+                json_projection: None,
                 type_oid: oid,
                 format: 0,
                 lenient: false,

@@ -67,12 +67,21 @@ fn resolve_json_extract_source(
         .iter()
         .map(|segment| (segment.value.clone(), segment.navigation))
         .collect();
-    let planned = if extract.as_text {
-        spec.for_json_text_extract(&path)
+    if extract.as_text {
+        spec.json_text_extract_spec(&path)
+            .map_or(ExpressionPolicy::Opaque, |spec| ExpressionPolicy::Masked {
+                spec,
+                projection: None,
+            })
     } else {
-        spec.for_json_document_extract(&path)
-    };
-    planned.map_or(ExpressionPolicy::Opaque, ExpressionPolicy::Masked)
+        spec.json_document_projection(&path)
+            .map_or(ExpressionPolicy::Opaque, |projection| {
+                ExpressionPolicy::Masked {
+                    spec: spec.clone(),
+                    projection: Some(projection),
+                }
+            })
+    }
 }
 
 fn unique_extract_owner<'a>(

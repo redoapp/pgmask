@@ -39,7 +39,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 57
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 58
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -125,6 +125,7 @@ INSERT INTO canary.documents VALUES (
       {"token":"CANARY_TEMP_j0k1l2","city":"Denver"},
       {"token":"CANARY_TEMP_j0k1l2","city":"Seattle"}
     ],
+    "numeric_object":{"0":{"token":"CANARY_TEMP_j0k1l2"}},
     "n": 99,
     "enabled": true
   }',
@@ -396,6 +397,7 @@ pub async fn start_proxy_with_roles(
         Opaque::Reject,
         roles,
         Lineage::Refuse,
+        pgmask::catalog::Posture::Default,
     )
     .await
 }
@@ -417,6 +419,7 @@ pub async fn start_proxy_at(
         opaque,
         Vec::new(),
         Lineage::Refuse,
+        pgmask::catalog::Posture::Default,
     )
     .await
 }
@@ -433,6 +436,22 @@ pub async fn start_proxy_allowing_lineage(db: &str, rules: Vec<ColumnRule>) -> R
         Opaque::Reject,
         Vec::new(),
         Lineage::Allow,
+        pgmask::catalog::Posture::Default,
+    )
+    .await
+}
+
+pub async fn start_proxy_hostile(db: &str, rules: Vec<ColumnRule>) -> Result<ProxyHandle> {
+    let backend = backend_addr().context("PGMASK_TEST_PG")?;
+    start_proxy_at_full(
+        &backend,
+        db,
+        rules,
+        Unclassified::Mask,
+        Opaque::Reject,
+        Vec::new(),
+        Lineage::Refuse,
+        pgmask::catalog::Posture::Hostile,
     )
     .await
 }
@@ -445,6 +464,7 @@ pub async fn start_proxy_at_full(
     opaque: Opaque,
     roles: Vec<pgmask::catalog::Role>,
     lineage: Lineage,
+    posture: pgmask::catalog::Posture,
 ) -> Result<ProxyHandle> {
     let backend = backend.to_string();
     let config = Config {
@@ -470,7 +490,7 @@ pub async fn start_proxy_at_full(
         catalog_refresh_min_seconds: 1,
         metrics_interval_seconds: 0,
         summaries: pgmask::catalog::Summaries::Allow,
-        posture: pgmask::catalog::Posture::Default,
+        posture,
         system_catalogs: SystemCatalogs::Refuse,
         lineage,
         metrics_listen: None,

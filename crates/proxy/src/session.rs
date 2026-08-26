@@ -1025,6 +1025,7 @@ impl Session {
                     .iter()
                     .map(|field| FieldPlan {
                         spec: MaskSpec::new(Mask::None),
+                        json_projection: None,
                         type_oid: field.type_oid,
                         format: field.format,
                         lenient: false,
@@ -1180,9 +1181,10 @@ impl Session {
             let masked = if field.spec.is_passthrough() {
                 value
             } else {
-                match self.policy.masker.apply_primed(
+                match self.policy.masker.apply_planned(
                     &field.spec,
                     field.primed.as_ref(),
+                    field.json_projection.as_ref(),
                     field.type_oid,
                     field.format,
                     value,
@@ -1987,6 +1989,7 @@ mod tests {
             .plans
             .finish_description(Arc::new(vec![FieldPlan {
                 spec: MaskSpec::new(Mask::None),
+                json_projection: None,
                 type_oid: 25,
                 format: 0,
                 lenient: false,
@@ -2010,6 +2013,7 @@ mod tests {
         let mut session = Session::new(policy(Unclassified::Allow, Opaque::Reject));
         let plan: Plan = Arc::new(vec![FieldPlan {
             spec: MaskSpec::new(Mask::None),
+            json_projection: None,
             type_oid: 25,
             format: 0,
             lenient: false,
