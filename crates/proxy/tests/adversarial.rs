@@ -101,10 +101,12 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
             column,
             pgmask::mask::Mask::Null,
             vec![
+                json_field("/profile", pgmask::mask::Mask::None),
                 email,
                 json_field("/profile/name", pgmask::mask::Mask::Redact),
                 json_field("/public", pgmask::mask::Mask::None),
-                json_field("/items/0/city", pgmask::mask::Mask::None),
+                json_field("/items/0", pgmask::mask::Mask::None),
+                json_field("/items/0/token", pgmask::mask::Mask::Redact),
             ],
         )
     };

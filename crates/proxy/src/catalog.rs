@@ -142,7 +142,8 @@ pub struct MaskParams {
     pub domain: Option<String>,
     /// Policy for JSON leaves with no exact path override. Defaults to `null`.
     pub json_default: Option<Mask>,
-    /// Exact JSON Pointer policy overrides at arbitrary nesting depths.
+    /// Inheritable JSON Pointer policies at arbitrary nesting depths. A more
+    /// specific pointer overrides its parent.
     pub json: Option<Vec<JsonFieldRule>>,
 }
 
@@ -186,7 +187,7 @@ impl MaskParams {
     }
 }
 
-/// One exact JSON Pointer override inside a structure-aware JSON mask.
+/// One inheritable JSON Pointer policy inside a structure-aware JSON mask.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsonFieldRule {
@@ -1497,15 +1498,6 @@ fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
                 {
                     bail!("{what}: duplicate JSON pointer {:?}", field.pointer);
                 }
-                if spec.json[..index].iter().any(|earlier| {
-                    earlier.segments.starts_with(&field.segments)
-                        || field.segments.starts_with(&earlier.segments)
-                }) {
-                    bail!(
-                        "{what}: overlapping JSON pointer {:?}; a parent policy would make one override unreachable",
-                        field.pointer
-                    );
-                }
             }
             Ok(())
         }
@@ -2356,8 +2348,9 @@ pseudonym_key = "k"
 relation = "s.documents"
 column = "payload"
 mask = "json"
-json_default = "none"
+json_default = "null"
 json = [
+  { pointer = "/profile", mask = "none" },
   { pointer = "/profile/email", mask = "partial", keep = 4 },
   { pointer = "/profile/age", mask = "numeric-bucket", bucket = 10 },
   { pointer = "/flags/0", mask = "null" },
@@ -2373,19 +2366,24 @@ json = [
                 .json_default
                 .as_deref()
                 .map(|spec| spec.kind),
-            Some(Mask::None)
+            Some(Mask::Null)
         );
-        assert_eq!(classification.default.json.len(), 3);
+        assert_eq!(classification.default.json.len(), 4);
         assert_eq!(
             classification.default.json[0].segments.as_ref(),
+            ["profile"]
+        );
+        assert_eq!(classification.default.json[0].spec.kind, Mask::None);
+        assert_eq!(
+            classification.default.json[1].segments.as_ref(),
             ["profile", "email"]
         );
-        assert_eq!(classification.default.json[0].spec.keep, 4);
-        assert_eq!(classification.default.json[1].spec.bucket, 10);
+        assert_eq!(classification.default.json[1].spec.keep, 4);
+        assert_eq!(classification.default.json[2].spec.bucket, 10);
     }
 
     #[test]
-    fn invalid_or_overlapping_json_pointers_fail_catalog_compilation() {
+    fn invalid_or_duplicate_json_pointers_fail_catalog_compilation() {
         let mut rule = ColumnRule {
             relation: "s.documents".into(),
             column: "payload".into(),
@@ -2410,14 +2408,14 @@ json = [
                 params: MaskParams::default(),
             },
             JsonFieldRule {
-                pointer: "/profile/email".into(),
+                pointer: "/profile".into(),
                 mask: Mask::Redact,
                 params: MaskParams::default(),
             },
         ]);
         assert!(
             classify(&rule, &HashMap::new()).is_err(),
-            "a parent override makes its child unreachable"
+            "duplicate policies are ambiguous"
         );
     }
 

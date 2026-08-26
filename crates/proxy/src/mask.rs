@@ -367,12 +367,12 @@ pub enum Mask {
     Scrub,
     /// Keep the network prefix of an IP: `203.0.113.7` -> `203.0.113.0`.
     IpPrefix,
-    /// Walk a JSON document and apply ordinary masks at exact JSON Pointer
-    /// paths. Every unmatched leaf receives the configured default policy.
+    /// Walk a JSON document and apply inheritable policies rooted at JSON
+    /// Pointer paths. A more-specific path overrides its parent policy.
     Json,
 }
 
-/// One exact, pre-parsed JSON Pointer and the mask applied at that location.
+/// One pre-parsed JSON Pointer and the policy inherited by that subtree.
 ///
 /// Kept on [`MaskSpec`] rather than in the catalog module because plans clone
 /// specs and apply them without consulting mutable configuration state.
@@ -440,7 +440,7 @@ pub struct MaskSpec {
     /// number that happens to equal an account number cannot be used to link
     /// them. Defaults to the semantic type name, which is usually what you want.
     pub domain: Option<Arc<str>>,
-    /// Exact path policy overrides used by [`Mask::Json`].
+    /// Hierarchical path policy overrides used by [`Mask::Json`].
     pub json: Arc<[JsonFieldSpec]>,
     /// Policy for every JSON leaf with no exact path override. `None` means
     /// NULL, the fail-closed default.
@@ -747,7 +747,12 @@ impl Masker {
         };
         let mut value: JsonValue = serde_json::from_slice(payload)
             .map_err(|_| MaskError::Undecodable { type_oid, format })?;
-        self.mask_json_node(spec, &mut Vec::new(), &mut value)?;
+        self.mask_json_node(
+            spec,
+            &mut Vec::new(),
+            spec.json_default.as_deref(),
+            &mut value,
+        )?;
 
         let encoded =
             serde_json::to_vec(&value).map_err(|_| MaskError::Undecodable { type_oid, format })?;
@@ -765,22 +770,21 @@ impl Masker {
         &self,
         json_spec: &MaskSpec,
         path: &mut Vec<String>,
+        inherited: Option<&MaskSpec>,
         value: &mut JsonValue,
     ) -> Result<(), MaskError> {
-        if let Some(field) = json_spec
+        let policy = json_spec
             .json
             .iter()
             .find(|field| field.segments.as_ref() == path.as_slice())
-        {
-            *value = self.mask_json_value(&field.spec, value)?;
-            return Ok(());
-        }
+            .map(|field| &field.spec)
+            .or(inherited);
 
         match value {
             JsonValue::Object(map) => {
                 for (key, child) in map {
                     path.push(key.clone());
-                    self.mask_json_node(json_spec, path, child)?;
+                    self.mask_json_node(json_spec, path, policy, child)?;
                     path.pop();
                 }
                 Ok(())
@@ -788,14 +792,14 @@ impl Masker {
             JsonValue::Array(values) => {
                 for (index, child) in values.iter_mut().enumerate() {
                     path.push(index.to_string());
-                    self.mask_json_node(json_spec, path, child)?;
+                    self.mask_json_node(json_spec, path, policy, child)?;
                     path.pop();
                 }
                 Ok(())
             }
             _ => {
-                *value = match json_spec.json_default.as_deref() {
-                    Some(default) => self.mask_json_value(default, value)?,
+                *value = match policy {
+                    Some(policy) => self.mask_json_value(policy, value)?,
                     None => JsonValue::Null,
                 };
                 Ok(())
@@ -1611,6 +1615,41 @@ mod tests {
             serde_json::json!({
                 "private": "***",
                 "arbitrary": {"nested": [1, true, "kept"]}
+            })
+        );
+    }
+
+    #[test]
+    fn json_subtree_release_is_inherited_and_more_specific_policies_win() {
+        let spec = json_spec(
+            Mask::Null,
+            vec![
+                ("/released", MaskSpec::new(Mask::None)),
+                ("/released/private/token", MaskSpec::new(Mask::Redact)),
+            ],
+        );
+        let output = apply_json(
+            &spec,
+            OID_JSONB,
+            FORMAT_TEXT,
+            br#"{
+                "released": {
+                    "future_field": "kept without listing it",
+                    "items": [1, true, {"also_future": "kept"}],
+                    "private": {"token": "secret", "note": "also kept"}
+                },
+                "outside": {"secret": "hidden"}
+            }"#,
+        );
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "released": {
+                    "future_field": "kept without listing it",
+                    "items": [1, true, {"also_future": "kept"}],
+                    "private": {"token": "***", "note": "also kept"}
+                },
+                "outside": {"secret": null}
             })
         );
     }

@@ -2,9 +2,10 @@
 
 ## 0.1.99 — structure-aware JSON and JSONB masking
 
-- Add `mask = "json"` for classified `json` and `jsonb` columns. Exact RFC
-  6901 JSON Pointer policies can use the existing scalar masks at arbitrary
-  object and array depths while preserving the document's structure.
+- Add `mask = "json"` for classified `json` and `jsonb` columns. RFC 6901 JSON
+  Pointer policies inherit through their subtree; more-specific paths override
+  parents, so one release rule can cover an evolving public object while
+  narrow child rules still redact sensitive fields.
 - Every unmatched scalar defaults to JSON `null`; an operator may explicitly
   choose another `json_default`, including `none` when unmentioned values are
   intentionally public. A configured mask/type mismatch, malformed JSON, or
