@@ -163,6 +163,7 @@ for shard in $(seq 0 $((SHARDS - 1))); do
     --file crates/proxy/src/session.rs \
     --file crates/proxy/src/protocol.rs \
     --file crates/proxy/src/mask.rs \
+    --file crates/proxy/src/mask/json.rs \
     --shard "$shard/$SHARDS" \
     --timeout 180 \
     "$@"

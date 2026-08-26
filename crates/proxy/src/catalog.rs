@@ -22,7 +22,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::mask::{JsonFieldSpec, JsonUnmatched, Mask, MaskSpec, MAX_JSON_MAX_DEPTH};
+use crate::mask::{JsonFieldSpec, JsonUnmatched, Mask, MaskSpec};
+
+mod json;
 
 /// Whether summarising aggregates over classified columns may be released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1488,70 +1490,9 @@ fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
             "{what}: outer needs `keep` >= 1. With keep = 0 the whole value is \
              the surviving middle, so nothing is masked."
         ),
-        Mask::Json => {
-            if spec.json_max_bytes == 0 {
-                bail!("{what}: json_max_bytes must be at least 1");
-            }
-            if spec.json_max_depth == 0 || spec.json_max_depth > MAX_JSON_MAX_DEPTH {
-                bail!(
-                    "{what}: json_max_depth must be between 1 and {MAX_JSON_MAX_DEPTH}, got {}",
-                    spec.json_max_depth
-                );
-            }
-            for (index, field) in spec.json.iter().enumerate() {
-                if field.spec.kind == Mask::Json {
-                    bail!(
-                        "{what}: JSON pointer {:?} cannot recursively use mask `json`",
-                        field.pointer
-                    );
-                }
-                validate_spec(
-                    &field.spec,
-                    &format!("{what} JSON pointer {:?}", field.pointer),
-                )?;
-                if spec
-                    .json
-                    .iter()
-                    .take(index)
-                    .any(|earlier| earlier.segments == field.segments)
-                {
-                    bail!("{what}: duplicate JSON pointer {:?}", field.pointer);
-                }
-                if spec.json.iter().take(index).any(|earlier| {
-                    json_pointer_patterns_overlap(earlier, field)
-                        && json_pointer_wildcards(earlier) == json_pointer_wildcards(field)
-                }) {
-                    bail!(
-                        "{what}: JSON pointer {:?} ambiguously overlaps another equally-specific \
-                         wildcard pointer",
-                        field.pointer
-                    );
-                }
-            }
-            Ok(())
-        }
+        Mask::Json => json::validate_json_spec(spec, what),
         _ => Ok(()),
     }
-}
-
-fn json_pointer_wildcards(field: &JsonFieldSpec) -> usize {
-    field
-        .segments
-        .iter()
-        .filter(|segment| segment.as_str() == "*")
-        .count()
-}
-
-/// Whether one path can match both patterns. Equal-specificity overlaps would
-/// otherwise make config order decide which mask wins for that path — a release
-/// direction hidden in TOML ordering — so validation refuses them.
-fn json_pointer_patterns_overlap(left: &JsonFieldSpec, right: &JsonFieldSpec) -> bool {
-    left.segments.len() == right.segments.len()
-        && left
-            .segments
-            .iter()
-            .zip(right.segments.iter())
-            .all(|(a, b)| a == b || a == "*" || b == "*")
 }
 
 /// Whether a catalog-resolution failure is a concurrent-DDL race rather than a

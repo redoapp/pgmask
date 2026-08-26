@@ -29,6 +29,9 @@
   of a node that still has child pointer policies is refused because the
   backend has already serialized the subtree. JSONPath, constructors,
   aggregates, and dynamic keys stay opaque.
+- Split JSON masking, extract parsing, extract policy, and catalog pointer
+  validation into their own modules so those seams stay reviewable as the
+  walker and allowlist grow.
 - Document JSON pointer inheritance, array wildcards, type placeholders, and
   which SQL shapes are served versus refused in `docs/json-masking.md`.
 - Support both pgwire formats. Text values are parsed directly; binary `jsonb`
