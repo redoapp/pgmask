@@ -74,6 +74,10 @@
   non-table-relation matrices use the same per-query isolation, including
   value checks on JSON extracts. Binary Bind of a document extract is covered
   alongside binary text extracts.
+- Pin the JSON pointer trie and catalog overlap helpers with named lookup
+  tables: exact beats `*`, object keys never take array wildcards, ambiguous
+  text steps refuse at a `*` edge, nested wildcards need a proven array index
+  at each `*`, and equal-specificity overlaps stay a load-time error.
 
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 

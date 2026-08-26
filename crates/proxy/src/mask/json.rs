@@ -515,8 +515,9 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::{
-        json_nesting_exceeds, JsonFieldSpec, JsonLimit, JsonPathNavigation, JsonProjection,
-        JsonUnmatched, Mask, MaskError, MaskSpec, Masker, FORMAT_BINARY, FORMAT_TEXT, OID_JSONB,
+        json_nesting_exceeds, path_segments, JsonFieldSpec, JsonLimit, JsonPathNavigation,
+        JsonPolicyTrie, JsonProjection, JsonUnmatched, Mask, MaskError, MaskSpec, Masker,
+        FORMAT_BINARY, FORMAT_TEXT, OID_JSONB,
     };
     use crate::mask::OID_JSON;
     use bytes::Bytes;
@@ -968,5 +969,239 @@ mod tests {
             output,
             serde_json::json!({"a/b": {"~key": "visible", "other": null}})
         );
+    }
+
+    /// Direct contract for [`JsonPolicyTrie`]: compile, `policy_at`,
+    /// `has_ambiguous_wildcard`, and `has_descendants_at`.
+    ///
+    /// Walker tests still prove disclosure on a document. This table names the
+    /// NFA edges so a wrong `*` follow, exact/wildcard tie-break, or descendant
+    /// check fails without a JSON blob to decode.
+    #[test]
+    fn json_policy_trie_lookup_table() {
+        use JsonPathNavigation::{Ambiguous, ArrayIndex, ObjectKey};
+
+        #[derive(Debug)]
+        enum Policy {
+            Kind(Mask),
+            Miss,
+        }
+
+        struct Case {
+            name: &'static str,
+            pointers: &'static [(&'static str, Mask)],
+            path: &'static [(&'static str, JsonPathNavigation)],
+            policy: Policy,
+            ambiguous_wildcard: bool,
+            descendants: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "empty trie misses",
+                pointers: &[],
+                path: &[("items", ObjectKey)],
+                policy: Policy::Miss,
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "empty path reports whether any pointer exists",
+                pointers: &[("/profile/email", Mask::Redact)],
+                path: &[],
+                policy: Policy::Miss,
+                ambiguous_wildcard: false,
+                descendants: true,
+            },
+            Case {
+                name: "exact object path",
+                pointers: &[("/profile/email", Mask::Redact)],
+                path: &[("profile", ObjectKey), ("email", ObjectKey)],
+                policy: Policy::Kind(Mask::Redact),
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "ambiguous text path still follows exact edges",
+                pointers: &[("/profile/email", Mask::Redact)],
+                path: &[("profile", Ambiguous), ("email", Ambiguous)],
+                policy: Policy::Kind(Mask::Redact),
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "parent node has child pointer policies",
+                pointers: &[("/profile", Mask::None), ("/profile/email", Mask::Redact)],
+                path: &[("profile", ObjectKey)],
+                policy: Policy::Kind(Mask::None),
+                ambiguous_wildcard: false,
+                descendants: true,
+            },
+            Case {
+                name: "proven array index takes the wildcard",
+                pointers: &[("/items/*/token", Mask::Redact)],
+                path: &[
+                    ("items", ObjectKey),
+                    ("0", ArrayIndex),
+                    ("token", ObjectKey),
+                ],
+                policy: Policy::Kind(Mask::Redact),
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "quoted numeric object key never takes an array wildcard",
+                pointers: &[("/items/*/token", Mask::Redact)],
+                path: &[("items", ObjectKey), ("0", ObjectKey), ("token", ObjectKey)],
+                policy: Policy::Miss,
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "exact index beats equally matching wildcard",
+                pointers: &[
+                    ("/items/*/token", Mask::Redact),
+                    ("/items/0/token", Mask::None),
+                ],
+                path: &[
+                    ("items", ObjectKey),
+                    ("0", ArrayIndex),
+                    ("token", ObjectKey),
+                ],
+                policy: Policy::Kind(Mask::None),
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "wildcard still applies to a later index when an exact sibling exists",
+                pointers: &[
+                    ("/items/*/token", Mask::Redact),
+                    ("/items/0/token", Mask::None),
+                ],
+                path: &[
+                    ("items", ObjectKey),
+                    ("1", ArrayIndex),
+                    ("token", ObjectKey),
+                ],
+                policy: Policy::Kind(Mask::Redact),
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "ambiguous segment at a node with * refuses to choose a branch",
+                pointers: &[("/items/*/token", Mask::Redact)],
+                path: &[("items", ObjectKey), ("0", Ambiguous), ("token", ObjectKey)],
+                policy: Policy::Miss,
+                ambiguous_wildcard: true,
+                descendants: false,
+            },
+            Case {
+                name: "ambiguous first segment is fine when root has no * child",
+                pointers: &[("/items/*/token", Mask::Redact)],
+                path: &[
+                    ("items", Ambiguous),
+                    ("0", ArrayIndex),
+                    ("token", ObjectKey),
+                ],
+                policy: Policy::Kind(Mask::Redact),
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "/* is the object key * , and any ambiguous step from root is unsafe",
+                pointers: &[("/*", Mask::None)],
+                path: &[("items", Ambiguous)],
+                policy: Policy::Miss,
+                ambiguous_wildcard: true,
+                descendants: false,
+            },
+            Case {
+                name: "/* matches the literal object key by exact edge",
+                pointers: &[("/*", Mask::None)],
+                path: &[("*", ObjectKey)],
+                policy: Policy::Kind(Mask::None),
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "nested wildcards require a proven array step at each *",
+                pointers: &[("/a/*/b/*/c", Mask::Redact)],
+                path: &[
+                    ("a", ObjectKey),
+                    ("0", ArrayIndex),
+                    ("b", ObjectKey),
+                    ("1", ArrayIndex),
+                    ("c", ObjectKey),
+                ],
+                policy: Policy::Kind(Mask::Redact),
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "nested wildcard does not fire on a quoted inner index",
+                pointers: &[("/a/*/b/*/c", Mask::Redact)],
+                path: &[
+                    ("a", ObjectKey),
+                    ("0", ArrayIndex),
+                    ("b", ObjectKey),
+                    ("1", ObjectKey),
+                    ("c", ObjectKey),
+                ],
+                policy: Policy::Miss,
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "escaped pointer segments are trie keys, not syntax",
+                pointers: &[("/a~1b/~0key", Mask::None)],
+                path: &[("a/b", ObjectKey), ("~key", ObjectKey)],
+                policy: Policy::Kind(Mask::None),
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+            Case {
+                name: "unrelated branch is a miss even when a sibling pointer exists",
+                pointers: &[("/profile/email", Mask::Redact)],
+                path: &[("public", ObjectKey)],
+                policy: Policy::Miss,
+                ambiguous_wildcard: false,
+                descendants: false,
+            },
+        ];
+
+        for case in cases {
+            let fields: Vec<JsonFieldSpec> = case
+                .pointers
+                .iter()
+                .map(|(pointer, kind)| JsonFieldSpec::new(*pointer, MaskSpec::new(*kind)).unwrap())
+                .collect();
+            let trie = JsonPolicyTrie::compile(&fields);
+            let path = path_segments(
+                &case
+                    .path
+                    .iter()
+                    .map(|(value, navigation)| ((*value).to_string(), *navigation))
+                    .collect::<Vec<_>>(),
+            );
+
+            let got = trie.policy_at(&path).map(|spec| spec.kind);
+            let want = match case.policy {
+                Policy::Kind(kind) => Some(kind),
+                Policy::Miss => None,
+            };
+            assert_eq!(got, want, "{}: policy_at", case.name);
+            assert_eq!(
+                trie.has_ambiguous_wildcard(&path),
+                case.ambiguous_wildcard,
+                "{}: has_ambiguous_wildcard",
+                case.name
+            );
+            assert_eq!(
+                trie.has_descendants_at(&path),
+                case.descendants,
+                "{}: has_descendants_at",
+                case.name
+            );
+        }
     }
 }
