@@ -41,6 +41,11 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
     };
     let mut rules = default_rules();
     for relation in ["canary.documents", "canary.documents_view"] {
+        // PRIMARY KEY `id` is not sensitive, but it is NOT NULL. Leaving it
+        // unclassified makes the type-aware fallback try SQL NULL and refuse
+        // `SELECT *`. Catalogue it as released so star expansion is a real
+        // JSON-masking path rather than a NOT NULL refusal.
+        rules.push(rule(relation, "id", pgmask::mask::Mask::None));
         rules.push(document_rule(relation, "payload"));
         rules.push(document_rule(relation, "legacy"));
     }
