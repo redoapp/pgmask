@@ -1722,6 +1722,11 @@ async fn a_rejection_does_not_break_the_session() -> Result<()> {
 // --- Everything at once -----------------------------------------------------
 
 /// The property test proper: one session, every path, one assertion.
+///
+/// This loop is not a [`SqlCase`] matrix: `BEGIN` / `COMMIT` / reconnect-on-hang
+/// shapes are not uniformly served or refused, and the canary property is the
+/// connection-wide transcript. Per-query isolation belongs in the named
+/// matrices above.
 #[tokio::test]
 async fn no_canary_escapes_across_every_path() -> Result<()> {
     require_pg!();
