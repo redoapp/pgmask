@@ -29,7 +29,10 @@ relation = "app.events"
 column = "payload"
 mask = "json"
 # Optional. Keep unmatched scalar types visible without their values.
-json_type_placeholders = true
+json_unmatched = "type-placeholders"
+# Optional resource bounds; these are the defaults.
+json_max_bytes = 1048576
+json_max_depth = 64
 json = [
   { pointer = "/profile", mask = "none" },
   { pointer = "/profile/email", mask = "partial", keep = 4 },
@@ -71,23 +74,38 @@ disclosure.
 
 ## Unmatched leaves
 
-When no pointer and no inherited parent policy apply:
+When no pointer and no inherited parent policy apply, `json_unmatched`
+chooses one behavior:
 
 | Setting | Unmatched string | number | boolean | JSON null |
 |---|---|---|---|---|
-| default (omit both options) | `null` | `null` | `null` | `null` |
-| `json_type_placeholders = true` | `""` | `0` | `false` | `null` |
-| `json_default = "null"` | `null` | `null` | `null` | `null` |
-| `json_default = "none"` | original value | original | original | `null` |
+| default / `json_unmatched = "null"` | `null` | `null` | `null` | `null` |
+| `json_unmatched = "type-placeholders"` | `""` | `0` | `false` | `null` |
+| `json_unmatched = "none"` | original value | original | original | `null` |
 
-`json_type_placeholders` and `json_default` are mutually exclusive. Use
-placeholders when analysts need to see *shape* (is this field a number? was it
-present?) without seeing the value. Use `json_default = "none"` only when
-unmentioned values are intentionally public; that includes keys added after
-the catalog was written.
+Use placeholders when analysts need to see *shape* (is this field a number?
+was it present?) without seeing the value. Use `json_unmatched = "none"` only
+when unmentioned values are intentionally public; that includes keys added
+after the catalog was written.
 
 Objects and arrays are never replaced as a whole. They are always walked, and
 the leaf rule above applies to each scalar.
+
+## Resource limits
+
+`json_max_bytes` defaults to 1,048,576 bytes and counts the encoded JSON
+payload (not the binary-jsonb version byte). `json_max_depth` defaults to 64
+and counts nested objects and arrays, with the root container at depth 1.
+Values over either limit refuse the result set.
+
+Both checks run before `serde_json` constructs a value tree. The depth
+preflight understands quoted strings and escapes, so braces inside strings do
+not count as nesting. `json_max_depth` must be between 1 and 128; the byte
+limit must be at least 1.
+
+Pointer rules are compiled into a trie when the catalog loads. Walking a node
+follows only its exact-key and array-wildcard edges instead of scanning every
+configured rule.
 
 ## How to inspect a large document
 
@@ -142,7 +160,7 @@ pgmask refuses the result set rather than passing a value it cannot honour:
   `numeric-bucket` on a string).
 - A `->>` / `#>>` extract of a path that still has child pointer policies.
 - `mask = "json"` on a non-json column (plan-time type mismatch).
-- Recursive `json` as `json_default` or as a nested pointer mask.
+- Recursive `json` as a nested pointer mask.
 
 Binary pgwire is supported. PostgreSQL `json` binary is UTF-8 JSON text.
 `jsonb` binary is version byte `1` plus JSON text. Key order and whitespace may
@@ -154,6 +172,6 @@ Treat `{ pointer = "/profile", mask = "none" }` as a grant of every current and
 future leaf under `/profile`, unless a narrower pointer overrides it. Review it
 the same way as a column-level `mask = "none"`.
 
-`json_type_placeholders` discloses JSON types and the presence of keys. That
-is usually what a debugger needs; it is still a disclosure relative to
-defaulting every unmatched leaf to `null`.
+`json_unmatched = "type-placeholders"` discloses JSON types and the presence
+of keys. That is usually what a debugger needs; it is still a disclosure
+relative to defaulting every unmatched leaf to `null`.

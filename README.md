@@ -166,7 +166,10 @@ column = "payload"
 mask = "json"
 # Keep the document useful for structural debugging: unmentioned strings,
 # numbers and booleans become "", 0 and false. Omit this for JSON null.
-json_type_placeholders = true
+json_unmatched = "type-placeholders"
+# Refuse before parsing or allocating an unexpectedly large/deep document.
+json_max_bytes = 1048576
+json_max_depth = 64
 json = [
   # Release arbitrary current and future profile fields...
   { pointer = "/profile", mask = "none" },
@@ -225,9 +228,12 @@ free text is required and partial disclosure is acceptable.
 
 `json` preserves object keys, arrays, and nesting while applying ordinary
 masks at JSON Pointers, including `/items/*` for every array element.
-Unmatched scalars become JSON `null` unless `json_type_placeholders` or an
-explicit `json_default` is set. Extraction and construction in SQL stay
-opaque. See [JSON and JSONB masking](docs/json-masking.md).
+`json_unmatched` is `null` by default; `type-placeholders` retains scalar
+types, and `none` explicitly releases unmatched leaves. Pointer policies are
+compiled into a trie. Documents over `json_max_bytes` (1 MiB by default) or
+`json_max_depth` (64 by default) refuse before parsing. Literal SQL extracts
+use the same pointer policy; construction stays opaque. See
+[JSON and JSONB masking](docs/json-masking.md).
 
 Pseudonyms preserve equality. This keeps joins useful, but also exposes
 frequency and repeated identity. Semantic types act as pseudonym domains:

@@ -7,15 +7,22 @@
   parents, so one release rule can cover an evolving public object while
   narrow child rules still redact sensitive fields.
 - Every unmatched scalar defaults to JSON `null`; an operator may explicitly
-  choose another `json_default`, including `none` when unmentioned values are
-  intentionally public. A configured mask/type mismatch, malformed JSON, or
-  unknown binary-jsonb version refuses the result set.
+  choose `json_unmatched = "none"` when unmentioned values are intentionally
+  public. A configured mask/type mismatch, malformed JSON, or unknown
+  binary-jsonb version refuses the result set.
 - Add `*` array-element policies, so `/items/*/account_id` masks every item
   without enumerating indices; an exact index wins over the wildcard. Add the
-  opt-in `json_type_placeholders = true` debugging default, which retains
-  scalar types as `""`, `0`, `false`, and `null` while withholding values.
-  Equally-specific overlapping wildcard policies and conflicting defaults are
-  rejected at config load rather than resolved by TOML order.
+  opt-in `json_unmatched = "type-placeholders"` debugging policy, which
+  retains scalar types as `""`, `0`, `false`, and `null` while withholding
+  values. One enum now owns all unmatched-leaf behavior (`null`,
+  `type-placeholders`, or `none`) instead of two conflicting settings.
+  Equally-specific overlapping wildcard policies are rejected at config load
+  rather than resolved by TOML order.
+- Compile JSON Pointer rules into a trie at catalog load, so walking a node
+  follows only exact-key and array-wildcard edges instead of scanning every
+  configured rule. Add per-column `json_max_bytes` (1 MiB default) and
+  `json_max_depth` (64 default, maximum 128); values over either limit refuse
+  before `serde_json` parses or allocates the document tree.
 - Attribute literal JSON extracts (`->`, `->>`, `#>`/`#>>`,
   `json[b]_extract_path[_text]`) of a schema-qualified classified column.
   The stored column's pointer policy is applied to the extract; a text extract

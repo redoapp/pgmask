@@ -19,7 +19,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use pgmask::catalog::{
     ColumnRule, Config, JsonFieldRule, Lineage, MaskParams, Opaque, SystemCatalogs, Unclassified,
 };
-use pgmask::mask::Mask;
+use pgmask::mask::{JsonUnmatched, Mask};
 use pgmask::protocol::{FrameReader, Message, StartupPacket};
 use pgmask::{Catalog, Policy};
 use tokio::io::AsyncWriteExt;
@@ -39,7 +39,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 56
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 57
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -330,11 +330,11 @@ pub fn json_field(pointer: &str, mask: Mask) -> JsonFieldRule {
 pub fn json_rule(
     relation: &str,
     column: &str,
-    default: Mask,
+    unmatched: JsonUnmatched,
     fields: Vec<JsonFieldRule>,
 ) -> ColumnRule {
     let mut rule = rule(relation, column, Mask::Json);
-    rule.params.json_default = Some(default);
+    rule.params.json_unmatched = Some(unmatched);
     rule.params.json = Some(fields);
     rule
 }

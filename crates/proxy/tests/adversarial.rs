@@ -25,10 +25,10 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
     let document_rule = |relation: &str, column: &str| {
         let mut email = json_field("/profile/email", pgmask::mask::Mask::Partial);
         email.params.keep = Some(4);
-        let mut rule = json_rule(
+        json_rule(
             relation,
             column,
-            pgmask::mask::Mask::Null,
+            pgmask::mask::JsonUnmatched::TypePlaceholders,
             vec![
                 json_field("/profile", pgmask::mask::Mask::None),
                 email,
@@ -37,13 +37,7 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
                 json_field("/items/*", pgmask::mask::Mask::None),
                 json_field("/items/*/token", pgmask::mask::Mask::Redact),
             ],
-        );
-        // Debugging policy: retain the scalar type of every unmentioned leaf
-        // without retaining its value. The explicit pointer policies above
-        // still override these placeholders.
-        rule.params.json_default = None;
-        rule.params.json_type_placeholders = Some(true);
-        rule
+        )
     };
     let mut rules = default_rules();
     for relation in ["canary.documents", "canary.documents_view"] {
@@ -400,7 +394,7 @@ async fn json_leaf_type_mismatch_refuses_the_wire_result_set() -> Result<()> {
     rules.push(json_rule(
         "canary.documents",
         "payload",
-        pgmask::mask::Mask::Null,
+        pgmask::mask::JsonUnmatched::Null,
         vec![
             json_field("/profile", pgmask::mask::Mask::None),
             email,
@@ -415,6 +409,56 @@ async fn json_leaf_type_mismatch_refuses_the_wire_result_set() -> Result<()> {
         .await?;
     assert_refused(&client, "partial mask on JSON number leaf");
     assert_no_canary(&client, "partial mask on JSON number leaf");
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_document_byte_and_depth_limits_refuse_before_rows_cross() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+
+    let make_rules = |max_bytes: usize, max_depth: usize| {
+        let mut rules = default_rules();
+        let mut document = json_rule(
+            "canary.documents",
+            "payload",
+            pgmask::mask::JsonUnmatched::Null,
+            vec![
+                json_field("/profile/email", pgmask::mask::Mask::Redact),
+                json_field("/public", pgmask::mask::Mask::None),
+            ],
+        );
+        document.params.json_max_bytes = Some(max_bytes);
+        document.params.json_max_depth = Some(max_depth);
+        rules.push(document);
+        rules
+    };
+
+    // Positive control: the same document and pointer policy are served when
+    // the limits cover it, so the two refusals below are exercising limits.
+    let control = start_proxy(DB, make_rules(1_048_576, 64)).await?;
+    let mut control_client = RawClient::connect(control.addr, DB).await?;
+    let messages = control_client
+        .simple_query("SELECT payload FROM canary.documents")
+        .await?;
+    assert_served(&messages, "JSON limit positive control");
+    assert_no_canary(&control_client, "JSON limit positive control");
+
+    let byte_limited = start_proxy(DB, make_rules(32, 64)).await?;
+    let mut byte_client = RawClient::connect(byte_limited.addr, DB).await?;
+    byte_client
+        .simple_query("SELECT payload FROM canary.documents")
+        .await?;
+    assert_refused(&byte_client, "JSON byte limit");
+    assert_no_canary(&byte_client, "JSON byte limit");
+
+    let depth_limited = start_proxy(DB, make_rules(1_048_576, 2)).await?;
+    let mut depth_client = RawClient::connect(depth_limited.addr, DB).await?;
+    depth_client
+        .simple_query("SELECT payload FROM canary.documents")
+        .await?;
+    assert_refused(&depth_client, "JSON depth limit");
+    assert_no_canary(&depth_client, "JSON depth limit");
     Ok(())
 }
 

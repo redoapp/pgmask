@@ -77,6 +77,9 @@ The policy file is not reloaded. Restart pgmask after changing it.
 
 Classify stored `json` / `jsonb` columns with `mask = "json"` and JSON Pointer
 rules. Array policies use `/items/*/field` rather than one rule per index.
+Set `json_unmatched` to `null` (default), `type-placeholders`, or `none`.
+`json_max_bytes` (1 MiB) and `json_max_depth` (64) refuse oversized documents
+before parsing; tune them per column for expected payloads.
 Literal extracts (`payload->>'email'`, `payload->'profile'`) are masked with
 the same pointer policy when the path is a literal and the relation is
 schema-qualified. `jsonb_pretty(payload)` and JSONPath stay refused as opaque

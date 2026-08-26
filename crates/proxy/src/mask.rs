@@ -18,6 +18,7 @@
 // first or bounded by the algorithm around it, and a new one has to say which.
 #![deny(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -48,6 +49,9 @@ pub const OID_BPCHAR: u32 = 1042;
 pub const OID_BOOL: u32 = 16;
 pub const OID_JSON: u32 = 114;
 pub const OID_JSONB: u32 = 3802;
+pub const DEFAULT_JSON_MAX_BYTES: usize = 1_048_576;
+pub const DEFAULT_JSON_MAX_DEPTH: usize = 64;
+pub const MAX_JSON_MAX_DEPTH: usize = 128;
 
 /// Structured identifiers, and the placeholder each becomes.
 ///
@@ -383,6 +387,19 @@ pub struct JsonFieldSpec {
     pub spec: MaskSpec,
 }
 
+/// Policy for a scalar leaf not covered by a JSON Pointer rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum JsonUnmatched {
+    /// Replace every unmatched scalar with JSON null.
+    #[default]
+    Null,
+    /// Preserve the scalar type without preserving its value.
+    TypePlaceholders,
+    /// Pass unmatched scalar values through unchanged.
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JsonPathSegment {
     value: String,
@@ -425,18 +442,87 @@ impl JsonFieldSpec {
         })
     }
 
-    fn matches(&self, path: &[JsonPathSegment]) -> bool {
-        self.segments.len() == path.len()
-            && self.segments.iter().zip(path).all(|(configured, actual)| {
-                (actual.array_index && configured == "*") || configured == &actual.value
-            })
-    }
-
     fn wildcard_count(&self) -> usize {
         self.segments
             .iter()
             .filter(|segment| segment.as_str() == "*")
             .count()
+    }
+}
+
+/// Compiled JSON Pointer policy.
+///
+/// Matching follows only exact and array-wildcard edges for the current path;
+/// it never scans the complete rule list. More-specific pointer inheritance is
+/// still resolved by the caller as it descends the document.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct JsonPolicyTrie {
+    root: JsonPolicyNode,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct JsonPolicyNode {
+    policy: Option<JsonTriePolicy>,
+    children: HashMap<String, JsonPolicyNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct JsonTriePolicy {
+    spec: MaskSpec,
+    wildcard_count: usize,
+}
+
+impl JsonPolicyTrie {
+    fn compile(fields: &[JsonFieldSpec]) -> Self {
+        let mut trie = Self::default();
+        for field in fields {
+            let mut node = &mut trie.root;
+            for segment in field.segments.iter() {
+                node = node.children.entry(segment.clone()).or_default();
+            }
+            node.policy = Some(JsonTriePolicy {
+                spec: field.spec.clone(),
+                wildcard_count: field.wildcard_count(),
+            });
+        }
+        trie
+    }
+
+    fn policy_at<'a>(&'a self, path: &[JsonPathSegment]) -> Option<&'a MaskSpec> {
+        let states = self.states_at(path);
+        states
+            .into_iter()
+            .filter_map(|node| node.policy.as_ref())
+            .min_by_key(|policy| policy.wildcard_count)
+            .map(|policy| &policy.spec)
+    }
+
+    fn has_descendants_at(&self, path: &[JsonPathSegment]) -> bool {
+        self.states_at(path)
+            .into_iter()
+            .any(|node| !node.children.is_empty())
+    }
+
+    fn states_at<'a>(&'a self, path: &[JsonPathSegment]) -> Vec<&'a JsonPolicyNode> {
+        let mut states = vec![&self.root];
+        for segment in path {
+            let mut next = Vec::with_capacity(states.len().saturating_mul(2));
+            for node in states {
+                if let Some(exact) = node.children.get(&segment.value) {
+                    next.push(exact);
+                }
+                if segment.array_index {
+                    if let Some(wildcard) = node.children.get("*") {
+                        next.push(wildcard);
+                    }
+                }
+            }
+            states = next;
+            if states.is_empty() {
+                break;
+            }
+        }
+        states
     }
 }
 
@@ -465,12 +551,14 @@ pub struct MaskSpec {
     pub domain: Option<Arc<str>>,
     /// Hierarchical path policy overrides used by [`Mask::Json`].
     pub json: Arc<[JsonFieldSpec]>,
-    /// Policy for every JSON leaf with no exact path override. `None` means
-    /// NULL, the fail-closed default.
-    pub json_default: Option<Arc<MaskSpec>>,
-    /// Replace unmatched scalar leaves with same-type placeholders (`""`, `0`,
-    /// `false`) instead of JSON null. Explicit path policies still win.
-    pub json_type_placeholders: bool,
+    /// Compiled form of `json`; rebuilt when the catalog compiles a rule.
+    json_trie: Arc<JsonPolicyTrie>,
+    /// Policy for leaves with no matching or inherited pointer rule.
+    pub json_unmatched: JsonUnmatched,
+    /// Maximum encoded JSON payload accepted before parsing.
+    pub json_max_bytes: usize,
+    /// Maximum object/array nesting accepted before parsing.
+    pub json_max_depth: usize,
     /// When this spec masks a JSON *extract* (`payload->'profile'`), the walk
     /// starts at this path in the original pointer policy rather than at the
     /// document root. Empty means the value is the stored column.
@@ -488,8 +576,10 @@ impl Default for MaskSpec {
             keep_domain: false,
             domain: None,
             json: Arc::default(),
-            json_default: None,
-            json_type_placeholders: false,
+            json_trie: Arc::default(),
+            json_unmatched: JsonUnmatched::Null,
+            json_max_bytes: DEFAULT_JSON_MAX_BYTES,
+            json_max_depth: DEFAULT_JSON_MAX_DEPTH,
             json_path_prefix: Arc::from([]),
         }
     }
@@ -563,6 +653,12 @@ impl MaskSpec {
         self.kind == Mask::None
     }
 
+    /// Install pointer rules and compile their lookup trie once.
+    pub(crate) fn set_json_fields(&mut self, fields: Vec<JsonFieldSpec>) {
+        self.json_trie = Arc::new(JsonPolicyTrie::compile(&fields));
+        self.json = fields.into();
+    }
+
     /// Bind this JSON column policy to an extracted subtree (`payload->'a'`).
     ///
     /// The stored document's pointer table is kept; the walk starts at `path`
@@ -588,37 +684,27 @@ impl MaskSpec {
             return None;
         }
         let segments = path_segments(path);
-        if self.json_extract_has_child_policies(&segments) {
+        if self.json_trie.has_descendants_at(&segments) {
             return None;
         }
         match self.policy_along(&segments) {
             Some(spec) if spec.kind == Mask::Json => None,
             Some(spec) => Some(spec.clone()),
-            None => Some(Self::new(Mask::Null)),
+            None => match self.json_unmatched {
+                JsonUnmatched::None => Some(Self::new(Mask::None)),
+                JsonUnmatched::Null | JsonUnmatched::TypePlaceholders => {
+                    Some(Self::new(Mask::Null))
+                }
+            },
         }
     }
 
-    fn json_extract_has_child_policies(&self, path: &[JsonPathSegment]) -> bool {
-        self.json.iter().any(|field| {
-            field.segments.len() > path.len()
-                && field.segments.iter().zip(path).all(|(configured, actual)| {
-                    (actual.array_index && configured == "*") || configured == &actual.value
-                })
-        })
-    }
-
     fn policy_along(&self, path: &[JsonPathSegment]) -> Option<&MaskSpec> {
-        let mut inherited = self.json_default.as_deref();
+        let mut inherited = None;
         let mut walked = Vec::with_capacity(path.len());
         for segment in path {
             walked.push(segment.clone());
-            inherited = self
-                .json
-                .iter()
-                .filter(|field| field.matches(&walked))
-                .min_by_key(|field| field.wildcard_count())
-                .map(|field| &field.spec)
-                .or(inherited);
+            inherited = self.json_trie.policy_at(&walked).or(inherited);
         }
         inherited
     }
@@ -818,10 +904,8 @@ impl Masker {
     /// Decode one JSON document, walk arbitrary objects and arrays, and apply
     /// exact path policies plus a default policy to all remaining leaves.
     ///
-    /// Object keys and array shape are preserved. Values are not: an
-    /// unconfigured leaf is JSON NULL unless the operator explicitly selects a
-    /// different `json_default`, including `none` when preserving it is
-    /// intentional.
+    /// Object keys and array shape are preserved. Values are not: the
+    /// `json_unmatched` policy governs leaves with no pointer policy.
     fn mask_json(
         &self,
         spec: &MaskSpec,
@@ -837,6 +921,18 @@ impl Masker {
         } else {
             bytes
         };
+        if payload.len() > spec.json_max_bytes {
+            return Err(MaskError::JsonLimitExceeded {
+                limit: JsonLimit::Bytes,
+                configured: spec.json_max_bytes,
+            });
+        }
+        if json_nesting_exceeds(payload, spec.json_max_depth) {
+            return Err(MaskError::JsonLimitExceeded {
+                limit: JsonLimit::Depth,
+                configured: spec.json_max_depth,
+            });
+        }
         let mut value: JsonValue = serde_json::from_slice(payload)
             .map_err(|_| MaskError::Undecodable { type_oid, format })?;
         let mut path: Vec<JsonPathSegment> = spec.json_path_prefix.iter().cloned().collect();
@@ -862,16 +958,10 @@ impl Masker {
         inherited: Option<&MaskSpec>,
         value: &mut JsonValue,
     ) -> Result<(), MaskError> {
-        let policy = json_spec
-            .json
-            .iter()
-            .filter(|field| field.matches(path))
-            // An exact index beats `*`; among wildcard paths, fewer
-            // wildcards is more specific. Catalog validation rejects
-            // overlapping ties, so config order cannot choose disclosure.
-            .min_by_key(|field| field.wildcard_count())
-            .map(|field| &field.spec)
-            .or(inherited);
+        // The trie follows only path-relevant exact / array-wildcard edges.
+        // Catalog validation rejects equally-specific overlap, so this lookup
+        // cannot let configuration order choose disclosure.
+        let policy = json_spec.json_trie.policy_at(path).or(inherited);
 
         match value {
             JsonValue::Object(map) => {
@@ -899,15 +989,18 @@ impl Masker {
             _ => {
                 *value = match policy {
                     Some(policy) => self.mask_json_value(policy, value)?,
-                    None if json_spec.json_type_placeholders => match value {
-                        JsonValue::String(_) => JsonValue::String(String::new()),
-                        JsonValue::Number(_) => JsonValue::Number(0.into()),
-                        JsonValue::Bool(_) => JsonValue::Bool(false),
-                        JsonValue::Null => JsonValue::Null,
-                        JsonValue::Array(_) | JsonValue::Object(_) => {
-                            unreachable!("containers recurse above")
+                    None if json_spec.json_unmatched == JsonUnmatched::TypePlaceholders => {
+                        match value {
+                            JsonValue::String(_) => JsonValue::String(String::new()),
+                            JsonValue::Number(_) => JsonValue::Number(0.into()),
+                            JsonValue::Bool(_) => JsonValue::Bool(false),
+                            JsonValue::Null => JsonValue::Null,
+                            JsonValue::Array(_) | JsonValue::Object(_) => {
+                                unreachable!("containers recurse above")
+                            }
                         }
-                    },
+                    }
+                    None if json_spec.json_unmatched == JsonUnmatched::None => value.clone(),
                     None => JsonValue::Null,
                 };
                 Ok(())
@@ -1105,6 +1198,45 @@ impl Masker {
             }
         }))
     }
+}
+
+/// Check JSON object/array nesting before `serde_json` allocates a value tree.
+///
+/// This is a lexical preflight, not a second parser. Brackets inside strings
+/// and escaped quotes are ignored; malformed JSON proceeds to `serde_json` and
+/// is refused as undecodable. Returning `true` on arithmetic doubt is the
+/// fail-closed direction.
+fn json_nesting_exceeds(bytes: &[u8], max_depth: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                let Some(next) = depth.checked_add(1) else {
+                    return true;
+                };
+                depth = next;
+                if depth > max_depth {
+                    return true;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
 }
 
 // --- String masks -----------------------------------------------------------
@@ -1585,6 +1717,14 @@ pub enum MaskError {
     },
     /// The value did not decode as its declared type.
     Undecodable { type_oid: u32, format: i16 },
+    /// JSON was refused before parsing because an operator limit was exceeded.
+    JsonLimitExceeded { limit: JsonLimit, configured: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonLimit {
+    Bytes,
+    Depth,
 }
 
 impl std::fmt::Display for MaskError {
@@ -1610,6 +1750,14 @@ impl std::fmt::Display for MaskError {
                     "binary"
                 } else {
                     "text"
+                }
+            ),
+            MaskError::JsonLimitExceeded { limit, configured } => write!(
+                f,
+                "JSON exceeds configured {} limit {configured}",
+                match limit {
+                    JsonLimit::Bytes => "byte",
+                    JsonLimit::Depth => "depth",
                 }
             ),
         }
@@ -1651,12 +1799,16 @@ mod tests {
 
     fn json_spec(default: Mask, fields: Vec<(&str, MaskSpec)>) -> MaskSpec {
         let mut spec = MaskSpec::new(Mask::Json);
-        spec.json_default = Some(Arc::new(MaskSpec::new(default)));
-        spec.json = fields
+        spec.json_unmatched = match default {
+            Mask::Null => JsonUnmatched::Null,
+            Mask::None => JsonUnmatched::None,
+            _ => panic!("test helper supports null or none unmatched policy"),
+        };
+        let fields = fields
             .into_iter()
             .map(|(pointer, field)| JsonFieldSpec::new(pointer, field).unwrap())
-            .collect::<Vec<_>>()
-            .into();
+            .collect();
+        spec.set_json_fields(fields);
         spec
     }
 
@@ -1720,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn json_default_none_preserves_unmentioned_nested_values_only_when_explicit() {
+    fn json_unmatched_none_preserves_unmentioned_nested_values_only_when_explicit() {
         let spec = json_spec(Mask::None, vec![("/private", MaskSpec::new(Mask::Redact))]);
         let output = apply_json(
             &spec,
@@ -1810,10 +1962,9 @@ mod tests {
     }
 
     #[test]
-    fn json_type_placeholders_keep_shape_without_leaf_values() {
+    fn json_unmatched_type_placeholders_keep_shape_without_leaf_values() {
         let mut spec = json_spec(Mask::Null, Vec::new());
-        spec.json_default = None;
-        spec.json_type_placeholders = true;
+        spec.json_unmatched = JsonUnmatched::TypePlaceholders;
         let output = apply_json(
             &spec,
             OID_JSONB,
@@ -1889,13 +2040,78 @@ mod tests {
     }
 
     #[test]
+    fn json_limits_refuse_before_unbounded_parsing() {
+        let mut byte_limited = json_spec(Mask::Null, Vec::new());
+        byte_limited.json_max_bytes = 8;
+        let oversized_and_malformed = br#"{"not even complete""#;
+        assert_eq!(
+            masker().apply(
+                &byte_limited,
+                OID_JSONB,
+                FORMAT_TEXT,
+                Some(Bytes::from_static(oversized_and_malformed)),
+            ),
+            Err(MaskError::JsonLimitExceeded {
+                limit: JsonLimit::Bytes,
+                configured: 8,
+            }),
+            "the byte limit runs before serde_json parses or allocates"
+        );
+
+        let mut depth_limited = json_spec(Mask::Null, Vec::new());
+        depth_limited.json_max_depth = 3;
+        let too_deep = br#"{"a":[{"b":[1]}],"brackets":"[[[["}"#;
+        assert_eq!(
+            masker().apply(
+                &depth_limited,
+                OID_JSONB,
+                FORMAT_TEXT,
+                Some(Bytes::from_static(too_deep)),
+            ),
+            Err(MaskError::JsonLimitExceeded {
+                limit: JsonLimit::Depth,
+                configured: 3,
+            })
+        );
+        assert!(
+            !json_nesting_exceeds(br#"{"brackets":"[[[[","quote":"\\\""}"#, 1),
+            "brackets and escaped quotes inside strings are not nesting"
+        );
+    }
+
+    #[test]
+    fn compiled_json_trie_keeps_exact_over_wildcard_precedence() {
+        let mut fields = (0..512)
+            .map(|index| (format!("/irrelevant/{index}"), MaskSpec::new(Mask::None)))
+            .collect::<Vec<_>>();
+        fields.push(("/items/*/token".to_string(), MaskSpec::new(Mask::Redact)));
+        fields.push(("/items/0/token".to_string(), MaskSpec::new(Mask::None)));
+        let spec = json_spec(
+            Mask::Null,
+            fields
+                .iter()
+                .map(|(pointer, spec)| (pointer.as_str(), spec.clone()))
+                .collect(),
+        );
+        let output = apply_json(
+            &spec,
+            OID_JSONB,
+            FORMAT_TEXT,
+            br#"{"items":[{"token":"first"},{"token":"second"}]}"#,
+        );
+        assert_eq!(
+            output,
+            serde_json::json!({"items":[{"token":"first"},{"token":"***"}]})
+        );
+    }
+
+    #[test]
     fn json_array_wildcard_has_no_index_horizon() {
         let mut spec = json_spec(
             Mask::Null,
             vec![("/items/*/account_id", MaskSpec::new(Mask::Redact))],
         );
-        spec.json_default = None;
-        spec.json_type_placeholders = true;
+        spec.json_unmatched = JsonUnmatched::TypePlaceholders;
         let input = serde_json::json!({
             "items": (0..512)
                 .map(|index| serde_json::json!({
