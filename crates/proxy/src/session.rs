@@ -33,9 +33,7 @@ use crate::lineage::{self, Verdict};
 use crate::mask::{Mask, MaskSpec};
 use crate::metrics::Cause;
 use crate::plan_state::{FieldPlan, PlanState};
-use crate::policy::{
-    resolve_json_extract_policies, resolve_summary_policies, FieldAnalysis, Policy, Rejection,
-};
+use crate::policy::{resolve_expression_policies, FieldAnalysis, Policy, Rejection};
 use crate::protocol::{self, FrameReader, Message};
 use crate::tls::{BackendTls, BoxStream};
 
@@ -1010,19 +1008,10 @@ impl Session {
             _ => Vec::new(),
         };
 
-        // Summary policy is resolved once, independently of optional lineage.
-        // Only one bare argument column over explicitly schema-qualified ranges
-        // is eligible. That makes the source exact enough to preserve either a
-        // mask or an explicit release; transformed and multi-source aggregates
-        // retain the opaque posture.
-        let summary_policies = resolve_summary_policies(
-            inspection.as_ref(),
-            fields.len(),
-            &safety,
-            &snapshot,
-            &self.roles,
-        );
-        let json_extract_policies = resolve_json_extract_policies(
+        // Syntax-verified expression shapes share one catalog-policy slot.
+        // A summary and a JSON extract have different parsers, but plan_for
+        // only receives Released / Masked / Opaque after unique attribution.
+        let expression_policies = resolve_expression_policies(
             inspection.as_ref(),
             fields.len(),
             &safety,
@@ -1051,8 +1040,7 @@ impl Session {
                 &FieldAnalysis {
                     safety: &safety,
                     lineage: &lineage_verdicts,
-                    summary: &summary_policies,
-                    json_extract: &json_extract_policies,
+                    expression: &expression_policies,
                     trust_provenance,
                 },
             )

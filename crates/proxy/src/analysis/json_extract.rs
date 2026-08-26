@@ -14,6 +14,7 @@ use pg_query::protobuf::{Node, SelectStmt};
 
 use super::safety::unwrap_star_over_subquery;
 use super::StatementInspection;
+pub use crate::json_path::JsonPathNavigation;
 
 mod parse;
 use parse::parse_extract;
@@ -22,10 +23,13 @@ use parse::parse_extract;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonExtractPathSegment {
     pub value: String,
-    /// `true` only when the SQL operand was an integer (`payload->0`) or a
-    /// digit-only `#>` element. Object key `"0"` from `payload->'0'` stays
-    /// `false`, so an array wildcard cannot claim it.
-    pub array_index: bool,
+    /// What the SQL syntax proves about navigation at this segment.
+    ///
+    /// `#>` and `jsonb_extract_path` take text paths whose digit segments mean
+    /// an array index only when the runtime parent is an array. Analysis does
+    /// not have that value, so it records [`JsonPathNavigation::Ambiguous`]
+    /// rather than letting syntax guess which pointer wildcard applies.
+    pub navigation: JsonPathNavigation,
 }
 
 /// How the extract named its source column.

@@ -32,6 +32,13 @@
 - Split JSON masking, extract parsing, extract policy, and catalog pointer
   validation into their own modules so those seams stay reviewable as the
   walker and allowlist grow.
+- Keep SQL attribution separate from JSON navigation. Integer `-> 0` is proven
+  array navigation; quoted keys are object navigation; text-path segments from
+  `#>` / `#>>` and `json[b]_extract_path[_text]` remain ambiguous. An ambiguous
+  segment that could enter a `*` policy now refuses instead of letting a
+  numeric object key inherit an array-only release. Summaries and JSON extracts
+  now enter `plan_for` through one resolved-expression policy slot rather than
+  a feature-specific fallback ladder.
 - Document JSON pointer inheritance, array wildcards, type placeholders, and
   which SQL shapes are served versus refused in `docs/json-masking.md`.
 - Support both pgwire formats. Text values are parsed directly; binary `jsonb`

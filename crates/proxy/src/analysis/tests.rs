@@ -1024,7 +1024,7 @@ fn json_extract_resolution_names_a_literal_path() {
             assert!(extract.as_text, "->> is text");
             assert_eq!(extract.column.column_name(), "payload");
             assert_eq!(extract.path[0].value, "public");
-            assert!(!extract.path[0].array_index);
+            assert_eq!(extract.path[0].navigation, JsonPathNavigation::ObjectKey);
         }
         JsonExtractArgument::Unattributable => panic!("expected extract"),
     }
@@ -1090,6 +1090,30 @@ fn json_extract_resolution_requires_schema_and_literal_keys() {
     assert!(!calls_untrusted_function(
         "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents"
     ));
+}
+
+#[test]
+fn json_extract_records_only_syntax_proven_array_navigation() {
+    let inspection = StatementInspection::new(
+        "SELECT payload->0, payload->'0', payload #> '{0}' FROM canary.documents",
+    );
+    let resolution = inspection.json_extract_resolution(3).unwrap();
+    let navigations = resolution
+        .fields()
+        .iter()
+        .map(|field| match field {
+            JsonExtractArgument::Extract(extract) => extract.path[0].navigation,
+            JsonExtractArgument::Unattributable => panic!("expected extract"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        navigations,
+        vec![
+            JsonPathNavigation::ArrayIndex,
+            JsonPathNavigation::ObjectKey,
+            JsonPathNavigation::Ambiguous,
+        ]
+    );
 }
 
 #[test]

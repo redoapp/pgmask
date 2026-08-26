@@ -8,7 +8,7 @@ use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{AExpr, FuncCall, Node};
 
 use super::super::names::{function_name, JSON_EXTRACT_FUNCTIONS};
-use super::{JsonExtract, JsonExtractColumn, JsonExtractPathSegment};
+use super::{JsonExtract, JsonExtractColumn, JsonExtractPathSegment, JsonPathNavigation};
 
 const MAX_EXTRACT_DEPTH: usize = 16;
 
@@ -86,7 +86,7 @@ fn parse_function_extract(call: &FuncCall, depth: usize) -> Option<JsonExtract> 
                     };
                     key_segments.push(JsonExtractPathSegment {
                         value: s.sval.clone(),
-                        array_index: false,
+                        navigation: JsonPathNavigation::Ambiguous,
                     });
                     break;
                 }
@@ -169,7 +169,7 @@ fn parse_single_key(expr: &NodeEnum) -> Option<JsonExtractPathSegment> {
     match constant.val.as_ref()? {
         pg_query::protobuf::a_const::Val::Sval(s) => Some(JsonExtractPathSegment {
             value: s.sval.clone(),
-            array_index: false,
+            navigation: JsonPathNavigation::ObjectKey,
         }),
         pg_query::protobuf::a_const::Val::Ival(i) => {
             if i.ival < 0 {
@@ -177,7 +177,7 @@ fn parse_single_key(expr: &NodeEnum) -> Option<JsonExtractPathSegment> {
             }
             Some(JsonExtractPathSegment {
                 value: i.ival.to_string(),
-                array_index: true,
+                navigation: JsonPathNavigation::ArrayIndex,
             })
         }
         _ => None,
@@ -226,8 +226,10 @@ fn parse_array_element(expr: &NodeEnum) -> Option<JsonExtractPathSegment> {
             .and_then(|arg| arg.node.as_ref())
             .and_then(parse_array_element),
         NodeEnum::AConst(_) => parse_single_key(expr).map(|mut segment| {
-            segment.array_index =
-                segment.value.bytes().all(|b| b.is_ascii_digit()) && !segment.value.is_empty();
+            // Every `#>` operand is text[]. Even a digit selects an object key
+            // when its runtime parent is an object, so syntax cannot promote
+            // it to an array wildcard.
+            segment.navigation = JsonPathNavigation::Ambiguous;
             segment
         }),
         _ => None,
@@ -252,10 +254,9 @@ fn parse_postgres_array_literal(text: &str) -> Option<Vec<JsonExtractPathSegment
         if value.is_empty() {
             return None;
         }
-        let array_index = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
         out.push(JsonExtractPathSegment {
             value: value.to_string(),
-            array_index,
+            navigation: JsonPathNavigation::Ambiguous,
         });
     }
     Some(out)

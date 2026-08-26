@@ -113,7 +113,7 @@ pub use hostile::{
 };
 pub use json_extract::{
     JsonExtract, JsonExtractArgument, JsonExtractColumn, JsonExtractPathSegment,
-    JsonExtractResolution, QualifiedFrom,
+    JsonExtractResolution, JsonPathNavigation, QualifiedFrom,
 };
 pub use safety::{analyze, Relaxations, Safety};
 

@@ -234,6 +234,9 @@ async fn json_extracts_constructors_and_set_operations_cannot_leak() -> Result<(
         // backend serializes the object, so child masks cannot be applied.
         "SELECT payload->>'profile' FROM canary.documents",
         "SELECT payload #>> '{profile}' FROM canary.documents",
+        // A text[] path does not reveal whether `0` is an array index or an
+        // object key. It must not select the permissive `/items/*` policy.
+        "SELECT payload #>> '{items,0,token}' FROM canary.documents",
     ] {
         client.simple_query(sql).await?;
         assert_refused(&client, sql);
@@ -286,6 +289,17 @@ async fn json_extracts_with_literal_paths_are_masked() -> Result<()> {
         "partial email extract: {email_text}"
     );
     assert_no_canary(&client, "chained JSON email extract");
+
+    let array_token = client
+        .simple_query("SELECT payload->'items'->0->>'token' FROM canary.documents")
+        .await?;
+    assert_served(&array_token, "integer array extract");
+    assert!(
+        client.received_text().contains("***"),
+        "{}",
+        client.received_text()
+    );
+    assert_no_canary(&client, "proven array wildcard extract");
 
     let hash = client
         .simple_query("SELECT payload #>> '{profile,email}' FROM canary.documents")

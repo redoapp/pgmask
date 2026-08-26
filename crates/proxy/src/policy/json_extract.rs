@@ -2,42 +2,15 @@
 //!
 //! Syntax lives in `analysis::json_extract`. This module is the catalog half:
 //! unique owner, classified source, then a pointer-prefixed [`MaskSpec`]. A
-//! missing path must not look like a release — same shape as [`super::SummaryPolicy`].
+//! missing path must not look like a release — same state machine as summaries.
 
 use std::collections::HashSet;
 
 use crate::analysis::{self, Safety};
 use crate::catalog::Snapshot;
-use crate::mask::MaskSpec;
+use crate::mask::JsonPathNavigation;
 
-use super::FieldAnalysis;
-
-/// Attribution for one JSON extract field. Parallel to [`SummaryPolicy`]: a
-/// missing path must not look like a release.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum JsonExtractPolicy {
-    NotApplicable,
-    Opaque,
-    Released,
-    Masked(MaskSpec),
-}
-
-impl FieldAnalysis<'_> {
-    /// The JSON-extract policy for `index`.
-    ///
-    /// Gated on [`Safety::JsonExtract`]: an expression that merely *contains* a
-    /// JSON operator is not enough. The source must be one schema-qualified
-    /// classified column and the path a sequence of literals.
-    pub(crate) fn json_extract_policy_for(&self, index: usize) -> JsonExtractPolicy {
-        if self.safety.get(index) != Some(&Safety::JsonExtract) {
-            return JsonExtractPolicy::NotApplicable;
-        }
-        self.json_extract
-            .get(index)
-            .cloned()
-            .unwrap_or(JsonExtractPolicy::Opaque)
-    }
-}
+use super::ExpressionPolicy;
 
 /// Resolve every result field to one JSON-extract policy state.
 ///
@@ -50,18 +23,18 @@ pub(crate) fn resolve_json_extract_policies(
     safety: &[Safety],
     snapshot: &Snapshot,
     roles: &HashSet<String>,
-) -> Vec<JsonExtractPolicy> {
+) -> Vec<ExpressionPolicy> {
     let resolution = inspection.and_then(|value| value.json_extract_resolution(field_count));
     (0..field_count)
         .map(|index| {
             if safety.get(index) != Some(&Safety::JsonExtract) {
-                return JsonExtractPolicy::NotApplicable;
+                return ExpressionPolicy::NotApplicable;
             }
             let Some(resolution) = resolution.as_ref() else {
-                return JsonExtractPolicy::Opaque;
+                return ExpressionPolicy::Opaque;
             };
             let Some(argument) = resolution.fields().get(index) else {
-                return JsonExtractPolicy::Opaque;
+                return ExpressionPolicy::Opaque;
             };
             resolve_json_extract_source(snapshot, resolution.relations(), argument, roles)
         })
@@ -73,33 +46,33 @@ fn resolve_json_extract_source(
     relations: &[analysis::QualifiedFrom],
     argument: &analysis::JsonExtractArgument,
     roles: &HashSet<String>,
-) -> JsonExtractPolicy {
+) -> ExpressionPolicy {
     let analysis::JsonExtractArgument::Extract(extract) = argument else {
-        return JsonExtractPolicy::Opaque;
+        return ExpressionPolicy::Opaque;
     };
     let Some(owner) = unique_extract_owner(snapshot, relations, &extract.column) else {
-        return JsonExtractPolicy::Opaque;
+        return ExpressionPolicy::Opaque;
     };
     let qualified = owner.qualified_name();
     let column = extract.column.column_name();
     let Some(classification) = snapshot.lookup_by_name(&qualified, column) else {
-        return JsonExtractPolicy::Opaque;
+        return ExpressionPolicy::Opaque;
     };
     let spec = classification.for_roles(roles);
     if spec.is_passthrough() {
-        return JsonExtractPolicy::Released;
+        return ExpressionPolicy::Released;
     }
-    let path: Vec<(String, bool)> = extract
+    let path: Vec<(String, JsonPathNavigation)> = extract
         .path
         .iter()
-        .map(|segment| (segment.value.clone(), segment.array_index))
+        .map(|segment| (segment.value.clone(), segment.navigation))
         .collect();
     let planned = if extract.as_text {
         spec.for_json_text_extract(&path)
     } else {
         spec.for_json_document_extract(&path)
     };
-    planned.map_or(JsonExtractPolicy::Opaque, JsonExtractPolicy::Masked)
+    planned.map_or(ExpressionPolicy::Opaque, ExpressionPolicy::Masked)
 }
 
 fn unique_extract_owner<'a>(

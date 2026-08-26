@@ -28,6 +28,7 @@ use sha2::Sha256;
 use crate::protocol::is_text_family;
 
 mod json;
+pub(crate) use crate::json_path::JsonPathNavigation;
 pub(crate) use json::JsonPathSegment;
 use json::JsonPolicyTrie;
 pub use json::{

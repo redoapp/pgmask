@@ -72,6 +72,13 @@ pointers and equally-specific overlapping wildcards (`/items/*/id` together
 with `/items/0/*`) are startup errors: config order must not decide a
 disclosure.
 
+Array wildcards require runtime array evidence. A document walk has the actual
+parent value, and `payload->0` uses PostgreSQL's integer array operator. Text
+paths (`#>` / `#>>` and `json[b]_extract_path[_text]`) do not distinguish array
+index `0` from object key `"0"`. If such a segment could enter a `*` pointer
+branch, pgmask refuses the extract rather than guess. Use an integer `-> 0`
+step when traversing a configured array wildcard.
+
 ## Unmatched leaves
 
 When no pointer and no inherited parent policy apply, `json_unmatched`

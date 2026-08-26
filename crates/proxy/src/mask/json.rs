@@ -12,6 +12,8 @@ use bytes::{Bytes, BytesMut};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
+use crate::json_path::JsonPathNavigation;
+
 use super::{
     Mask, MaskError, MaskSpec, Masker, FORMAT_BINARY, FORMAT_TEXT, OID_BOOL, OID_JSONB, OID_NUMERIC,
 };
@@ -47,10 +49,7 @@ pub enum JsonUnmatched {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JsonPathSegment {
     value: String,
-    /// `*` is a wildcard only here. In an object it remains the literal key
-    /// `"*"`, so adding array policies does not make any object key
-    /// unaddressable.
-    array_index: bool,
+    navigation: JsonPathNavigation,
 }
 
 impl JsonFieldSpec {
@@ -147,26 +146,53 @@ impl JsonPolicyTrie {
             .any(|node| !node.children.is_empty())
     }
 
+    /// Whether a text path could enter an array-wildcard branch depending on
+    /// the runtime JSON shape. The proxy does not have the parent value when it
+    /// plans an extract, so choosing that branch would make SQL syntax decide a
+    /// disclosure. Refusal is the only shape-independent answer.
+    fn has_ambiguous_wildcard(&self, path: &[JsonPathSegment]) -> bool {
+        let mut states = vec![&self.root];
+        for segment in path {
+            if segment.navigation == JsonPathNavigation::Ambiguous
+                && states.iter().any(|node| node.children.contains_key("*"))
+            {
+                return true;
+            }
+            states = Self::next_states(states, segment);
+            if states.is_empty() {
+                break;
+            }
+        }
+        false
+    }
+
     fn states_at<'a>(&'a self, path: &[JsonPathSegment]) -> Vec<&'a JsonPolicyNode> {
         let mut states = vec![&self.root];
         for segment in path {
-            let mut next = Vec::with_capacity(states.len().saturating_mul(2));
-            for node in states {
-                if let Some(exact) = node.children.get(&segment.value) {
-                    next.push(exact);
-                }
-                if segment.array_index {
-                    if let Some(wildcard) = node.children.get("*") {
-                        next.push(wildcard);
-                    }
-                }
-            }
-            states = next;
+            states = Self::next_states(states, segment);
             if states.is_empty() {
                 break;
             }
         }
         states
+    }
+
+    fn next_states<'a>(
+        states: Vec<&'a JsonPolicyNode>,
+        segment: &JsonPathSegment,
+    ) -> Vec<&'a JsonPolicyNode> {
+        let mut next = Vec::with_capacity(states.len().saturating_mul(2));
+        for node in states {
+            if let Some(exact) = node.children.get(&segment.value) {
+                next.push(exact);
+            }
+            if segment.navigation == JsonPathNavigation::ArrayIndex {
+                if let Some(wildcard) = node.children.get("*") {
+                    next.push(wildcard);
+                }
+            }
+        }
+        next
     }
 }
 
@@ -182,12 +208,21 @@ impl MaskSpec {
     /// The stored document's pointer table is kept; the walk starts at `path`
     /// so child overrides still apply. `path` must not be empty — the full
     /// column is the ordinary `Mask::Json` plan.
-    pub(crate) fn for_json_document_extract(&self, path: &[(String, bool)]) -> Option<Self> {
+    pub(crate) fn for_json_document_extract(
+        &self,
+        path: &[(String, JsonPathNavigation)],
+    ) -> Option<Self> {
         if self.kind != Mask::Json || path.is_empty() {
             return None;
         }
         let mut spec = self.clone();
         spec.json_path_prefix = path_segments(path);
+        if self
+            .json_trie
+            .has_ambiguous_wildcard(&spec.json_path_prefix)
+        {
+            return None;
+        }
         Some(spec)
     }
 
@@ -197,12 +232,17 @@ impl MaskSpec {
     /// the node. A path with any more-specific pointer therefore refuses
     /// rather than apply `none` to a blob that still contains masked leaves.
     /// Unmatched paths become SQL NULL, matching the default JSON leaf.
-    pub(crate) fn for_json_text_extract(&self, path: &[(String, bool)]) -> Option<Self> {
+    pub(crate) fn for_json_text_extract(
+        &self,
+        path: &[(String, JsonPathNavigation)],
+    ) -> Option<Self> {
         if self.kind != Mask::Json || path.is_empty() {
             return None;
         }
         let segments = path_segments(path);
-        if self.json_trie.has_descendants_at(&segments) {
+        if self.json_trie.has_ambiguous_wildcard(&segments)
+            || self.json_trie.has_descendants_at(&segments)
+        {
             return None;
         }
         match self.policy_along(&segments) {
@@ -296,7 +336,7 @@ impl Masker {
                 for (key, child) in map {
                     path.push(JsonPathSegment {
                         value: key.clone(),
-                        array_index: false,
+                        navigation: JsonPathNavigation::ObjectKey,
                     });
                     self.mask_json_node(json_spec, path, policy, child)?;
                     path.pop();
@@ -307,7 +347,7 @@ impl Masker {
                 for (index, child) in values.iter_mut().enumerate() {
                     path.push(JsonPathSegment {
                         value: index.to_string(),
-                        array_index: true,
+                        navigation: JsonPathNavigation::ArrayIndex,
                     });
                     self.mask_json_node(json_spec, path, policy, child)?;
                     path.pop();
@@ -442,11 +482,11 @@ fn json_nesting_exceeds(bytes: &[u8], max_depth: usize) -> bool {
     false
 }
 
-fn path_segments(path: &[(String, bool)]) -> Arc<[JsonPathSegment]> {
+fn path_segments(path: &[(String, JsonPathNavigation)]) -> Arc<[JsonPathSegment]> {
     path.iter()
-        .map(|(value, array_index)| JsonPathSegment {
+        .map(|(value, navigation)| JsonPathSegment {
             value: value.clone(),
-            array_index: *array_index,
+            navigation: *navigation,
         })
         .collect::<Vec<_>>()
         .into()
@@ -467,8 +507,8 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::{
-        json_nesting_exceeds, JsonFieldSpec, JsonLimit, JsonUnmatched, Mask, MaskError, MaskSpec,
-        Masker, FORMAT_BINARY, FORMAT_TEXT, OID_JSONB,
+        json_nesting_exceeds, JsonFieldSpec, JsonLimit, JsonPathNavigation, JsonUnmatched, Mask,
+        MaskError, MaskSpec, Masker, FORMAT_BINARY, FORMAT_TEXT, OID_JSONB,
     };
     use crate::mask::OID_JSON;
     use bytes::Bytes;
@@ -684,7 +724,7 @@ mod tests {
                 ("/profile/name", MaskSpec::new(Mask::Redact)),
             ],
         )
-        .for_json_document_extract(&[("profile".into(), false)])
+        .for_json_document_extract(&[("profile".into(), JsonPathNavigation::ObjectKey)])
         .unwrap();
         let output = apply_json(
             &spec,
@@ -712,12 +752,46 @@ mod tests {
             ],
         );
         assert!(spec
-            .for_json_text_extract(&[("profile".into(), false)])
+            .for_json_text_extract(&[("profile".into(), JsonPathNavigation::ObjectKey)])
             .is_none());
         let leaf = spec
-            .for_json_text_extract(&[("profile".into(), false), ("email".into(), false)])
+            .for_json_text_extract(&[
+                ("profile".into(), JsonPathNavigation::ObjectKey),
+                ("email".into(), JsonPathNavigation::ObjectKey),
+            ])
             .unwrap();
         assert_eq!(leaf.kind, Mask::Redact);
+    }
+
+    #[test]
+    fn ambiguous_text_paths_never_choose_an_array_wildcard() {
+        let spec = json_spec(
+            Mask::Null,
+            vec![("/items/*/token", MaskSpec::new(Mask::None))],
+        );
+        let ambiguous = [
+            ("items".into(), JsonPathNavigation::Ambiguous),
+            ("0".into(), JsonPathNavigation::Ambiguous),
+            ("token".into(), JsonPathNavigation::Ambiguous),
+        ];
+        assert!(
+            spec.for_json_text_extract(&ambiguous).is_none(),
+            "#> text paths cannot prove that numeric object keys are array indices"
+        );
+        assert!(
+            spec.for_json_document_extract(&ambiguous).is_none(),
+            "a document prefix must not guess which wildcard branch to inherit"
+        );
+
+        let proven = [
+            ("items".into(), JsonPathNavigation::ObjectKey),
+            ("0".into(), JsonPathNavigation::ArrayIndex),
+            ("token".into(), JsonPathNavigation::ObjectKey),
+        ];
+        assert_eq!(
+            spec.for_json_text_extract(&proven).unwrap().kind,
+            Mask::None
+        );
     }
 
     #[test]
