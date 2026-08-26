@@ -347,6 +347,26 @@ pub struct ProxyHandle {
     pub metrics: Arc<pgmask::metrics::Metrics>,
 }
 
+struct TestPolicy {
+    unclassified: Unclassified,
+    opaque: Opaque,
+    roles: Vec<pgmask::catalog::Role>,
+    lineage: Lineage,
+    posture: pgmask::catalog::Posture,
+}
+
+impl Default for TestPolicy {
+    fn default() -> Self {
+        Self {
+            unclassified: Unclassified::Mask,
+            opaque: Opaque::Reject,
+            roles: Vec::new(),
+            lineage: Lineage::Refuse,
+            posture: pgmask::catalog::Posture::Default,
+        }
+    }
+}
+
 /// A proxy where the connecting principal *is* a member of `role`.
 ///
 /// The other half of a role test: without it, "the value did not come through"
@@ -393,11 +413,10 @@ pub async fn start_proxy_with_roles(
         &backend,
         db,
         rules,
-        Unclassified::Mask,
-        Opaque::Reject,
-        roles,
-        Lineage::Refuse,
-        pgmask::catalog::Posture::Default,
+        TestPolicy {
+            roles,
+            ..Default::default()
+        },
     )
     .await
 }
@@ -415,11 +434,11 @@ pub async fn start_proxy_at(
         backend,
         db,
         rules,
-        unclassified,
-        opaque,
-        Vec::new(),
-        Lineage::Refuse,
-        pgmask::catalog::Posture::Default,
+        TestPolicy {
+            unclassified,
+            opaque,
+            ..Default::default()
+        },
     )
     .await
 }
@@ -432,11 +451,10 @@ pub async fn start_proxy_allowing_lineage(db: &str, rules: Vec<ColumnRule>) -> R
         &backend,
         db,
         rules,
-        Unclassified::Mask,
-        Opaque::Reject,
-        Vec::new(),
-        Lineage::Allow,
-        pgmask::catalog::Posture::Default,
+        TestPolicy {
+            lineage: Lineage::Allow,
+            ..Default::default()
+        },
     )
     .await
 }
@@ -447,24 +465,19 @@ pub async fn start_proxy_hostile(db: &str, rules: Vec<ColumnRule>) -> Result<Pro
         &backend,
         db,
         rules,
-        Unclassified::Mask,
-        Opaque::Reject,
-        Vec::new(),
-        Lineage::Refuse,
-        pgmask::catalog::Posture::Hostile,
+        TestPolicy {
+            posture: pgmask::catalog::Posture::Hostile,
+            ..Default::default()
+        },
     )
     .await
 }
 
-pub async fn start_proxy_at_full(
+async fn start_proxy_at_full(
     backend: &str,
     db: &str,
     rules: Vec<ColumnRule>,
-    unclassified: Unclassified,
-    opaque: Opaque,
-    roles: Vec<pgmask::catalog::Role>,
-    lineage: Lineage,
-    posture: pgmask::catalog::Posture,
+    policy: TestPolicy,
 ) -> Result<ProxyHandle> {
     let backend = backend.to_string();
     let config = Config {
@@ -472,12 +485,12 @@ pub async fn start_proxy_at_full(
         backend: backend.clone(),
         catalog_dsn: backend_dsn(db),
         pseudonym_key: "test-key-long-enough".into(),
-        unclassified,
+        unclassified: policy.unclassified,
         unclassified_mask: Default::default(),
-        opaque,
+        opaque: policy.opaque,
         column: rules,
         semantic_type: Vec::new(),
-        role: roles,
+        role: policy.roles,
         tls_cert: None,
         tls_key: None,
         // No certificate, so nothing to require: these harnesses drive a raw
@@ -490,9 +503,9 @@ pub async fn start_proxy_at_full(
         catalog_refresh_min_seconds: 1,
         metrics_interval_seconds: 0,
         summaries: pgmask::catalog::Summaries::Allow,
-        posture,
+        posture: policy.posture,
         system_catalogs: SystemCatalogs::Refuse,
-        lineage,
+        lineage: policy.lineage,
         metrics_listen: None,
         rate_limit_per_minute: 0,
         rate_limit_burst: 0,
