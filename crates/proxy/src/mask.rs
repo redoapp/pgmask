@@ -1769,6 +1769,34 @@ mod tests {
     }
 
     #[test]
+    fn json_array_wildcard_has_no_index_horizon() {
+        let mut spec = json_spec(
+            Mask::Null,
+            vec![("/items/*/account_id", MaskSpec::new(Mask::Redact))],
+        );
+        spec.json_default = None;
+        spec.json_type_placeholders = true;
+        let input = serde_json::json!({
+            "items": (0..512)
+                .map(|index| serde_json::json!({
+                    "account_id": format!("secret-{index}"),
+                    "sequence": index,
+                    "active": true
+                }))
+                .collect::<Vec<_>>()
+        });
+        let encoded = serde_json::to_vec(&input).unwrap();
+        let output = apply_json(&spec, OID_JSONB, FORMAT_TEXT, &encoded);
+        let items = output["items"].as_array().unwrap();
+        assert_eq!(items.len(), 512);
+        for item in items {
+            assert_eq!(item["account_id"], "***");
+            assert_eq!(item["sequence"], 0);
+            assert_eq!(item["active"], false);
+        }
+    }
+
+    #[test]
     fn jsonb_binary_version_and_nested_policy_round_trip() {
         let spec = json_spec(Mask::Null, vec![("/email", MaskSpec::new(Mask::Redact))]);
         let mut input = vec![1];
