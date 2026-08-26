@@ -395,9 +395,18 @@ async fn json_sql_surface_is_useful_without_guessing_provenance_or_shape() -> Re
          WHERE payload @> '{\"public\":\"Portland\"}'",
     ] {
         let messages = client.simple_query(sql).await?;
-        assert_served(&messages, sql);
+        assert!(
+            messages.iter().any(|message| message.tag == b'D'),
+            "{sql}: expected rows, got {}",
+            client.received_text()
+        );
         assert_no_canary(&client, sql);
     }
+
+    // Make the unqualified relation real on this backend session. Otherwise
+    // PostgreSQL's own undefined-table error would pass the no-canary check
+    // without exercising pgmask's search_path refusal.
+    client.simple_query("SET search_path = canary").await?;
 
     for sql in [
         // Source ownership is unresolved.

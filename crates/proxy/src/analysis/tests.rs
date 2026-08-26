@@ -1045,6 +1045,20 @@ fn json_extract_resolution_names_a_literal_path() {
 }
 
 #[test]
+fn collated_json_extract_keeps_the_same_shape_and_attribution() {
+    let inspection =
+        StatementInspection::new("SELECT (payload->>'public') COLLATE \"C\" FROM canary.documents");
+    assert_eq!(
+        inspection.output_safety(1, ALLOW_ALL),
+        vec![Safety::JsonExtract]
+    );
+    assert!(matches!(
+        inspection.json_extract_resolution(1).unwrap().fields(),
+        [JsonExtractArgument::Extract(_)]
+    ));
+}
+
+#[test]
 fn json_extract_resolution_requires_schema_and_literal_keys() {
     assert!(
         StatementInspection::new("SELECT payload->>'x' FROM documents")

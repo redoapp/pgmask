@@ -355,6 +355,15 @@ fn classify(expr: &NodeEnum, allow: Relaxations) -> Safety {
             Some(inner) => classify(inner, allow),
             None => Safety::Unknown,
         },
+        // Collation changes comparison/sort semantics, not the projected
+        // bytes. Keep it aligned with the extract/summary parsers, which both
+        // peel this wrapper before attributing the source.
+        NodeEnum::CollateClause(collate) => {
+            match collate.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                Some(inner) => classify(inner, allow),
+                None => Safety::Unknown,
+            }
+        }
 
         NodeEnum::FuncCall(call) => {
             if super::json_extract::expr_is_json_extract(expr) {

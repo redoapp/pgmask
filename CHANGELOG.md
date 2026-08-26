@@ -46,6 +46,11 @@
   and document operators, function forms, aliases, joins, views, wrappers,
   binary results, ambiguous text paths, CTEs/subqueries, reshaping, set
   operations, and hostile-posture predicate refusal.
+- Align the outer safety classifier with extract attribution for `COLLATE`.
+  The extract parser already peeled a collation wrapper, but `classify` did
+  not, so a valid `(payload->>'public') COLLATE "C"` projection was refused
+  despite having the same output bytes and source policy. The live SQL matrix
+  found and now pins that cross-layer drift.
 - Document JSON pointer inheritance, array wildcards, type placeholders, and
   which SQL shapes are served versus refused in `docs/json-masking.md`.
 - Support both pgwire formats. Text values are parsed directly; binary `jsonb`
