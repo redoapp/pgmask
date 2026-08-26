@@ -84,6 +84,9 @@ enum Op {
     ErrorResponse,
     /// CommandComplete: one result set ended.
     ResultSetEnd,
+    /// PortalSuspended: the streaming Execute paused; the next DataRows may
+    /// belong to a different already-queued portal.
+    PortalSuspended,
     /// EmptyQueryResponse: one *empty simple query's* result ended, with no
     /// RowDescription of its own.
     EmptyQueryResponse,
@@ -95,6 +98,10 @@ enum Op {
     ReadyForQuery {
         epoch: u8,
     },
+    /// Backend ReadyForQuery Idle: implicit transaction ended.
+    ReadyForQueryIdle,
+    /// Backend ReadyForQuery InTxn: BEGIN keeps a suspended portal.
+    ReadyForQueryInTxn,
     ClearActive,
     /// A catalog refresh landing between two messages.
     CatalogRefresh {
@@ -133,10 +140,13 @@ fuzz_target!(|ops: Vec<Op>| {
             Op::DiscardDescription => model.discard_description(),
             Op::ErrorResponse => model.discard_failed_epoch(),
             Op::ResultSetEnd => model.finish_result_set(),
+            Op::PortalSuspended => model.suspend_result(),
             Op::EmptyQueryResponse => model.finish_empty_query(),
 
             Op::Reject => model.reject(),
             Op::ReadyForQuery { epoch } => model.finish_suppressed_epoch(epoch),
+            Op::ReadyForQueryIdle => model.ready_for_query(b'I'),
+            Op::ReadyForQueryInTxn => model.ready_for_query(b'T'),
             Op::ClearActive => model.clear_active(),
             Op::CatalogRefresh { generation } => model.invalidate_if_stale(generation),
         }

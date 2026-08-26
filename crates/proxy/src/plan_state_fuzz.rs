@@ -244,7 +244,26 @@ impl ProtocolModel {
 
     pub fn execute(&mut self, portal: u8) {
         let portal = name_of(portal);
+        let was_suspended = self.state.suspended;
+        let prior_owner = self.state.result_owner();
         self.state.execute(&bytes_of(portal));
+
+        if was_suspended {
+            if prior_owner.as_deref() != Some(portal.as_bytes()) {
+                assert_eq!(
+                    self.state.result_owner().as_deref(),
+                    Some(portal.as_bytes()),
+                    "step {}: Execute of {portal:?} after PortalSuspended left the \
+                     suspended portal as result owner — its plan would mask these rows",
+                    self.step
+                );
+            }
+            assert!(
+                !self.state.suspended,
+                "step {}: Execute after PortalSuspended left the pause flag set",
+                self.step
+            );
+        }
 
         // The moment a plan is handed to a result set. Everything about "served
         // for something it was not described for" is decided here.
@@ -516,19 +535,166 @@ impl ProtocolModel {
         self.after_step();
     }
 
+    /// `PortalSuspended`: the streaming Execute paused.
+    ///
+    /// If another Execute is already queued, those DataRows belong to *that*
+    /// portal — Postgres runs it. The suspended owner must not still govern
+    /// the stream (0.1.97: stale all-passthrough plan, `unmasked_row`).
+    pub fn suspend_result(&mut self) {
+        let queued = self.state.pending_executes.len();
+        let before = self.state.result_owner();
+        self.state.suspend_result();
+        if queued > 1 {
+            assert_ne!(
+                self.state.result_owner(),
+                before,
+                "step {}: PortalSuspended with another Execute queued left the \
+                 suspended portal owning the next DataRows",
+                self.step
+            );
+            assert!(
+                !self.state.suspended,
+                "step {}: a later Execute is now streaming, so the pause flag \
+                 must be clear",
+                self.step
+            );
+        } else if queued == 1 {
+            assert!(
+                self.state.suspended,
+                "step {}: PortalSuspended of the only owner must mark the pause \
+                 so a later different portal cannot inherit it",
+                self.step
+            );
+            assert_eq!(self.state.result_owner(), before);
+        }
+        self.after_step();
+    }
+
     pub fn discard_description(&mut self) {
         self.state.discard_description();
         self.after_step();
     }
 
     /// An `ErrorResponse`.
+    /// Backend `ReadyForQuery` transaction status. Distinct from
+    /// [`ProtocolModel::finish_suppressed_epoch`], which ends a locally
+    /// refused exchange.
+    pub fn ready_for_query(&mut self, status: u8) {
+        let was_suspended = self.state.suspended;
+        let owner_before = self.state.result_owner();
+        self.state.ready_for_query(status);
+        if was_suspended && status == b'I' {
+            assert_eq!(
+                self.state.result_owner(),
+                None,
+                "step {}: ReadyForQuery Idle after PortalSuspended left the \
+                 destroyed portal as result owner — Postgres ended the \
+                 implicit transaction (H10a / H5b)",
+                self.step
+            );
+            assert!(
+                !self.state.suspended,
+                "step {}: ReadyForQuery Idle left the pause flag set",
+                self.step
+            );
+        }
+        if was_suspended && status == b'T' {
+            assert_eq!(
+                self.state.result_owner(),
+                owner_before,
+                "step {}: ReadyForQuery InTxn discarded the suspended portal \
+                 — BEGIN keeps it",
+                self.step
+            );
+            assert!(
+                self.state.suspended,
+                "step {}: ReadyForQuery InTxn cleared the pause flag",
+                self.step
+            );
+        }
+        self.after_step();
+    }
+
     pub fn discard_failed_epoch(&mut self) {
+        let execute_only = self.state.pending_descriptions.is_empty()
+            && self.state.pending_parses.is_empty()
+            && self.state.pending_binds.is_empty();
+        let was_suspended = self.state.suspended;
+        let owner_before = self.state.result_owner();
+        let owner_epoch = self
+            .state
+            .pending_executes
+            .front()
+            .map(|pending| pending.epoch);
+        let cmd_epoch = [
+            self.state
+                .pending_descriptions
+                .front()
+                .map(|pending| match pending {
+                    PendingDescription::Describe(pending) => pending.epoch,
+                    PendingDescription::Simple(pending) => pending.epoch,
+                }),
+            self.state
+                .pending_parses
+                .front()
+                .map(|pending| pending.epoch),
+            self.state
+                .pending_binds
+                .front()
+                .map(|pending| pending.epoch),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         self.state.discard_failed_epoch();
         assert!(
             !self.state.streaming_simple_result,
             "step {}: a backend error left a simple result streaming",
             self.step
         );
+        // Execute-only ErrorResponse (34000 after Sync destroyed a suspended
+        // named portal): the owner must not linger. A later portal would
+        // inherit its plan — sibling of 0.1.97, `unmasked_row`.
+        if execute_only {
+            if let Some(epoch) = owner_epoch {
+                assert!(
+                    self.state
+                        .pending_executes
+                        .iter()
+                        .all(|pending| pending.epoch != epoch),
+                    "step {}: ErrorResponse completed an Execute and left epoch \
+                     {epoch} owning the stream — a later portal would inherit \
+                     that plan",
+                    self.step
+                );
+            }
+            if owner_before.is_some() {
+                assert_ne!(
+                    self.state.result_owner(),
+                    owner_before,
+                    "step {}: ErrorResponse left the destroyed portal as result \
+                     owner — its plan would mask the next DataRows",
+                    self.step
+                );
+            }
+        }
+        // A later-epoch ErrorResponse (H10a Query 1/0, H5b 34000 on
+        // Describe) must not leave the paused owner. The resume-only
+        // stamp closed only A's own Execute.
+        if was_suspended {
+            if let (Some(owner_ep), Some(cmd_ep)) = (owner_epoch, cmd_epoch) {
+                if owner_ep < cmd_ep && owner_before.is_some() {
+                    assert_ne!(
+                        self.state.result_owner(),
+                        owner_before,
+                        "step {}: later-epoch ErrorResponse left the suspended \
+                         portal as result owner — a later portal would inherit \
+                         that plan (H10a / H5b)",
+                        self.step
+                    );
+                }
+            }
+        }
         self.after_step();
     }
 
@@ -582,7 +748,54 @@ impl ProtocolModel {
         self.check_described_sql();
         self.check_active_plan_is_real();
         self.check_epoch_ordering();
+        self.check_inflight_plan_survives_rebind();
         self.step += 1;
+    }
+
+    /// In-flight Execute rows must keep the plan snapshotted at Execute.
+    /// Bind of the same portal name overwrites `portal_plans`; looking that
+    /// map up by owner name is how classified DataRows took an all-passthrough
+    /// plan (`unmasked_row`).
+    fn check_inflight_plan_survives_rebind(&self) {
+        if self.state.streaming_simple_result {
+            return;
+        }
+        let Some(pending) = self.state.pending_executes.front() else {
+            return;
+        };
+        if let Some(ref snap) = pending.plan {
+            let Some(streaming) = self.state.streaming_plan() else {
+                panic!(
+                    "step {}: in-flight Execute has a snapshotted plan but \
+                     streaming_plan is None — those DataRows would be refused \
+                     or, worse, judged with a later Bind's plan",
+                    self.step
+                );
+            };
+            let snap_id = snap.first().map(|field| field.type_oid);
+            let stream_id = streaming.first().map(|field| field.type_oid);
+            assert_eq!(
+                stream_id, snap_id,
+                "step {}: streaming_plan used plan {stream_id:?} for in-flight \
+                 rows snapshotted as {snap_id:?} — a later Bind of portal {:?} \
+                 must not replace that plan",
+                self.step, pending.name
+            );
+        } else if pending.bind_generation != self.state.bind_generation(&pending.name) {
+            if let Some(streaming) = self.state.streaming_plan() {
+                let current = self.state.portal_plan(&pending.name);
+                let stream_id = streaming.first().map(|field| field.type_oid);
+                let current_id = current.and_then(|plan| plan.first().map(|field| field.type_oid));
+                assert_ne!(
+                    stream_id, current_id,
+                    "step {}: in-flight Execute of {:?} has no snapshot and a \
+                     stale bind generation, but streaming_plan is the rebound \
+                     portal's plan {stream_id:?} — those DataRows would take \
+                     unmasked_row under the new plan",
+                    self.step, pending.name
+                );
+            }
+        }
     }
 
     /// **The disclosure invariant.**
@@ -887,8 +1100,11 @@ mod tests {
         model.describe_portal(1);
         model.finish_no_data();
         model.execute(1);
+        model.suspend_result();
         model.finish_result_set();
         model.sync();
+        model.ready_for_query(b'I');
+        model.ready_for_query(b'T');
         model.describe_statement(0);
         model.discard_description();
         model.describe_statement(0);
@@ -959,5 +1175,145 @@ mod tests {
         model.finish_result_set();
         assert!(model.state.pending_descriptions.is_empty());
         assert_eq!(model.state.result_owner().as_deref(), Some(&b"a"[..]));
+    }
+
+    /// The 0.1.97 disclosure, as the fuzzer must be able to see it: after
+    /// PortalSuspended, Execute of a different portal must own the stream.
+    #[test]
+    fn a_different_portal_after_suspend_owns_the_stream() {
+        let mut model = ProtocolModel::new();
+        model.parse(1, 0);
+        model.describe_statement(1);
+        model.finish_description(1);
+        model.bind(1, 1, None);
+        model.execute(1);
+        model.suspend_result();
+        model.parse(2, 1);
+        model.describe_statement(2);
+        model.finish_description(1);
+        model.bind(2, 2, None);
+        model.execute(2);
+        assert_eq!(model.state.result_owner().as_deref(), Some(&b"b"[..]));
+    }
+
+    /// Sibling of 0.1.97: resume after Sync, ErrorResponse, next portal.
+    /// The destroyed portal must not still own the stream.
+    #[test]
+    fn a_failed_resume_after_sync_does_not_leave_a_zombie_owner() {
+        let mut model = ProtocolModel::new();
+        model.parse(1, 0);
+        model.describe_statement(1);
+        model.finish_description(1);
+        model.finish_parse();
+        model.bind(1, 1, None);
+        model.finish_bind();
+        model.execute(1);
+        model.suspend_result();
+        model.sync();
+        model.execute(1);
+        model.discard_failed_epoch();
+        assert_eq!(model.state.result_owner(), None);
+        assert!(model.state.streaming_plan().is_none());
+        model.parse(2, 1);
+        model.describe_statement(2);
+        model.finish_description(1);
+        model.bind(2, 2, None);
+        model.execute(2);
+        assert_eq!(model.state.result_owner().as_deref(), Some(&b"b"[..]));
+    }
+
+    /// H10a as the fuzzer must see it: ReadyForQuery Idle after suspend
+    /// discards the owner; a later-epoch error must not restore it.
+    #[test]
+    fn a_later_epoch_error_after_suspend_idle_does_not_leave_a_zombie_owner() {
+        let mut model = ProtocolModel::new();
+        model.parse(1, 0);
+        model.describe_statement(1);
+        model.finish_description(1);
+        model.finish_parse();
+        model.bind(1, 1, None);
+        model.finish_bind();
+        model.execute(1);
+        model.suspend_result();
+        model.sync();
+        model.ready_for_query(b'I');
+        assert_eq!(model.state.result_owner(), None);
+        model.simple_query(Some(0));
+        model.discard_failed_epoch();
+        assert_eq!(model.state.result_owner(), None);
+        model.parse(2, 1);
+        model.describe_statement(2);
+        model.finish_description(1);
+        model.bind(2, 2, None);
+        model.execute(2);
+        assert_eq!(model.state.result_owner().as_deref(), Some(&b"b"[..]));
+    }
+
+    /// BEGIN; suspend; ReadyForQuery InTxn keeps the owner.
+    #[test]
+    fn ready_for_query_in_txn_keeps_the_suspended_owner() {
+        let mut model = ProtocolModel::new();
+        model.parse(1, 0);
+        model.describe_statement(1);
+        model.finish_description(1);
+        model.bind(1, 1, None);
+        model.execute(1);
+        model.suspend_result();
+        model.sync();
+        model.ready_for_query(b'T');
+        assert_eq!(model.state.result_owner().as_deref(), Some(&b"a"[..]));
+        model.parse(2, 1);
+        model.describe_statement(2);
+        model.finish_description(1);
+        model.bind(2, 2, None);
+        model.execute(2);
+        assert_eq!(model.state.result_owner().as_deref(), Some(&b"b"[..]));
+    }
+
+    /// Bind/Execute classified then Bind/Execute passthrough on the *same*
+    /// portal in one Sync must not judge the first DataRows with the second
+    /// plan. The 0.1.97 sibling without PortalSuspended.
+    #[test]
+    fn rebind_of_the_same_portal_does_not_replace_the_inflight_plan() {
+        let mut model = ProtocolModel::new();
+        model.parse(1, 0);
+        model.describe_statement(1);
+        model.finish_description(1);
+        model.parse(2, 1);
+        model.describe_statement(2);
+        model.finish_description(1);
+        model.bind(1, 1, None);
+        model.execute(1);
+        let first = model
+            .state
+            .streaming_plan()
+            .and_then(|plan| plan.first().map(|field| field.type_oid));
+        model.bind(1, 2, None);
+        assert_eq!(
+            model
+                .state
+                .streaming_plan()
+                .and_then(|plan| plan.first().map(|field| field.type_oid)),
+            first,
+            "Bind of the same portal must not replace the in-flight Execute's plan"
+        );
+        model.execute(1);
+        assert_eq!(
+            model
+                .state
+                .streaming_plan()
+                .and_then(|plan| plan.first().map(|field| field.type_oid)),
+            first,
+            "the second Execute is a new owner, queued behind the first"
+        );
+        model.finish_result_set();
+        let second = model
+            .state
+            .streaming_plan()
+            .and_then(|plan| plan.first().map(|field| field.type_oid));
+        assert_ne!(
+            second, first,
+            "classified in-flight rows must not leave the passthrough plan as owner"
+        );
     }
 }

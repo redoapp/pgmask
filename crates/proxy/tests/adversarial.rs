@@ -176,6 +176,345 @@ async fn suspended_and_resumed_portals_stay_masked() -> Result<()> {
     Ok(())
 }
 
+/// After PortalSuspended, a *different* named portal's DataRows must not
+/// inherit the paused plan.
+///
+/// Measured live on the GUI catalog: `Execute` of
+/// `SELECT ship_city, id …` with `max_rows=1` (released columns), then
+/// `SELECT email, name …` (same arity) served `user1@example.com` through
+/// `Vetted::unmasked_row`. The proxy still named the suspended portal as
+/// `streaming_plan`. Postgres does run the second portal; the comment that
+/// it refuses was wrong. Same leak for binary Bind, a same-Sync pipeline,
+/// and a mixed plan (only the passthrough slots).
+///
+/// Either a masked row or a `pgmask:` refusal is fail-closed. Cleartext
+/// canaries are not.
+#[tokio::test]
+async fn a_different_portal_after_suspend_does_not_inherit_the_stale_plan() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    // Sequential Sync: the GUI repro. Passthrough city,id then classified
+    // email,name — same arity, so a stale all-passthrough plan forwards the
+    // second row unchanged.
+    client
+        .send(parse_msg(
+            "s1",
+            "SELECT city, id FROM canary.subjects ORDER BY id",
+        ))
+        .await?;
+    client.send(describe_statement("s1")).await?;
+    client.send(bind_msg("p1", "s1")).await?;
+    client.send(execute_msg("p1", 1)).await?;
+    client.send(sync_msg()).await?;
+    let _ = client.read_until_ready_or_eof().await?;
+
+    client
+        .send(parse_msg(
+            "s2",
+            "SELECT email, name FROM canary.subjects WHERE id = 1",
+        ))
+        .await?;
+    client.send(describe_statement("s2")).await?;
+    client.send(bind_msg("p2", "s2")).await?;
+    client.send(execute_msg("p2", 0)).await?;
+    client.send(sync_msg()).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "classified portal after suspend");
+    assert_no_canary(&client, "classified portal after suspend");
+
+    // Same-Sync pipeline: Execute p_pass max_rows=1 then Execute p_mask
+    // before reading PortalSuspended.
+    client = RawClient::connect(proxy.addr, DB).await?;
+    let mut buf = Vec::new();
+    for msg in [
+        parse_msg("s1", "SELECT city, id FROM canary.subjects ORDER BY id"),
+        parse_msg("s2", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        describe_statement("s1"),
+        describe_statement("s2"),
+        bind_msg("p1", "s1"),
+        bind_msg("p2", "s2"),
+        execute_msg("p1", 1),
+        execute_msg("p2", 0),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "pipelined classified portal after suspend");
+    assert_no_canary(&client, "pipelined classified portal after suspend");
+
+    // Binary Bind of the classified portal after a text suspend.
+    client = RawClient::connect(proxy.addr, DB).await?;
+    client
+        .send(parse_msg(
+            "s1",
+            "SELECT city, id FROM canary.subjects ORDER BY id",
+        ))
+        .await?;
+    client.send(describe_statement("s1")).await?;
+    client.send(bind_msg("p1", "s1")).await?;
+    client.send(execute_msg("p1", 1)).await?;
+    client.send(sync_msg()).await?;
+    let _ = client.read_until_ready_or_eof().await?;
+
+    client
+        .send(parse_msg(
+            "s2",
+            "SELECT email, name FROM canary.subjects WHERE id = 1",
+        ))
+        .await?;
+    client.send(describe_statement("s2")).await?;
+    client
+        .send(bind_msg_with_result_format("p2", "s2", 1))
+        .await?;
+    client.send(execute_msg("p2", 0)).await?;
+    client.send(sync_msg()).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "binary classified portal after suspend");
+    assert_no_canary(&client, "binary classified portal after suspend");
+    Ok(())
+}
+
+/// Failed resume of a suspended named portal after Sync must not leak the
+/// next portal's rows.
+///
+/// Sibling of the 0.1.97 leak. Sync without BEGIN ends the implicit
+/// transaction; Postgres destroys named portal A (`SQLSTATE 34000`). Resume
+/// cleared `suspended` but left A as a zombie `pending_executes` owner.
+/// The next classified portal (`email, name`, same arity) was judged with
+/// A's all-passthrough plan and served through `Vetted::unmasked_row`.
+///
+/// Either a masked row or a `pgmask:` refusal is fail-closed. Cleartext
+/// canaries are not.
+#[tokio::test]
+async fn a_failed_portal_resume_after_sync_does_not_leak_the_next_portal() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    client
+        .send(parse_msg(
+            "s1",
+            "SELECT city, id FROM canary.subjects ORDER BY id",
+        ))
+        .await?;
+    client.send(describe_statement("s1")).await?;
+    client.send(bind_msg("A", "s1")).await?;
+    client.send(execute_msg("A", 1)).await?;
+    client.send(sync_msg()).await?;
+    let _ = client.read_until_ready_or_eof().await?;
+
+    // Resume of A: the implicit transaction ended, portal is gone.
+    client.send(execute_msg("A", 0)).await?;
+    client.send(sync_msg()).await?;
+    let _ = client.read_until_ready_or_eof().await?;
+    assert!(
+        client.received_text().contains("34000"),
+        "the resume must fail because Sync destroyed the portal; got:\n{}",
+        client.received_text()
+    );
+
+    client
+        .send(parse_msg(
+            "s2",
+            "SELECT email, name FROM canary.subjects WHERE id = 1",
+        ))
+        .await?;
+    client.send(describe_statement("s2")).await?;
+    client.send(bind_msg("B", "s2")).await?;
+    client.send(execute_msg("B", 0)).await?;
+    client.send(sync_msg()).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "classified portal after 34000 resume");
+    assert_no_canary(&client, "classified portal after 34000 resume");
+    Ok(())
+}
+
+/// Later-epoch ErrorResponse after PortalSuspended+Idle must not leak
+/// the next portal's rows.
+///
+/// H10a: `Execute A max_rows=1 Sync` (city|id passthrough, Idle), Query
+/// `SELECT 1/0` (22012), then Execute B (`email, name`, same arity).
+/// The resume-only stamp closed only 34000 on A's own Execute; this
+/// error is not that Execute. Keep the 34000-resume and A-then-B tests;
+/// they stay closed.
+///
+/// Either a masked row or a `pgmask:` refusal is fail-closed. Cleartext
+/// canaries are not.
+#[tokio::test]
+async fn a_simple_query_error_after_suspend_does_not_leak_the_next_portal() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    client
+        .send(parse_msg(
+            "s1",
+            "SELECT city, id FROM canary.subjects ORDER BY id",
+        ))
+        .await?;
+    client.send(describe_statement("s1")).await?;
+    client.send(bind_msg("A", "s1")).await?;
+    client.send(execute_msg("A", 1)).await?;
+    client.send(sync_msg()).await?;
+    let _ = client.read_until_ready_or_eof().await?;
+
+    let _ = client.simple_query("SELECT 1/0").await?;
+
+    client
+        .send(parse_msg(
+            "s2",
+            "SELECT email, name FROM canary.subjects WHERE id = 1",
+        ))
+        .await?;
+    client.send(describe_statement("s2")).await?;
+    client.send(bind_msg("B", "s2")).await?;
+    client.send(execute_msg("B", 0)).await?;
+    client.send(sync_msg()).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(
+        &msgs,
+        &client,
+        "classified portal after 1/0 following suspend",
+    );
+    assert_no_canary(&client, "classified portal after 1/0 following suspend");
+    Ok(())
+}
+
+/// Rebinding the same portal before CommandComplete must not leak the
+/// first Execute's rows.
+///
+/// Sibling of the 0.1.97 PortalSuspended leak, without a suspend.
+/// `Bind p s_class; Execute p 0; Bind p s_pass; Execute p 0; Sync` let
+/// the second Bind overwrite `portal_plans[p]` while `execute` treated
+/// the second Execute as a resume. `streaming_plan` applied the
+/// all-passthrough plan to the classified first row;
+/// `Vetted::unmasked_row` released the canaries. Unnamed portal `""`
+/// and binary Bind leaked the same way. Pass-then-class over-masked
+/// (fail-closed). Two different portal names in one Sync were already
+/// safe.
+///
+/// Either a masked row or a `pgmask:` refusal is fail-closed. Cleartext
+/// canaries are not.
+#[tokio::test]
+async fn rebinding_the_same_portal_before_complete_does_not_leak() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    // Class then pass on one named portal, one Sync.
+    let mut buf = Vec::new();
+    for msg in [
+        parse_msg("s1", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        parse_msg("s2", "SELECT city, id FROM canary.subjects WHERE id = 1"),
+        describe_statement("s1"),
+        describe_statement("s2"),
+        bind_msg("p", "s1"),
+        execute_msg("p", 0),
+        bind_msg("p", "s2"),
+        execute_msg("p", 0),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "class-then-pass same portal");
+    assert_no_canary(&client, "class-then-pass same portal");
+
+    // Unnamed portal — the JDBC/psycopg reuse pattern.
+    client = RawClient::connect(proxy.addr, DB).await?;
+    buf.clear();
+    for msg in [
+        parse_msg("s1", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        parse_msg("s2", "SELECT city, id FROM canary.subjects WHERE id = 1"),
+        describe_statement("s1"),
+        describe_statement("s2"),
+        bind_msg("", "s1"),
+        execute_msg("", 0),
+        bind_msg("", "s2"),
+        execute_msg("", 0),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "class-then-pass unnamed portal");
+    assert_no_canary(&client, "class-then-pass unnamed portal");
+
+    // Binary Bind of the passthrough rebind.
+    client = RawClient::connect(proxy.addr, DB).await?;
+    buf.clear();
+    for msg in [
+        parse_msg("s1", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        parse_msg("s2", "SELECT city, id FROM canary.subjects WHERE id = 1"),
+        describe_statement("s1"),
+        describe_statement("s2"),
+        bind_msg("p", "s1"),
+        execute_msg("p", 0),
+        bind_msg_with_result_format("p", "s2", 1),
+        execute_msg("p", 0),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "class-then-pass binary Bind");
+    assert_no_canary(&client, "class-then-pass binary Bind");
+
+    // Control: two different portal names in one Sync still serve.
+    client = RawClient::connect(proxy.addr, DB).await?;
+    buf.clear();
+    for msg in [
+        parse_msg("s1", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        parse_msg("s2", "SELECT city, id FROM canary.subjects WHERE id = 1"),
+        describe_statement("s1"),
+        describe_statement("s2"),
+        bind_msg("p1", "s1"),
+        execute_msg("p1", 0),
+        bind_msg("p2", "s2"),
+        execute_msg("p2", 0),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_served(&msgs, "different portal names same Sync");
+    assert_no_canary(&client, "different portal names same Sync");
+
+    // Pass-then-class on the same name: over-mask is fail-closed.
+    client = RawClient::connect(proxy.addr, DB).await?;
+    buf.clear();
+    for msg in [
+        parse_msg("s1", "SELECT city, id FROM canary.subjects WHERE id = 1"),
+        parse_msg("s2", "SELECT email, name FROM canary.subjects WHERE id = 1"),
+        describe_statement("s1"),
+        describe_statement("s2"),
+        bind_msg("p", "s1"),
+        execute_msg("p", 0),
+        bind_msg("p", "s2"),
+        execute_msg("p", 0),
+        sync_msg(),
+    ] {
+        buf.extend_from_slice(&msg.encode());
+    }
+    client.send_raw(&buf).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "pass-then-class same portal");
+    assert_no_canary(&client, "pass-then-class same portal");
+    Ok(())
+}
+
 #[tokio::test]
 async fn pipelined_interleaved_portals_stay_masked() -> Result<()> {
     require_pg!();

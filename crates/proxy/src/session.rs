@@ -77,6 +77,22 @@ impl Vetted {
     /// A row we are forwarding unchanged because the plan masks nothing in it.
     ///
     /// Takes the plan to make the claim checkable rather than assumed.
+    ///
+    /// The plan must be `streaming_plan` for *this* result set. After
+    /// `PortalSuspended`, a different portal's DataRows used to arrive here
+    /// under the suspended portal's all-passthrough plan (0.1.97) — same
+    /// arity, so the field-count check passed and classified values went out
+    /// in the clear. A sibling: resume after Sync, without BEGIN, 34000s
+    /// (portal gone) but left that same passthrough plan as a zombie owner;
+    /// the next portal's rows took this path too. A later-epoch error that
+    /// is not A's own Execute — H10a `SELECT 1/0`, H5b 34000 on Describe —
+    /// left the same zombie; the resume-only stamp missed those. Another
+    /// sibling without PortalSuspended: two full Executes that reuse one
+    /// portal name. Bind of the second statement overwrote `portal_plans`
+    /// before the first DataRows; `execute` treated the second Execute as a
+    /// resume, so this path forwarded the classified row under the new
+    /// all-passthrough plan. Unnamed portal `""` and binary Bind leaked the
+    /// same way.
     fn unmasked_row(msg: &Message, plan: &[FieldPlan]) -> Self {
         debug_assert!(
             plan.iter().all(|f| f.spec.is_passthrough()),
@@ -696,6 +712,27 @@ impl Session {
             // rows belong to the next queued Execute.
             protocol::B_COMMAND_COMPLETE => {
                 self.plans.finish_result_set();
+                out.client(Vetted::control(&msg))
+            }
+
+            // A limited Execute paused; it has not completed. The next
+            // DataRows may belong to a *different* portal — Postgres runs
+            // that Execute (the comment that it refuses was wrong, and the
+            // stale plan took `unmasked_row`). See `PlanState::suspend_result`.
+            protocol::B_PORTAL_SUSPENDED => {
+                self.plans.suspend_result();
+                out.client(Vetted::control(&msg))
+            }
+
+            // After PortalSuspended, ReadyForQuery Idle means the implicit
+            // transaction ended and named portals are gone. Discard the
+            // paused owner here — a later-epoch ErrorResponse that is not
+            // A's own Execute (H10a, H5b) used to leave it queued.
+            // InTxn (`T`) keeps the portal (`BEGIN; suspend; Sync`).
+            protocol::B_READY_FOR_QUERY => {
+                if let Some(&status) = msg.body.first() {
+                    self.plans.ready_for_query(status);
+                }
                 out.client(Vetted::control(&msg))
             }
 
