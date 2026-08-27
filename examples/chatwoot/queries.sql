@@ -744,6 +744,153 @@ WHERE EXISTS (
 )
 ORDER BY c.id;
 
+-- ---------------------------------------------------------------------------
+-- Red-team sweep: try alternate projections, laundering, predicates, sorting,
+-- joins and JSON syntax against canary-bearing columns.
+-- ---------------------------------------------------------------------------
+
+-- Pointers present in seed but easy to miss in a hand-written catalog.
+-- @id: message-cc-emails
+-- @expect: served
+-- @refute: ops@acme.example
+SELECT content_attributes->>'cc_emails'
+FROM chatwoot.messages
+WHERE id = 9004;
+
+-- @id: user-select-star
+-- @expect: served
+-- @refute: Jordan Agent
+-- @refute: jordan.agent@acme.example
+-- @refute: tok_agent_pubsub
+-- @refute: draft about Alice
+SELECT * FROM chatwoot.users WHERE id = 10;
+
+-- @id: user-editor-draft
+-- @expect: served
+-- @refute: draft about Alice
+SELECT ui_settings->>'editor_message'
+FROM chatwoot.users
+WHERE id = 10;
+
+-- @id: contact-social-profile
+-- @expect: served
+-- @refute: alice_canary
+SELECT additional_attributes->'social_profiles'->>'twitter'
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- Serializing the protected parent to text would bypass child masks.
+-- @id: contact-social-parent-text
+-- @expect: refused
+SELECT additional_attributes->>'social_profiles'
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- Known inbox config remains useful after changing unknown leaves to
+-- type-placeholders.
+-- @id: inbox-csat-config
+-- @expect: served
+-- @contains: emoji|How was your chat?
+SELECT csat_config->>'display_type', csat_config->>'message'
+FROM chatwoot.inboxes
+WHERE id = 100;
+
+-- Cast laundering attempts on scalar and double-encoded JSON.
+-- @id: contact-email-text-cast
+-- @expect: refused
+SELECT email::text FROM chatwoot.contacts WHERE id = 1001;
+
+-- @id: double-encoded-json-text-cast
+-- @expect: refused
+SELECT content_attributes::text
+FROM chatwoot.messages
+WHERE id = 9005;
+
+-- @id: whole-json-identity-cast
+-- @expect: refused
+SELECT additional_attributes::jsonb
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- JSONPath and runtime keys remain opaque.
+-- @id: jsonpath-city
+-- @expect: refused
+SELECT jsonb_path_query_first(additional_attributes, '$.city')
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- @id: case-json-key
+-- @expect: refused
+SELECT additional_attributes[
+  CASE WHEN id = 1001 THEN 'referer' ELSE 'city' END
+]
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- Text path "0" is ambiguous at the configured array wildcard.
+-- @id: message-items-ambiguous-hash-path
+-- @expect: refused
+SELECT content_attributes #>> '{items,0,value}'
+FROM chatwoot.messages
+WHERE id = 9003;
+
+-- Prove the integer operator rewrite reaches the same sensitive leaf and
+-- applies the wildcard policy.
+-- @id: message-items-integer-path
+-- @expect: served
+-- @refute: alice.cw-canary@inbox.test
+SELECT content_attributes->'items'->0->>'value'
+FROM chatwoot.messages
+WHERE id = 9003;
+
+-- Hostile predicate variants: joins, HAVING and subqueries must not turn
+-- source equality into an oracle.
+-- @id: hostile-masked-join
+-- @expect: refused
+SELECT c.id, d.id
+FROM chatwoot.contacts c
+JOIN chatwoot.contact_directory d ON d.email = c.email;
+
+-- @id: hostile-masked-having
+-- @expect: refused
+SELECT id
+FROM chatwoot.contacts
+GROUP BY id, email
+HAVING email = 'alice.cw-canary@inbox.test';
+
+-- @id: hostile-masked-correlated-subquery
+-- @expect: refused
+SELECT c.id
+FROM chatwoot.contacts c
+WHERE EXISTS (
+  SELECT 1
+  FROM chatwoot.contact_directory d
+  WHERE d.email = c.email
+);
+
+-- Simple ordering is a documented relative-order disclosure. Expressions in
+-- ORDER BY are not credited and must refuse.
+-- @id: hostile-order-by-membership
+-- @expect: refused
+SELECT id
+FROM chatwoot.contacts
+ORDER BY email = 'alice.cw-canary@inbox.test';
+
+-- @id: hostile-order-by-lower
+-- @expect: refused
+SELECT id
+FROM chatwoot.contacts
+ORDER BY lower(email);
+
+-- DISTINCT over deterministic pseudonyms exposes equality/frequency by
+-- design, but never the source bytes.
+-- @id: hostile-distinct-email
+-- @expect: served
+-- @refute: alice.cw-canary@inbox.test
+SELECT DISTINCT email
+FROM chatwoot.contacts
+ORDER BY email;
+
 -- Operator workaround after resolving "billing" to tag id 301.
 -- @id: chatwoot-label-filter-by-id
 -- @expect: served

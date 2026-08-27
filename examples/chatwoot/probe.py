@@ -260,6 +260,7 @@ FROM chatwoot.contacts WHERE id = 1001;
     failed = 0
     for name, script, required, forbidden in checks:
         _code, output = run_psql_script(host, port, db, user, script)
+        folded_output = output.casefold()
         problems = [f"missing {value!r}" for value in required if value not in output]
         problems.extend(
             f"unexpected {value!r}" for value in forbidden if value in output
@@ -267,7 +268,7 @@ FROM chatwoot.contacts WHERE id = 1001;
         problems.extend(
             f"forbidden source value leaked: {value}"
             for value in FORBIDDEN_SOURCE_VALUES
-            if value in output
+            if value.casefold() in folded_output
         )
         if problems:
             failed += 1
@@ -341,8 +342,9 @@ def main() -> int:
         problems: list[str] = []
         if got != case.expect:
             problems.append(f"expected {case.expect}, got {got}")
+        folded_output = output.casefold()
         for token in FORBIDDEN_SOURCE_VALUES:
-            if token in output:
+            if token.casefold() in folded_output:
                 problems.append(f"forbidden source value leaked: {token}")
         if got == "served":
             for needle in case.contains:
