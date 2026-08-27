@@ -52,6 +52,12 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
         rules.push(document_rule(relation, "payload"));
         rules.push(document_rule(relation, "legacy"));
     }
+    rules.push(json_rule(
+        "canary.documents",
+        "encoded",
+        pgmask::mask::JsonUnmatched::TypePlaceholders,
+        Vec::new(),
+    ));
     rules
 }
 
@@ -145,10 +151,15 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
         pgmask::mask::Mask::None,
     ));
     released_rules.push(rule("canary.documents", "legacy", pgmask::mask::Mask::None));
+    released_rules.push(rule(
+        "canary.documents",
+        "encoded",
+        pgmask::mask::Mask::None,
+    ));
     let released = start_proxy(DB, released_rules).await?;
     let mut text_control = RawClient::connect(released.addr, DB).await?;
     text_control
-        .simple_query("SELECT payload, legacy FROM canary.documents")
+        .simple_query("SELECT payload, legacy, encoded FROM canary.documents")
         .await?;
     assert_canary_present(&text_control, CANARY_EMAIL);
 
@@ -173,7 +184,7 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
 
     let mut text_client = RawClient::connect(masked.addr, DB).await?;
     let text_msgs = text_client
-        .simple_query("SELECT payload, legacy FROM canary.documents")
+        .simple_query("SELECT payload, legacy, encoded FROM canary.documents")
         .await?;
     assert_served(&text_msgs, "text json and jsonb");
     assert_no_canary(&text_client, "structure-aware JSON text formats");
@@ -262,6 +273,64 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
         }),
         "binary json must carry the exact pointer masks"
     );
+
+    // A JSON string scalar holding an encoded object is how Chatwoot's native
+    // JSON + Rails coder mismatch appears on disk. Exercise it in binary too:
+    // OID 114 has no version byte, and the string's inner bytes are still
+    // sensitive even though no JSON Pointer can enter them.
+    let mut encoded_control = RawClient::connect(released.addr, DB).await?;
+    encoded_control
+        .send(parse_msg(
+            "encoded",
+            "SELECT encoded FROM canary.documents WHERE id = 1",
+        ))
+        .await?;
+    encoded_control.send(describe_statement("encoded")).await?;
+    encoded_control
+        .send(bind_msg_with_result_format("encoded_portal", "encoded", 1))
+        .await?;
+    encoded_control
+        .send(execute_msg("encoded_portal", 0))
+        .await?;
+    encoded_control.send(sync_msg()).await?;
+    let encoded_control_msgs = encoded_control.read_until_ready().await?;
+    assert_served(
+        &encoded_control_msgs,
+        "double-encoded binary JSON poison control",
+    );
+    assert_canary_present(&encoded_control, CANARY_EMAIL);
+
+    let mut encoded_client = RawClient::connect(masked.addr, DB).await?;
+    encoded_client
+        .send(parse_msg(
+            "encoded",
+            "SELECT encoded FROM canary.documents WHERE id = 1",
+        ))
+        .await?;
+    encoded_client.send(describe_statement("encoded")).await?;
+    encoded_client
+        .send(bind_msg_with_result_format("encoded_portal", "encoded", 1))
+        .await?;
+    encoded_client
+        .send(execute_msg("encoded_portal", 0))
+        .await?;
+    encoded_client.send(sync_msg()).await?;
+    let encoded_msgs = encoded_client.read_until_ready().await?;
+    assert_served(&encoded_msgs, "double-encoded binary JSON");
+    assert_no_canary(&encoded_client, "double-encoded binary JSON");
+    let encoded_rows = data_rows(&encoded_msgs)?;
+    let encoded_value = encoded_rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(Option::as_ref)
+        .expect("one non-NULL double-encoded binary JSON field");
+    let encoded_value: serde_json::Value =
+        serde_json::from_slice(encoded_value).expect("binary json is unversioned JSON text");
+    assert_eq!(
+        encoded_value,
+        serde_json::json!(""),
+        "double-encoded JSON must retain only its scalar type"
+    );
     Ok(())
 }
 
@@ -340,6 +409,15 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
                 "public": "Portland",
                 "unknown": ""
             })),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "double-encoded JSON string scalar",
+            sql: "SELECT encoded FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!(
+                r#"{"submitted_email":"CANARY_EMAIL_a1b2c3"}"#
+            )),
+            masked: JsonSqlValue::Json(serde_json::json!("")),
             poison: Some(CANARY_EMAIL),
         },
         JsonSqlValueCase {

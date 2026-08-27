@@ -113,7 +113,12 @@ INSERT INTO canary.subjects VALUES
 CREATE TABLE canary.documents (
   id      int PRIMARY KEY,
   payload jsonb NOT NULL,
-  legacy  json NOT NULL
+  legacy  json NOT NULL,
+  -- Chatwoot's `store ..., coder: JSON` over a native JSON column has been
+  -- observed storing an encoded object as a JSON string scalar. Keep that
+  -- production shape in the raw-wire fixture; it is not equivalent to an
+  -- object, and pointer policy must still withhold the bytes.
+  encoded json NOT NULL
 );
 INSERT INTO canary.documents VALUES (
   1,
@@ -140,7 +145,8 @@ INSERT INTO canary.documents VALUES (
     "profile":{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6"},
     "public":"Portland",
     "unknown":"CANARY_NOTE_97h8i9"
-  }'
+  }',
+  to_json('{"submitted_email":"CANARY_EMAIL_a1b2c3"}'::text)
 );
 
 CREATE VIEW canary.subject_view AS SELECT id, email, name, city FROM canary.subjects;
