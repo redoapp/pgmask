@@ -1157,6 +1157,223 @@ SELECT content_attributes['items'][0]['value']
 FROM chatwoot.messages
 WHERE id = 9003;
 
+-- Additional expression/function families from the final red-team pass.
+-- @id: hostile-content-length
+-- @expect: refused
+-- @direct_expect: served
+SELECT length(content)
+FROM chatwoot.messages
+WHERE id = 9001;
+
+-- @id: hostile-email-substring
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-ca
+SELECT substring(email FROM 1 FOR 11)
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- An SRF cardinality driven by a masked comparison is a boolean oracle.
+-- @id: hostile-generate-series
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1
+SELECT generated
+FROM chatwoot.contacts,
+LATERAL generate_series(
+  1,
+  CASE
+    WHEN email = 'alice.cw-canary@inbox.test' THEN 1
+    ELSE 0
+  END
+) generated
+WHERE id = 1001;
+
+-- COLLATE and pagination variants retain the documented simple-sort leak.
+-- @id: hostile-order-email-collate-desc
+-- @expect: served
+-- @rows: 2
+-- @refute: alice.cw-canary@inbox.test
+SELECT id
+FROM chatwoot.contacts
+ORDER BY email COLLATE "C" DESC NULLS LAST;
+
+-- @id: hostile-order-email-fetch-first
+-- @expect: served
+-- @rows: 1
+-- @contains: 1001
+SELECT id
+FROM chatwoot.contacts
+ORDER BY email
+FETCH FIRST 1 ROW ONLY;
+
+-- @id: hostile-project-email-order
+-- @expect: served
+-- @rows: 2
+-- @refute: alice.cw-canary@inbox.test
+SELECT id, email
+FROM chatwoot.contacts
+ORDER BY email;
+
+-- DISTINCT ON uses the source value to choose a representative row.
+-- @id: hostile-distinct-on-email
+-- @expect: refused
+-- @direct_expect: served
+SELECT DISTINCT ON (email) id
+FROM chatwoot.contacts
+ORDER BY email, id;
+
+-- Aggregation/fingerprinting must not turn source bytes into an opaque scalar.
+-- @id: hostile-array-agg-email
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+SELECT array_agg(email) FROM chatwoot.contacts;
+
+-- @id: hostile-string-agg-email
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+SELECT string_agg(email, ',') FROM chatwoot.contacts;
+
+-- @id: hostile-md5-email
+-- @expect: refused
+-- @direct_expect: served
+SELECT md5(email) FROM chatwoot.contacts WHERE id = 1001;
+
+-- @id: hostile-case-email
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+SELECT CASE
+  WHEN email = 'alice.cw-canary@inbox.test' THEN email
+  ELSE 'no'
+END
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- LIMIT can encode the result of a hidden membership query.
+-- @id: hostile-limit-subquery
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
+SELECT id
+FROM chatwoot.contacts
+ORDER BY id
+LIMIT (
+  SELECT count(*)
+  FROM chatwoot.contacts
+  WHERE email = 'alice.cw-canary@inbox.test'
+);
+
+-- Recursive machinery must not make a masked projection releasable.
+-- @id: hostile-recursive-cte
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+WITH RECURSIVE sequence(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM sequence WHERE n < 2
+)
+SELECT email
+FROM chatwoot.contacts, sequence
+WHERE contacts.id = 1001;
+
+-- Built-in array helpers still create opaque expression output.
+-- @id: array-position-conversation-label
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1
+SELECT array_position(label_list, 'billing')
+FROM chatwoot.conversations
+WHERE id = 5001;
+
+-- Leaky system catalogs can carry query text containing source values.
+-- @id: pg-stat-activity-query-text
+-- @expect: refused
+-- @direct_expect: served
+SELECT query
+FROM pg_catalog.pg_stat_activity
+WHERE datname = current_database()
+LIMIT 1;
+
+-- A literal is client-supplied, but naming it like a masked column is an
+-- intentional parser edge: either safe release or conservative refusal must
+-- stay pinned.
+-- @id: values-column-named-email
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+SELECT *
+FROM (VALUES ('alice.cw-canary@inbox.test')) literal(email);
+
+-- Contrasting provenance path: inner SELECT * preserves enough OID/attnum
+-- evidence for the outer JSON field to receive the original pointer plan.
+-- @id: cte-select-star-json
+-- @expect: served
+-- @contains: Austin
+-- @refute: CANARYREF
+WITH contact_row AS (
+  SELECT * FROM chatwoot.contacts WHERE id = 1001
+)
+SELECT additional_attributes FROM contact_row;
+
+-- Released array predicates remain useful; only SRF/expression output refuses.
+-- @id: label-list-any
+-- @expect: served
+-- @contains: 5001
+SELECT id
+FROM chatwoot.conversations
+WHERE 'billing' = ANY (label_list);
+
+-- Condition values are customer-controlled; direct integer array navigation
+-- reaches the wildcard redact policy.
+-- @id: automation-condition-value
+-- @expect: served
+-- @contains: ***
+-- @refute: Canary Logistics
+SELECT conditions->0->'values'->>0
+FROM chatwoot.automation_rules
+WHERE id = 70;
+
+-- A masked JSON leaf in a WHERE expression stays an oracle and refuses.
+-- @id: hostile-submitted-email-predicate
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 9003
+SELECT id
+FROM chatwoot.messages
+WHERE content_attributes->>'submitted_email' =
+  'alice.cw-canary@inbox.test';
+
+-- The same expression in the result list is also opaque.
+-- @id: hostile-submitted-email-nullness
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: f
+SELECT (content_attributes->>'submitted_email') IS NULL
+FROM chatwoot.messages
+WHERE id = 9003;
+
+-- Cast the native-json pre-chat object, not only the double-encoded row.
+-- @id: content-attributes-text-cast
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+SELECT content_attributes::text
+FROM chatwoot.messages
+WHERE id = 9003;
+
+-- JSONPath aimed directly at a sensitive pointer.
+-- @id: jsonpath-referer
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: CANARYREF
+SELECT jsonb_path_query(additional_attributes, '$.referer')
+FROM chatwoot.contacts
+WHERE id = 1001;
+
 -- Operator workaround after resolving "billing" to tag id 301.
 -- @id: chatwoot-label-filter-by-id
 -- @expect: served

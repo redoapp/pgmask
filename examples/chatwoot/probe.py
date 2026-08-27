@@ -292,6 +292,18 @@ SELECT id FROM chatwoot.contacts ORDER BY email
             ("1001", "1002"),
             (),
         ),
+        (
+            "extended-bind-masked-json-predicate",
+            """
+SELECT id
+FROM chatwoot.contacts
+WHERE additional_attributes->>'created_at_ip' = $1
+\\bind 203.0.113.77
+\\g
+""",
+            ("pgmask:",),
+            (),
+        ),
     ]
     failed = 0
     for name, script, required, forbidden in checks:
