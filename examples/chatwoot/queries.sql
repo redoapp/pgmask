@@ -1388,3 +1388,112 @@ WHERE EXISTS (
     AND taggings.tag_id = 301
 )
 ORDER BY c.id;
+
+-- Parent `none` on `/initiated_at` would inherit into note/email children.
+-- Timestamp is released; nested canaries must not be.
+-- @id: initiated-at-timestamp
+-- @expect: served
+-- @contains: 2026-03-14T09:21:55.000Z
+-- @refute: CANARYNEST
+-- @refute: nested.cw-canary
+SELECT additional_attributes->'initiated_at'->>'timestamp'
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- @id: initiated-at-nested-note
+-- @expect: served
+-- @rows: 1
+-- @refute: initiated-CANARYNEST
+SELECT additional_attributes->'initiated_at'->>'note'
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- @id: initiated-at-object
+-- @expect: served
+-- @contains: 2026-03-14T09:21:55.000Z
+-- @contains: "note":""
+-- @refute: initiated-CANARYNEST
+-- @refute: nested.cw-canary@inbox.test
+SELECT additional_attributes->'initiated_at'
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- @id: conversation-initiated-at-secret
+-- @expect: served
+-- @rows: 1
+-- @refute: conv-initiated-CANARYNEST
+SELECT additional_attributes->'initiated_at'->>'secret'
+FROM chatwoot.conversations
+WHERE id = 5001;
+
+-- Unmatched widget key holding a source email (including JSON `\u` forms
+-- after parse) keeps type without value.
+-- @id: unmatched-escaped-email
+-- @expect: served
+-- @rows: 1
+-- @refute: alice.cw-canary@inbox.test
+SELECT additional_attributes->>'escaped'
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- send_message params are customer-facing prose; action_name stays visible.
+-- @id: automation-send-message-name
+-- @expect: served
+-- @contains: send_message
+SELECT actions->1->>'action_name'
+FROM chatwoot.automation_rules
+WHERE id = 70;
+
+-- @id: automation-send-message-params
+-- @expect: served
+-- @contains: ***
+-- @refute: alice.cw-canary@inbox.test
+-- @refute: ORD-9911
+SELECT actions->1->'action_params'->>0
+FROM chatwoot.automation_rules
+WHERE id = 70;
+
+-- add_label params are also redacted: pointer policy cannot depend on
+-- sibling action_name.
+-- @id: automation-add-label-params
+-- @expect: served
+-- @contains: ***
+SELECT actions->0->'action_params'->>0
+FROM chatwoot.automation_rules
+WHERE id = 70;
+
+-- Custom-attribute regex/cue fields can embed sample PII.
+-- @id: custom-attribute-regex-pattern
+-- @expect: served
+-- @contains: ***
+-- @refute: alice.cw-canary@inbox.test
+SELECT regex_pattern
+FROM chatwoot.custom_attribute_definitions
+WHERE id = 201;
+
+-- @id: custom-attribute-regex-cue
+-- @expect: served
+-- @contains: ***
+-- @refute: Alice Canary
+-- @refute: 078-05-4391
+SELECT regex_cue
+FROM chatwoot.custom_attribute_definitions
+WHERE id = 201;
+
+-- Inbox and account routing addresses are emails, not ops literals.
+-- @id: inbox-email-address
+-- @expect: served
+-- @refute: widget@acme.example
+-- @refute: support@acme.example
+SELECT email_address FROM chatwoot.inboxes ORDER BY id;
+
+-- @id: account-support-email
+-- @expect: served
+-- @refute: help@acme.example
+SELECT support_email FROM chatwoot.accounts WHERE id = 1;
+
+-- Second contact's source email must not pass just because it is not Alice.
+-- @id: bob-email-pseudonym
+-- @expect: served
+-- @refute: bob.ops@vendor.example
+SELECT email FROM chatwoot.contacts WHERE id = 1002;

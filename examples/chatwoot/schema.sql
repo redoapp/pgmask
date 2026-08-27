@@ -307,8 +307,11 @@ INSERT INTO chatwoot.contacts (
         ),
         'referer', 'https://shop.acme.example/checkout?token=CANARYREF',
         'initiated_at', jsonb_build_object(
-            'timestamp', '2026-03-14T09:21:55.000Z'
+            'timestamp', '2026-03-14T09:21:55.000Z',
+            'note', 'initiated-CANARYNEST',
+            'email', 'nested.cw-canary@inbox.test'
         ),
+        'escaped', 'alice.cw-canary@inbox.test',
         'conversation_language', 'en'
     ),
     0,
@@ -360,7 +363,10 @@ INSERT INTO chatwoot.conversations (
             'device_name', 'MacIntel'
         ),
         'referer', 'https://shop.acme.example/checkout?token=CANARYREF',
-        'initiated_at', jsonb_build_object('timestamp', '2026-03-14T09:21:55.000Z'),
+        'initiated_at', jsonb_build_object(
+            'timestamp', '2026-03-14T09:21:55.000Z',
+            'secret', 'conv-initiated-CANARYNEST'
+        ),
         'browser_language', 'en-US',
         'conversation_language', 'en',
         'type', 'widget',
@@ -505,6 +511,12 @@ VALUES (
         jsonb_build_object(
             'action_name', 'add_label',
             'action_params', jsonb_build_array('billing')
+        ),
+        jsonb_build_object(
+            'action_name', 'send_message',
+            'action_params', jsonb_build_array(
+                'email alice.cw-canary@inbox.test that ORD-9911 is late'
+            )
         )
     ),
     true
@@ -527,7 +539,10 @@ INSERT INTO chatwoot.custom_attribute_definitions (
 (
     201, 'Order reference', 'order_id', 0, 1, 1,
     TIMESTAMP '2026-01-01 00:00:00', TIMESTAMP '2026-01-01 00:00:00',
-    'Commerce order supplied by the customer', '[]'::jsonb, NULL, NULL
+    'Commerce order supplied by the customer',
+    '[]'::jsonb,
+    'alice.cw-canary@inbox.test',
+    'hint: Alice Canary SSN 078-05-4391'
 ),
 (
     202, 'Service tier', 'service_tier', 6, 0, 1,

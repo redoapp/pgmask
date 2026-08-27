@@ -88,7 +88,11 @@
   per-query direct controls prove refusal-shaped attacks are valid. The raw
   wire suite also pins that encoded-string shape in binary OID-114 results and
   star expansion. Refusals remain refusals rather than driving an allowlist
-  expansion.
+  expansion. A later red-team pass found parent `none` on widget
+  `/initiated_at`, released automation `action_params`, and unmasked
+  custom-attribute regex/cue fields forwarding nested PII; those grants
+  are now leaf-only or redact, with canaries for nested initiated_at
+  keys, send_message params, and regex samples.
 - Pin the JSON pointer trie and catalog overlap helpers with named lookup
   tables: exact beats `*`, object keys never take array wildcards, ambiguous
   text steps refuse at a `*` edge, nested wildcards need a proven array index

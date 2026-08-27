@@ -46,7 +46,7 @@ rather than a type-aware-fallback refusal.
 ## Corpus
 
 [queries.sql](queries.sql) is the pin. Each case declares `@expect: served`,
-`refused`, or `error`. [probe.py](probe.py) first proves **36 forbidden source
+`refused`, or `error`. [probe.py](probe.py) first proves **48 forbidden source
 values** are observable directly, then scans every proxied result for them.
 `verify.sh` also starts a deliberately releasing second proxy: the poison
 control must expose the email or the leak detector is not trusted.
@@ -117,3 +117,7 @@ Other runbook lessons found by the live corpus:
   cells reveal only `""`, while `->>` silently returns SQL NULL.
 - `conditions[0]['attribute_key']` refuses at the runtime-shape-ambiguous
   subscript; `conditions->0->>'attribute_key'` proves the array step and serves.
+- `{ pointer = "/initiated_at", mask = "none" }` granted every nested key
+  the widget later grew. Release `/initiated_at/timestamp` only.
+  `action_params` cannot be released just because `add_label` is ops-shaped;
+  Chatwoot also stores `send_message` prose there.

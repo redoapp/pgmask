@@ -16,7 +16,7 @@ Pinned against Chatwoot `develop` as fetched 2026-08-27.
 | Native `json` / `jsonb` values observed double-encoded by `store ..., coder: JSON` | [Chatwoot issue #14660](https://github.com/chatwoot/chatwoot/issues/14660), a self-hosted production report; the `store` declarations remain in [`app/models/message.rb`](https://github.com/chatwoot/chatwoot/blob/develop/app/models/message.rb) |
 | Widget `browser` / `referer` / `initiated_at` | Chatwoot widget session payload (`additional_attributes` on Contact and Conversation) |
 | `accounts.internal_attributes` / `settings` | Account model + `schema.rb` |
-| `automation_rules.conditions` / `actions` | Automation rule JSON (attribute_key / values / action_name) |
+| `automation_rules.conditions` / `actions` | Automation rule JSON (attribute_key / values / action_name); `action_params` may be `send_message` prose |
 | `LOWER(custom_attributes ->> key)::type` filters | [`app/services/filters/custom_attribute_filter_helper.rb`](https://github.com/chatwoot/chatwoot/blob/develop/app/services/filters/custom_attribute_filter_helper.rb) |
 | `COUNT(*) FILTER` conversation dashboard counts | [`app/services/filter_service.rb`](https://github.com/chatwoot/chatwoot/blob/develop/app/services/filter_service.rb) |
 | Custom-attribute metadata and enum meanings | [`app/models/custom_attribute_definition.rb`](https://github.com/chatwoot/chatwoot/blob/develop/app/models/custom_attribute_definition.rb) |

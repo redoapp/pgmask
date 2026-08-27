@@ -323,6 +323,8 @@ json = [
 ]
 
 # Widget / CRM blob written by the Chatwoot JS SDK and Contact model.
+# Do not grant `/initiated_at` as `none`: that inherits to every future
+# child. Timestamp is the ops key; nested PII stays unmatched.
 [[column]]
 relation = "chatwoot.contacts"
 column = "additional_attributes"
@@ -338,7 +340,7 @@ json = [
   { pointer = "/browser/browser_version", mask = "none" },
   { pointer = "/browser/os", mask = "none" },
   { pointer = "/browser/device_name", mask = "redact" },
-  { pointer = "/initiated_at", mask = "none" },
+  { pointer = "/initiated_at/timestamp", mask = "none" },
   { pointer = "/created_at_ip", mask = "ip-prefix" },
   { pointer = "/updated_at_ip", mask = "ip-prefix" },
   { pointer = "/referer", mask = "redact" },
@@ -430,7 +432,7 @@ json = [
   { pointer = "/browser/browser_version", mask = "none" },
   { pointer = "/browser/os", mask = "none" },
   { pointer = "/browser/device_name", mask = "redact" },
-  { pointer = "/initiated_at", mask = "none" },
+  { pointer = "/initiated_at/timestamp", mask = "none" },
   { pointer = "/browser_language", mask = "none" },
   { pointer = "/conversation_language", mask = "none" },
   { pointer = "/type", mask = "none" },
@@ -712,9 +714,11 @@ relation = "chatwoot.automation_rules"
 column = "actions"
 mask = "json"
 json_unmatched = "type-placeholders"
+# action_params hold send_message prose, emails, and labels. action_name
+# is the ops diagnostic; params are customer-controlled.
 json = [
   { pointer = "/*/action_name", mask = "none" },
-  { pointer = "/*/action_params/*", mask = "none" },
+  { pointer = "/*/action_params/*", mask = "redact" },
 ]
 
 [[column]]
@@ -818,12 +822,12 @@ json_unmatched = "type-placeholders"
 [[column]]
 relation = "chatwoot.custom_attribute_definitions"
 column = "regex_pattern"
-mask = "none"
+mask = "redact"
 
 [[column]]
 relation = "chatwoot.custom_attribute_definitions"
 column = "regex_cue"
-mask = "none"
+mask = "redact"
 
 [[column]]
 relation = "chatwoot.tags"
@@ -919,7 +923,7 @@ json = [
   { pointer = "/browser/browser_version", mask = "none" },
   { pointer = "/browser/os", mask = "none" },
   { pointer = "/browser/device_name", mask = "redact" },
-  { pointer = "/initiated_at", mask = "none" },
+  { pointer = "/initiated_at/timestamp", mask = "none" },
   { pointer = "/created_at_ip", mask = "ip-prefix" },
   { pointer = "/updated_at_ip", mask = "ip-prefix" },
   { pointer = "/referer", mask = "redact" },
