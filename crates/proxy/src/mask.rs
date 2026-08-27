@@ -32,7 +32,7 @@ pub(crate) use crate::json_path::JsonPathNavigation;
 use json::JsonPolicyTrie;
 pub(crate) use json::JsonProjection;
 pub use json::{
-    JsonFieldSpec, JsonLimit, JsonUnmatched, DEFAULT_JSON_MAX_BYTES, DEFAULT_JSON_MAX_DEPTH,
+    JsonFieldSpec, JsonLimit, JsonUnlisted, DEFAULT_JSON_MAX_BYTES, DEFAULT_JSON_MAX_DEPTH,
     MAX_JSON_MAX_DEPTH,
 };
 
@@ -407,8 +407,8 @@ pub struct MaskSpec {
     pub json: Arc<[JsonFieldSpec]>,
     /// Compiled form of `json`; rebuilt when the catalog compiles a rule.
     json_trie: Arc<JsonPolicyTrie>,
-    /// Policy for leaves with no matching or inherited pointer rule.
-    pub json_unmatched: JsonUnmatched,
+    /// What to do with JSON scalars the catalog did not list.
+    pub json_unlisted: JsonUnlisted,
     /// Maximum encoded JSON payload accepted before parsing.
     pub json_max_bytes: usize,
     /// Maximum object/array nesting accepted before parsing.
@@ -427,7 +427,7 @@ impl Default for MaskSpec {
             domain: None,
             json: Arc::default(),
             json_trie: Arc::default(),
-            json_unmatched: JsonUnmatched::Null,
+            json_unlisted: JsonUnlisted::Null,
             json_max_bytes: DEFAULT_JSON_MAX_BYTES,
             json_max_depth: DEFAULT_JSON_MAX_DEPTH,
         }

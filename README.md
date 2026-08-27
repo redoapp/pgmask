@@ -164,8 +164,9 @@ id = { mask = "none" }
 [columns."app.events".payload]
 mask = "json"
 # Keep the document useful for structural debugging: unmentioned strings,
-# numbers and booleans become "", 0 and false. Omit this for JSON null.
-json_unmatched = "type-placeholders"
+# numbers and booleans become "", 0 and false. Omit this to keep the default
+# allowlist (unlisted scalars become JSON null).
+json_unlisted = "shape-only"
 # Refuse before parsing or allocating an unexpectedly large/deep document.
 json_max_bytes = 1048576
 json_max_depth = 64
@@ -224,7 +225,7 @@ rejects catalog relations that may contain user values or SQL text. See
 | `numeric-bucket` | Floor to a configured bucket | Integers, floats, and text-format `numeric` |
 | `ip-prefix` | Remove the host portion | Text and text-format `inet` or `cidr` |
 | `scrub` | Replace recognized identifiers in free text | Text |
-| `json` | Recursively mask JSON Pointer policies and every unmatched leaf | `json`, `jsonb` |
+| `json` | Recursively mask JSON Pointer policies; unlisted scalars follow `json_unlisted` | `json`, `jsonb` |
 
 `scrub` reveals all text it does not recognize. It does not reliably identify
 names, street addresses, or obfuscated identifiers. Use it only when readable
@@ -232,8 +233,9 @@ free text is required and partial disclosure is acceptable.
 
 `json` preserves object keys, arrays, and nesting while applying ordinary
 masks at JSON Pointers, including `/items/*` for every array element.
-`json_unmatched` is `null` by default; `type-placeholders` retains scalar
-types, and `none` explicitly releases unmatched leaves. Pointer policies are
+`json_unlisted` is `null` by default (allowlist: strip unlisted values);
+`shape-only` keeps types without values; `pass-through` is denylist mode and
+releases unlisted scalars, including keys added later. Pointer policies are
 compiled into a trie. Documents over `json_max_bytes` (1 MiB by default) or
 `json_max_depth` (64 by default) refuse before parsing. Literal SQL extracts
 use the same pointer policy; construction stays opaque. See

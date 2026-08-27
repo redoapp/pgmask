@@ -34,11 +34,11 @@ ids, SSNs, Stripe ids, device fingerprints, or checkout referer tokens.
 | Contact/channel/conversation/message/order ids | domain-separated pseudonyms |
 | Widget public keys (`company_name`, `city`, browser family/version, …) | `mask = "json"` pointer `none` |
 | Widget device name | redact |
-| CSAT `/message`, pre-chat item `name`, conversation `/source` | redact / unmatched (not parent `none`) |
+| CSAT `/message`, pre-chat item `name`, conversation `/source` | redact / unlisted (not parent `none`) |
 | Widget device name | redact |
 | `created_at_ip` | `ip-prefix` |
 | `referer`, `mail_subject`, email subject, SSN, Stripe ids | redact |
-| Evolving custom keys | `json_unmatched = "type-placeholders"` |
+| Evolving custom keys | `json_unlisted = "shape-only"` |
 | Message/automation/free-text fields | redact (regex scrubbing cannot reliably find names) |
 | `contact_directory` view | **own** `[columns."chatwoot.contact_directory"]` rules — Postgres reports the view OID |
 

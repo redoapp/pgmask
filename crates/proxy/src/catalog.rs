@@ -22,7 +22,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::mask::{JsonFieldSpec, JsonUnmatched, Mask, MaskSpec};
+use crate::mask::{JsonFieldSpec, JsonUnlisted, Mask, MaskSpec};
 
 pub(crate) mod json;
 
@@ -142,8 +142,8 @@ pub struct MaskParams {
     /// different domains cannot be linked by comparing masked values. Defaults
     /// to the semantic type's name.
     pub domain: Option<String>,
-    /// Policy for JSON leaves with no exact path override.
-    pub json_unmatched: Option<JsonUnmatched>,
+    /// What to do with JSON scalars the catalog did not list.
+    pub json_unlisted: Option<JsonUnlisted>,
     /// Maximum encoded JSON payload accepted before parsing.
     pub json_max_bytes: Option<usize>,
     /// Maximum object/array nesting accepted before parsing.
@@ -156,7 +156,7 @@ pub struct MaskParams {
 
 impl MaskParams {
     fn apply_to(&self, spec: &mut MaskSpec) -> Result<()> {
-        let has_json_params = self.json_unmatched.is_some()
+        let has_json_params = self.json_unlisted.is_some()
             || self.json_max_bytes.is_some()
             || self.json_max_depth.is_some()
             || self.json.is_some();
@@ -181,8 +181,8 @@ impl MaskParams {
         if let Some(v) = &self.domain {
             spec.domain = Some(v.as_str().into());
         }
-        if let Some(unmatched) = self.json_unmatched {
-            spec.json_unmatched = unmatched;
+        if let Some(unlisted) = self.json_unlisted {
+            spec.json_unlisted = unlisted;
         }
         if let Some(max_bytes) = self.json_max_bytes {
             spec.json_max_bytes = max_bytes;
@@ -2305,7 +2305,7 @@ email = { type = "email", by_role = { support = "partial" } }
 
 [columns."app.events".payload]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/profile/email", mask = "pseudonym", domain = "email" },
 ]
@@ -2322,10 +2322,7 @@ json = [
         assert_eq!(rules[1].mask, Some(Mask::None));
         assert_eq!(rules[2].display(), "app.events.payload");
         assert_eq!(rules[2].mask, Some(Mask::Json));
-        assert_eq!(
-            rules[2].params.json_unmatched,
-            Some(JsonUnmatched::TypePlaceholders)
-        );
+        assert_eq!(rules[2].params.json_unlisted, Some(JsonUnlisted::ShapeOnly));
         assert_eq!(
             rules[2]
                 .params
@@ -2374,6 +2371,27 @@ email = { mask = "redact", typo = true }
 "#,
         )
         .expect_err("an ignored compact field could be a missed mask");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn json_unmatched_is_not_a_recognized_key() {
+        // The knob is `json_unlisted`. A silent ignore of the old spelling
+        // would load as default null and look like an allowlist.
+        let err = toml::from_str::<Config>(
+            r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "a-long-enough-key"
+
+[[column]]
+relation = "s.documents"
+column = "payload"
+mask = "json"
+json_unmatched = "pass-through"
+"#,
+        )
+        .expect_err("the retired key must not parse");
         assert!(err.to_string().contains("unknown field"));
     }
 
@@ -2491,7 +2509,7 @@ pseudonym_key = "k"
 relation = "s.documents"
 column = "payload"
 mask = "json"
-json_unmatched = "none"
+json_unlisted = "pass-through"
 json_max_bytes = 2048
 json_max_depth = 12
 json = [
@@ -2505,7 +2523,10 @@ json = [
         let classification =
             classify(&cfg.column[0], &HashMap::new()).expect("JSON policy should compile");
         assert_eq!(classification.default.kind, Mask::Json);
-        assert_eq!(classification.default.json_unmatched, JsonUnmatched::None);
+        assert_eq!(
+            classification.default.json_unlisted,
+            JsonUnlisted::PassThrough
+        );
         assert_eq!(classification.default.json_max_bytes, 2048);
         assert_eq!(classification.default.json_max_depth, 12);
         assert_eq!(classification.default.json.len(), 4);
@@ -2533,7 +2554,7 @@ pseudonym_key = "k"
 relation = "s.documents"
 column = "payload"
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/items/*/account_id", mask = "pseudonym", domain = "account" },
   { pointer = "/items/0/account_id", mask = "redact" },
@@ -2543,8 +2564,8 @@ json = [
         let classification =
             classify(&cfg.column[0], &HashMap::new()).expect("JSON policy should compile");
         assert_eq!(
-            classification.default.json_unmatched,
-            JsonUnmatched::TypePlaceholders
+            classification.default.json_unlisted,
+            JsonUnlisted::ShapeOnly
         );
         assert_eq!(
             classification.default.json[0].segments.as_ref(),
@@ -2614,7 +2635,7 @@ json = [
 
         rule.mask = Some(Mask::Redact);
         rule.params.json_max_bytes = None;
-        rule.params.json_unmatched = Some(JsonUnmatched::Null);
+        rule.params.json_unlisted = Some(JsonUnlisted::Null);
         assert!(
             classify(&rule, &HashMap::new()).is_err(),
             "JSON-only parameters on an ordinary mask must be refused"

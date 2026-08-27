@@ -27,8 +27,8 @@ the result. JSON that Postgres constructs
 ```toml
 [columns."app.events".payload]
 mask = "json"
-# Optional. Keep unmatched scalar types visible without their values.
-json_unmatched = "type-placeholders"
+# Optional. Keep unlisted scalar types visible without their values.
+json_unlisted = "shape-only"
 # Optional resource bounds; these are the defaults.
 json_max_bytes = 1048576
 json_max_depth = 64
@@ -80,21 +80,23 @@ index 0 under an array and key `"0"` under an object. If such a segment could
 enter a `*` pointer branch, pgmask refuses the extract rather than guess. Use
 an integer `-> 0` step when traversing a configured array wildcard.
 
-## Unmatched leaves
+## Keys you did not list
 
-When no pointer and no inherited parent policy apply, `json_unmatched`
-chooses one behavior:
+Listed JSON Pointers always win, including inheritance to their subtree.
+`json_unlisted` is what happens to every other scalar — the allowlist /
+denylist switch for this column:
 
-| Setting | Unmatched string | number | boolean | JSON null |
+| Setting | String | number | boolean | JSON null |
 |---|---|---|---|---|
-| default / `json_unmatched = "null"` | `null` | `null` | `null` | `null` |
-| `json_unmatched = "type-placeholders"` | `""` | `0` | `false` | `null` |
-| `json_unmatched = "none"` | original value | original | original | `null` |
+| default / `json_unlisted = "null"` | `null` | `null` | `null` | `null` |
+| `json_unlisted = "shape-only"` | `""` | `0` | `false` | `null` |
+| `json_unlisted = "pass-through"` | original value | original | original | `null` |
 
-Use placeholders when analysts need to see *shape* (is this field a number?
-was it present?) without seeing the value. Use `json_unmatched = "none"` only
-when unmentioned values are intentionally public; that includes keys added
-after the catalog was written.
+Default is an allowlist: if you did not name the path, the value is stripped.
+Use `shape-only` when analysts need key presence and types without values.
+Use `pass-through` only for a denylist catalog — every sensitive path is
+listed, and anything new, including keys added after the catalog was written,
+is released. It is the least safe of the three; it is not a default.
 
 Objects and arrays are never replaced as a whole. They are always walked, and
 the leaf rule above applies to each scalar.
@@ -193,6 +195,6 @@ Treat `{ pointer = "/profile", mask = "none" }` as a grant of every current and
 future leaf under `/profile`, unless a narrower pointer overrides it. Review it
 the same way as a column-level `mask = "none"`.
 
-`json_unmatched = "type-placeholders"` discloses JSON types and the presence
+`json_unlisted = "shape-only"` discloses JSON types and the presence
 of keys. That is usually what a debugger needs; it is still a disclosure
-relative to defaulting every unmatched leaf to `null`.
+relative to defaulting every unlisted scalar to `null`.
