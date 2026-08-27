@@ -2,6 +2,11 @@
 
 ## 0.1.99 — structure-aware JSON and JSONB masking
 
+- Add compact TOML column tables: `[columns."schema.relation"]` groups simple
+  inline rules, while `[columns."schema.relation".column]` holds longer JSON
+  or role-specific policy. The original `[[column]]` spelling remains
+  compatible; duplicates across either form are startup errors. `classify`
+  now emits the compact form.
 - Add `mask = "json"` for classified `json` and `jsonb` columns. RFC 6901 JSON
   Pointer policies inherit through their subtree; more-specific paths override
   parents, so one release rule can cover an evolving public object while

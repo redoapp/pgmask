@@ -527,6 +527,7 @@ async fn start_proxy_at_full(
         unclassified_mask: Default::default(),
         opaque: policy.opaque,
         column: rules,
+        columns: Default::default(),
         semantic_type: Vec::new(),
         role: policy.roles,
         tls_cert: None,
@@ -549,8 +550,9 @@ async fn start_proxy_at_full(
         rate_limit_burst: 0,
         max_notices_per_exchange: 0,
     };
+    let column_rules: Vec<_> = config.column_rules().cloned().collect();
     let catalog = Arc::new(
-        Catalog::resolve(&config.column, &config.semantic_type, &config.catalog_dsn).await?,
+        Catalog::resolve(&column_rules, &config.semantic_type, &config.catalog_dsn).await?,
     );
     tokio::spawn(catalog.clone().run_refresher(
         std::time::Duration::from_secs(config.catalog_refresh_seconds),

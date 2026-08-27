@@ -25,9 +25,7 @@ the result. JSON that Postgres constructs
 ## Configuration
 
 ```toml
-[[column]]
-relation = "app.events"
-column = "payload"
+[columns."app.events".payload]
 mask = "json"
 # Optional. Keep unmatched scalar types visible without their values.
 json_unmatched = "type-placeholders"

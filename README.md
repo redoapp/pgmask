@@ -157,19 +157,11 @@ mask = "pseudonym"
 by_role = { support = "inner" }
 keep = 3
 
-[[column]]
-relation = "app.customers"
-column = "email"
-type = "email"
+[columns."app.customers"]
+email = { type = "email" }
+id = { mask = "none" }
 
-[[column]]
-relation = "app.customers"
-column = "id"
-mask = "none"
-
-[[column]]
-relation = "app.events"
-column = "payload"
+[columns."app.events".payload]
 mask = "json"
 # Keep the document useful for structural debugging: unmentioned strings,
 # numbers and booleans become "", 0 and false. Omit this for JSON null.
@@ -187,6 +179,11 @@ json = [
   { pointer = "/items/*/account_id", mask = "pseudonym", domain = "account" },
 ]
 ```
+
+The compact `[columns."schema.relation"]` form groups simple rules by table;
+a nested column table holds longer JSON or role-specific policy. The original
+`[[column]]` form remains supported, and both forms may coexist, but defining
+the same column twice is a startup error.
 
 Unknown configuration keys, invalid mask parameters, duplicate column rules,
 and unresolved configured columns are startup errors.

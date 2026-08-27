@@ -216,6 +216,7 @@ async fn start_proxy(
         unclassified_mask: Default::default(),
         opaque,
         column: Vec::new(),
+        columns: Default::default(),
         semantic_type: Vec::new(),
         role: Vec::new(),
         tls_cert: None,
