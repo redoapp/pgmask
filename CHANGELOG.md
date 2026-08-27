@@ -1,7 +1,8 @@
 # Changelog
 
-## 0.1.99 — structure-aware JSON and JSONB masking
+## 0.2.0 — structure-aware JSON and JSONB masking
 
+- Ship the unreleased 0.1.99 JSON and catalog work as a minor version.
 - Add compact TOML column tables: `[columns."schema.relation"]` groups simple
   inline rules, while `[columns."schema.relation".column]` holds longer JSON
   or role-specific policy. The original `[[column]]` spelling remains
@@ -143,6 +144,12 @@
   exact object paths is attributed through the same parser; subscripts that
   could enter an array wildcard, plus negative, computed, sliced, or casted
   keys, stay opaque.
+
+## 0.1.99 — unreleased working version
+
+- Tracked JSON masking, compact TOML catalogs, `json_keys`, and the Chatwoot
+  fixture on `main` before this minor. Never tagged as its own release; the
+  notes are under 0.2.0.
 
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 
