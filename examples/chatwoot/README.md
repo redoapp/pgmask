@@ -59,8 +59,10 @@ The main policy uses `posture = "hostile"`. Email equality/grouping and masked
 JSON predicates refuse. This is stronger than result-byte masking, but it is
 not a general information-flow proof: simple `ORDER BY` on a masked column is
 allowed and exposes relative order, and deterministic pseudonyms expose
-equality/frequency. Production still needs rate limiting and no route around
-the proxy; see [the security model](../../docs/security.md).
+equality/frequency. `DISTINCT` over a redacted column still exposes how many
+distinct source classes exist (the returned values are all `***`). Production
+still needs rate limiting and no route around the proxy; see
+[the security model](../../docs/security.md).
 
 Chatwoot's Arel is unqualified (`FROM "contacts"`). Two cases cover that:
 
@@ -76,14 +78,15 @@ qualify it, see whether the catalog answers the ops question without a leak.
 
 ## What a first run showed
 
-Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.1.99:
+Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.1.99
+(122 SQL cases):
 
 | Kind | Count | What happened |
 |---|---|---|
-| Served | 69 | Queue/delivery/status counts, timeline envelopes, dashboard FILTER counts, message `today`/`chat`, pseudonym correlation, whole masked JSON, `SELECT *`, view OIDs, literal extract spellings, tag-id filtering |
-| Refused | 31 | Unqualified/app JSON ordering, custom-attribute membership, label-name `EXISTS`, masked JOIN/HAVING/subqueries/grouping, JSON casts/JSONPath/parent text, dynamic or ambiguous keys, CTE alias, `jsonb_pretty` / `jsonb_each` / `to_jsonb`, UNION |
-| Error | 1 | Unqualified `FROM "contacts"` with no search_path — backend `undefined_table`, message withheld |
-| Protocol | 3 | Extended bind, same-session recovery after refusal, and mid-session `search_path` all pass |
+| Served | 73 | Queue/delivery/status counts, timeline envelopes, dashboard FILTER counts, message `today`/`chat`, pseudonym correlation, whole masked JSON, `SELECT *`, view OIDs, literal extract spellings, tag-id filtering, and documented order/cardinality disclosures |
+| Refused | 47 | Unqualified/app JSON ordering, containment/custom-attribute membership, label-name `EXISTS`, masked JOIN/NATURAL/LATERAL/HAVING/subqueries/windows/grouping, JSON casts/constructors/JSONPath/parent text, dynamic or ambiguous keys, CTE alias, SRFs, COPY and set operations |
+| Error | 2 | Unqualified `FROM "contacts"` and JSON-only bracket subscripting — backend messages withheld |
+| Protocol | 5 | Extended binds for released extract, masked predicate and masked ordering; same-session refusal recovery; mid-session `search_path` |
 | Poison control | 1 | A release-policy proxy exposes the source email, proving the detector can see a leak |
 
 The raw-wire integration suite separately sends Chatwoot's reported
