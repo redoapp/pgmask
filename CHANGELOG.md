@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.4 — attach CycloneDX SBOMs to the GitHub Release
+
+- 0.2.3 claimed a CycloneDX SBOM on the GitHub Release. cargo-dist 0.32.0's
+  generated workflow uploads `steps.cargo-cyclonedx.output.paths` (empty),
+  so those files never reached the Release; a sibling `find | mv` can also
+  fail on GNU mv. Turn that generator off and ship `pgmask.cdx.xml` and
+  `classify.cdx.xml` as dist extra-artifacts (`scripts/generate-sboms.sh`),
+  which reach the Release through dist's own manifest and upload path
+  rather than a generated step of its own. Pin cargo-cyclonedx 0.5.9:
+  0.5.5 (what dist 0.32 installs) cannot parse Cargo.lock v4 and omits
+  the package hashes that make an SBOM worth having.
+
 ## 0.2.3 — version flags and artifact supply chain
 
 - Print `pgmask --version` and `classify --version` from `CARGO_PKG_VERSION` so

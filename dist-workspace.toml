@@ -27,11 +27,20 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 packages = ["pgmask", "classify"]
 # Build only the required packages, and individually
 precise-builds = true
-# Embed the crate graph in each ELF (`cargo audit bin`) and attach a CycloneDX
-# SBOM to the GitHub Release. Size cost is small; both are for the artifact,
-# not only the checkout.
+# Embed the crate graph in each ELF (`cargo audit bin`). Size cost is small;
+# this is for the artifact, not only the checkout.
 cargo-auditable = true
-cargo-cyclonedx = true
+# cargo-dist 0.32.0's `cargo-cyclonedx = true` generates a Release step that
+# never uploads the files (empty `steps.*.output.paths`) and a `find | mv`
+# that GNU mv can refuse. Keep it off; extra-artifacts below go through
+# dist's own checksum/manifest/upload path.
+
+# CycloneDX SBOMs for the two shipped binaries. The script pins
+# cargo-cyclonedx 0.5.9: dist 0.32 would have installed 0.5.5, which
+# cannot parse Cargo.lock v4 and silently omits package hashes.
+[[dist.extra-artifacts]]
+artifacts = ["target/sbom/pgmask.cdx.xml", "target/sbom/classify.cdx.xml"]
+build = ["./scripts/generate-sboms.sh"]
 
 # Pin the same checkout action the rest of CI already uses.
 [dist.github-action-commits]

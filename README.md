@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.2.3**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.2.4**. Licensed under the [MIT License](LICENSE).
 
 ## Install
 
@@ -23,14 +23,15 @@ Pin the tag, then confirm the binary:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/redoapp/pgmask/releases/download/v0.2.3/pgmask-installer.sh | sh
+  https://github.com/redoapp/pgmask/releases/download/v0.2.4/pgmask-installer.sh | sh
 pgmask --version
 ```
 
 `classify` is a separate artifact (`classify-installer.sh` on the same
-release). Each GitHub Release also carries a CycloneDX SBOM. Verify an
-archive against GitHub's build provenance, and the ELF against rustsec
-once you have `cargo audit`:
+release). Each GitHub Release also carries CycloneDX SBOMs
+(`pgmask.cdx.xml`, `classify.cdx.xml`). Verify an archive against
+GitHub's build provenance, and the ELF against rustsec once you have
+`cargo audit`:
 
 ```bash
 gh attestation verify pgmask-x86_64-unknown-linux-gnu.tar.xz --repo redoapp/pgmask

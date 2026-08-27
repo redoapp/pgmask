@@ -1,4 +1,7 @@
 /target
+# cargo-cyclonedx writes next to a crate's Cargo.toml; dist extra-artifacts
+# copy the two we ship into target/sbom/. Neither belongs in git.
+*.cdx.xml
 
 # libFuzzer build output, saved corpora and crash reproducers. A corpus is a
 # cache — regenerable, machine-specific, and megabytes of it. A crash artifact
