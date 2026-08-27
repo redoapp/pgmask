@@ -1,6 +1,7 @@
 //! pgmask — a fail-closed column masking proxy for Postgres.
 //!
 //!   pgmask <config.toml>
+//!   pgmask --version
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,11 +32,24 @@ fn init_logging() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let path = match std::env::args().nth(1).as_deref() {
+        None => anyhow::bail!("{}", usage()),
+        Some("-V" | "--version") => {
+            println!("pgmask {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("-h" | "--help") => {
+            println!("{}", usage());
+            return Ok(());
+        }
+        Some(flag) if flag.starts_with('-') => {
+            anyhow::bail!("unrecognised option {flag}\n{}", usage());
+        }
+        Some(path) => path.to_owned(),
+    };
+
     init_logging();
 
-    let path = std::env::args()
-        .nth(1)
-        .context("usage: pgmask <config.toml>")?;
     let config = Config::load(&path)?;
 
     // Resolving the catalog before binding is deliberate: a proxy that starts
@@ -157,6 +171,10 @@ async fn main() -> Result<()> {
             .instrument(tracing::info_span!("session", %peer)),
         );
     }
+}
+
+fn usage() -> &'static str {
+    "usage: pgmask [--version] <config.toml>"
 }
 
 /// Resolves on SIGTERM or SIGINT.
