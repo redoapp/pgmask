@@ -24,7 +24,7 @@ use tokio::sync::Notify;
 
 use crate::mask::{JsonFieldSpec, JsonUnmatched, Mask, MaskSpec};
 
-mod json;
+pub(crate) mod json;
 
 /// Whether summarising aggregates over classified columns may be released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

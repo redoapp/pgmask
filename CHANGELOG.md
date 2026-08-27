@@ -83,7 +83,10 @@
   rule list. Any equivalence-preserving mutant on `compile`, `next_states`,
   `policy_at`, `has_ambiguous_wildcard`, or `has_descendants_at` diverges on
   some generated case; a temporary mutation was caught in seventeen cases
-  before this landed.
+  before this landed. The generator keeps tables catalog load would accept
+  by using the same equally-specific overlap predicate, then calls
+  `validate_json_spec`. Rule segments include `0` and `*` so exact-index vs
+  array-wildcard pairs appear; path `*` covers the literal object key.
 
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 

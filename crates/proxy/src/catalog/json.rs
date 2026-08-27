@@ -6,11 +6,11 @@
 
 use anyhow::{bail, Result};
 
-use crate::mask::{JsonFieldSpec, Mask, MaskSpec, MAX_JSON_MAX_DEPTH};
+use crate::mask::{Mask, MaskSpec, MAX_JSON_MAX_DEPTH};
 
 use super::validate_spec;
 
-pub(super) fn validate_json_spec(spec: &MaskSpec, what: &str) -> Result<()> {
+pub(crate) fn validate_json_spec(spec: &MaskSpec, what: &str) -> Result<()> {
     if spec.json_max_bytes == 0 {
         bail!("{what}: json_max_bytes must be at least 1");
     }
@@ -39,10 +39,12 @@ pub(super) fn validate_json_spec(spec: &MaskSpec, what: &str) -> Result<()> {
         {
             bail!("{what}: duplicate JSON pointer {:?}", field.pointer);
         }
-        if spec.json.iter().take(index).any(|earlier| {
-            json_pointer_patterns_overlap(earlier, field)
-                && json_pointer_wildcards(earlier) == json_pointer_wildcards(field)
-        }) {
+        if spec
+            .json
+            .iter()
+            .take(index)
+            .any(|earlier| earlier.equally_specific_overlap(field))
+        {
             bail!(
                 "{what}: JSON pointer {:?} ambiguously overlaps another equally-specific \
                  wildcard pointer",
@@ -53,31 +55,10 @@ pub(super) fn validate_json_spec(spec: &MaskSpec, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn json_pointer_wildcards(field: &JsonFieldSpec) -> usize {
-    field
-        .segments
-        .iter()
-        .filter(|segment| segment.as_str() == "*")
-        .count()
-}
-
-/// Whether one path can match both patterns. Equal-specificity overlaps would
-/// otherwise make config order decide which mask wins for that path — a release
-/// direction hidden in TOML ordering — so validation refuses them.
-fn json_pointer_patterns_overlap(left: &JsonFieldSpec, right: &JsonFieldSpec) -> bool {
-    left.segments.len() == right.segments.len()
-        && left
-            .segments
-            .iter()
-            .zip(right.segments.iter())
-            .all(|(a, b)| a == b || a == "*" || b == "*")
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::{json_pointer_patterns_overlap, json_pointer_wildcards};
     use crate::mask::{JsonFieldSpec, Mask, MaskSpec};
 
     fn field(pointer: &str) -> JsonFieldSpec {
@@ -153,15 +134,21 @@ mod tests {
             let left = field(case.left);
             let right = field(case.right);
             assert_eq!(
-                json_pointer_patterns_overlap(&left, &right),
+                JsonFieldSpec::patterns_overlap(&left, &right),
                 case.overlap,
                 "{}: overlap",
                 case.name
             );
             assert_eq!(
-                json_pointer_wildcards(&left) == json_pointer_wildcards(&right),
+                left.wildcard_count() == right.wildcard_count(),
                 case.equal_specificity,
                 "{}: equal specificity",
+                case.name
+            );
+            assert_eq!(
+                left.equally_specific_overlap(&right),
+                case.overlap && case.equal_specificity,
+                "{}: equally-specific overlap",
                 case.name
             );
         }

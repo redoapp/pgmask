@@ -94,11 +94,27 @@ impl JsonFieldSpec {
         })
     }
 
-    fn wildcard_count(&self) -> usize {
+    pub(crate) fn wildcard_count(&self) -> usize {
         self.segments
             .iter()
             .filter(|segment| segment.as_str() == "*")
             .count()
+    }
+
+    /// Whether one path can match both patterns. Equal-specificity overlaps
+    /// would otherwise make config order decide which mask wins.
+    pub(crate) fn patterns_overlap(left: &Self, right: &Self) -> bool {
+        left.segments.len() == right.segments.len()
+            && left
+                .segments
+                .iter()
+                .zip(right.segments.iter())
+                .all(|(a, b)| a == b || a == "*" || b == "*")
+    }
+
+    /// Catalog load refuses this pair: same `*` count and a shared match.
+    pub(crate) fn equally_specific_overlap(&self, other: &Self) -> bool {
+        Self::patterns_overlap(self, other) && self.wildcard_count() == other.wildcard_count()
     }
 }
 
@@ -1216,20 +1232,22 @@ mod tests {
         use super::{
             path_segments, JsonFieldSpec, JsonPathNavigation, JsonPolicyTrie, Mask, MaskSpec,
         };
+        use crate::catalog::json::validate_json_spec;
         use proptest::prelude::*;
 
-        /// Alphabet: `*` is the only wildcard segment; other segments are
-        /// literal keys or numeric-looking strings. The path alphabet includes
-        /// `c`, which no rule uses, so most paths must miss.
+        /// Rule segments include a numeric exact index (`0`) and `*` so
+        /// exact-vs-wildcard pairs appear. Path `c` is never a rule segment,
+        /// so most paths must miss.
         fn rule_segments() -> impl Strategy<Value = Vec<String>> {
             prop::collection::vec(
-                prop_oneof![Just("a"), Just("b"), Just("*")].prop_map(str::to_string),
+                prop_oneof![Just("a"), Just("b"), Just("0"), Just("*")].prop_map(str::to_string),
                 1..=4,
             )
         }
 
         fn path_value() -> impl Strategy<Value = String> {
-            prop_oneof![Just("a"), Just("b"), Just("0"), Just("c")].prop_map(str::to_string)
+            prop_oneof![Just("a"), Just("b"), Just("0"), Just("*"), Just("c")]
+                .prop_map(str::to_string)
         }
 
         fn navigation() -> impl Strategy<Value = JsonPathNavigation> {
@@ -1240,29 +1258,26 @@ mod tests {
             ]
         }
 
-        /// Rule sets that pass catalog load, computed inline rather than
-        /// calling the validator so the strategy always yields something.
-        ///
-        /// Refuses equal-specificity overlaps the same way `catalog::json`
-        /// does: same segment length, same `*` count, and every pair equal or
-        /// one side wildcard. A duplicate is the degenerate equal-specificity
-        /// overlap, so this covers it too.
-        fn accepted_rule_set() -> impl Strategy<Value = Vec<Vec<String>>> {
+        fn field_from_segments(segments: &[String], kind: Mask) -> JsonFieldSpec {
+            JsonFieldSpec::new(format!("/{}", segments.join("/")), MaskSpec::new(kind))
+                .expect("alphabet segments are valid JSON Pointer pieces")
+        }
+
+        /// Keep insertion order, dropping any pointer catalog load would refuse
+        /// as an equally-specific overlap (including duplicates).
+        fn accepted_fields() -> impl Strategy<Value = Vec<JsonFieldSpec>> {
             prop::collection::vec(rule_segments(), 0..=6).prop_map(|pointers| {
-                let mut accepted: Vec<Vec<String>> = Vec::new();
-                for candidate in pointers {
-                    let wildcards = candidate.iter().filter(|s| s.as_str() == "*").count();
-                    let overlaps = accepted.iter().any(|earlier| {
-                        earlier.len() == candidate.len()
-                            && earlier.iter().filter(|s| s.as_str() == "*").count() == wildcards
-                            && earlier
-                                .iter()
-                                .zip(candidate.iter())
-                                .all(|(a, b)| a == b || a == "*" || b == "*")
-                    });
-                    if !overlaps {
-                        accepted.push(candidate);
+                let kinds = [Mask::Redact, Mask::None, Mask::Null, Mask::Hash];
+                let mut accepted = Vec::new();
+                for (index, segments) in pointers.into_iter().enumerate() {
+                    let field = field_from_segments(&segments, kinds[index % kinds.len()]);
+                    if accepted
+                        .iter()
+                        .any(|earlier: &JsonFieldSpec| earlier.equally_specific_overlap(&field))
+                    {
+                        continue;
                     }
+                    accepted.push(field);
                 }
                 accepted
             })
@@ -1279,32 +1294,33 @@ mod tests {
         }
 
         fn spec_policy_at(
-            pointers: &[(Vec<String>, Mask)],
+            fields: &[JsonFieldSpec],
             path: &[(String, JsonPathNavigation)],
         ) -> Option<Mask> {
-            pointers
+            fields
                 .iter()
-                .filter(|(segments, _)| {
-                    segments.len() == path.len()
-                        && segments
+                .filter(|field| {
+                    field.segments.len() == path.len()
+                        && field
+                            .segments
                             .iter()
                             .zip(path.iter())
                             .all(|(rule, step)| step_matches(rule, step))
                 })
-                .min_by_key(|(segments, _)| segments.iter().filter(|s| s.as_str() == "*").count())
-                .map(|(_, kind)| *kind)
+                .min_by_key(|field| field.wildcard_count())
+                .map(|field| field.spec.kind)
         }
 
         fn spec_has_ambiguous_wildcard(
-            pointers: &[(Vec<String>, Mask)],
+            fields: &[JsonFieldSpec],
             path: &[(String, JsonPathNavigation)],
         ) -> bool {
             path.iter().enumerate().any(|(depth, (_, nav))| {
                 *nav == JsonPathNavigation::Ambiguous
-                    && pointers.iter().any(|(segments, _)| {
-                        segments.len() > depth
-                            && segments[depth] == "*"
-                            && segments[..depth]
+                    && fields.iter().any(|field| {
+                        field.segments.len() > depth
+                            && field.segments[depth] == "*"
+                            && field.segments[..depth]
                                 .iter()
                                 .zip(path[..depth].iter())
                                 .all(|(rule, step)| step_matches(rule, step))
@@ -1313,12 +1329,12 @@ mod tests {
         }
 
         fn spec_has_descendants_at(
-            pointers: &[(Vec<String>, Mask)],
+            fields: &[JsonFieldSpec],
             path: &[(String, JsonPathNavigation)],
         ) -> bool {
-            pointers.iter().any(|(segments, _)| {
-                segments.len() > path.len()
-                    && segments[..path.len()]
+            fields.iter().any(|field| {
+                field.segments.len() > path.len()
+                    && field.segments[..path.len()]
                         .iter()
                         .zip(path.iter())
                         .all(|(rule, step)| step_matches(rule, step))
@@ -1326,52 +1342,34 @@ mod tests {
         }
 
         proptest! {
-            // A wider net than the default 256: the alphabet is small and the
-            // filter drops occasionally, so more cases give more genuine
-            // coverage without slowing the release gate meaningfully.
             #![proptest_config(ProptestConfig::with_cases(1024))]
 
             #[test]
             fn compiled_trie_matches_brute_force_lookup(
-                rule_set in accepted_rule_set(),
+                fields in accepted_fields(),
                 path in path_strategy(),
             ) {
-                // Distinct kinds per rule so a wrong tie-break shows as a wrong
-                // kind, not the same kind coincidentally being right.
-                let kinds = [Mask::Redact, Mask::None, Mask::Null, Mask::Hash];
-                let with_kinds: Vec<(Vec<String>, Mask)> = rule_set
-                    .iter()
-                    .enumerate()
-                    .map(|(index, segments)| {
-                        (segments.clone(), kinds[index % kinds.len()])
-                    })
-                    .collect();
-                let fields: Vec<JsonFieldSpec> = with_kinds
-                    .iter()
-                    .map(|(segments, kind)| {
-                        JsonFieldSpec::new(
-                            format!("/{}", segments.join("/")),
-                            MaskSpec::new(*kind),
-                        )
-                        .expect("catalog-passing pointer")
-                    })
-                    .collect();
+                let mut catalog = MaskSpec::new(Mask::Json);
+                catalog.set_json_fields(fields.clone());
+                validate_json_spec(&catalog, "proptest")
+                    .expect("strategy must only yield tables catalog load would accept");
+
                 let trie = JsonPolicyTrie::compile(&fields);
                 let segments = path_segments(&path);
 
                 prop_assert_eq!(
                     trie.policy_at(&segments).map(|spec| spec.kind),
-                    spec_policy_at(&with_kinds, &path),
+                    spec_policy_at(&fields, &path),
                     "policy_at mismatch"
                 );
                 prop_assert_eq!(
                     trie.has_ambiguous_wildcard(&segments),
-                    spec_has_ambiguous_wildcard(&with_kinds, &path),
+                    spec_has_ambiguous_wildcard(&fields, &path),
                     "has_ambiguous_wildcard mismatch"
                 );
                 prop_assert_eq!(
                     trie.has_descendants_at(&segments),
-                    spec_has_descendants_at(&with_kinds, &path),
+                    spec_has_descendants_at(&fields, &path),
                     "has_descendants_at mismatch"
                 );
             }
