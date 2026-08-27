@@ -28,7 +28,7 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
         json_rule(
             relation,
             column,
-            pgmask::mask::JsonUnmatched::TypePlaceholders,
+            pgmask::mask::JsonUnlisted::ShapeOnly,
             vec![
                 json_field("/profile", pgmask::mask::Mask::None),
                 email,
@@ -55,7 +55,7 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
     rules.push(json_rule(
         "canary.documents",
         "encoded",
-        pgmask::mask::JsonUnmatched::TypePlaceholders,
+        pgmask::mask::JsonUnlisted::ShapeOnly,
         Vec::new(),
     ));
     rules
@@ -608,35 +608,35 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             poison: Some(CANARY_EMAIL),
         },
         JsonSqlValueCase {
-            name: "unmatched sensitive string becomes SQL NULL",
+            name: "unlisted sensitive string becomes SQL NULL",
             sql: "SELECT payload->>'unknown' FROM canary.documents",
             direct: JsonSqlValue::Text(CANARY_NOTE),
             masked: JsonSqlValue::Null,
             poison: Some(CANARY_NOTE),
         },
         JsonSqlValueCase {
-            name: "unmatched number text extract becomes SQL NULL",
+            name: "unlisted number text extract becomes SQL NULL",
             sql: "SELECT payload->>'n' FROM canary.documents",
             direct: JsonSqlValue::Text("99"),
             masked: JsonSqlValue::Null,
             poison: None,
         },
         JsonSqlValueCase {
-            name: "unmatched boolean text extract becomes SQL NULL",
+            name: "unlisted boolean text extract becomes SQL NULL",
             sql: "SELECT payload->>'enabled' FROM canary.documents",
             direct: JsonSqlValue::Text("true"),
             masked: JsonSqlValue::Null,
             poison: None,
         },
         JsonSqlValueCase {
-            name: "unmatched number document extract keeps type",
+            name: "unlisted number document extract keeps type",
             sql: "SELECT payload->'n' FROM canary.documents",
             direct: JsonSqlValue::Json(serde_json::json!(99)),
             masked: JsonSqlValue::Json(serde_json::json!(0)),
             poison: None,
         },
         JsonSqlValueCase {
-            name: "unmatched boolean document extract keeps type",
+            name: "unlisted boolean document extract keeps type",
             sql: "SELECT payload->'enabled' FROM canary.documents",
             direct: JsonSqlValue::Json(serde_json::json!(true)),
             masked: JsonSqlValue::Json(serde_json::json!(false)),
@@ -685,14 +685,14 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             poison: None,
         },
         JsonSqlValueCase {
-            name: "empty object text extract follows unmatched SQL NULL policy",
+            name: "empty object text extract follows unlisted SQL NULL policy",
             sql: "SELECT payload->>'empty_object' FROM canary.documents",
             direct: JsonSqlValue::Text("{}"),
             masked: JsonSqlValue::Null,
             poison: None,
         },
         JsonSqlValueCase {
-            name: "empty array text extract follows unmatched SQL NULL policy",
+            name: "empty array text extract follows unlisted SQL NULL policy",
             sql: "SELECT payload->>'empty_array' FROM canary.documents",
             direct: JsonSqlValue::Text("[]"),
             masked: JsonSqlValue::Null,
@@ -959,7 +959,7 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
         assert_single_sql_value(&rows, &case.masked, case.name);
     }
 
-    // One RowDescription carrying released, masked, unmatched, typed, and
+    // One RowDescription carrying released, masked, unlisted, typed, and
     // array-wildcard extracts pins positional alignment across fields. Testing
     // each projection alone would not catch a plan shifted by one slot.
     let sql = "SELECT payload->>'public', \
@@ -1052,17 +1052,18 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
     Ok(())
 }
 
-/// `json_unmatched = "none"` is a deliberate release grant, including text
+/// `json_unlisted = "pass-through"` is a deliberate release grant, including text
 /// extracts. Pin that disclosure while proving a narrower pointer still wins.
 #[tokio::test]
-async fn json_unmatched_none_releases_only_unlisted_extracts_by_configuration() -> Result<()> {
+async fn json_unlisted_pass_through_releases_only_unlisted_extracts_by_configuration() -> Result<()>
+{
     require_pg!();
     load_schema(DB).await?;
     let mut rules = default_rules();
     rules.push(json_rule(
         "canary.documents",
         "payload",
-        pgmask::mask::JsonUnmatched::None,
+        pgmask::mask::JsonUnlisted::PassThrough,
         vec![
             json_field("/profile/email", pgmask::mask::Mask::Redact),
             json_field("/items/*/token", pgmask::mask::Mask::Redact),
@@ -1077,7 +1078,7 @@ async fn json_unmatched_none_releases_only_unlisted_extracts_by_configuration() 
         "SELECT payload->>'unknown' FROM canary.documents",
     )
     .await?;
-    assert_served(&unknown.messages, "json_unmatched none release");
+    assert_served(&unknown.messages, "json_unlisted pass-through release");
     assert_eq!(
         unknown.text_rows()?,
         vec![vec![Some(CANARY_NOTE.into())]],
@@ -1091,22 +1092,22 @@ async fn json_unmatched_none_releases_only_unlisted_extracts_by_configuration() 
     .await?;
     assert_served(
         &email.messages,
-        "pointer override under json_unmatched none",
+        "pointer override under json_unlisted pass-through",
     );
     assert_no_canary_bytes(
         &email.received,
-        "pointer override under json_unmatched none",
+        "pointer override under json_unlisted pass-through",
     );
     assert_eq!(
         email.text_rows()?,
         vec![vec![Some("***".into())]],
-        "explicit pointer must override unmatched release"
+        "explicit pointer must override pass-through release"
     );
 
     // The runtime parent and post-cast type decide subscript navigation.
     // PostgreSQL uses both bare `0` and `'0'` as index 0 under an array and key
     // "0" under an object. Casts add another inversion: `'0'::int` is an array
-    // index while `0::text` is an object key. Under this unmatched-release
+    // index while `0::text` is an object key. Under this pass-through
     // policy, claiming either shape can release the token instead of applying
     // the explicit wildcard or refusing.
     for (name, sql) in [
@@ -1632,7 +1633,7 @@ async fn json_leaf_type_mismatch_refuses_the_wire_result_set() -> Result<()> {
     rules.push(json_rule(
         "canary.documents",
         "payload",
-        pgmask::mask::JsonUnmatched::Null,
+        pgmask::mask::JsonUnlisted::Null,
         vec![
             json_field("/profile", pgmask::mask::Mask::None),
             email,
@@ -1660,7 +1661,7 @@ async fn json_document_byte_and_depth_limits_refuse_before_rows_cross() -> Resul
         let mut document = json_rule(
             "canary.documents",
             "payload",
-            pgmask::mask::JsonUnmatched::Null,
+            pgmask::mask::JsonUnlisted::Null,
             vec![
                 json_field("/profile/email", pgmask::mask::Mask::Redact),
                 json_field("/public", pgmask::mask::Mask::None),

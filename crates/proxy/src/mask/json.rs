@@ -33,17 +33,22 @@ pub struct JsonFieldSpec {
     pub spec: MaskSpec,
 }
 
-/// Policy for a scalar leaf not covered by a JSON Pointer rule.
+/// What to do with a JSON scalar the catalog did not list, and that does not
+/// inherit a parent pointer policy.
+///
+/// Listed pointers still win. This is the allowlist / denylist switch for
+/// everything else: default [`Self::Null`] withholds unlisted values;
+/// [`Self::PassThrough`] releases them, including keys added later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub enum JsonUnmatched {
-    /// Replace every unmatched scalar with JSON null.
+pub enum JsonUnlisted {
+    /// Default. Replace the scalar with JSON null.
     #[default]
     Null,
-    /// Preserve the scalar type without preserving its value.
-    TypePlaceholders,
-    /// Pass unmatched scalar values through unchanged.
-    None,
+    /// Keep the JSON type (`""`, `0`, `false`) but not the value.
+    ShapeOnly,
+    /// Pass the original scalar through. New keys added later are released.
+    PassThrough,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,7 +257,7 @@ impl MaskSpec {
     /// Text extracts cannot walk children: the backend has already serialized
     /// the node. A path with any more-specific pointer therefore refuses
     /// rather than apply `none` to a blob that still contains masked leaves.
-    /// Unmatched paths become SQL NULL, matching the default JSON leaf.
+    /// Unlisted paths become SQL NULL, matching the default JSON leaf.
     pub(crate) fn json_text_extract_spec(
         &self,
         path: &[(String, JsonPathNavigation)],
@@ -269,11 +274,9 @@ impl MaskSpec {
         match self.policy_along(&segments) {
             Some(spec) if spec.kind == Mask::Json => None,
             Some(spec) => Some(spec.clone()),
-            None => match self.json_unmatched {
-                JsonUnmatched::None => Some(Self::new(Mask::None)),
-                JsonUnmatched::Null | JsonUnmatched::TypePlaceholders => {
-                    Some(Self::new(Mask::Null))
-                }
+            None => match self.json_unlisted {
+                JsonUnlisted::PassThrough => Some(Self::new(Mask::None)),
+                JsonUnlisted::Null | JsonUnlisted::ShapeOnly => Some(Self::new(Mask::Null)),
             },
         }
     }
@@ -294,7 +297,7 @@ impl Masker {
     /// exact path policies plus a default policy to all remaining leaves.
     ///
     /// Object keys and array shape are preserved. Values are not: the
-    /// `json_unmatched` policy governs leaves with no pointer policy.
+    /// `json_unlisted` policy governs scalars with no pointer policy.
     pub(super) fn mask_json(
         &self,
         spec: &MaskSpec,
@@ -381,18 +384,16 @@ impl Masker {
             _ => {
                 *value = match policy {
                     Some(policy) => self.mask_json_value(policy, value)?,
-                    None if json_spec.json_unmatched == JsonUnmatched::TypePlaceholders => {
-                        match value {
-                            JsonValue::String(_) => JsonValue::String(String::new()),
-                            JsonValue::Number(_) => JsonValue::Number(0.into()),
-                            JsonValue::Bool(_) => JsonValue::Bool(false),
-                            JsonValue::Null => JsonValue::Null,
-                            JsonValue::Array(_) | JsonValue::Object(_) => {
-                                unreachable!("containers recurse above")
-                            }
+                    None if json_spec.json_unlisted == JsonUnlisted::ShapeOnly => match value {
+                        JsonValue::String(_) => JsonValue::String(String::new()),
+                        JsonValue::Number(_) => JsonValue::Number(0.into()),
+                        JsonValue::Bool(_) => JsonValue::Bool(false),
+                        JsonValue::Null => JsonValue::Null,
+                        JsonValue::Array(_) | JsonValue::Object(_) => {
+                            unreachable!("containers recurse above")
                         }
-                    }
-                    None if json_spec.json_unmatched == JsonUnmatched::None => value.clone(),
+                    },
+                    None if json_spec.json_unlisted == JsonUnlisted::PassThrough => value.clone(),
                     None => JsonValue::Null,
                 };
                 Ok(())
@@ -532,7 +533,7 @@ mod tests {
     )]
     use super::{
         json_nesting_exceeds, path_segments, JsonFieldSpec, JsonLimit, JsonPathNavigation,
-        JsonPolicyTrie, JsonProjection, JsonUnmatched, Mask, MaskError, MaskSpec, Masker,
+        JsonPolicyTrie, JsonProjection, JsonUnlisted, Mask, MaskError, MaskSpec, Masker,
         FORMAT_BINARY, FORMAT_TEXT, OID_JSONB,
     };
     use crate::mask::OID_JSON;
@@ -545,10 +546,10 @@ mod tests {
 
     fn json_spec(default: Mask, fields: Vec<(&str, MaskSpec)>) -> MaskSpec {
         let mut spec = MaskSpec::new(Mask::Json);
-        spec.json_unmatched = match default {
-            Mask::Null => JsonUnmatched::Null,
-            Mask::None => JsonUnmatched::None,
-            _ => panic!("test helper supports null or none unmatched policy"),
+        spec.json_unlisted = match default {
+            Mask::Null => JsonUnlisted::Null,
+            Mask::None => JsonUnlisted::PassThrough,
+            _ => panic!("test helper supports null or pass-through unlisted policy"),
         };
         let fields = fields
             .into_iter()
@@ -635,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn json_unmatched_none_preserves_unmentioned_nested_values_only_when_explicit() {
+    fn json_unlisted_pass_through_preserves_unmentioned_nested_values_only_when_explicit() {
         let spec = json_spec(Mask::None, vec![("/private", MaskSpec::new(Mask::Redact))]);
         let output = apply_json(
             &spec,
@@ -725,9 +726,9 @@ mod tests {
     }
 
     #[test]
-    fn json_unmatched_type_placeholders_keep_shape_without_leaf_values() {
+    fn json_unlisted_shape_only_keep_shape_without_leaf_values() {
         let mut spec = json_spec(Mask::Null, Vec::new());
-        spec.json_unmatched = JsonUnmatched::TypePlaceholders;
+        spec.json_unlisted = JsonUnlisted::ShapeOnly;
         let output = apply_json(
             &spec,
             OID_JSONB,
@@ -910,7 +911,7 @@ mod tests {
             Mask::Null,
             vec![("/items/*/account_id", MaskSpec::new(Mask::Redact))],
         );
-        spec.json_unmatched = JsonUnmatched::TypePlaceholders;
+        spec.json_unlisted = JsonUnlisted::ShapeOnly;
         let input = serde_json::json!({
             "items": (0..512)
                 .map(|index| serde_json::json!({

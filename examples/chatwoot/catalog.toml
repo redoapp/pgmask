@@ -65,7 +65,7 @@ status = { mask = "none" }
 
 [columns."chatwoot.accounts".settings]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/auto_resolve_after", mask = "none" },
   { pointer = "/audio_transcriptions", mask = "none" },
@@ -74,7 +74,7 @@ json = [
 
 [columns."chatwoot.accounts".custom_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/industry", mask = "none" },
   { pointer = "/plan", mask = "none" },
@@ -82,7 +82,7 @@ json = [
 
 [columns."chatwoot.accounts".limits]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/agents", mask = "none" },
   { pointer = "/inboxes", mask = "none" },
@@ -91,7 +91,7 @@ json = [
 # Billing identifiers live here in real Chatwoot installs.
 [columns."chatwoot.accounts".internal_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/onboarding_step", mask = "none" },
   { pointer = "/stripe_customer_id", mask = "redact" },
@@ -111,7 +111,7 @@ type = { mask = "none" }
 
 [columns."chatwoot.users".ui_settings]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/rtl_view", mask = "none" },
   { pointer = "/is_conv_actions_open", mask = "none" },
@@ -120,7 +120,7 @@ json = [
 
 [columns."chatwoot.users".custom_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/language", mask = "none" },
   { pointer = "/phone_number", mask = "pseudonym", domain = "phone" },
@@ -146,14 +146,14 @@ lock_to_single_conversation = { mask = "none" }
 
 [columns."chatwoot.inboxes".auto_assignment_config]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/max_assignment_limit", mask = "none" },
 ]
 
 [columns."chatwoot.inboxes".csat_config]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/display_type", mask = "none" },
   # CSAT copy is tenant prose (same class as greeting_message), not an
@@ -184,7 +184,7 @@ blocked = { mask = "none" }
 # everything else keeps type without value until an operator adds a pointer.
 [columns."chatwoot.contacts".custom_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/order_id", mask = "pseudonym", domain = "order_id" },
   { pointer = "/signed_up_at", mask = "none" },
@@ -194,10 +194,10 @@ json = [
 
 # Widget / CRM blob written by the Chatwoot JS SDK and Contact model.
 # Do not grant `/initiated_at` as `none`: that inherits to every future
-# child. Timestamp is the ops key; nested PII stays unmatched.
+# child. Timestamp is the ops key; nested PII stays unlisted.
 [columns."chatwoot.contacts".additional_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/company_name", mask = "none" },
   { pointer = "/city", mask = "none" },
@@ -245,7 +245,7 @@ label_list = { mask = "null" }
 
 [columns."chatwoot.conversations".additional_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/browser/browser_name", mask = "none" },
   { pointer = "/browser/browser_version", mask = "none" },
@@ -265,7 +265,7 @@ json = [
 
 [columns."chatwoot.conversations".custom_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/priority_reason", mask = "redact" },
   { pointer = "/stripe_charge", mask = "redact" },
@@ -309,7 +309,7 @@ processed_message_content = { mask = "redact" }
 
 [columns."chatwoot.messages".content_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/automation_rule_id", mask = "none" },
   { pointer = "/submitted_email", mask = "pseudonym", domain = "email" },
@@ -326,18 +326,18 @@ json = [
 
 [columns."chatwoot.messages".external_source_ids]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 
 [columns."chatwoot.messages".additional_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/campaign_id", mask = "none" },
 ]
 
 [columns."chatwoot.messages".sentiment]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/label", mask = "none" },
   { pointer = "/score", mask = "none" },
@@ -357,7 +357,7 @@ active = { mask = "none" }
 
 [columns."chatwoot.automation_rules".conditions]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/*/attribute_key", mask = "none" },
   { pointer = "/*/query_operator", mask = "none" },
@@ -368,7 +368,7 @@ json = [
 
 [columns."chatwoot.automation_rules".actions]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 # action_params hold send_message prose, emails, and labels. action_name
 # is the ops diagnostic; params are customer-controlled.
 json = [
@@ -388,7 +388,7 @@ webhook_type = { mask = "none" }
 
 [columns."chatwoot.webhooks".subscriptions]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 
 # ---------------------------------------------------------------------------
 # chatwoot.custom_attribute_definitions / tags / taggings
@@ -410,7 +410,7 @@ regex_cue = { mask = "redact" }
 
 [columns."chatwoot.custom_attribute_definitions".attribute_values]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 
 [columns."chatwoot.tags"]
 id = { mask = "none" }
@@ -440,7 +440,7 @@ account_name = { mask = "none" }
 
 [columns."chatwoot.contact_directory".additional_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/company_name", mask = "none" },
   { pointer = "/city", mask = "none" },
@@ -461,7 +461,7 @@ json = [
 
 [columns."chatwoot.contact_directory".custom_attributes]
 mask = "json"
-json_unmatched = "type-placeholders"
+json_unlisted = "shape-only"
 json = [
   { pointer = "/order_id", mask = "pseudonym", domain = "order_id" },
   { pointer = "/signed_up_at", mask = "none" },

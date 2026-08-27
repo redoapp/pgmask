@@ -19,7 +19,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pgmask::catalog::{
     ColumnRule, Config, JsonFieldRule, Lineage, MaskParams, Opaque, SystemCatalogs, Unclassified,
 };
-use pgmask::mask::{JsonUnmatched, Mask};
+use pgmask::mask::{JsonUnlisted, Mask};
 use pgmask::protocol::{FrameReader, Message, StartupPacket};
 use pgmask::{Catalog, Policy};
 use tokio::io::AsyncWriteExt;
@@ -369,11 +369,11 @@ pub fn json_field(pointer: &str, mask: Mask) -> JsonFieldRule {
 pub fn json_rule(
     relation: &str,
     column: &str,
-    unmatched: JsonUnmatched,
+    unlisted: JsonUnlisted,
     fields: Vec<JsonFieldRule>,
 ) -> ColumnRule {
     let mut rule = rule(relation, column, Mask::Json);
-    rule.params.json_unmatched = Some(unmatched);
+    rule.params.json_unlisted = Some(unlisted);
     rule.params.json = Some(fields);
     rule
 }

@@ -12,16 +12,16 @@
   Pointer policies inherit through their subtree; more-specific paths override
   parents, so one release rule can cover an evolving public object while
   narrow child rules still redact sensitive fields.
-- Every unmatched scalar defaults to JSON `null`; an operator may explicitly
-  choose `json_unmatched = "none"` when unmentioned values are intentionally
-  public. A configured mask/type mismatch, malformed JSON, or unknown
-  binary-jsonb version refuses the result set.
+- Every unlisted JSON scalar defaults to JSON `null` (allowlist of pointers);
+  an operator may choose `json_unlisted = "pass-through"` when unmentioned
+  values are intentionally public (denylist). A configured mask/type mismatch,
+  malformed JSON, or unknown binary-jsonb version refuses the result set.
 - Add `*` array-element policies, so `/items/*/account_id` masks every item
   without enumerating indices; an exact index wins over the wildcard. Add the
-  opt-in `json_unmatched = "type-placeholders"` debugging policy, which
+  opt-in `json_unlisted = "shape-only"` debugging policy, which
   retains scalar types as `""`, `0`, `false`, and `null` while withholding
-  values. One enum now owns all unmatched-leaf behavior (`null`,
-  `type-placeholders`, or `none`) instead of two conflicting settings.
+  values. One enum now owns all unlisted-scalar behavior (`null`,
+  `shape-only`, or `pass-through`) instead of two conflicting settings.
   Equally-specific overlapping wildcard policies are rejected at config load
   rather than resolved by TOML order.
 - Compile JSON Pointer rules into a trie at catalog load, so walking a node
@@ -102,7 +102,7 @@
   pass found the same inheritance class on CSAT `/message`, pre-chat
   `/items/*/name`, conversation `/source`, webhook `subscriptions/*`,
   plus column-level `none` on `label_list`, `tags.name`, `accounts.domain`,
-  and `priority_reason`; those are now redact, null, or unmatched, with
+  and `priority_reason`; those are now redact, null, or unlisted, with
   planted RT2 canaries.
 - Pin the JSON pointer trie and catalog overlap helpers with named lookup
   tables: exact beats `*`, object keys never take array wildcards, ambiguous
@@ -119,7 +119,7 @@
   array-wildcard pairs appear; path `*` covers the literal object key.
 - Add a live-Postgres JSON SQL value campaign. Sixty-six operator, function,
   cast/collation, alias/join/view/CTE/subquery, object, array, `json`/`jsonb`,
-  unmatched-leaf, and whole-document queries first run directly against
+  unlisted-scalar, and whole-document queries first run directly against
   PostgreSQL, requiring poison values where applicable, then decode pgmask's
   raw-wire DataRows and compare the exact text, SQL NULL, or semantic JSON
   result; a five-field projection plus star expansion and a two-column view
@@ -129,7 +129,7 @@
   pgmask's own refusal without one byte of poison. Binary Bind assertions now
   check the exact partial text mask and versioned masked jsonb document, not
   only absence of a canary. Pin the intentional disclosure from
-  `json_unmatched = "none"` while proving a narrower pointer still wins, and
+  `json_unlisted = "pass-through"` while proving a narrower pointer still wins, and
   apply byte/depth refusal checks to document extracts as well as whole
   columns. Fold the earlier canary-only JSON extract, constructor, and
   provenance matrices into these campaigns so a served shape has one exact

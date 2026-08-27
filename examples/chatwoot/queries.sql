@@ -266,7 +266,7 @@ FROM chatwoot.conversations
 WHERE id = 5001;
 
 -- IMAP threading data is useful as a presence/shape diagnosis but the message
--- id itself is external customer data. Channel `source` is unmatched so a
+-- id itself is external customer data. Channel `source` is unlisted so a
 -- later object-shaped value cannot inherit `none`.
 -- @id: conversation-email-routing-json
 -- @expect: served
@@ -829,7 +829,7 @@ FROM chatwoot.contacts
 WHERE id = 1001;
 
 -- Known inbox config remains useful after changing unknown leaves to
--- type-placeholders. CSAT copy is tenant prose and is redacted.
+-- shape-only. CSAT copy is tenant prose and is redacted.
 -- @id: inbox-csat-config
 -- @expect: served
 -- @contains: emoji|***
@@ -1395,7 +1395,7 @@ ORDER BY c.id;
 
 -- Parent `none` on `/initiated_at` would inherit into note/email children.
 -- Timestamp is released; nested canaries must not be. A text extract of an
--- unmatched leaf is JSON-null (SQL NULL); the parent object walk keeps `""`.
+-- unlisted leaf is JSON-null (SQL NULL); the parent object walk keeps `""`.
 -- @id: initiated-at-timestamp
 -- @expect: served
 -- @contains: 2026-03-14T09:21:55.000Z
