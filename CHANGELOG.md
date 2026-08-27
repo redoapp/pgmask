@@ -87,6 +87,18 @@
   by using the same equally-specific overlap predicate, then calls
   `validate_json_spec`. Rule segments include `0` and `*` so exact-index vs
   array-wildcard pairs appear; path `*` covers the literal object key.
+- Add a live-Postgres JSON SQL value campaign. Forty-six operator, function,
+  cast/collation, alias/join/view, object, array, `json`/`jsonb`, and unmatched
+  leaf queries first run directly against PostgreSQL, requiring poison values
+  where applicable, then decode pgmask's raw-wire DataRows and compare the
+  exact text, SQL NULL, or semantic JSON result; one multi-field query pins
+  positional plan alignment across released, masked, unmatched, typed, and
+  array-wildcard extracts. Twenty-three refused
+  construction, expansion, JSONPath, dynamic/ambiguous path, mutation,
+  subscripting, aggregate, and set-operation shapes likewise must expose a
+  poison directly and produce pgmask's own refusal without one byte of poison.
+  Binary Bind assertions now check the exact partial text mask and versioned
+  masked jsonb document, not only absence of a canary.
 
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 

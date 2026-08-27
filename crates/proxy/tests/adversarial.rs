@@ -38,6 +38,7 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
                 json_field("/items/*/token", pgmask::mask::Mask::Redact),
                 json_field("/numeric_object/*", pgmask::mask::Mask::None),
                 json_field("/numeric_object/*/token", pgmask::mask::Mask::Redact),
+                json_field("/a~1b/~0key", pgmask::mask::Mask::Redact),
             ],
         )
     };
@@ -52,6 +53,45 @@ fn classified_json_document_rules() -> Vec<pgmask::catalog::ColumnRule> {
         rules.push(document_rule(relation, "legacy"));
     }
     rules
+}
+
+#[derive(Debug)]
+enum JsonSqlValue {
+    Text(&'static str),
+    Json(serde_json::Value),
+    Null,
+}
+
+struct JsonSqlValueCase {
+    name: &'static str,
+    sql: &'static str,
+    direct: JsonSqlValue,
+    masked: JsonSqlValue,
+    poison: Option<&'static str>,
+}
+
+fn assert_single_sql_value(rows: &[Vec<Option<String>>], expected: &JsonSqlValue, context: &str) {
+    assert_eq!(rows.len(), 1, "{context}: expected one row, got {rows:?}");
+    assert_eq!(
+        rows[0].len(),
+        1,
+        "{context}: expected one field, got {:?}",
+        rows[0]
+    );
+    match expected {
+        JsonSqlValue::Text(expected) => {
+            assert_eq!(rows[0][0].as_deref(), Some(*expected), "{context}")
+        }
+        JsonSqlValue::Json(expected) => {
+            let actual = rows[0][0]
+                .as_ref()
+                .unwrap_or_else(|| panic!("{context}: expected JSON, got SQL NULL"));
+            let actual: serde_json::Value = serde_json::from_str(actual)
+                .unwrap_or_else(|error| panic!("{context}: invalid JSON {actual:?}: {error}"));
+            assert_eq!(&actual, expected, "{context}");
+        }
+        JsonSqlValue::Null => assert_eq!(rows[0][0], None, "{context}"),
+    }
 }
 
 // --- Negative control -------------------------------------------------------
@@ -410,6 +450,613 @@ async fn json_extracts_with_literal_paths_are_masked() -> Result<()> {
     Ok(())
 }
 
+/// Analyst-facing JSON queries return the useful value implied by pointer
+/// policy, not merely "something without a canary".
+///
+/// Every case first runs directly against Postgres. Sensitive cases require
+/// the direct value to contain a poison token, proving the SQL reaches the
+/// secret and that a refusal/NULL/mask through pgmask is meaningful. The same
+/// SQL then runs through the raw-wire client and its one text DataRow is
+/// decoded exactly (JSON values compare semantically, not by key order).
+#[tokio::test]
+async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, classified_json_document_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    let partial_email = "***************b2c3";
+    let cases = vec![
+        JsonSqlValueCase {
+            name: "released text leaf",
+            sql: "SELECT payload->>'public' FROM canary.documents",
+            direct: JsonSqlValue::Text("Portland"),
+            masked: JsonSqlValue::Text("Portland"),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "masked chained text leaf",
+            sql: "SELECT payload->'profile'->>'email' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "qualified operator syntax masked text leaf",
+            sql: "SELECT (payload OPERATOR(pg_catalog.->) 'profile') \
+                  OPERATOR(pg_catalog.->>) 'email' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked hash-path text leaf",
+            sql: "SELECT payload #>> '{profile,email}' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked ARRAY path text leaf",
+            sql: "SELECT payload #>> ARRAY['profile','email'] FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked cast ARRAY path text leaf",
+            sql: "SELECT payload #>> ARRAY['profile'::text,'email'::text] \
+                  FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked extract-path text leaf",
+            sql: "SELECT jsonb_extract_path_text(payload, 'profile', 'email') \
+                  FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "qualified masked extract-path text leaf",
+            sql: "SELECT pg_catalog.jsonb_extract_path_text(payload, 'profile', 'email') \
+                  FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "cast keys in extract-path text leaf",
+            sql: "SELECT jsonb_extract_path_text(payload, 'profile'::text, 'email'::text) \
+                  FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "legacy json masked text leaf",
+            sql: "SELECT legacy->'profile'->>'email' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "legacy json extract-path text leaf",
+            sql: "SELECT json_extract_path_text(legacy, 'profile', 'email') \
+                  FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "view-owned masked text leaf",
+            sql: "SELECT payload->'profile'->>'email' FROM canary.documents_view",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "aliased joined masked text leaf",
+            sql: "SELECT d.payload->'profile'->>'email' FROM canary.documents d \
+                  JOIN canary.subjects s ON s.id = d.id",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "cast wrapper keeps masked value",
+            sql: "SELECT CAST(payload->'profile'->>'email' AS text) FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "collation wrapper keeps masked value",
+            sql: "SELECT (payload->'profile'->>'email') COLLATE \"C\" \
+                  FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked extract with containment predicate in default posture",
+            sql: "SELECT payload->'profile'->>'email' FROM canary.documents \
+                  WHERE payload @> '{\"public\":\"Portland\"}'",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked extract with text predicate in default posture",
+            sql: "SELECT payload->'profile'->>'email' FROM canary.documents \
+                  WHERE payload->>'public' = 'Portland'",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked extract ordered by itself",
+            sql: "SELECT payload->'profile'->>'email' FROM canary.documents \
+                  ORDER BY payload->'profile'->>'email'",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "distinct masked extract",
+            sql: "SELECT DISTINCT payload->'profile'->>'email' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked extract with limit",
+            sql: "SELECT payload->'profile'->>'email' FROM canary.documents LIMIT 1",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "unmatched sensitive string becomes SQL NULL",
+            sql: "SELECT payload->>'unknown' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_NOTE),
+            masked: JsonSqlValue::Null,
+            poison: Some(CANARY_NOTE),
+        },
+        JsonSqlValueCase {
+            name: "unmatched number text extract becomes SQL NULL",
+            sql: "SELECT payload->>'n' FROM canary.documents",
+            direct: JsonSqlValue::Text("99"),
+            masked: JsonSqlValue::Null,
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "unmatched boolean text extract becomes SQL NULL",
+            sql: "SELECT payload->>'enabled' FROM canary.documents",
+            direct: JsonSqlValue::Text("true"),
+            masked: JsonSqlValue::Null,
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "unmatched number document extract keeps type",
+            sql: "SELECT payload->'n' FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!(99)),
+            masked: JsonSqlValue::Json(serde_json::json!(0)),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "unmatched boolean document extract keeps type",
+            sql: "SELECT payload->'enabled' FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!(true)),
+            masked: JsonSqlValue::Json(serde_json::json!(false)),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "explicit JSON null document extract stays JSON null",
+            sql: "SELECT payload->'nothing' FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::Value::Null),
+            masked: JsonSqlValue::Json(serde_json::Value::Null),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "explicit JSON null text extract is SQL NULL",
+            sql: "SELECT payload->>'nothing' FROM canary.documents",
+            direct: JsonSqlValue::Null,
+            masked: JsonSqlValue::Null,
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "missing document path is SQL NULL",
+            sql: "SELECT payload->'missing' FROM canary.documents",
+            direct: JsonSqlValue::Null,
+            masked: JsonSqlValue::Null,
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "missing text path is SQL NULL",
+            sql: "SELECT payload->>'missing' FROM canary.documents",
+            direct: JsonSqlValue::Null,
+            masked: JsonSqlValue::Null,
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "empty object document extract preserves shape",
+            sql: "SELECT payload->'empty_object' FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({})),
+            masked: JsonSqlValue::Json(serde_json::json!({})),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "empty array document extract preserves shape",
+            sql: "SELECT payload->'empty_array' FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!([])),
+            masked: JsonSqlValue::Json(serde_json::json!([])),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "empty object text extract follows unmatched SQL NULL policy",
+            sql: "SELECT payload->>'empty_object' FROM canary.documents",
+            direct: JsonSqlValue::Text("{}"),
+            masked: JsonSqlValue::Null,
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "empty array text extract follows unmatched SQL NULL policy",
+            sql: "SELECT payload->>'empty_array' FROM canary.documents",
+            direct: JsonSqlValue::Text("[]"),
+            masked: JsonSqlValue::Null,
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "released array city",
+            sql: "SELECT payload->'items'->0->>'city' FROM canary.documents",
+            direct: JsonSqlValue::Text("Denver"),
+            masked: JsonSqlValue::Text("Denver"),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "second released array city",
+            sql: "SELECT payload->'items'->1->>'city' FROM canary.documents",
+            direct: JsonSqlValue::Text("Seattle"),
+            masked: JsonSqlValue::Text("Seattle"),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "masked array token text leaf",
+            sql: "SELECT payload->'items'->0->>'token' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_TEMP),
+            masked: JsonSqlValue::Text("***"),
+            poison: Some(CANARY_TEMP),
+        },
+        JsonSqlValueCase {
+            name: "masked array token document scalar",
+            sql: "SELECT payload->'items'->0->'token' FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!(CANARY_TEMP)),
+            masked: JsonSqlValue::Json(serde_json::json!("***")),
+            poison: Some(CANARY_TEMP),
+        },
+        JsonSqlValueCase {
+            name: "masked array object",
+            sql: "SELECT payload->'items'->0 FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "token": CANARY_TEMP,
+                "city": "Denver"
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "token": "***",
+                "city": "Denver"
+            })),
+            poison: Some(CANARY_TEMP),
+        },
+        JsonSqlValueCase {
+            name: "masked whole array",
+            sql: "SELECT payload->'items' FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!([
+                {"token": CANARY_TEMP, "city": "Denver"},
+                {"token": CANARY_TEMP, "city": "Seattle"}
+            ])),
+            masked: JsonSqlValue::Json(serde_json::json!([
+                {"token": "***", "city": "Denver"},
+                {"token": "***", "city": "Seattle"}
+            ])),
+            poison: Some(CANARY_TEMP),
+        },
+        JsonSqlValueCase {
+            name: "masked profile object",
+            sql: "SELECT payload->'profile' FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "email": CANARY_EMAIL,
+                "name": CANARY_NAME
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "email": partial_email,
+                "name": "***"
+            })),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked hash-path profile object",
+            sql: "SELECT payload #> '{profile}' FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "email": CANARY_EMAIL,
+                "name": CANARY_NAME
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "email": partial_email,
+                "name": "***"
+            })),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked ARRAY path profile object",
+            sql: "SELECT payload #> ARRAY['profile'] FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "email": CANARY_EMAIL,
+                "name": CANARY_NAME
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "email": partial_email,
+                "name": "***"
+            })),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "masked extract-path profile object",
+            sql: "SELECT jsonb_extract_path(payload, 'profile') FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "email": CANARY_EMAIL,
+                "name": CANARY_NAME
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "email": partial_email,
+                "name": "***"
+            })),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "quoted numeric object key never inherits array wildcard",
+            sql: "SELECT payload->'numeric_object'->'0'->>'token' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_TEMP),
+            masked: JsonSqlValue::Null,
+            poison: Some(CANARY_TEMP),
+        },
+        JsonSqlValueCase {
+            name: "literal object star key uses the star pointer",
+            sql: "SELECT payload->'numeric_object'->'*'->>'token' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_TEMP),
+            masked: JsonSqlValue::Text("***"),
+            poison: Some(CANARY_TEMP),
+        },
+        JsonSqlValueCase {
+            name: "RFC 6901 escaped pointer keys work through SQL",
+            sql: "SELECT payload->'a/b'->>'~key' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_NOTE),
+            masked: JsonSqlValue::Text("***"),
+            poison: Some(CANARY_NOTE),
+        },
+    ];
+
+    for case in cases {
+        let direct = simple_query_direct(DB, case.sql).await?;
+        assert_single_sql_value(
+            &direct,
+            &case.direct,
+            &format!("{} direct poison", case.name),
+        );
+        if let Some(poison) = case.poison {
+            assert!(
+                direct
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .any(|value| value.contains(poison)),
+                "{}: direct query did not expose poison {poison:?}: {direct:?}",
+                case.name
+            );
+        }
+
+        let masked = simple_query_round(&mut client, case.sql).await?;
+        assert_served(&masked.messages, case.name);
+        assert_no_canary_bytes(&masked.received, case.name);
+        let rows = masked.text_rows()?;
+        assert_single_sql_value(&rows, &case.masked, case.name);
+    }
+
+    // One RowDescription carrying released, masked, unmatched, typed, and
+    // array-wildcard extracts pins positional alignment across fields. Testing
+    // each projection alone would not catch a plan shifted by one slot.
+    let sql = "SELECT payload->>'public', \
+                      payload->'profile'->>'email', \
+                      payload->>'unknown', \
+                      payload->>'n', \
+                      payload->'items'->0->>'token' \
+               FROM canary.documents";
+    let direct = simple_query_direct(DB, sql).await?;
+    assert_eq!(
+        direct,
+        vec![vec![
+            Some("Portland".into()),
+            Some(CANARY_EMAIL.into()),
+            Some(CANARY_NOTE.into()),
+            Some("99".into()),
+            Some(CANARY_TEMP.into()),
+        ]],
+        "multi-field direct poison control"
+    );
+    let masked = simple_query_round(&mut client, sql).await?;
+    assert_served(&masked.messages, "multi-field JSON projection");
+    assert_no_canary_bytes(&masked.received, "multi-field JSON projection");
+    assert_eq!(
+        masked.text_rows()?,
+        vec![vec![
+            Some("Portland".into()),
+            Some(partial_email.into()),
+            None,
+            None,
+            Some("***".into()),
+        ]],
+        "JSON expression plans must align with RowDescription positions"
+    );
+    Ok(())
+}
+
+/// Every refused JSON shape is valid SQL that exposes a poison value on the
+/// backend. This distinguishes a pgmask refusal from a PostgreSQL parse/type
+/// error and from a query that never reached sensitive data.
+#[tokio::test]
+async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, classified_json_document_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    let cases = [
+        (
+            "named extract alias through subquery",
+            "SELECT email FROM (SELECT payload->'profile'->>'email' AS email \
+             FROM canary.documents) q",
+            CANARY_EMAIL,
+        ),
+        (
+            "named extract alias through CTE",
+            "WITH q AS (SELECT payload->'profile'->>'email' AS email \
+             FROM canary.documents) SELECT email FROM q",
+            CANARY_EMAIL,
+        ),
+        (
+            "runtime operator key",
+            "SELECT payload->>(CASE WHEN id = 1 THEN 'unknown' ELSE 'public' END) \
+             FROM canary.documents",
+            CANARY_NOTE,
+        ),
+        (
+            "runtime ARRAY path element",
+            "SELECT payload #>> ARRAY['profile', CASE WHEN id = 1 THEN 'email' ELSE 'name' END] \
+             FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "ambiguous text path through an array wildcard",
+            "SELECT payload #>> '{items,0,token}' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "ambiguous extract-path function through an array wildcard",
+            "SELECT jsonb_extract_path_text(payload, 'items', '0', 'token') \
+             FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "negative array index",
+            "SELECT payload->'items'->-1->>'token' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "protected object serialized by text operator",
+            "SELECT payload->>'profile' FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "protected object serialized by hash path",
+            "SELECT payload #>> '{profile}' FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "protected object serialized by extract-path function",
+            "SELECT jsonb_extract_path_text(payload, 'profile') FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "JSONPath query first",
+            "SELECT jsonb_path_query_first(payload, '$.profile.email') \
+             FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "JSONPath set-returning query",
+            "SELECT jsonb_path_query(payload, '$.items[*].token') \
+             FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "pretty serialization",
+            "SELECT jsonb_pretty(payload) FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "object expansion",
+            "SELECT jsonb_each(payload) FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "array expansion",
+            "SELECT jsonb_array_elements(payload->'items') FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "object construction around an extract",
+            "SELECT jsonb_build_object('email', payload->'profile'->>'email') \
+             FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "document concatenation",
+            "SELECT payload || '{\"added\":true}'::jsonb FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "document deletion",
+            "SELECT payload - 'public' FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "document mutation",
+            "SELECT jsonb_set(payload, '{public}', '\"changed\"') FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "document text cast",
+            "SELECT payload::text FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "JSON aggregate",
+            "SELECT jsonb_agg(payload) FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "JSON set operation",
+            "SELECT payload FROM canary.documents \
+             UNION ALL SELECT payload FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "JSON subscripting",
+            "SELECT payload['profile']['email'] FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+    ];
+
+    for (name, sql, poison) in cases {
+        let direct = simple_query_direct(DB, sql).await?;
+        assert!(
+            direct
+                .iter()
+                .flatten()
+                .flatten()
+                .any(|value| value.contains(poison)),
+            "{name}: direct poison control did not expose {poison:?}: {direct:?}"
+        );
+
+        let masked = simple_query_round(&mut client, sql).await?;
+        assert_refused_bytes(&masked.received, name);
+        assert_no_canary_bytes(&masked.received, name);
+    }
+    Ok(())
+}
+
 /// One live-server matrix for the JSON SQL surface.
 ///
 /// Unit tests pin parser nodes and trie branches; this test asks PostgreSQL to
@@ -649,6 +1296,14 @@ async fn json_sql_surface_is_useful_without_guessing_provenance_or_shape() -> Re
     let messages = binary.read_until_ready().await?;
     assert_served(&messages, "binary JSON text extract");
     assert_no_canary(&binary, "binary JSON text extract");
+    let rows = data_rows(&messages)?;
+    assert_eq!(rows.len(), 1, "binary JSON text extract rows");
+    assert_eq!(rows[0].len(), 1, "binary JSON text extract fields");
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(b"***************b2c3".as_slice()),
+        "binary text-family result must contain the exact partial mask"
+    );
 
     let mut binary_document = RawClient::connect(proxy.addr, DB).await?;
     binary_document
@@ -674,24 +1329,55 @@ async fn json_sql_surface_is_useful_without_guessing_provenance_or_shape() -> Re
     let messages = binary_document.read_until_ready().await?;
     assert_served(&messages, "binary JSON document extract");
     assert_no_canary(&binary_document, "binary JSON document extract");
+    let rows = data_rows(&messages)?;
+    let value = rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(Option::as_ref)
+        .expect("one non-NULL binary JSON document field");
+    assert_eq!(value.first(), Some(&1), "binary jsonb version");
+    let value: serde_json::Value =
+        serde_json::from_slice(&value[1..]).expect("binary jsonb JSON payload");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "email": "***************b2c3",
+            "name": "***"
+        }),
+        "binary JSON document extract must carry the exact pointer masks"
+    );
 
     // Hostile posture still credits one literal extract as the projection, but
     // rejects a second mention of the masked document in a predicate.
     let hostile = start_proxy_hostile(DB, rules).await?;
     let mut hostile_client = RawClient::connect(hostile.addr, DB).await?;
-    let messages = hostile_client
-        .simple_query("SELECT payload->>'public' FROM canary.documents")
-        .await?;
-    assert_served(&messages, "hostile literal JSON projection");
-    assert_no_canary(&hostile_client, "hostile literal JSON projection");
-    hostile_client
-        .simple_query(
-            "SELECT payload->>'public' FROM canary.documents \
-             WHERE payload @> '{\"public\":\"Portland\"}'",
-        )
-        .await?;
-    assert_refused(&hostile_client, "hostile JSON predicate oracle");
-    assert_no_canary(&hostile_client, "hostile JSON predicate oracle");
+    let projection = simple_query_round(
+        &mut hostile_client,
+        "SELECT payload->'profile'->>'email' FROM canary.documents",
+    )
+    .await?;
+    assert_served(&projection.messages, "hostile literal JSON projection");
+    assert_no_canary_bytes(&projection.received, "hostile literal JSON projection");
+    assert_eq!(
+        projection.text_rows()?,
+        vec![vec![Some("***************b2c3".into())]],
+        "hostile posture must still return the exact pointer mask"
+    );
+
+    let predicate_sql = "SELECT payload->'profile'->>'email' FROM canary.documents \
+                         WHERE payload @> '{\"public\":\"Portland\"}'";
+    let direct = simple_query_direct(DB, predicate_sql).await?;
+    assert!(
+        direct
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|value| value.contains(CANARY_EMAIL)),
+        "hostile predicate poison control: {direct:?}"
+    );
+    let predicate = simple_query_round(&mut hostile_client, predicate_sql).await?;
+    assert_refused_bytes(&predicate.received, "hostile JSON predicate oracle");
+    assert_no_canary_bytes(&predicate.received, "hostile JSON predicate oracle");
     Ok(())
 }
 
