@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pgmask::catalog::{
     ColumnRule, Config, JsonFieldRule, Lineage, MaskParams, Opaque, SystemCatalogs, Unclassified,
 };
@@ -125,9 +125,16 @@ INSERT INTO canary.documents VALUES (
       {"token":"CANARY_TEMP_j0k1l2","city":"Denver"},
       {"token":"CANARY_TEMP_j0k1l2","city":"Seattle"}
     ],
-    "numeric_object":{"0":{"token":"CANARY_TEMP_j0k1l2"}},
+    "numeric_object":{
+      "0":{"token":"CANARY_TEMP_j0k1l2"},
+      "*":{"token":"CANARY_TEMP_j0k1l2"}
+    },
+    "a/b":{"~key":"CANARY_NOTE_97h8i9"},
     "n": 99,
-    "enabled": true
+    "enabled": true,
+    "nothing": null,
+    "empty_object": {},
+    "empty_array": []
   }',
   '{
     "profile":{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6"},
@@ -247,6 +254,31 @@ pub async fn exec_direct(db: &str, sql: &str) -> Result<()> {
     });
     client.batch_execute(sql).await?;
     Ok(())
+}
+
+/// Run a simple query straight against Postgres and return its text rows.
+///
+/// This is only a poison/control path. Assertions about pgmask still use
+/// [`RawClient`] so they inspect the bytes that crossed the proxy boundary.
+pub async fn simple_query_direct(db: &str, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+    let (client, connection) =
+        tokio_postgres::connect(&backend_dsn(db), tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let messages = client.simple_query(sql).await?;
+    Ok(messages
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|index| row.get(index).map(str::to_owned))
+                    .collect(),
+            ),
+            tokio_postgres::SimpleQueryMessage::CommandComplete(_) => None,
+            _ => None,
+        })
+        .collect())
 }
 
 pub async fn load_schema(db: &str) -> Result<()> {
@@ -688,6 +720,62 @@ impl QueryRound {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.received).into_owned()
     }
+
+    /// Decode DataRows from a simple query, whose result format is always text.
+    pub fn text_rows(&self) -> Result<Vec<Vec<Option<String>>>> {
+        data_rows(&self.messages)?
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| {
+                        value
+                            .map(|value| String::from_utf8(value.to_vec()))
+                            .transpose()
+                            .map_err(Into::into)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+/// Decode raw DataRow fields without assuming a result format.
+pub fn data_rows(messages: &[Message]) -> Result<Vec<Vec<Option<Bytes>>>> {
+    let mut rows = Vec::new();
+    for message in messages.iter().filter(|message| message.tag == b'D') {
+        let mut body = message.body.clone();
+        if body.remaining() < 2 {
+            bail!("DataRow is missing its field count");
+        }
+        let field_count = body.get_i16();
+        if field_count < 0 {
+            bail!("DataRow has a negative field count");
+        }
+        let mut row = Vec::with_capacity(usize::try_from(field_count)?);
+        for _ in 0..field_count {
+            if body.remaining() < 4 {
+                bail!("DataRow is missing a field length");
+            }
+            let length = body.get_i32();
+            if length == -1 {
+                row.push(None);
+                continue;
+            }
+            if length < 0 {
+                bail!("DataRow has an invalid negative field length");
+            }
+            let length = usize::try_from(length)?;
+            if body.remaining() < length {
+                bail!("DataRow field length exceeds its body");
+            }
+            row.push(Some(body.copy_to_bytes(length)));
+        }
+        if body.has_remaining() {
+            bail!("DataRow has trailing bytes after its fields");
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// Run a simple query and return only the bytes this round added.
@@ -868,7 +956,7 @@ pub fn assert_refused(client: &RawClient, context: &str) {
 }
 
 #[track_caller]
-fn assert_refused_bytes(received: &[u8], context: &str) {
+pub fn assert_refused_bytes(received: &[u8], context: &str) {
     let text = String::from_utf8_lossy(received);
     assert!(
         text.contains("pgmask:"),
