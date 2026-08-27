@@ -80,7 +80,7 @@ qualify it, see whether the catalog answers the ops question without a leak.
 
 ## What a first run showed
 
-Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.2.0
+Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.2.1
 (165 SQL cases):
 
 | Kind | Count | What happened |

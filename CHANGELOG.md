@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 — GitHub Releases with attested binaries
+
+- Ship `pgmask` and `classify` on GitHub Releases via cargo-dist. Pushing a
+  `vX.Y.Z` tag builds native archives for `x86_64` and `aarch64` Linux (gnu)
+  and macOS, a shell installer, checksums, and GitHub artifact attestations.
+  `publish = false` is unchanged: this is an application, not a crates.io
+  crate. Internal binaries (`spike`, `bench`, `corpus`, `fuzz`) are not
+  shipped.
+- Stop treating a `@` byte in the full wire transcript as an email leak.
+  `BackendKeyData`'s cancel secret is random; a 0x40 there failed
+  `multi_statement_simple_query_stays_masked` on CI. The pin is the email
+  canary.
+
 ## 0.2.0 — structure-aware JSON and JSONB masking
 
 - Ship the unreleased 0.1.99 JSON and catalog work as a minor version.
