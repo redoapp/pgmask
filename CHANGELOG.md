@@ -6,7 +6,8 @@
   inline rules, while `[columns."schema.relation".column]` holds longer JSON
   or role-specific policy. The original `[[column]]` spelling remains
   compatible; duplicates across either form are startup errors. `classify`
-  now emits the compact form.
+  now emits the compact form. The Chatwoot golden catalog is authored in
+  that compact grouping; policy is unchanged.
 - Add `mask = "json"` for classified `json` and `jsonb` columns. RFC 6901 JSON
   Pointer policies inherit through their subtree; more-specific paths override
   parents, so one release rule can cover an evolving public object while
