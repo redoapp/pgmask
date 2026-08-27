@@ -7,9 +7,10 @@
   so those files never reached the Release; a sibling `find | mv` can also
   fail on GNU mv. Turn that generator off and ship `pgmask.cdx.xml` and
   `classify.cdx.xml` as dist extra-artifacts (`scripts/generate-sboms.sh`),
-  which checksum and upload through the same path as the installers. Pin
-  cargo-cyclonedx 0.5.9: 0.5.5 (what dist 0.32 installs) cannot parse
-  Cargo.lock v4 and omits package hashes.
+  which reach the Release through dist's own manifest and upload path
+  rather than a generated step of its own. Pin cargo-cyclonedx 0.5.9:
+  0.5.5 (what dist 0.32 installs) cannot parse Cargo.lock v4 and omits
+  the package hashes that make an SBOM worth having.
 
 ## 0.2.3 — version flags and artifact supply chain
 
