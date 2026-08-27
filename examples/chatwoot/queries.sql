@@ -180,6 +180,16 @@ SELECT content_attributes->'email'->>'subject'
 FROM chatwoot.messages
 WHERE id = 9004;
 
+-- Whole OID-114 json document: keys/array shape survive, submitted values do
+-- not. This is the pre-chat form shape used by Message store accessors.
+-- @id: message-content-attributes-blob
+-- @expect: served
+-- @contains: "name":"email"
+-- @refute: alice.cw-canary@inbox.test
+SELECT content_attributes
+FROM chatwoot.messages
+WHERE id = 9003;
+
 -- Transcript text may contain names and addresses a recogniser cannot find.
 -- Metadata stays useful; the prose is wholly redacted.
 -- @id: message-content-redact
@@ -380,6 +390,26 @@ SELECT conditions->0->>'attribute_key', conditions->0->>'filter_operator'
 FROM chatwoot.automation_rules
 WHERE id = 70;
 
+-- PostgreSQL JSONB subscripts decide whether 0 means an array index from the
+-- runtime parent. A configured `*` edge therefore cannot be proven statically.
+-- Integer -> is the safe diagnostic form above.
+-- @id: automation-condition-subscript
+-- @expect: refused
+SELECT conditions[0]['attribute_key']
+FROM chatwoot.automation_rules
+WHERE id = 70;
+
+-- The two masked projections use one semantic domain, so an engineer can
+-- correlate a contact reached through a base table and a view without seeing
+-- the source email.
+-- @id: email-pseudonym-consistency
+-- @expect: served
+-- @refute: alice.cw-canary@inbox.test
+SELECT c.email, d.email
+FROM chatwoot.contacts c
+JOIN chatwoot.contact_directory d ON d.id = c.id
+WHERE c.id = 1001;
+
 -- ---------------------------------------------------------------------------
 -- A real Chatwoot storage bug: `store ..., coder: JSON` can double-encode a
 -- native json/jsonb column as a JSON string scalar (chatwoot#14660).
@@ -463,3 +493,50 @@ WHERE additional_attributes->>'city' = 'Austin';
 SELECT id, location
 FROM chatwoot.contacts
 WHERE location = 'Austin';
+
+-- ---------------------------------------------------------------------------
+-- More exact ActiveRecord shapes from Chatwoot models/services.
+-- ---------------------------------------------------------------------------
+
+-- CustomAttributeFilterHelper builds LOWER(json ->> key)::text predicates.
+-- The custom value is masked and hostile posture refuses the membership
+-- oracle, even though only an id is projected.
+-- @id: chatwoot-custom-attribute-filter
+-- @expect: refused
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/services/filters/custom_attribute_filter_helper.rb
+SELECT id
+FROM chatwoot.contacts
+WHERE LOWER(custom_attributes->>'order_id')::text IN ('ord-9911');
+
+-- Conversations::FilterService computes these three dashboard counts in one
+-- scan with COUNT(*) FILTER. Hostile posture disables reducing summaries; the
+-- simpler per-status operational counts above remain available.
+-- @id: chatwoot-conversation-dashboard-counts
+-- @expect: refused
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/services/filter_service.rb
+SELECT
+  count(*) FILTER (WHERE assignee_id = 10),
+  count(*) FILTER (WHERE assignee_id IS NULL),
+  count(*)
+FROM chatwoot.conversations;
+
+-- Message.today is a real model scope. created_at and row-envelope fields are
+-- released operational metadata, so this remains useful under hostile posture.
+-- @id: chatwoot-message-today-scope
+-- @expect: served
+-- @contains: 9005|3
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/message.rb
+SELECT id, status
+FROM chatwoot.messages
+WHERE date_trunc('day', created_at) = TIMESTAMP '2026-03-14 00:00:00'
+ORDER BY id;
+
+-- Message.chat excludes activity/private rows. It is pure released metadata.
+-- @id: chatwoot-message-chat-scope
+-- @expect: served
+-- @contains: 9001|0|f
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/message.rb
+SELECT id, message_type, private
+FROM chatwoot.messages
+WHERE message_type <> 2 AND private = false
+ORDER BY id;
