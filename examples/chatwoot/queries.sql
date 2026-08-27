@@ -954,6 +954,209 @@ SELECT DISTINCT email
 FROM chatwoot.contacts
 ORDER BY email;
 
+-- Relative ordering is also observable for wholly redacted transcript text.
+-- The ids reproduce backend cleartext order; no body bytes cross.
+-- @id: hostile-order-by-content
+-- @expect: served
+-- @rows: 5
+-- @contains: 9004
+-- @contains: 9001
+-- @contains: 9005
+-- @contains: 9002
+-- @contains: 9003
+SELECT id
+FROM chatwoot.messages
+WHERE conversation_id = 5001
+ORDER BY content;
+
+-- Grouping deterministic JSON pseudonyms exposes equality/frequency.
+-- @id: group-by-order-id-pseudonym
+-- @expect: served
+-- @rows: 2
+-- @refute: ORD-9911
+SELECT custom_attributes->>'order_id', count(*)
+FROM chatwoot.contacts
+GROUP BY 1
+ORDER BY 1;
+
+-- Redaction hides values but not distinct plaintext cardinality: four
+-- non-NULL bodies become four identical `***` rows.
+-- @id: distinct-redacted-content
+-- @expect: served
+-- @rows: 4
+-- @contains: ***
+SELECT DISTINCT content
+FROM chatwoot.messages
+WHERE conversation_id = 5001;
+
+-- JSON containment is a membership oracle, including when the target pointer
+-- itself is released. Hostile posture refuses the masked document use.
+-- @id: hostile-json-containment-referer
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
+SELECT id
+FROM chatwoot.contacts
+WHERE additional_attributes @>
+  '{"referer":"https://shop.acme.example/checkout?token=CANARYREF"}'::jsonb;
+
+-- @id: hostile-json-containment-company
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
+SELECT id
+FROM chatwoot.contacts
+WHERE additional_attributes @> '{"company_name":"Canary Logistics"}'::jsonb;
+
+-- @id: hostile-json-containment-order
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
+SELECT id
+FROM chatwoot.contacts
+WHERE custom_attributes @> '{"order_id":"ORD-9911"}'::jsonb;
+
+-- Rename the source columns, then try to predicate on the alias instead of the
+-- catalogued name. The hostile rename guard must not lose the masked source.
+-- @id: hostile-column-list-rename
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
+SELECT contact_id
+FROM chatwoot.contacts AS renamed(
+  contact_id, contact_name, contact_email, contact_phone, account,
+  external_identifier, last_seen, custom_json, additional_json,
+  kind, middle, family, place, country, is_blocked
+)
+WHERE contact_email = 'alice.cw-canary@inbox.test';
+
+-- NATURAL JOIN implicitly introduces every same-named column, including
+-- masked names/emails. Even a count cannot make that safe.
+-- @id: hostile-natural-join
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 0
+SELECT count(*)
+FROM chatwoot.contacts
+NATURAL JOIN chatwoot.users;
+
+-- LATERAL and scalar-subquery routes to the same membership oracle.
+-- @id: hostile-lateral-membership
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
+SELECT c.id
+FROM chatwoot.contacts c,
+LATERAL (
+  SELECT 1 AS matched
+  WHERE c.email = 'alice.cw-canary@inbox.test'
+) probe;
+
+-- @id: hostile-scalar-subquery-email
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+SELECT (
+  SELECT email FROM chatwoot.contacts WHERE id = 1001
+);
+
+-- Window order can expose the same rank as top-level ORDER BY but adds an
+-- expression result with no safe provenance.
+-- @id: hostile-window-order-email
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
+SELECT id, row_number() OVER (ORDER BY email)
+FROM chatwoot.contacts;
+
+-- Transcript predicate and nullness probes.
+-- @id: hostile-content-like
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 9001
+SELECT id
+FROM chatwoot.messages
+WHERE content LIKE '%ORD-9911%';
+
+-- @id: hostile-email-is-not-null
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 2
+SELECT count(*)
+FROM chatwoot.contacts
+WHERE email IS NOT NULL;
+
+-- Unicode-escaped identifiers must decode before hostile matching.
+-- @id: hostile-unicode-email
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1
+SELECT count(*)
+FROM chatwoot.contacts
+WHERE u&"email" = 'alice.cw-canary@inbox.test';
+
+-- Constructor and SRF laundering.
+-- @id: row-to-json-contact
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+SELECT row_to_json(c)
+FROM chatwoot.contacts c
+WHERE id = 1001;
+
+-- @id: jsonb-set-contact
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: CANARYREF
+SELECT jsonb_set(additional_attributes, '{city}', '"Houston"')
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- @id: unnest-conversation-labels
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: billing
+SELECT unnest(label_list)
+FROM chatwoot.conversations
+WHERE id = 5001;
+
+-- Set-operation provenance cannot be recovered from matching pseudonym
+-- domains.
+-- @id: intersect-contact-emails
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+SELECT email FROM chatwoot.contacts
+INTERSECT
+SELECT email FROM chatwoot.contact_directory;
+
+-- COPY bypasses RowDescription and must be stopped before source rows stream.
+-- @id: copy-contacts
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
+COPY chatwoot.contacts TO STDOUT;
+
+-- Inner SELECT * retains OID/attnum provenance; outer projections still mask.
+-- @id: subquery-select-star-email
+-- @expect: served
+-- @refute: alice.cw-canary@inbox.test
+SELECT email
+FROM (
+  SELECT * FROM chatwoot.contacts WHERE id = 1001
+) contact_row;
+
+-- A `json` (OID 114) value cannot use PostgreSQL's JSONB bracket subscripts.
+-- The backend message is withheld because SQL can choose error text.
+-- @id: json-bracket-backend-error
+-- @expect: error
+-- @contains: withheld
+-- @direct_expect: error
+-- @direct_contains: cannot subscript type json
+SELECT content_attributes['items'][0]['value']
+FROM chatwoot.messages
+WHERE id = 9003;
+
 -- Operator workaround after resolving "billing" to tag id 301.
 -- @id: chatwoot-label-filter-by-id
 -- @expect: served

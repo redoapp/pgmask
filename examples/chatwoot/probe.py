@@ -81,6 +81,7 @@ class Case:
     search_path: str = ""
     direct_expect: str = ""
     direct_contains: list[str] = field(default_factory=list)
+    rows: int | None = None
 
 
 def parse_queries(path: str) -> list[Case]:
@@ -110,6 +111,11 @@ def parse_queries(path: str) -> list[Case]:
                 search_path=(header.get("search_path") or [""])[0],
                 direct_expect=(header.get("direct_expect") or [""])[0],
                 direct_contains=header.get("direct_contains", []),
+                rows=(
+                    int(header["rows"][0])
+                    if header.get("rows")
+                    else None
+                ),
             )
         )
         header, sql_lines, in_sql = {}, [], False
@@ -264,6 +270,28 @@ FROM chatwoot.contacts WHERE id = 1001;
             ("pgmask:", "Austin"),
             (),
         ),
+        (
+            "extended-bind-masked-predicate",
+            """
+SELECT count(*)
+FROM chatwoot.contacts
+WHERE email = $1
+\\bind alice.cw-canary@inbox.test
+\\g
+""",
+            ("pgmask:",),
+            (),
+        ),
+        (
+            "extended-bind-masked-order",
+            """
+SELECT id FROM chatwoot.contacts ORDER BY email
+\\bind
+\\g
+""",
+            ("1001", "1002"),
+            (),
+        ),
     ]
     failed = 0
     for name, script, required, forbidden in checks:
@@ -376,6 +404,12 @@ def main() -> int:
         if got == "served":
             if not output.strip():
                 problems.append("served query returned no observable row")
+            if case.rows is not None:
+                actual_rows = len(output.rstrip("\n").splitlines())
+                if actual_rows != case.rows:
+                    problems.append(
+                        f"expected {case.rows} rows, got {actual_rows}"
+                    )
             for needle in case.contains:
                 if needle not in output:
                     problems.append(f"missing {needle!r}")
