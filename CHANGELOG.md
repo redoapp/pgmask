@@ -85,7 +85,10 @@
   app SQL, JSON/JSONB extracts, views, `SELECT *`, extended Bind, refusal
   recovery, and reported native-JSON double encoding. Direct source controls
   plus a deliberately releasing poison proxy prove the harness can see a leak;
-  refusals remain refusals rather than driving an allowlist expansion.
+  per-query direct controls prove refusal-shaped attacks are valid. The raw
+  wire suite also pins that encoded-string shape in binary OID-114 results and
+  star expansion. Refusals remain refusals rather than driving an allowlist
+  expansion.
 - Pin the JSON pointer trie and catalog overlap helpers with named lookup
   tables: exact beats `*`, object keys never take array wildcards, ambiguous
   text steps refuse at a `*` edge, nested wildcards need a proven array index

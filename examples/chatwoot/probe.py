@@ -79,6 +79,8 @@ class Case:
     source: str = ""
     notes: str = ""
     search_path: str = ""
+    direct_expect: str = ""
+    direct_contains: list[str] = field(default_factory=list)
 
 
 def parse_queries(path: str) -> list[Case]:
@@ -106,6 +108,8 @@ def parse_queries(path: str) -> list[Case]:
                 source=(header.get("source") or [""])[0],
                 notes=(header.get("notes") or [""])[0],
                 search_path=(header.get("search_path") or [""])[0],
+                direct_expect=(header.get("direct_expect") or [""])[0],
+                direct_contains=header.get("direct_contains", []),
             )
         )
         header, sql_lines, in_sql = {}, [], False
@@ -149,6 +153,8 @@ def run_psql(
             "-v",
             "ON_ERROR_STOP=0",
             "-tA",
+            "-P",
+            "null=[NULL]",
             "-c",
             sql,
         ],
@@ -181,6 +187,8 @@ def run_psql_script(
             "-v",
             "ON_ERROR_STOP=0",
             "-tA",
+            "-P",
+            "null=[NULL]",
         ],
         check=False,
         capture_output=True,
@@ -323,6 +331,25 @@ def main() -> int:
     print("-" * 88)
 
     for case in cases:
+        direct_problems: list[str] = []
+        if args.direct_port and case.direct_expect:
+            direct_code, direct_output = run_psql(
+                args.host,
+                args.direct_port,
+                args.dbname,
+                args.user,
+                case.sql,
+                search_path=case.search_path,
+            )
+            direct_got = classify(direct_output, direct_code)
+            if direct_got != case.direct_expect:
+                direct_problems.append(
+                    f"direct expected {case.direct_expect}, got {direct_got}"
+                )
+            for needle in case.direct_contains:
+                if needle not in direct_output:
+                    direct_problems.append(f"direct missing {needle!r}")
+
         code, output = run_psql(
             args.host,
             args.port,
@@ -339,7 +366,7 @@ def main() -> int:
         else:
             errors += 1
 
-        problems: list[str] = []
+        problems = direct_problems
         if got != case.expect:
             problems.append(f"expected {case.expect}, got {got}")
         folded_output = output.casefold()
@@ -347,6 +374,8 @@ def main() -> int:
             if token.casefold() in folded_output:
                 problems.append(f"forbidden source value leaked: {token}")
         if got == "served":
+            if not output.strip():
+                problems.append("served query returned no observable row")
             for needle in case.contains:
                 if needle not in output:
                     problems.append(f"missing {needle!r}")

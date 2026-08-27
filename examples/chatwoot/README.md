@@ -50,6 +50,10 @@ rather than a type-aware-fallback refusal.
 values** are observable directly, then scans every proxied result for them.
 `verify.sh` also starts a deliberately releasing second proxy: the poison
 control must expose the email or the leak detector is not trusted.
+Refusal-shaped attacks carry `@direct_expect` controls: the same SQL must be
+valid and often expose its poison directly before a pgmask refusal counts.
+Every served SELECT must emit an observable row (`[NULL]` is explicit), and
+the source scan is case-insensitive.
 
 The main policy uses `posture = "hostile"`. Email equality/grouping and masked
 JSON predicates refuse. This is stronger than result-byte masking, but it is
@@ -76,11 +80,16 @@ Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.1.99:
 
 | Kind | Count | What happened |
 |---|---|---|
-| Served | 62 | Queue/delivery/status counts, timeline envelopes, dashboard FILTER counts, message `today`/`chat`, pseudonym correlation, whole masked JSON, `SELECT *`, view OIDs, literal extract spellings, tag-id filtering |
-| Refused | 19 | Unqualified/app JSON ordering, custom-attribute membership, label-name `EXISTS`, masked predicates/grouping, JSON parent text, dynamic key/subscript ambiguity, CTE alias, `jsonb_pretty` / `jsonb_each` / `to_jsonb`, UNION |
+| Served | 69 | Queue/delivery/status counts, timeline envelopes, dashboard FILTER counts, message `today`/`chat`, pseudonym correlation, whole masked JSON, `SELECT *`, view OIDs, literal extract spellings, tag-id filtering |
+| Refused | 31 | Unqualified/app JSON ordering, custom-attribute membership, label-name `EXISTS`, masked JOIN/HAVING/subqueries/grouping, JSON casts/JSONPath/parent text, dynamic or ambiguous keys, CTE alias, `jsonb_pretty` / `jsonb_each` / `to_jsonb`, UNION |
 | Error | 1 | Unqualified `FROM "contacts"` with no search_path — backend `undefined_table`, message withheld |
 | Protocol | 3 | Extended bind, same-session recovery after refusal, and mid-session `search_path` all pass |
 | Poison control | 1 | A release-policy proxy exposes the source email, proving the detector can see a leak |
+
+The raw-wire integration suite separately sends Chatwoot's reported
+double-encoded JSON string scalar in PostgreSQL's **binary OID-114 format**.
+Its release control exposes the inner email; the real policy emits exactly the
+empty string type-placeholder, including through `SELECT *`.
 
 No forbidden source value appeared through the main proxy. Message bodies and
 subjects become `***`; email/phone/order/external ids become deterministic

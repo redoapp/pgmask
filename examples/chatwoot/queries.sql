@@ -34,6 +34,8 @@ ORDER BY 1;
 -- guessing search_path.
 -- @id: search-path-unqualified-extract
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: Canary Logistics
 -- @search_path: chatwoot
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/contact.rb
 SELECT "contacts"."additional_attributes"->>'company_name'
@@ -44,6 +46,8 @@ ORDER BY 1;
 -- The operator rewrite: schema-qualify what Chatwoot generated.
 -- @id: contact-order-on-company-name
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: Canary Logistics
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/contact.rb
 SELECT chatwoot.contacts.additional_attributes->>'company_name' AS company_name
 FROM chatwoot.contacts
@@ -163,6 +167,8 @@ WHERE id = 1001;
 -- wrapping it in IS NULL is an expression and is refused (no provenance).
 -- @id: first-reply-campaign-id-null
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: t
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/message.rb
 SELECT (additional_attributes->'campaign_id') IS NULL AS no_campaign
 FROM chatwoot.messages
@@ -330,6 +336,8 @@ SELECT conditions FROM chatwoot.automation_rules WHERE id = 70;
 -- / pretty-print has no provenance.
 -- @id: debug-jsonb-pretty
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: CANARYREF
 SELECT jsonb_pretty(additional_attributes)
 FROM chatwoot.contacts
 WHERE id = 1001;
@@ -337,6 +345,8 @@ WHERE id = 1001;
 -- jsonb_each is how people explode keys while debugging.
 -- @id: debug-jsonb-each
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: CANARYREF
 SELECT key, value
 FROM chatwoot.contacts,
      jsonb_each(additional_attributes)
@@ -346,6 +356,8 @@ WHERE id = 1001;
 -- not follow a renamed output.
 -- @id: extract-through-subquery-alias
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: Canary Logistics
 SELECT company FROM (
   SELECT additional_attributes->>'company_name' AS company
   FROM chatwoot.contacts
@@ -355,6 +367,8 @@ SELECT company FROM (
 -- Set operations drop provenance.
 -- @id: union-cities
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: Austin
 SELECT additional_attributes->>'city' FROM chatwoot.contacts
 UNION ALL
 SELECT additional_attributes->>'city' FROM chatwoot.contacts;
@@ -362,6 +376,8 @@ SELECT additional_attributes->>'city' FROM chatwoot.contacts;
 -- Row-to-json laundering.
 -- @id: to-jsonb-contact
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
 SELECT to_jsonb(c) FROM chatwoot.contacts c WHERE c.id = 1001;
 
 -- Mixed operator + subscript, the shape an engineer writes after reading both
@@ -425,6 +441,8 @@ SELECT sentiment FROM chatwoot.messages WHERE id = 9005;
 -- "Is one inbox failing?" Join only released operational columns.
 -- @id: delivery-counts-by-inbox
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: Website Widget
 SELECT i.name, m.status, count(*)
 FROM chatwoot.messages m
 JOIN chatwoot.inboxes i ON i.id = m.inbox_id
@@ -509,6 +527,8 @@ WHERE id = 70;
 -- Integer -> is the safe diagnostic form above.
 -- @id: automation-condition-subscript
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: company_name
 SELECT conditions[0]['attribute_key']
 FROM chatwoot.automation_rules
 WHERE id = 70;
@@ -543,6 +563,7 @@ WHERE id = 9005;
 -- matching the production bug report.
 -- @id: legacy-double-encoded-extract
 -- @expect: served
+-- @contains: [NULL]
 -- @refute: legacy.cw-canary@inbox.test
 -- @source: https://github.com/chatwoot/chatwoot/issues/14660
 SELECT content_attributes->>'automation_rule_id'
@@ -584,6 +605,8 @@ WHERE id = 9003;
 -- A text extract of an object with child policies cannot be safely walked.
 -- @id: contact-browser-parent-text
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: MacIntel
 SELECT additional_attributes->>'browser'
 FROM chatwoot.contacts
 WHERE id = 1001;
@@ -591,6 +614,7 @@ WHERE id = 1001;
 -- Runtime/dynamic keys stay opaque.
 -- @id: contact-dynamic-json-key
 -- @expect: refused
+-- @direct_expect: served
 SELECT additional_attributes->>(id::text)
 FROM chatwoot.contacts
 WHERE id = 1001;
@@ -599,6 +623,8 @@ WHERE id = 1001;
 -- refuse before the outer RowDescription can rescue it.
 -- @id: contact-json-through-cte
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 203.0.113.77
 WITH c AS (
   SELECT additional_attributes
   FROM chatwoot.contacts
@@ -614,6 +640,8 @@ SELECT additional_attributes FROM c;
 
 -- @id: hostile-email-equality-oracle
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1
 SELECT count(*)
 FROM chatwoot.contacts
 WHERE email = 'alice.cw-canary@inbox.test';
@@ -628,12 +656,16 @@ ORDER BY phone_number;
 
 -- @id: hostile-email-group-oracle
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
 SELECT email, count(*)
 FROM chatwoot.contacts
 GROUP BY email;
 
 -- @id: hostile-json-ip-predicate
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
 SELECT id
 FROM chatwoot.contacts
 WHERE additional_attributes->>'created_at_ip' = '203.0.113.77';
@@ -641,6 +673,8 @@ WHERE additional_attributes->>'created_at_ip' = '203.0.113.77';
 -- A released operational key remains usable in the same posture.
 -- @id: hostile-released-city-predicate
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001|Austin
 SELECT id, additional_attributes->>'city'
 FROM chatwoot.contacts
 WHERE additional_attributes->>'city' = 'Austin';
@@ -665,6 +699,8 @@ WHERE location = 'Austin';
 -- oracle, even though only an id is projected.
 -- @id: chatwoot-custom-attribute-filter
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/services/filters/custom_attribute_filter_helper.rb
 SELECT id
 FROM chatwoot.contacts
@@ -728,6 +764,8 @@ WHERE id = 202;
 -- hostile preflight conservatively refuses by identifier spelling.
 -- @id: chatwoot-label-filter
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 5001|0
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/services/filter_service.rb
 SELECT c.id, c.status
 FROM chatwoot.conversations c
@@ -782,6 +820,8 @@ WHERE id = 1001;
 -- Serializing the protected parent to text would bypass child masks.
 -- @id: contact-social-parent-text
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice_canary
 SELECT additional_attributes->>'social_profiles'
 FROM chatwoot.contacts
 WHERE id = 1001;
@@ -798,16 +838,22 @@ WHERE id = 100;
 -- Cast laundering attempts on scalar and double-encoded JSON.
 -- @id: contact-email-text-cast
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
 SELECT email::text FROM chatwoot.contacts WHERE id = 1001;
 
 -- @id: double-encoded-json-text-cast
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: legacy.cw-canary@inbox.test
 SELECT content_attributes::text
 FROM chatwoot.messages
 WHERE id = 9005;
 
 -- @id: whole-json-identity-cast
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 203.0.113.77
 SELECT additional_attributes::jsonb
 FROM chatwoot.contacts
 WHERE id = 1001;
@@ -815,12 +861,16 @@ WHERE id = 1001;
 -- JSONPath and runtime keys remain opaque.
 -- @id: jsonpath-city
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: Austin
 SELECT jsonb_path_query_first(additional_attributes, '$.city')
 FROM chatwoot.contacts
 WHERE id = 1001;
 
 -- @id: case-json-key
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: CANARYREF
 SELECT additional_attributes[
   CASE WHEN id = 1001 THEN 'referer' ELSE 'city' END
 ]
@@ -830,6 +880,8 @@ WHERE id = 1001;
 -- Text path "0" is ambiguous at the configured array wildcard.
 -- @id: message-items-ambiguous-hash-path
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: alice.cw-canary@inbox.test
 SELECT content_attributes #>> '{items,0,value}'
 FROM chatwoot.messages
 WHERE id = 9003;
@@ -847,12 +899,16 @@ WHERE id = 9003;
 -- source equality into an oracle.
 -- @id: hostile-masked-join
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001|1001
 SELECT c.id, d.id
 FROM chatwoot.contacts c
 JOIN chatwoot.contact_directory d ON d.email = c.email;
 
 -- @id: hostile-masked-having
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
 SELECT id
 FROM chatwoot.contacts
 GROUP BY id, email
@@ -860,6 +916,8 @@ HAVING email = 'alice.cw-canary@inbox.test';
 
 -- @id: hostile-masked-correlated-subquery
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
 SELECT c.id
 FROM chatwoot.contacts c
 WHERE EXISTS (
@@ -872,12 +930,16 @@ WHERE EXISTS (
 -- ORDER BY are not credited and must refuse.
 -- @id: hostile-order-by-membership
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
 SELECT id
 FROM chatwoot.contacts
 ORDER BY email = 'alice.cw-canary@inbox.test';
 
 -- @id: hostile-order-by-lower
 -- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 1001
 SELECT id
 FROM chatwoot.contacts
 ORDER BY lower(email);
