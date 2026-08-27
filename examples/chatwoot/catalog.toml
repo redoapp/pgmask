@@ -72,7 +72,7 @@ mask = "none"
 [[column]]
 relation = "chatwoot.accounts"
 column = "domain"
-mask = "none"
+mask = "redact"
 
 [[column]]
 relation = "chatwoot.accounts"
@@ -266,7 +266,9 @@ mask = "json"
 json_unmatched = "type-placeholders"
 json = [
   { pointer = "/display_type", mask = "none" },
-  { pointer = "/message", mask = "none" },
+  # CSAT copy is tenant prose (same class as greeting_message), not an
+  # ops enum. Parent/leaf `none` here forwarded planted emails.
+  { pointer = "/message", mask = "redact" },
 ]
 
 # ---------------------------------------------------------------------------
@@ -436,7 +438,8 @@ json = [
   { pointer = "/browser_language", mask = "none" },
   { pointer = "/conversation_language", mask = "none" },
   { pointer = "/type", mask = "none" },
-  { pointer = "/source", mask = "none" },
+  # `/source` as `none` inherited into object-shaped values Chatwoot
+  # does not always store as the channel enum string.
   { pointer = "/auto_reply", mask = "none" },
   { pointer = "/in_reply_to", mask = "redact" },
   { pointer = "/referer", mask = "redact" },
@@ -484,7 +487,7 @@ column = "custom_attributes"
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
-  { pointer = "/priority_reason", mask = "none" },
+  { pointer = "/priority_reason", mask = "redact" },
   { pointer = "/stripe_charge", mask = "redact" },
 ]
 
@@ -503,10 +506,12 @@ relation = "chatwoot.conversations"
 column = "sla_policy_id"
 mask = "none"
 
+# varchar[] is not a text-family mask target; null withholds the array
+# without refusing SELECT * the way redact would.
 [[column]]
 relation = "chatwoot.conversations"
 column = "label_list"
-mask = "none"
+mask = "null"
 
 # ---------------------------------------------------------------------------
 # chatwoot.contact_inboxes
@@ -615,12 +620,13 @@ column = "content_attributes"
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
-  { pointer = "/in_reply_to", mask = "none" },
   { pointer = "/automation_rule_id", mask = "none" },
   { pointer = "/submitted_email", mask = "pseudonym", domain = "email" },
   { pointer = "/items/*/title", mask = "redact" },
   { pointer = "/items/*/value", mask = "redact" },
-  { pointer = "/items/*/name", mask = "none" },
+  # Pre-chat `name` is a field id in happy-path Chatwoot and an email or
+  # nested object when the form is abused; `none` inherited either way.
+  { pointer = "/items/*/name", mask = "redact" },
   { pointer = "/email/subject", mask = "redact" },
   { pointer = "/email/from", mask = "redact" },
   { pointer = "/email/message_id", mask = "redact" },
@@ -755,9 +761,6 @@ relation = "chatwoot.webhooks"
 column = "subscriptions"
 mask = "json"
 json_unmatched = "type-placeholders"
-json = [
-  { pointer = "/*", mask = "none" },
-]
 
 # ---------------------------------------------------------------------------
 # chatwoot.custom_attribute_definitions / tags / taggings
@@ -837,7 +840,7 @@ mask = "none"
 [[column]]
 relation = "chatwoot.tags"
 column = "name"
-mask = "none"
+mask = "redact"
 
 [[column]]
 relation = "chatwoot.tags"

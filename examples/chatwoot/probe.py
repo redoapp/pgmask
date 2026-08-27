@@ -59,6 +59,14 @@ FORBIDDEN_SOURCE_VALUES = (
     "When company is Canary Logistics, add billing label",
     "tier-CANARYPRIVATE",
     "Hi, my order",
+    "RT2CANARY-tenant.example",
+    "RT2CANARY-csat-email@leak.test",
+    "RT2CANARY-item-name@leak.test",
+    "INREPLY-NESTED-CANARY",
+    "RT2CANARY-priority",
+    "RT2CANARY-alice-label",
+    "RT2CANARY-hook-event",
+    "RT2CANARY-customer-tag",
 )
 
 DIRECT_CONTROL_SQL = """

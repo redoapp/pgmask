@@ -92,7 +92,12 @@
   `/initiated_at`, released automation `action_params`, and unmasked
   custom-attribute regex/cue fields forwarding nested PII; those grants
   are now leaf-only or redact, with canaries for nested initiated_at
-  keys, send_message params, and regex samples.
+  keys, send_message params, and regex samples. A second multi-agent
+  pass found the same inheritance class on CSAT `/message`, pre-chat
+  `/items/*/name`, conversation `/source`, webhook `subscriptions/*`,
+  plus column-level `none` on `label_list`, `tags.name`, `accounts.domain`,
+  and `priority_reason`; those are now redact, null, or unmatched, with
+  planted RT2 canaries.
 - Pin the JSON pointer trie and catalog overlap helpers with named lookup
   tables: exact beats `*`, object keys never take array wildcards, ambiguous
   text steps refuse at a `*` edge, nested wildcards need a proven array index
