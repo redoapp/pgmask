@@ -1,0 +1,4 @@
+{
+  "install": "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq\nsudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql postgresql-client\ncargo fetch --locked",
+  "start": "bash scripts/lib/local-postgres.sh"
+}

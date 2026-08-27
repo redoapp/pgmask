@@ -8,6 +8,8 @@ Use the shortest document that answers your question.
 - [Security model](security.md): guarantees, threat postures, deployment controls,
   and known limits.
 - [Operations](operations.md): schema changes, CI, restarts, logs, and metrics.
+- [JSON and JSONB masking](json-masking.md): pointer policies, array wildcards,
+  type placeholders, and how to inspect large documents.
 - [Policy ownership](responsibilities.md): catalog review and team responsibilities.
 - [GUI clients](gui-clients.md): DBeaver, DataGrip, pgAdmin, and `psql` metadata.
 - [Engine notes](engines.md): PostgreSQL and CockroachDB differences.

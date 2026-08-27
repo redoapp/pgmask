@@ -659,6 +659,17 @@ fn outer_bare_projection_counts(
                 .unwrap_or(0usize)
                 .saturating_add(1);
             counts.insert(name, n);
+        } else if let Some(name) = super::json_extract::extract_projection_column(val) {
+            // `payload->>'email'` is the projection of `payload`, not a
+            // predicate over it. Without this credit, hostile posture would
+            // refuse every JSON extract because the column name appears in the
+            // expression and not as a bare ColumnRef.
+            let n = counts
+                .get(&name)
+                .copied()
+                .unwrap_or(0usize)
+                .saturating_add(1);
+            counts.insert(name, n);
         }
     }
     Some(counts)

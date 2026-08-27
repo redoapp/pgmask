@@ -23,6 +23,12 @@ pub enum Safety {
     /// summaries retain the opaque posture; optional lineage may still prove
     /// that all of their sources are explicitly released.
     Summary,
+    /// A JSON/JSONB extract whose path is a sequence of literals
+    /// (`payload->>'email'`, `payload->'profile'`, `#>> '{a,b}'`). Provenance
+    /// is gone, so the session resolves the source column from schema-qualified
+    /// SQL and applies that column's pointer policy to the extract. Anything
+    /// not on the allowlist stays `Unknown` and is refused.
+    JsonExtract,
     /// Everything else. Says nothing about the field; the caller keeps its
     /// existing behaviour.
     Unknown,
@@ -349,8 +355,20 @@ fn classify(expr: &NodeEnum, allow: Relaxations) -> Safety {
             Some(inner) => classify(inner, allow),
             None => Safety::Unknown,
         },
+        // Collation changes comparison/sort semantics, not the projected
+        // bytes. Keep it aligned with the extract/summary parsers, which both
+        // peel this wrapper before attributing the source.
+        NodeEnum::CollateClause(collate) => {
+            match collate.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                Some(inner) => classify(inner, allow),
+                None => Safety::Unknown,
+            }
+        }
 
         NodeEnum::FuncCall(call) => {
+            if super::json_extract::expr_is_json_extract(expr) {
+                return Safety::JsonExtract;
+            }
             let Some(name) = function_name(&call.funcname) else {
                 return Safety::Unknown;
             };
@@ -469,7 +487,13 @@ fn classify(expr: &NodeEnum, allow: Relaxations) -> Safety {
 
         // Arithmetic and comparison. Releasable exactly when every operand is:
         // `sum(a)/sum(b)` is still a summary, `salary * 2` is still a salary.
-        NodeEnum::AExpr(expr) => {
+        NodeEnum::AExpr(_) => {
+            if super::json_extract::expr_is_json_extract(expr) {
+                return Safety::JsonExtract;
+            }
+            let NodeEnum::AExpr(aexpr) = expr else {
+                return Safety::Unknown;
+            };
             let operand = |side: &Option<Box<pg_query::protobuf::Node>>| match side
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
@@ -478,8 +502,8 @@ fn classify(expr: &NodeEnum, allow: Relaxations) -> Safety {
                 // A missing side is a unary operator, not a hidden column.
                 None => Safety::Releasable,
             };
-            if operand(&expr.lexpr) == Safety::Releasable
-                && operand(&expr.rexpr) == Safety::Releasable
+            if operand(&aexpr.lexpr) == Safety::Releasable
+                && operand(&aexpr.rexpr) == Safety::Releasable
             {
                 Safety::Releasable
             } else {

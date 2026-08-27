@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.1.98**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.1.99**. Licensed under the [MIT License](LICENSE).
 
 ## What pgmask provides
 
@@ -159,6 +159,26 @@ type = "email"
 relation = "app.customers"
 column = "id"
 mask = "none"
+
+[[column]]
+relation = "app.events"
+column = "payload"
+mask = "json"
+# Keep the document useful for structural debugging: unmentioned strings,
+# numbers and booleans become "", 0 and false. Omit this for JSON null.
+json_unmatched = "type-placeholders"
+# Refuse before parsing or allocating an unexpectedly large/deep document.
+json_max_bytes = 1048576
+json_max_depth = 64
+json = [
+  # Release arbitrary current and future profile fields...
+  { pointer = "/profile", mask = "none" },
+  # ...except for narrower policies, which take precedence.
+  { pointer = "/profile/email", mask = "partial", keep = 4 },
+  { pointer = "/profile/name", mask = "redact" },
+  # `*` applies to every array element; an exact index would override it.
+  { pointer = "/items/*/account_id", mask = "pseudonym", domain = "account" },
+]
 ```
 
 Unknown configuration keys, invalid mask parameters, duplicate column rules,
@@ -200,10 +220,20 @@ rejects catalog relations that may contain user values or SQL text. See
 | `numeric-bucket` | Floor to a configured bucket | Integers, floats, and text-format `numeric` |
 | `ip-prefix` | Remove the host portion | Text and text-format `inet` or `cidr` |
 | `scrub` | Replace recognized identifiers in free text | Text |
+| `json` | Recursively mask JSON Pointer policies and every unmatched leaf | `json`, `jsonb` |
 
 `scrub` reveals all text it does not recognize. It does not reliably identify
 names, street addresses, or obfuscated identifiers. Use it only when readable
 free text is required and partial disclosure is acceptable.
+
+`json` preserves object keys, arrays, and nesting while applying ordinary
+masks at JSON Pointers, including `/items/*` for every array element.
+`json_unmatched` is `null` by default; `type-placeholders` retains scalar
+types, and `none` explicitly releases unmatched leaves. Pointer policies are
+compiled into a trie. Documents over `json_max_bytes` (1 MiB by default) or
+`json_max_depth` (64 by default) refuse before parsing. Literal SQL extracts
+use the same pointer policy; construction stays opaque. See
+[JSON and JSONB masking](docs/json-masking.md).
 
 Pseudonyms preserve equality. This keeps joins useful, but also exposes
 frequency and repeated identity. Semantic types act as pseudonym domains:
@@ -236,7 +266,13 @@ mapping.
 - Safe scalar values such as literals, `now()`, and `count(*)` pass through.
 - Expressions over masked columns, value-returning aggregates such as `max`,
   set operations, recursive common table expressions, and set-returning
-  functions are rejected unless a conservative rule proves them safe.
+  functions are rejected unless a conservative rule proves them safe. JSON
+  operators (`->`, `->>`, JSONPath), constructors, and aggregates over a
+  classified JSON column are refused unless they are a **literal extract**
+  (`->`, `->>`, `#>`/`#>>`, `json[b]_extract_path[_text]`) of one
+  schema-qualified column, in which case that column's pointer policy is
+  applied to the result. JSONPath, constructors, and aggregates stay refused.
+  See [JSON and JSONB masking](docs/json-masking.md).
 - Supported one-column reductions such as `sum`, `avg`, variance, and boolean
   reductions inherit the source policy only for a bare column over explicitly
   schema-qualified named relations. Other shapes remain opaque unless lineage
@@ -314,6 +350,7 @@ Start with the [documentation index](docs/README.md).
 
 - [Security model](docs/security.md)
 - [Operations](docs/operations.md)
+- [JSON and JSONB masking](docs/json-masking.md)
 - [Policy ownership and catalog workflow](docs/responsibilities.md)
 - [GUI clients](docs/gui-clients.md)
 - [PostgreSQL and CockroachDB](docs/engines.md)

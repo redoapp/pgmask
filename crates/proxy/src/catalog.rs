@@ -22,7 +22,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::mask::{Mask, MaskSpec};
+use crate::mask::{JsonFieldSpec, JsonUnmatched, Mask, MaskSpec};
+
+pub(crate) mod json;
 
 /// Whether summarising aggregates over classified columns may be released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -140,10 +142,27 @@ pub struct MaskParams {
     /// different domains cannot be linked by comparing masked values. Defaults
     /// to the semantic type's name.
     pub domain: Option<String>,
+    /// Policy for JSON leaves with no exact path override.
+    pub json_unmatched: Option<JsonUnmatched>,
+    /// Maximum encoded JSON payload accepted before parsing.
+    pub json_max_bytes: Option<usize>,
+    /// Maximum object/array nesting accepted before parsing.
+    pub json_max_depth: Option<usize>,
+    /// Inheritable JSON Pointer policies at arbitrary nesting depths. A more
+    /// specific pointer overrides its parent. `*` matches every element of an
+    /// array and remains a literal `*` when traversing an object.
+    pub json: Option<Vec<JsonFieldRule>>,
 }
 
 impl MaskParams {
-    fn apply_to(&self, spec: &mut MaskSpec) {
+    fn apply_to(&self, spec: &mut MaskSpec) -> Result<()> {
+        let has_json_params = self.json_unmatched.is_some()
+            || self.json_max_bytes.is_some()
+            || self.json_max_depth.is_some()
+            || self.json.is_some();
+        if has_json_params && spec.kind != Mask::Json {
+            bail!("JSON parameters are valid only with mask `json`");
+        }
         if let Some(v) = self.keep {
             spec.keep = v;
         }
@@ -162,7 +181,40 @@ impl MaskParams {
         if let Some(v) = &self.domain {
             spec.domain = Some(v.as_str().into());
         }
+        if let Some(unmatched) = self.json_unmatched {
+            spec.json_unmatched = unmatched;
+        }
+        if let Some(max_bytes) = self.json_max_bytes {
+            spec.json_max_bytes = max_bytes;
+        }
+        if let Some(max_depth) = self.json_max_depth {
+            spec.json_max_depth = max_depth;
+        }
+        if let Some(fields) = &self.json {
+            let mut compiled = Vec::with_capacity(fields.len());
+            for field in fields {
+                let mut field_spec = MaskSpec::new(field.mask);
+                field.params.apply_to(&mut field_spec)?;
+                compiled.push(
+                    JsonFieldSpec::new(field.pointer.as_str(), field_spec).map_err(|reason| {
+                        anyhow::anyhow!("JSON pointer {:?}: {reason}", field.pointer)
+                    })?,
+                );
+            }
+            spec.set_json_fields(compiled);
+        }
+        Ok(())
     }
+}
+
+/// One inheritable JSON Pointer policy inside a structure-aware JSON mask.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonFieldRule {
+    pub pointer: String,
+    pub mask: Mask,
+    #[serde(flatten)]
+    pub params: MaskParams,
 }
 
 /// A named classification with a default mask, so `email` is described once and
@@ -273,7 +325,7 @@ fn restrictiveness(mask: Mask) -> u8 {
         // restrictive than passing the value through. Ranked here deliberately:
         // if one of a principal's roles says `scrub` and another says `redact`,
         // redact has to win.
-        Mask::Scrub => 1,
+        Mask::Scrub | Mask::Json => 1,
         Mask::Partial | Mask::Inner | Mask::Outer | Mask::Range => 2,
         Mask::DateMonth | Mask::IpPrefix | Mask::NumericBucket => 3,
         Mask::DateYear => 4,
@@ -1278,30 +1330,30 @@ fn classify(rule: &ColumnRule, types: &HashMap<String, SemanticType>) -> Result<
     };
 
     // Build the default spec: semantic parameters first, column parameters win.
-    let build = |kind: Mask| {
+    let build = |kind: Mask| -> Result<MaskSpec> {
         let mut spec = MaskSpec::new(kind);
         if let Some(t) = semantic {
             // A semantic type names its own pseudonym domain, so every column
             // of that type stays joinable without anyone configuring it.
             spec.domain = Some(t.name.as_str().into());
-            t.params.apply_to(&mut spec);
+            t.params.apply_to(&mut spec)?;
         }
-        rule.params.apply_to(&mut spec);
-        spec
+        rule.params.apply_to(&mut spec)?;
+        Ok(spec)
     };
 
     let mut by_role: HashMap<String, MaskSpec> = HashMap::new();
     if let Some(t) = semantic {
         for (role, kind) in &t.by_role {
-            by_role.insert(role.clone(), build(*kind));
+            by_role.insert(role.clone(), build(*kind)?);
         }
     }
     for (role, kind) in &rule.by_role {
-        by_role.insert(role.clone(), build(*kind));
+        by_role.insert(role.clone(), build(*kind)?);
     }
 
     let classification = Classification {
-        default: build(base_kind),
+        default: build(base_kind)?,
         by_role,
     };
     // A mask whose parameters leave the value unchanged is worse than no mask:
@@ -1438,6 +1490,7 @@ fn validate_spec(spec: &MaskSpec, what: &str) -> Result<()> {
             "{what}: outer needs `keep` >= 1. With keep = 0 the whole value is \
              the surviving middle, so nothing is masked."
         ),
+        Mask::Json => json::validate_json_spec(spec, what),
         _ => Ok(()),
     }
 }
@@ -2272,6 +2325,147 @@ by_role = { analyst = "partial" }
             "by_role on column"
         );
         assert_eq!(cfg.column[0].semantic_type.as_deref(), Some("email"));
+    }
+
+    #[test]
+    fn config_builds_nested_json_policies_with_an_explicit_default() {
+        let toml_src = r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "k"
+
+[[column]]
+relation = "s.documents"
+column = "payload"
+mask = "json"
+json_unmatched = "none"
+json_max_bytes = 2048
+json_max_depth = 12
+json = [
+  { pointer = "/profile", mask = "none" },
+  { pointer = "/profile/email", mask = "partial", keep = 4 },
+  { pointer = "/profile/age", mask = "numeric-bucket", bucket = 10 },
+  { pointer = "/flags/0", mask = "null" },
+]
+"#;
+        let cfg: crate::catalog::Config = toml::from_str(toml_src).expect("should parse");
+        let classification =
+            classify(&cfg.column[0], &HashMap::new()).expect("JSON policy should compile");
+        assert_eq!(classification.default.kind, Mask::Json);
+        assert_eq!(classification.default.json_unmatched, JsonUnmatched::None);
+        assert_eq!(classification.default.json_max_bytes, 2048);
+        assert_eq!(classification.default.json_max_depth, 12);
+        assert_eq!(classification.default.json.len(), 4);
+        assert_eq!(
+            classification.default.json[0].segments.as_ref(),
+            ["profile"]
+        );
+        assert_eq!(classification.default.json[0].spec.kind, Mask::None);
+        assert_eq!(
+            classification.default.json[1].segments.as_ref(),
+            ["profile", "email"]
+        );
+        assert_eq!(classification.default.json[1].spec.keep, 4);
+        assert_eq!(classification.default.json[2].spec.bucket, 10);
+    }
+
+    #[test]
+    fn config_builds_json_wildcards_and_type_placeholders() {
+        let toml_src = r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "k"
+
+[[column]]
+relation = "s.documents"
+column = "payload"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/items/*/account_id", mask = "pseudonym", domain = "account" },
+  { pointer = "/items/0/account_id", mask = "redact" },
+]
+"#;
+        let cfg: crate::catalog::Config = toml::from_str(toml_src).expect("should parse");
+        let classification =
+            classify(&cfg.column[0], &HashMap::new()).expect("JSON policy should compile");
+        assert_eq!(
+            classification.default.json_unmatched,
+            JsonUnmatched::TypePlaceholders
+        );
+        assert_eq!(
+            classification.default.json[0].segments.as_ref(),
+            ["items", "*", "account_id"]
+        );
+    }
+
+    #[test]
+    fn invalid_or_duplicate_json_pointers_fail_catalog_compilation() {
+        let mut rule = ColumnRule {
+            relation: "s.documents".into(),
+            column: "payload".into(),
+            semantic_type: None,
+            mask: Some(Mask::Json),
+            params: MaskParams {
+                json: Some(vec![JsonFieldRule {
+                    pointer: "missing-slash".into(),
+                    mask: Mask::Redact,
+                    params: MaskParams::default(),
+                }]),
+                ..MaskParams::default()
+            },
+            by_role: HashMap::new(),
+        };
+        assert!(classify(&rule, &HashMap::new()).is_err());
+
+        rule.params.json = Some(vec![
+            JsonFieldRule {
+                pointer: "/profile".into(),
+                mask: Mask::Null,
+                params: MaskParams::default(),
+            },
+            JsonFieldRule {
+                pointer: "/profile".into(),
+                mask: Mask::Redact,
+                params: MaskParams::default(),
+            },
+        ]);
+        assert!(
+            classify(&rule, &HashMap::new()).is_err(),
+            "duplicate policies are ambiguous"
+        );
+
+        rule.params.json = Some(vec![
+            JsonFieldRule {
+                pointer: "/items/*/account_id".into(),
+                mask: Mask::Null,
+                params: MaskParams::default(),
+            },
+            JsonFieldRule {
+                pointer: "/items/0/*".into(),
+                mask: Mask::Redact,
+                params: MaskParams::default(),
+            },
+        ]);
+        assert!(
+            classify(&rule, &HashMap::new()).is_err(),
+            "overlapping wildcard policies with equal specificity are ambiguous"
+        );
+
+        rule.params.json = None;
+        rule.params.json_max_bytes = Some(0);
+        assert!(
+            classify(&rule, &HashMap::new()).is_err(),
+            "a zero byte limit would refuse every document"
+        );
+
+        rule.mask = Some(Mask::Redact);
+        rule.params.json_max_bytes = None;
+        rule.params.json_unmatched = Some(JsonUnmatched::Null);
+        assert!(
+            classify(&rule, &HashMap::new()).is_err(),
+            "JSON-only parameters on an ordinary mask must be refused"
+        );
     }
 
     #[test]

@@ -23,13 +23,16 @@ use crate::catalog::{
     UnclassifiedMask,
 };
 use crate::lineage::Verdict;
-use crate::mask::{Mask, MaskSpec, Masker};
+use crate::mask::{JsonProjection, Mask, MaskSpec, Masker};
 use crate::metrics::{Cause, Metrics};
 use crate::plan_state::{FieldPlan, Plan};
 use crate::protocol;
 use crate::rate_limit::PrincipalRateLimit;
 use crate::tls::BackendTls;
 use secrecy::ExposeSecret;
+
+mod json_extract;
+use json_extract::resolve_json_extract_policies;
 
 /// Why a result set was refused: the words the client sees, plus the bucket the
 /// counters see.
@@ -75,43 +78,47 @@ pub(crate) struct FieldAnalysis<'a> {
     pub safety: &'a [Safety],
     /// Per-field lineage verdict, when lineage ran (`Release`/`Blocked`/…).
     pub lineage: &'a [Verdict],
-    /// Per-field reducing-aggregate policy after syntax and catalog resolution.
-    pub summary: &'a [SummaryPolicy],
+    /// Per-field policy for a syntax-verified expression projection.
+    pub expression: &'a [ExpressionPolicy],
     /// Whether the engine's column provenance is believed (set-op distrust).
     pub trust_provenance: bool,
 }
 
-/// The complete policy state for one potential reducing-aggregate field.
+/// The complete policy state for one syntax-verified expression field.
 ///
 /// Keeping `Released` distinct from `Masked` prevents a missing attribution
 /// (`Opaque`) from being represented as a permissive `None` mask. Keeping
 /// `NotApplicable` distinct from `Opaque` makes the safety gate explicit too.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum SummaryPolicy {
+pub(crate) enum ExpressionPolicy {
     NotApplicable,
     Opaque,
     Released,
-    Masked(MaskSpec),
+    Masked {
+        spec: MaskSpec,
+        projection: Option<JsonProjection>,
+    },
 }
 
 impl FieldAnalysis<'_> {
-    /// The reducing-aggregate policy for `index`.
+    /// The resolved policy for one syntax-verified expression field.
     ///
-    /// Gated on the field actually being `Safety::Summary`, not merely being an
-    /// aggregate-shaped expression: `max(x)` returns a stored value and must
-    /// keep falling through to the opaque posture, and it is refused there. Only
-    /// the reducing purity-allowlist (which `classify` maps to `Summary`)
-    /// reaches a policy here. The source can be masked or explicitly released:
-    /// schema qualification removes the `search_path` guess that made
-    /// passthrough unsafe in the earlier fallback.
-    pub(crate) fn summary_policy_for(&self, index: usize) -> SummaryPolicy {
-        if self.safety.get(index) != Some(&Safety::Summary) {
-            return SummaryPolicy::NotApplicable;
+    /// Gated on the field actually being `Safety::Summary` or
+    /// `Safety::JsonExtract`, not merely containing an aggregate or JSON
+    /// operator. The source can be masked or explicitly released; schema
+    /// qualification removes the `search_path` guess that made passthrough
+    /// unsafe in earlier fallbacks.
+    pub(crate) fn expression_policy_for(&self, index: usize) -> ExpressionPolicy {
+        if !matches!(
+            self.safety.get(index),
+            Some(Safety::Summary | Safety::JsonExtract)
+        ) {
+            return ExpressionPolicy::NotApplicable;
         }
-        self.summary
+        self.expression
             .get(index)
             .cloned()
-            .unwrap_or(SummaryPolicy::Opaque)
+            .unwrap_or(ExpressionPolicy::Opaque)
     }
 }
 
@@ -207,6 +214,7 @@ impl Policy {
             // Operator-chosen masks stay fail-closed.
             let mut lenient = false;
             let mut type_aware_fallback = false;
+            let mut json_projection = None;
             // A set operation can put values from several columns into one
             // output field, and CockroachDB reports the first branch's OID for
             // the whole thing. Believing it applies one column's mask to
@@ -226,65 +234,18 @@ impl Policy {
                     self.metrics.record_rescued();
                     MaskSpec::new(Mask::None)
                 } else {
-                    match analysis.summary_policy_for(index) {
-                        // One shared summary-policy path, independent of
-                        // whether optional lineage ran. Only an aggregate over
-                        // exactly one syntax-verified bare column on qualified
-                        // FROM ranges reaches either resolved state.
-                        SummaryPolicy::Released => {
+                    match analysis.expression_policy_for(index) {
+                        ExpressionPolicy::Released => {
                             self.metrics.record_rescued();
                             MaskSpec::new(Mask::None)
                         }
-                        SummaryPolicy::Masked(spec) => spec,
-                        // Expressions and multi-argument regressions remain
-                        // opaque because applying one source's mask after a
-                        // transformation is not equivalent to masking it.
-                        SummaryPolicy::NotApplicable | SummaryPolicy::Opaque => match self.opaque {
-                            Opaque::Reject => {
-                                // When lineage worked out *why*, say so.
-                                // "derives from customer.c_first_name, which is
-                                // masked" is the difference between a ticket
-                                // and a rewrite.
-                                if let Some(Verdict::Blocked(source)) = analysis.lineage.get(index)
-                                {
-                                    return Err(Rejection {
-                                        cause: Cause::classify_opaque(&field.name, snapshot),
-                                        message: format!(
-                                            "pgmask: output column \"{}\" derives from {source}, \
-                                             which is masked",
-                                            field.name
-                                        ),
-                                        hint: Some(
-                                            "An expression over a masked column cannot be masked \
-                                             after the fact. Select a column that is released, or \
-                                             aggregate in a way that cannot return a stored value."
-                                                .into(),
-                                        ),
-                                    });
-                                }
-                                return Err(Rejection {
-                                    cause: Cause::classify_opaque(&field.name, snapshot),
-                                    message: format!(
-                                        "pgmask: output column \"{}\" has no column provenance, so it \
-                                         cannot be classified",
-                                        field.name
-                                    ),
-                                    hint: Some(
-                                        "Select the underlying column directly. Expressions, set \
-                                         operations (UNION/INTERSECT/EXCEPT), recursive CTEs and \
-                                         SETOF-returning functions all erase provenance."
-                                            .into(),
-                                    ),
-                                });
-                            }
-                            // Deliberately stricter than the type-aware
-                            // unclassified fallback, and documented with it on
-                            // `MaskSpec::for_unclassified`: a provenance-free
-                            // field has no stable column identity to key a
-                            // pseudonym domain, so NULL is the only honest
-                            // default here.
-                            Opaque::Mask => MaskSpec::new(Mask::Null),
-                        },
+                        ExpressionPolicy::Masked { spec, projection } => {
+                            json_projection = projection;
+                            spec
+                        }
+                        ExpressionPolicy::NotApplicable | ExpressionPolicy::Opaque => {
+                            self.plan_opaque_field(snapshot, field, analysis.lineage.get(index))?
+                        }
                     }
                 }
             } else {
@@ -386,6 +347,7 @@ impl Policy {
             let primed = self.masker.prime(&spec);
             plan.push(FieldPlan {
                 spec,
+                json_projection,
                 type_oid: field.type_oid,
                 format: field.format,
                 lenient,
@@ -393,6 +355,46 @@ impl Policy {
             });
         }
         Ok(Arc::new(plan))
+    }
+
+    fn plan_opaque_field(
+        &self,
+        snapshot: &Snapshot,
+        field: &protocol::FieldDescription,
+        lineage: Option<&Verdict>,
+    ) -> Result<MaskSpec, Rejection> {
+        if self.opaque == Opaque::Mask {
+            return Ok(MaskSpec::new(Mask::Null));
+        }
+        if let Some(Verdict::Blocked(source)) = lineage {
+            return Err(Rejection {
+                cause: Cause::classify_opaque(&field.name, snapshot),
+                message: format!(
+                    "pgmask: output column \"{}\" derives from {source}, which is masked",
+                    field.name
+                ),
+                hint: Some(
+                    "An expression over a masked column cannot be masked after the fact. \
+                     Select a released column, a supported summary, or a literal JSON extract \
+                     whose pointer policy can be applied to the result."
+                        .into(),
+                ),
+            });
+        }
+        Err(Rejection {
+            cause: Cause::classify_opaque(&field.name, snapshot),
+            message: format!(
+                "pgmask: output column \"{}\" has no column provenance, so it cannot be classified",
+                field.name
+            ),
+            hint: Some(
+                "Select the underlying column directly. Expressions, set operations \
+                 (UNION/INTERSECT/EXCEPT), recursive CTEs and SETOF-returning functions erase \
+                 provenance. Rescued expressions need one syntax-verified, catalog-attributed \
+                 source."
+                    .into(),
+            ),
+        })
     }
 }
 
@@ -411,29 +413,60 @@ pub(crate) fn roles_by_principal(
     out
 }
 
-/// Resolve every result field to one explicit reducing-aggregate policy state.
+/// Resolve every syntax-verified expression through one policy seam.
 ///
-/// This is the seam between syntax analysis and catalog policy. It owns the
-/// positional alignment and the safety gate, so callers cannot accidentally
-/// treat a non-summary expression or a missing attribution as released.
-pub(crate) fn resolve_summary_policies(
+/// `plan_for` does not know whether a rescued expression was a reducing
+/// aggregate or a JSON projection. Analysis chooses the shape; this function
+/// aligns that shape's catalog result to the corresponding output field.
+pub(crate) fn resolve_expression_policies(
     inspection: Option<&analysis::StatementInspection<'_>>,
     field_count: usize,
     safety: &[Safety],
     snapshot: &Snapshot,
     roles: &HashSet<String>,
-) -> Vec<SummaryPolicy> {
+) -> Vec<ExpressionPolicy> {
+    let summaries = resolve_summary_policies(inspection, field_count, safety, snapshot, roles);
+    let json_extracts =
+        resolve_json_extract_policies(inspection, field_count, safety, snapshot, roles);
+
+    (0..field_count)
+        .map(|index| match safety.get(index) {
+            Some(Safety::Summary) => summaries
+                .get(index)
+                .cloned()
+                .unwrap_or(ExpressionPolicy::Opaque),
+            Some(Safety::JsonExtract) => json_extracts
+                .get(index)
+                .cloned()
+                .unwrap_or(ExpressionPolicy::Opaque),
+            _ => ExpressionPolicy::NotApplicable,
+        })
+        .collect()
+}
+
+/// Resolve every result field to one explicit reducing-aggregate policy state.
+///
+/// This is the seam between syntax analysis and catalog policy. It owns the
+/// positional alignment and the safety gate, so callers cannot accidentally
+/// treat a non-summary expression or a missing attribution as released.
+fn resolve_summary_policies(
+    inspection: Option<&analysis::StatementInspection<'_>>,
+    field_count: usize,
+    safety: &[Safety],
+    snapshot: &Snapshot,
+    roles: &HashSet<String>,
+) -> Vec<ExpressionPolicy> {
     let resolution = inspection.and_then(|value| value.summary_resolution(field_count));
     (0..field_count)
         .map(|index| {
             if safety.get(index) != Some(&Safety::Summary) {
-                return SummaryPolicy::NotApplicable;
+                return ExpressionPolicy::NotApplicable;
             }
             let Some(resolution) = resolution.as_ref() else {
-                return SummaryPolicy::Opaque;
+                return ExpressionPolicy::Opaque;
             };
             let Some(argument) = resolution.fields().get(index) else {
-                return SummaryPolicy::Opaque;
+                return ExpressionPolicy::Opaque;
             };
             resolve_summary_source(snapshot, resolution.relations(), argument, roles)
         })
@@ -449,7 +482,7 @@ pub(crate) fn resolve_summary_policies(
 /// this function decides which relation owns the name and what that column is
 /// masked with.
 ///
-/// Returns [`SummaryPolicy::Opaque`] when an argument is not a bare column, a
+/// Returns [`ExpressionPolicy::Opaque`] when an argument is not a bare column, a
 /// relation is unqualified, ownership is not unique, or the catalog has never
 /// heard of a relation or column. Explicit schema qualification is
 /// load-bearing: the proxy does not track `search_path`, and a wrong relation
@@ -459,20 +492,20 @@ fn resolve_summary_source(
     relations: &[(String, String)],
     argument: &analysis::SummaryArgument,
     roles: &HashSet<String>,
-) -> SummaryPolicy {
+) -> ExpressionPolicy {
     let analysis::SummaryArgument::BareColumn(column) = argument else {
-        return SummaryPolicy::Opaque;
+        return ExpressionPolicy::Opaque;
     };
     let mut owners = 0usize;
     let mut owner: Option<&(String, String)> = None;
     for relation in relations {
         let Some(qualified) = qualify_relation(relation) else {
-            return SummaryPolicy::Opaque;
+            return ExpressionPolicy::Opaque;
         };
         // A relation the catalog has never heard of means ownership cannot be
         // ruled out, so nothing is attributed.
         let Some(columns) = snapshot.relation_columns(&qualified) else {
-            return SummaryPolicy::Opaque;
+            return ExpressionPolicy::Opaque;
         };
         if columns.iter().any(|c| c.as_str() == column) {
             owners = owners.saturating_add(1);
@@ -480,19 +513,22 @@ fn resolve_summary_source(
         }
     }
     if owners != 1 {
-        return SummaryPolicy::Opaque;
+        return ExpressionPolicy::Opaque;
     }
     let Some(qualified) = owner.and_then(qualify_relation) else {
-        return SummaryPolicy::Opaque;
+        return ExpressionPolicy::Opaque;
     };
     let Some(classification) = snapshot.lookup_by_name(&qualified, column) else {
-        return SummaryPolicy::Opaque;
+        return ExpressionPolicy::Opaque;
     };
     let spec = classification.for_roles(roles).clone();
     if spec.is_passthrough() {
-        SummaryPolicy::Released
+        ExpressionPolicy::Released
     } else {
-        SummaryPolicy::Masked(spec)
+        ExpressionPolicy::Masked {
+            spec,
+            projection: None,
+        }
     }
 }
 
@@ -691,7 +727,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -710,7 +746,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -754,7 +790,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -805,7 +841,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -831,7 +867,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -866,7 +902,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -897,7 +933,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -927,7 +963,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -959,7 +995,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -984,7 +1020,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -1009,7 +1045,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[Verdict::Release],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -1041,7 +1077,10 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[Verdict::Blocked("demo.t.salary".into())],
-                    summary: &[SummaryPolicy::Masked(MaskSpec::new(Mask::NumericBucket))],
+                    expression: &[ExpressionPolicy::Masked {
+                        spec: MaskSpec::new(Mask::NumericBucket),
+                        projection: None,
+                    }],
                     trust_provenance: true,
                 },
             )
@@ -1064,7 +1103,10 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[Verdict::Blocked("demo.t.salary".into())],
-                    summary: &[SummaryPolicy::Masked(MaskSpec::new(Mask::NumericBucket))],
+                    expression: &[ExpressionPolicy::Masked {
+                        spec: MaskSpec::new(Mask::NumericBucket),
+                        projection: None,
+                    }],
                     trust_provenance: true,
                 },
             )
@@ -1082,7 +1124,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[Verdict::Unresolved],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -1112,7 +1154,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[Verdict::Blocked("demo.t.a".into())],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -1132,7 +1174,7 @@ mask = "none"
                 &analysis::SummaryArgument::BareColumn("salary".into()),
                 &HashSet::new(),
             ),
-            SummaryPolicy::Opaque,
+            ExpressionPolicy::Opaque,
             "the backend may resolve payroll through search_path to another schema"
         );
     }
@@ -1169,7 +1211,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[],
                     lineage: &[],
-                    summary: &[],
+                    expression: &[],
                     trust_provenance: true,
                 },
             )
@@ -1200,7 +1242,10 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[],
-                    summary: &[SummaryPolicy::Masked(MaskSpec::new(Mask::NumericBucket))],
+                    expression: &[ExpressionPolicy::Masked {
+                        spec: MaskSpec::new(Mask::NumericBucket),
+                        projection: None,
+                    }],
                     trust_provenance: true,
                 },
             )
@@ -1227,7 +1272,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[],
-                    summary: &[SummaryPolicy::Opaque],
+                    expression: &[ExpressionPolicy::Opaque],
                     trust_provenance: true,
                 },
             )
@@ -1247,7 +1292,7 @@ mask = "none"
                 &FieldAnalysis {
                     safety: &[Safety::Summary],
                     lineage: &[],
-                    summary: &[SummaryPolicy::Released],
+                    expression: &[ExpressionPolicy::Released],
                     trust_provenance: true,
                 },
             )

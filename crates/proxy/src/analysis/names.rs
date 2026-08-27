@@ -506,6 +506,17 @@ pub(crate) fn func_call_name_parts(call: &pg_query::protobuf::FuncCall) -> Optio
     Some(parts)
 }
 
+/// Built-in JSON path extractors. Trusted to *call* (they are pg_catalog
+/// builtins with no user function body) and allowlisted as extract shapes.
+/// Policy still applies the source column's pointer mask, or refuses when the
+/// path is not a sequence of literals.
+pub(crate) const JSON_EXTRACT_FUNCTIONS: &[&str] = &[
+    "json_extract_path",
+    "jsonb_extract_path",
+    "json_extract_path_text",
+    "jsonb_extract_path_text",
+];
+
 pub(crate) fn is_trusted_function_name(name: &str) -> bool {
     CONTEXT_FUNCTIONS.contains(&name)
         || SIZE_FUNCTIONS.contains(&name)
@@ -514,6 +525,7 @@ pub(crate) fn is_trusted_function_name(name: &str) -> bool {
         || PURE_SCALARS.contains(&name)
         || TEXT_FUNCTIONS.contains(&name)
         || name == "date_trunc"
+        || JSON_EXTRACT_FUNCTIONS.contains(&name)
 }
 
 /// Unqualified text helpers that analysis already treats as ordinary expressions

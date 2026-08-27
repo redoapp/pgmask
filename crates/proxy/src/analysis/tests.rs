@@ -1004,6 +1004,171 @@ fn summary_resolution_peels_a_cast_off_the_aggregate() {
 }
 
 #[test]
+fn json_extract_resolution_names_a_literal_path() {
+    let inspection = StatementInspection::new(
+        "SELECT payload->>'public', payload->'profile'->>'email' FROM canary.documents",
+    );
+    assert_eq!(
+        inspection.output_safety(2, ALLOW_ALL),
+        vec![Safety::JsonExtract, Safety::JsonExtract]
+    );
+    let resolution = inspection
+        .json_extract_resolution(2)
+        .expect("trusted select");
+    assert_eq!(
+        resolution.relations()[0].qualified_name(),
+        "canary.documents"
+    );
+    match &resolution.fields()[0] {
+        JsonExtractArgument::Extract(extract) => {
+            assert!(extract.as_text, "->> is text");
+            assert_eq!(extract.column.column_name(), "payload");
+            assert_eq!(extract.path[0].value, "public");
+            assert_eq!(extract.path[0].navigation, JsonPathNavigation::ObjectKey);
+        }
+        JsonExtractArgument::Unattributable => panic!("expected extract"),
+    }
+    match &resolution.fields()[1] {
+        JsonExtractArgument::Extract(extract) => {
+            assert!(extract.as_text);
+            assert_eq!(
+                extract
+                    .path
+                    .iter()
+                    .map(|s| s.value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["profile", "email"]
+            );
+        }
+        JsonExtractArgument::Unattributable => panic!("expected extract"),
+    }
+}
+
+#[test]
+fn collated_json_extract_keeps_the_same_shape_and_attribution() {
+    let inspection =
+        StatementInspection::new("SELECT (payload->>'public') COLLATE \"C\" FROM canary.documents");
+    assert_eq!(
+        inspection.output_safety(1, ALLOW_ALL),
+        vec![Safety::JsonExtract]
+    );
+    assert!(matches!(
+        inspection.json_extract_resolution(1).unwrap().fields(),
+        [JsonExtractArgument::Extract(_)]
+    ));
+}
+
+#[test]
+fn json_extract_resolution_requires_schema_and_literal_keys() {
+    assert!(
+        StatementInspection::new("SELECT payload->>'x' FROM documents")
+            .json_extract_resolution(1)
+            .is_none(),
+        "unqualified FROM cannot be resolved without search_path"
+    );
+    let inspection = StatementInspection::new("SELECT payload->col FROM canary.documents");
+    let resolution = inspection.json_extract_resolution(1).unwrap();
+    assert_eq!(
+        resolution.fields(),
+        vec![JsonExtractArgument::Unattributable]
+    );
+    let inspection = StatementInspection::new(
+        "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents",
+    );
+    assert_eq!(
+        inspection.output_safety(1, ALLOW_ALL),
+        vec![Safety::JsonExtract]
+    );
+    let resolution = inspection.json_extract_resolution(1).unwrap();
+    match &resolution.fields()[0] {
+        JsonExtractArgument::Extract(extract) => {
+            assert!(extract.as_text);
+            assert_eq!(
+                extract
+                    .path
+                    .iter()
+                    .map(|s| s.value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["profile", "email"]
+            );
+        }
+        JsonExtractArgument::Unattributable => panic!("expected extract_path_text"),
+    }
+    assert_eq!(
+        StatementInspection::new(
+            "SELECT jsonb_path_query(payload, '$.email') FROM canary.documents"
+        )
+        .output_safety(1, ALLOW_ALL),
+        vec![Safety::Unknown]
+    );
+    assert!(!calls_untrusted_function(
+        "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents"
+    ));
+}
+
+#[test]
+fn json_extract_records_only_syntax_proven_array_navigation() {
+    let inspection = StatementInspection::new(
+        "SELECT payload->0, payload->'0', payload #> '{0}' FROM canary.documents",
+    );
+    let resolution = inspection.json_extract_resolution(3).unwrap();
+    let navigations = resolution
+        .fields()
+        .iter()
+        .map(|field| match field {
+            JsonExtractArgument::Extract(extract) => extract.path[0].navigation,
+            JsonExtractArgument::Unattributable => panic!("expected extract"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        navigations,
+        vec![
+            JsonPathNavigation::ArrayIndex,
+            JsonPathNavigation::ObjectKey,
+            JsonPathNavigation::Ambiguous,
+        ]
+    );
+}
+
+#[test]
+fn json_extract_resolution_collects_join_ranges() {
+    let inspection = StatementInspection::new(
+        "SELECT d.payload->>'public' FROM canary.documents d \
+         JOIN canary.subjects s ON s.id = d.id",
+    );
+    let resolution = inspection
+        .json_extract_resolution(1)
+        .expect("join of named ranges");
+    assert_eq!(resolution.relations().len(), 2);
+    match &resolution.fields()[0] {
+        JsonExtractArgument::Extract(extract) => match &extract.column {
+            JsonExtractColumn::Named { relation, column } => {
+                assert_eq!(relation, "d");
+                assert_eq!(column, "payload");
+            }
+            other => panic!("expected named column, got {other:?}"),
+        },
+        JsonExtractArgument::Unattributable => panic!("expected extract"),
+    }
+}
+
+#[test]
+fn hostile_counts_a_json_extract_as_a_projection_of_the_column() {
+    let masked = std::collections::HashSet::from(["payload".to_string()]);
+    assert!(
+        !masked_exceeds_outer_projection("SELECT payload->>'email' FROM canary.documents", &masked),
+        "a literal extract is the projection of payload"
+    );
+    assert!(
+        masked_exceeds_outer_projection(
+            "SELECT payload->>'email' FROM canary.documents WHERE payload @> '{}'",
+            &masked
+        ),
+        "a second mention in WHERE is still a membership oracle"
+    );
+}
+
+#[test]
 fn summary_resolution_requires_explicit_relation_schemas() {
     let inspection = StatementInspection::new("SELECT sum(salary) FROM payroll");
     assert!(

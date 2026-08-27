@@ -27,6 +27,15 @@ use sha2::Sha256;
 
 use crate::protocol::is_text_family;
 
+mod json;
+pub(crate) use crate::json_path::JsonPathNavigation;
+use json::JsonPolicyTrie;
+pub(crate) use json::JsonProjection;
+pub use json::{
+    JsonFieldSpec, JsonLimit, JsonUnmatched, DEFAULT_JSON_MAX_BYTES, DEFAULT_JSON_MAX_DEPTH,
+    MAX_JSON_MAX_DEPTH,
+};
+
 type HmacSha256 = Hmac<Sha256>;
 
 // Type OIDs we handle beyond the text family.
@@ -44,6 +53,9 @@ pub const OID_INET: u32 = 869;
 pub const OID_CIDR: u32 = 650;
 pub const OID_VARCHAR: u32 = 1043;
 pub const OID_BPCHAR: u32 = 1042;
+pub const OID_BOOL: u32 = 16;
+pub const OID_JSON: u32 = 114;
+pub const OID_JSONB: u32 = 3802;
 
 /// Structured identifiers, and the placeholder each becomes.
 ///
@@ -363,6 +375,9 @@ pub enum Mask {
     Scrub,
     /// Keep the network prefix of an IP: `203.0.113.7` -> `203.0.113.0`.
     IpPrefix,
+    /// Walk a JSON document and apply inheritable policies rooted at JSON
+    /// Pointer paths. A more-specific path overrides its parent policy.
+    Json,
 }
 
 /// A mask plus its parameters and pseudonym domain.
@@ -388,6 +403,16 @@ pub struct MaskSpec {
     /// number that happens to equal an account number cannot be used to link
     /// them. Defaults to the semantic type name, which is usually what you want.
     pub domain: Option<Arc<str>>,
+    /// Hierarchical path policy overrides used by [`Mask::Json`].
+    pub json: Arc<[JsonFieldSpec]>,
+    /// Compiled form of `json`; rebuilt when the catalog compiles a rule.
+    json_trie: Arc<JsonPolicyTrie>,
+    /// Policy for leaves with no matching or inherited pointer rule.
+    pub json_unmatched: JsonUnmatched,
+    /// Maximum encoded JSON payload accepted before parsing.
+    pub json_max_bytes: usize,
+    /// Maximum object/array nesting accepted before parsing.
+    pub json_max_depth: usize,
 }
 
 impl Default for MaskSpec {
@@ -400,6 +425,11 @@ impl Default for MaskSpec {
             bucket: 1,
             keep_domain: false,
             domain: None,
+            json: Arc::default(),
+            json_trie: Arc::default(),
+            json_unmatched: JsonUnmatched::Null,
+            json_max_bytes: DEFAULT_JSON_MAX_BYTES,
+            json_max_depth: DEFAULT_JSON_MAX_DEPTH,
         }
     }
 }
@@ -528,6 +558,11 @@ impl MaskSpec {
                 is_text_family(type_oid)
                     || (matches!(type_oid, OID_INET | OID_CIDR) && format == FORMAT_TEXT)
             }
+
+            // PostgreSQL's binary jsonb representation on the wire is a
+            // version byte followed by JSON text. `json` is JSON text in both
+            // formats. The decoder below handles that distinction explicitly.
+            Mask::Json => matches!(type_oid, OID_JSON | OID_JSONB),
         }
     }
 
@@ -548,6 +583,9 @@ impl MaskSpec {
             }
             Mask::Pseudonym => {
                 "pseudonym handles text-family types and uuid. Use mask = \"null\" otherwise."
+            }
+            Mask::Json => {
+                "json handles PostgreSQL json and jsonb columns. Use mask = \"null\" otherwise."
             }
             _ => "This mask rewrites values as text. Use mask = \"null\" for non-text types.",
         }
@@ -618,6 +656,20 @@ impl Masker {
         format: i16,
         value: Option<Bytes>,
     ) -> Result<Option<Bytes>, MaskError> {
+        self.apply_planned(spec, primed, None, type_oid, format, value)
+    }
+
+    /// Apply one field plan, including JSON projection context kept outside the
+    /// reusable column policy.
+    pub(crate) fn apply_planned(
+        &self,
+        spec: &MaskSpec,
+        primed: Option<&PrimedMac>,
+        projection: Option<&JsonProjection>,
+        type_oid: u32,
+        format: i16,
+        value: Option<Bytes>,
+    ) -> Result<Option<Bytes>, MaskError> {
         if spec.kind == Mask::None {
             return Ok(value);
         }
@@ -650,6 +702,7 @@ impl Masker {
             Mask::NumericBucket => bucket_number(&bytes, type_oid, format, spec.bucket)?,
             Mask::IpPrefix => text_op(&bytes, ip_prefix),
             Mask::Scrub => text_op(&bytes, scrub_free_text),
+            Mask::Json => self.mask_json(spec, projection, type_oid, format, &bytes)?,
             Mask::None | Mask::Null => unreachable!("handled above"),
         };
         Ok(Some(out))
@@ -1249,6 +1302,8 @@ pub enum MaskError {
     },
     /// The value did not decode as its declared type.
     Undecodable { type_oid: u32, format: i16 },
+    /// JSON was refused before parsing because an operator limit was exceeded.
+    JsonLimitExceeded { limit: JsonLimit, configured: usize },
 }
 
 impl std::fmt::Display for MaskError {
@@ -1274,6 +1329,14 @@ impl std::fmt::Display for MaskError {
                     "binary"
                 } else {
                     "text"
+                }
+            ),
+            MaskError::JsonLimitExceeded { limit, configured } => write!(
+                f,
+                "JSON exceeds configured {} limit {configured}",
+                match limit {
+                    JsonLimit::Bytes => "byte",
+                    JsonLimit::Depth => "depth",
                 }
             ),
         }

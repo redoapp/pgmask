@@ -6,6 +6,7 @@
 
 pub mod analysis;
 pub mod catalog;
+mod json_path;
 pub mod lineage;
 pub mod mask;
 pub mod metrics;

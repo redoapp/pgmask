@@ -16,8 +16,10 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
-use pgmask::catalog::{ColumnRule, Config, Lineage, Opaque, SystemCatalogs, Unclassified};
-use pgmask::mask::Mask;
+use pgmask::catalog::{
+    ColumnRule, Config, JsonFieldRule, Lineage, MaskParams, Opaque, SystemCatalogs, Unclassified,
+};
+use pgmask::mask::{JsonUnmatched, Mask};
 use pgmask::protocol::{FrameReader, Message, StartupPacket};
 use pgmask::{Catalog, Policy};
 use tokio::io::AsyncWriteExt;
@@ -37,7 +39,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 50
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 58
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -108,7 +110,34 @@ INSERT INTO canary.subjects VALUES
   (1, 'CANARY_EMAIL_a1b2c3', 'CANARY_NAME_d4e5f6', 'CANARY_NOTE_97h8i9', 'Portland'),
   (2, 'CANARY_EMAIL_a1b2c3', 'CANARY_NAME_d4e5f6', 'CANARY_NOTE_97h8i9', 'Denver');
 
+CREATE TABLE canary.documents (
+  id      int PRIMARY KEY,
+  payload jsonb NOT NULL,
+  legacy  json NOT NULL
+);
+INSERT INTO canary.documents VALUES (
+  1,
+  '{
+    "profile":{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6"},
+    "public":"Portland",
+    "unknown":"CANARY_NOTE_97h8i9",
+    "items":[
+      {"token":"CANARY_TEMP_j0k1l2","city":"Denver"},
+      {"token":"CANARY_TEMP_j0k1l2","city":"Seattle"}
+    ],
+    "numeric_object":{"0":{"token":"CANARY_TEMP_j0k1l2"}},
+    "n": 99,
+    "enabled": true
+  }',
+  '{
+    "profile":{"email":"CANARY_EMAIL_a1b2c3","name":"CANARY_NAME_d4e5f6"},
+    "public":"Portland",
+    "unknown":"CANARY_NOTE_97h8i9"
+  }'
+);
+
 CREATE VIEW canary.subject_view AS SELECT id, email, name, city FROM canary.subjects;
+CREATE VIEW canary.documents_view AS SELECT id, payload, legacy FROM canary.documents;
 
 CREATE FUNCTION canary.all_subjects() RETURNS SETOF canary.subjects AS $$
   SELECT * FROM canary.subjects;
@@ -291,11 +320,51 @@ pub fn rule(relation: &str, column: &str, mask: Mask) -> ColumnRule {
     }
 }
 
+pub fn json_field(pointer: &str, mask: Mask) -> JsonFieldRule {
+    JsonFieldRule {
+        pointer: pointer.into(),
+        mask,
+        params: MaskParams::default(),
+    }
+}
+
+pub fn json_rule(
+    relation: &str,
+    column: &str,
+    unmatched: JsonUnmatched,
+    fields: Vec<JsonFieldRule>,
+) -> ColumnRule {
+    let mut rule = rule(relation, column, Mask::Json);
+    rule.params.json_unmatched = Some(unmatched);
+    rule.params.json = Some(fields);
+    rule
+}
+
 // --- In-process proxy -------------------------------------------------------
 
 pub struct ProxyHandle {
     pub addr: SocketAddr,
     pub metrics: Arc<pgmask::metrics::Metrics>,
+}
+
+struct TestPolicy {
+    unclassified: Unclassified,
+    opaque: Opaque,
+    roles: Vec<pgmask::catalog::Role>,
+    lineage: Lineage,
+    posture: pgmask::catalog::Posture,
+}
+
+impl Default for TestPolicy {
+    fn default() -> Self {
+        Self {
+            unclassified: Unclassified::Mask,
+            opaque: Opaque::Reject,
+            roles: Vec::new(),
+            lineage: Lineage::Refuse,
+            posture: pgmask::catalog::Posture::Default,
+        }
+    }
 }
 
 /// A proxy where the connecting principal *is* a member of `role`.
@@ -344,10 +413,10 @@ pub async fn start_proxy_with_roles(
         &backend,
         db,
         rules,
-        Unclassified::Mask,
-        Opaque::Reject,
-        roles,
-        Lineage::Refuse,
+        TestPolicy {
+            roles,
+            ..Default::default()
+        },
     )
     .await
 }
@@ -365,10 +434,11 @@ pub async fn start_proxy_at(
         backend,
         db,
         rules,
-        unclassified,
-        opaque,
-        Vec::new(),
-        Lineage::Refuse,
+        TestPolicy {
+            unclassified,
+            opaque,
+            ..Default::default()
+        },
     )
     .await
 }
@@ -381,22 +451,33 @@ pub async fn start_proxy_allowing_lineage(db: &str, rules: Vec<ColumnRule>) -> R
         &backend,
         db,
         rules,
-        Unclassified::Mask,
-        Opaque::Reject,
-        Vec::new(),
-        Lineage::Allow,
+        TestPolicy {
+            lineage: Lineage::Allow,
+            ..Default::default()
+        },
     )
     .await
 }
 
-pub async fn start_proxy_at_full(
+pub async fn start_proxy_hostile(db: &str, rules: Vec<ColumnRule>) -> Result<ProxyHandle> {
+    let backend = backend_addr().context("PGMASK_TEST_PG")?;
+    start_proxy_at_full(
+        &backend,
+        db,
+        rules,
+        TestPolicy {
+            posture: pgmask::catalog::Posture::Hostile,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn start_proxy_at_full(
     backend: &str,
     db: &str,
     rules: Vec<ColumnRule>,
-    unclassified: Unclassified,
-    opaque: Opaque,
-    roles: Vec<pgmask::catalog::Role>,
-    lineage: Lineage,
+    policy: TestPolicy,
 ) -> Result<ProxyHandle> {
     let backend = backend.to_string();
     let config = Config {
@@ -404,12 +485,12 @@ pub async fn start_proxy_at_full(
         backend: backend.clone(),
         catalog_dsn: backend_dsn(db),
         pseudonym_key: "test-key-long-enough".into(),
-        unclassified,
+        unclassified: policy.unclassified,
         unclassified_mask: Default::default(),
-        opaque,
+        opaque: policy.opaque,
         column: rules,
         semantic_type: Vec::new(),
-        role: roles,
+        role: policy.roles,
         tls_cert: None,
         tls_key: None,
         // No certificate, so nothing to require: these harnesses drive a raw
@@ -422,9 +503,9 @@ pub async fn start_proxy_at_full(
         catalog_refresh_min_seconds: 1,
         metrics_interval_seconds: 0,
         summaries: pgmask::catalog::Summaries::Allow,
-        posture: pgmask::catalog::Posture::Default,
+        posture: policy.posture,
         system_catalogs: SystemCatalogs::Refuse,
-        lineage,
+        lineage: policy.lineage,
         metrics_listen: None,
         rate_limit_per_minute: 0,
         rate_limit_burst: 0,
@@ -556,6 +637,97 @@ impl RawClient {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum SqlExpectation {
+    Served,
+    Refused,
+    /// Served or refused, never silent. Use when either outcome is policy, but
+    /// a no-canary check would pass if the statement was never exercised.
+    Exercised,
+}
+
+pub struct SqlCase<'a> {
+    pub name: &'a str,
+    pub sql: &'a str,
+    pub expectation: SqlExpectation,
+}
+
+impl<'a> SqlCase<'a> {
+    pub const fn served(name: &'a str, sql: &'a str) -> Self {
+        Self {
+            name,
+            sql,
+            expectation: SqlExpectation::Served,
+        }
+    }
+
+    pub const fn refused(name: &'a str, sql: &'a str) -> Self {
+        Self {
+            name,
+            sql,
+            expectation: SqlExpectation::Refused,
+        }
+    }
+
+    pub const fn exercised(name: &'a str, sql: &'a str) -> Self {
+        Self {
+            name,
+            sql,
+            expectation: SqlExpectation::Exercised,
+        }
+    }
+}
+
+/// One simple-query round-trip and the bytes received during it.
+pub struct QueryRound {
+    pub messages: Vec<Message>,
+    pub received: Vec<u8>,
+}
+
+impl QueryRound {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.received).into_owned()
+    }
+}
+
+/// Run a simple query and return only the bytes this round added.
+pub async fn simple_query_round(client: &mut RawClient, sql: &str) -> Result<QueryRound> {
+    let received_before = client.received.len();
+    let messages = client.simple_query(sql).await?;
+    let received = client
+        .received
+        .get(received_before..)
+        .context("raw client receive buffer shrank during simple query")?
+        .to_vec();
+    Ok(QueryRound { messages, received })
+}
+
+/// Run related SQL shapes through one proxy while keeping each failure local.
+///
+/// Starting a proxy per row makes the already-serial live-Postgres suite much
+/// slower and introduces more catalog-refresh races. The client still retains
+/// every byte for the connection-wide canary audit; each row's assertions use
+/// only the bytes received during that query, so a failure does not dump all
+/// preceding responses or mistake an earlier refusal for this row's outcome.
+pub async fn assert_sql_cases(client: &mut RawClient, cases: &[SqlCase<'_>]) -> Result<()> {
+    for case in cases {
+        let round = simple_query_round(client, case.sql)
+            .await
+            .with_context(|| format!("SQL matrix case {:?}: {}", case.name, case.sql))?;
+        let context = format!("{} ({})", case.name, case.sql);
+
+        match case.expectation {
+            SqlExpectation::Served => assert_served(&round.messages, &context),
+            SqlExpectation::Refused => assert_refused_bytes(&round.received, &context),
+            SqlExpectation::Exercised => {
+                assert_exercised_bytes(&round.messages, &round.received, &context);
+            }
+        }
+        assert_no_canary_bytes(&round.received, &context);
+    }
+    Ok(())
+}
+
 // --- Extended-protocol message builders -------------------------------------
 
 pub fn parse_msg(name: &str, sql: &str) -> Message {
@@ -661,8 +833,13 @@ pub fn function_call_msg(oid: u32) -> Message {
 /// floor — an error carries no canary. Pairing it with this turns "no canary
 /// crossed" into "the proxy handled this statement and no canary crossed".
 pub fn assert_exercised(msgs: &[Message], client: &RawClient, context: &str) {
+    assert_exercised_bytes(msgs, &client.received, context);
+}
+
+#[track_caller]
+fn assert_exercised_bytes(msgs: &[Message], received: &[u8], context: &str) {
     let served = msgs.iter().any(|m| m.tag == b'D');
-    let refused = client.received_text().contains("pgmask:");
+    let refused = String::from_utf8_lossy(received).contains("pgmask:");
     assert!(
         served || refused,
         "{context}: the proxy neither served a row nor refused with a pgmask \
@@ -674,6 +851,7 @@ pub fn assert_exercised(msgs: &[Message], client: &RawClient, context: &str) {
 /// The proxy served data rows: a masking test that must SUCCEED, not be refused.
 /// A refusal carries no canary, so without this a "stays masked" test passes
 /// even when the path stopped running.
+#[track_caller]
 pub fn assert_served(msgs: &[Message], context: &str) {
     assert!(
         msgs.iter().any(|m| m.tag == b'D'),
@@ -684,22 +862,34 @@ pub fn assert_served(msgs: &[Message], context: &str) {
 /// The proxy refused the statement with its own message. A "cannot leak by
 /// refusal" test that only checks for a canary passes if the refusal quietly
 /// stops happening; this pins that the refusal is what closed the path.
+#[track_caller]
 pub fn assert_refused(client: &RawClient, context: &str) {
-    let text = client.received_text();
+    assert_refused_bytes(&client.received, context);
+}
+
+#[track_caller]
+fn assert_refused_bytes(received: &[u8], context: &str) {
+    let text = String::from_utf8_lossy(received);
     assert!(
         text.contains("pgmask:"),
         "{context}: expected a pgmask refusal, got:\n{text}"
     );
 }
 
+#[track_caller]
 pub fn assert_no_canary(client: &RawClient, context: &str) {
-    let text = client.received_text();
+    assert_no_canary_bytes(&client.received, context);
+}
+
+#[track_caller]
+pub fn assert_no_canary_bytes(received: &[u8], context: &str) {
+    let text = String::from_utf8_lossy(received);
     for canary in CANARIES {
         assert!(
             !text.contains(canary),
             "LEAK via {context}: {canary} crossed the boundary\n\
              received {} bytes",
-            client.received.len(),
+            received.len(),
         );
     }
 }

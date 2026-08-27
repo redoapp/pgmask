@@ -40,6 +40,8 @@ disclosure record before changing anything in `crates/proxy/src`.
   `Snapshot::names` is classified-only; `Snapshot::all_columns` is every live
   column (pseudonym-domain identity). Keep them separate.
 - `mask.rs` — masking algorithms. Masks must preserve wire type and format.
+  JSON pointer policy, array `*`, and type placeholders are documented in
+  `docs/json-masking.md`.
 - `analysis/` — SQL allowlisting; rules are allowlists of shapes, not
   searches for column refs.
 
@@ -47,7 +49,7 @@ disclosure record before changing anything in `crates/proxy/src`.
 
 ```bash
 PGMASK_ALLOW_SKIP=1 cargo test --workspace   # unit suites
-./scripts/test-integration.sh                # adversarial + resilience vs real Postgres (podman)
+./scripts/test-integration.sh                # adversarial + resilience vs real Postgres
 cargo clippy --workspace --all-targets       # zero warnings; unwrap/panic denied
 cargo fmt --all --check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
@@ -60,6 +62,11 @@ also update the `pgmask` entry there or CI fails on staleness.
 
 Database-backed tests panic without `PGMASK_TEST_PG` unless
 `PGMASK_ALLOW_SKIP=1`; that is deliberate (they once passed vacuously).
+`./scripts/test-integration.sh` prefers an existing `PGMASK_TEST_PG`, then
+podman, then a host `postgresql` install (unix sockets in `/tmp`). Cloud
+Agent images typically have no podman. `.cursor/environment.json` installs
+`postgresql` / `postgresql-client`, fetches crates, and starts the same
+trust cluster on `127.0.0.1:55433` that the integration script reuses.
 
 ## Release discipline
 

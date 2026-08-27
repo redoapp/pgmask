@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.1.99 — structure-aware JSON and JSONB masking
+
+- Add `mask = "json"` for classified `json` and `jsonb` columns. RFC 6901 JSON
+  Pointer policies inherit through their subtree; more-specific paths override
+  parents, so one release rule can cover an evolving public object while
+  narrow child rules still redact sensitive fields.
+- Every unmatched scalar defaults to JSON `null`; an operator may explicitly
+  choose `json_unmatched = "none"` when unmentioned values are intentionally
+  public. A configured mask/type mismatch, malformed JSON, or unknown
+  binary-jsonb version refuses the result set.
+- Add `*` array-element policies, so `/items/*/account_id` masks every item
+  without enumerating indices; an exact index wins over the wildcard. Add the
+  opt-in `json_unmatched = "type-placeholders"` debugging policy, which
+  retains scalar types as `""`, `0`, `false`, and `null` while withholding
+  values. One enum now owns all unmatched-leaf behavior (`null`,
+  `type-placeholders`, or `none`) instead of two conflicting settings.
+  Equally-specific overlapping wildcard policies are rejected at config load
+  rather than resolved by TOML order.
+- Compile JSON Pointer rules into a trie at catalog load, so walking a node
+  follows only exact-key and array-wildcard edges instead of scanning every
+  configured rule. Add per-column `json_max_bytes` (1 MiB default) and
+  `json_max_depth` (64 default, maximum 128); values over either limit refuse
+  before `serde_json` parses or allocates the document tree.
+- Attribute literal JSON extracts (`->`, `->>`, `#>`/`#>>`,
+  `json[b]_extract_path[_text]`) of a schema-qualified classified column.
+  The stored column's pointer policy is applied to the extract; a text extract
+  of a node that still has child pointer policies is refused because the
+  backend has already serialized the subtree. JSONPath, constructors,
+  aggregates, and dynamic keys stay opaque.
+- Split JSON masking, extract parsing, extract policy, and catalog pointer
+  validation into their own modules so those seams stay reviewable as the
+  walker and allowlist grow.
+- Keep SQL attribution separate from JSON navigation. Integer `-> 0` is proven
+  array navigation; quoted keys are object navigation; text-path segments from
+  `#>` / `#>>` and `json[b]_extract_path[_text]` remain ambiguous. An ambiguous
+  segment that could enter a `*` policy now refuses instead of letting a
+  numeric object key inherit an array-only release. Summaries and JSON extracts
+  now enter `plan_for` through one resolved-expression policy slot rather than
+  a feature-specific fallback ladder.
+- Keep extract provenance out of reusable column policy. `MaskSpec` no longer
+  carries a hidden `json_path_prefix`; `FieldPlan` carries an explicit
+  `JsonProjection` only for document extracts, and the masker receives it as
+  execution context. Add a live-Postgres SQL surface matrix covering scalar
+  and document operators, function forms, aliases, joins, views, wrappers,
+  binary results, ambiguous text paths, CTEs/subqueries, reshaping, set
+  operations, and hostile-posture predicate refusal.
+- Align the outer safety classifier with extract attribution for `COLLATE`.
+  The extract parser already peeled a collation wrapper, but `classify` did
+  not, so a valid `(payload->>'public') COLLATE "C"` projection was refused
+  despite having the same output bytes and source policy. The live SQL matrix
+  found and now pins that cross-layer drift.
+- Document JSON pointer inheritance, array wildcards, type placeholders, and
+  which SQL shapes are served versus refused in `docs/json-masking.md`.
+- Support both pgwire formats. Text values are parsed directly; binary `jsonb`
+  validates and preserves PostgreSQL's version byte. Real-Postgres poison
+  controls prove the same text and binary rows expose canaries when released,
+  and that no canary crosses under the JSON policy. Extraction, construction,
+  aggregates, set operations, and COPY of classified JSON refuse; aliases,
+  joins, CTEs, subqueries, views, and pipelined portals stay masked on the
+  wire. Binary `json` (no version byte) is covered alongside `jsonb`.
+- `scripts/test-integration.sh` starts a local trust Postgres when `podman`
+  is absent, so the adversarial and resilience suites run on Cloud Agent
+  VMs that have host `postgresql` packages but no container runtime.
+- Give table-driven raw-wire SQL cases stable names and isolate each case's
+  diagnostics to the bytes received for that query, while retaining the full
+  connection transcript for the canary audit. JSON and COPY matrices reuse one
+  proxy instead of paying setup cost per row. Ordinary and CI `cargo nextest`
+  runs now share the serial Postgres test group. This exposed and fixes a
+  vacuous dynamic-key case whose nonexistent column produced PostgreSQL 42703;
+  the old cumulative buffer mistook an earlier `pgmask:` refusal for its own.
+  Remaining uniform expression, summary, rescue, star-expansion, and
+  non-table-relation matrices use the same per-query isolation, including
+  value checks on JSON extracts. Binary Bind of a document extract is covered
+  alongside binary text extracts.
+- Pin the JSON pointer trie and catalog overlap helpers with named lookup
+  tables: exact beats `*`, object keys never take array wildcards, ambiguous
+  text steps refuse at a `*` edge, nested wildcards need a proven array index
+  at each `*`, and equal-specificity overlaps stay a load-time error.
+- Add a property test that generates random accepted pointer sets and paths
+  and cross-checks the compiled trie against a brute-force scan over the
+  rule list. Any equivalence-preserving mutant on `compile`, `next_states`,
+  `policy_at`, `has_ambiguous_wildcard`, or `has_descendants_at` diverges on
+  some generated case; a temporary mutation was caught in seventeen cases
+  before this landed. The generator keeps tables catalog load would accept
+  by using the same equally-specific overlap predicate, then calls
+  `validate_json_spec`. Rule segments include `0` and `*` so exact-index vs
+  array-wildcard pairs appear; path `*` covers the literal object key.
+
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 
 - **`Close` must not reset bind generation while an Execute of that name

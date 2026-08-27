@@ -379,6 +379,7 @@ impl ProtocolModel {
                 (0..width)
                     .map(|_| FieldPlan {
                         spec: MaskSpec::new(Mask::None),
+                        json_projection: None,
                         type_oid: id,
                         format: 0,
                         lenient: false,

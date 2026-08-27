@@ -335,6 +335,7 @@ fn mask_name(mask: &pgmask::mask::Mask) -> &'static str {
         Mask::NumericBucket => "numeric-bucket",
         Mask::IpPrefix => "ip-prefix",
         Mask::Scrub => "scrub",
+        Mask::Json => "json",
     }
 }
 
@@ -360,6 +361,7 @@ const ALL_MASKS: &[pgmask::mask::Mask] = {
         NumericBucket,
         IpPrefix,
         Scrub,
+        Json,
     ]
 };
 
@@ -383,6 +385,7 @@ fn _index_of(mask: pgmask::mask::Mask) -> usize {
         Mask::NumericBucket => 11,
         Mask::IpPrefix => 12,
         Mask::Scrub => 13,
+        Mask::Json => 14,
     }
 }
 
@@ -408,6 +411,7 @@ fn mask_kind(name: &str) -> Option<pgmask::mask::Mask> {
         "numeric-bucket" => Mask::NumericBucket,
         "ip-prefix" => Mask::IpPrefix,
         "scrub" => Mask::Scrub,
+        "json" => Mask::Json,
         _ => return None,
     })
 }
@@ -415,13 +419,14 @@ fn mask_kind(name: &str) -> Option<pgmask::mask::Mask> {
 /// The type OID behind a `format_type(atttypid, NULL)` string, for the types
 /// the proxy's capability table knows how to answer for.
 ///
-/// `None` for anything else — `boolean`, `json`, arrays, `money`, extension
+/// `None` for anything else — `boolean`, arrays, `money`, extension
 /// types. That is not "the proxy refuses these"; it is "this tool cannot vouch
 /// for them", and `mask_fits` treats the two the same way.
 fn type_oid(data_type: &str) -> Option<u32> {
     use pgmask::mask::{
         OID_BPCHAR, OID_CIDR, OID_DATE, OID_FLOAT4, OID_FLOAT8, OID_INET, OID_INT2, OID_INT4,
-        OID_INT8, OID_NUMERIC, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_UUID, OID_VARCHAR,
+        OID_INT8, OID_JSON, OID_JSONB, OID_NUMERIC, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_UUID,
+        OID_VARCHAR,
     };
     Some(match data_type {
         // `mask.rs` only names constants for types *beyond* the text family;
@@ -443,6 +448,8 @@ fn type_oid(data_type: &str) -> Option<u32> {
         "real" => OID_FLOAT4,
         "double precision" => OID_FLOAT8,
         "numeric" => OID_NUMERIC,
+        "json" => OID_JSON,
+        "jsonb" => OID_JSONB,
         _ => return None,
     })
 }
@@ -1598,7 +1605,7 @@ mod tests {
     /// — except under `null` and `none`, which never touch the value.
     #[test]
     fn an_unknown_data_type_is_refused_not_waved_through() {
-        for data_type in ["boolean", "money", "json", "text[]", "citext"] {
+        for data_type in ["boolean", "money", "text[]", "citext"] {
             assert!(!mask_fits("redact", data_type), "redact on {data_type}");
             assert!(
                 !mask_fits("date-year", data_type),
@@ -1607,6 +1614,9 @@ mod tests {
             assert!(mask_fits("null", data_type), "null withholds anything");
             assert!(mask_fits("none", data_type), "none touches nothing");
         }
+        assert!(mask_fits("json", "json"));
+        assert!(mask_fits("json", "jsonb"));
+        assert!(!mask_fits("json", "text"));
     }
 
     /// A postcode's identifying half is its tail, which is what `partial` keeps.
