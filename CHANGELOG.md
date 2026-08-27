@@ -77,6 +77,12 @@
   non-table-relation matrices use the same per-query isolation, including
   value checks on JSON extracts. Binary Bind of a document extract is covered
   alongside binary text extracts.
+- Add a Chatwoot-shaped golden fixture (`examples/chatwoot`) with a reduced
+  real schema, JSON/JSONB-heavy seed, operator catalog, and a sourced query
+  corpus. The pin is realistic support-inbox SQL (widget extracts, JSONB
+  subscripts, `json` `content_attributes`, views, `SELECT *`) through pgmask,
+  including Chatwoot's unqualified `FROM "contacts"` friction — not an
+  allowlist expansion.
 - Pin the JSON pointer trie and catalog overlap helpers with named lookup
   tables: exact beats `*`, object keys never take array wildcards, ambiguous
   text steps refuse at a `*` edge, nested wildcards need a proven array index

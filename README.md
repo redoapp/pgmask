@@ -40,6 +40,13 @@ Run the complete demo:
 ./examples/demo/verify.sh
 ```
 
+A Chatwoot-shaped JSON/JSONB corpus (real schema names and app SQL) lives in
+[examples/chatwoot](examples/chatwoot):
+
+```bash
+./examples/chatwoot/verify.sh
+```
+
 Or start it manually:
 
 ```bash
