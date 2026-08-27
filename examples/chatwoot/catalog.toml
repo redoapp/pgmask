@@ -54,34 +54,16 @@ mask = "pseudonym"
 # chatwoot.accounts
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.accounts"
-column = "id"
-mask = "none"
+[columns."chatwoot.accounts"]
+id = { mask = "none" }
+name = { mask = "none" }
+locale = { mask = "none" }
+domain = { mask = "redact" }
+support_email = { type = "email" }
+feature_flags = { mask = "none" }
+status = { mask = "none" }
 
-[[column]]
-relation = "chatwoot.accounts"
-column = "name"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.accounts"
-column = "locale"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.accounts"
-column = "domain"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.accounts"
-column = "support_email"
-type = "email"
-
-[[column]]
-relation = "chatwoot.accounts"
-column = "settings"
+[columns."chatwoot.accounts".settings]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -90,9 +72,7 @@ json = [
   { pointer = "/auto_resolve_ignore_waiting", mask = "none" },
 ]
 
-[[column]]
-relation = "chatwoot.accounts"
-column = "custom_attributes"
+[columns."chatwoot.accounts".custom_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -100,9 +80,7 @@ json = [
   { pointer = "/plan", mask = "none" },
 ]
 
-[[column]]
-relation = "chatwoot.accounts"
-column = "limits"
+[columns."chatwoot.accounts".limits]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -110,20 +88,8 @@ json = [
   { pointer = "/inboxes", mask = "none" },
 ]
 
-[[column]]
-relation = "chatwoot.accounts"
-column = "feature_flags"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.accounts"
-column = "status"
-mask = "none"
-
 # Billing identifiers live here in real Chatwoot installs.
-[[column]]
-relation = "chatwoot.accounts"
-column = "internal_attributes"
+[columns."chatwoot.accounts".internal_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -135,34 +101,15 @@ json = [
 # chatwoot.users
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.users"
-column = "id"
-mask = "none"
+[columns."chatwoot.users"]
+id = { mask = "none" }
+name = { type = "person_name" }
+display_name = { type = "person_name" }
+email = { type = "email" }
+pubsub_token = { type = "secret_token" }
+type = { mask = "none" }
 
-[[column]]
-relation = "chatwoot.users"
-column = "name"
-type = "person_name"
-
-[[column]]
-relation = "chatwoot.users"
-column = "display_name"
-type = "person_name"
-
-[[column]]
-relation = "chatwoot.users"
-column = "email"
-type = "email"
-
-[[column]]
-relation = "chatwoot.users"
-column = "pubsub_token"
-type = "secret_token"
-
-[[column]]
-relation = "chatwoot.users"
-column = "ui_settings"
+[columns."chatwoot.users".ui_settings]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -171,9 +118,7 @@ json = [
   { pointer = "/editor_message", mask = "redact" },
 ]
 
-[[column]]
-relation = "chatwoot.users"
-column = "custom_attributes"
+[columns."chatwoot.users".custom_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -181,87 +126,32 @@ json = [
   { pointer = "/phone_number", mask = "pseudonym", domain = "phone" },
 ]
 
-[[column]]
-relation = "chatwoot.users"
-column = "type"
-mask = "none"
-
 # ---------------------------------------------------------------------------
 # chatwoot.inboxes
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.inboxes"
-column = "id"
-mask = "none"
+[columns."chatwoot.inboxes"]
+id = { mask = "none" }
+channel_id = { mask = "none" }
+account_id = { mask = "none" }
+name = { mask = "none" }
+email_address = { type = "email" }
+greeting_enabled = { mask = "none" }
+greeting_message = { mask = "redact" }
+enable_email_collect = { mask = "none" }
+csat_survey_enabled = { mask = "none" }
+timezone = { mask = "none" }
+selected_feature_flags = { mask = "none" }
+lock_to_single_conversation = { mask = "none" }
 
-[[column]]
-relation = "chatwoot.inboxes"
-column = "channel_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "account_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "name"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "email_address"
-type = "email"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "greeting_enabled"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "greeting_message"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "enable_email_collect"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "csat_survey_enabled"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "auto_assignment_config"
+[columns."chatwoot.inboxes".auto_assignment_config]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
   { pointer = "/max_assignment_limit", mask = "none" },
 ]
 
-[[column]]
-relation = "chatwoot.inboxes"
-column = "timezone"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "selected_feature_flags"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "lock_to_single_conversation"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.inboxes"
-column = "csat_config"
+[columns."chatwoot.inboxes".csat_config]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -275,46 +165,24 @@ json = [
 # chatwoot.contacts
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.contacts"
-column = "id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "name"
-type = "person_name"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "email"
-type = "email"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "phone_number"
-type = "phone"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "account_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "identifier"
-type = "external_id"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "last_activity_at"
-mask = "none"
+[columns."chatwoot.contacts"]
+id = { mask = "none" }
+name = { type = "person_name" }
+email = { type = "email" }
+phone_number = { type = "phone" }
+account_id = { mask = "none" }
+identifier = { type = "external_id" }
+last_activity_at = { mask = "none" }
+contact_type = { mask = "none" }
+middle_name = { type = "person_name" }
+last_name = { type = "person_name" }
+location = { mask = "none" }
+country_code = { mask = "none" }
+blocked = { mask = "none" }
 
 # Custom attributes are tenant-defined. Public commerce keys are released;
 # everything else keeps type without value until an operator adds a pointer.
-[[column]]
-relation = "chatwoot.contacts"
-column = "custom_attributes"
+[columns."chatwoot.contacts".custom_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -327,9 +195,7 @@ json = [
 # Widget / CRM blob written by the Chatwoot JS SDK and Contact model.
 # Do not grant `/initiated_at` as `none`: that inherits to every future
 # child. Timestamp is the ops key; nested PII stays unmatched.
-[[column]]
-relation = "chatwoot.contacts"
-column = "additional_attributes"
+[columns."chatwoot.contacts".additional_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -350,83 +216,34 @@ json = [
   { pointer = "/social_profiles/linkedin", mask = "redact" },
 ]
 
-[[column]]
-relation = "chatwoot.contacts"
-column = "contact_type"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "middle_name"
-type = "person_name"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "last_name"
-type = "person_name"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "location"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "country_code"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.contacts"
-column = "blocked"
-mask = "none"
-
 # ---------------------------------------------------------------------------
 # chatwoot.conversations
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.conversations"
-column = "id"
-mask = "none"
+[columns."chatwoot.conversations"]
+id = { mask = "none" }
+account_id = { mask = "none" }
+inbox_id = { mask = "none" }
+status = { mask = "none" }
+assignee_id = { mask = "none" }
+contact_id = { mask = "none" }
+display_id = { mask = "none" }
+contact_last_seen_at = { mask = "none" }
+contact_inbox_id = { mask = "none" }
+uuid = { type = "external_id" }
+identifier = { type = "external_id" }
+last_activity_at = { mask = "none" }
+team_id = { mask = "none" }
+campaign_id = { mask = "none" }
+snoozed_until = { mask = "none" }
+first_reply_created_at = { mask = "none" }
+priority = { mask = "none" }
+sla_policy_id = { mask = "none" }
+# varchar[] is not a text-family mask target; null withholds the array
+# without refusing SELECT * the way redact would.
+label_list = { mask = "null" }
 
-[[column]]
-relation = "chatwoot.conversations"
-column = "account_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "inbox_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "status"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "assignee_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "contact_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "display_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "contact_last_seen_at"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "additional_attributes"
+[columns."chatwoot.conversations".additional_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -446,44 +263,7 @@ json = [
   { pointer = "/mail_subject", mask = "redact" },
 ]
 
-[[column]]
-relation = "chatwoot.conversations"
-column = "contact_inbox_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "uuid"
-type = "external_id"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "identifier"
-type = "external_id"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "last_activity_at"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "team_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "campaign_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "snoozed_until"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "custom_attributes"
+[columns."chatwoot.conversations".custom_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -491,132 +271,43 @@ json = [
   { pointer = "/stripe_charge", mask = "redact" },
 ]
 
-[[column]]
-relation = "chatwoot.conversations"
-column = "first_reply_created_at"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "priority"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.conversations"
-column = "sla_policy_id"
-mask = "none"
-
-# varchar[] is not a text-family mask target; null withholds the array
-# without refusing SELECT * the way redact would.
-[[column]]
-relation = "chatwoot.conversations"
-column = "label_list"
-mask = "null"
-
 # ---------------------------------------------------------------------------
 # chatwoot.contact_inboxes
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.contact_inboxes"
-column = "id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.contact_inboxes"
-column = "contact_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.contact_inboxes"
-column = "inbox_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.contact_inboxes"
-column = "source_id"
-type = "external_id"
-
-[[column]]
-relation = "chatwoot.contact_inboxes"
-column = "hmac_verified"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.contact_inboxes"
-column = "pubsub_token"
-type = "secret_token"
+[columns."chatwoot.contact_inboxes"]
+id = { mask = "none" }
+contact_id = { mask = "none" }
+inbox_id = { mask = "none" }
+source_id = { type = "external_id" }
+hmac_verified = { mask = "none" }
+pubsub_token = { type = "secret_token" }
 
 # ---------------------------------------------------------------------------
 # chatwoot.messages
 # content_attributes is json (OID 114) in Chatwoot, not jsonb.
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.messages"
-column = "id"
-mask = "none"
-
+[columns."chatwoot.messages"]
+id = { mask = "none" }
 # Transcript text can contain names, addresses, and secrets that a recogniser
 # cannot identify reliably. Debug from metadata; do not release prose.
-[[column]]
-relation = "chatwoot.messages"
-column = "content"
-mask = "redact"
+content = { mask = "redact" }
+account_id = { mask = "none" }
+inbox_id = { mask = "none" }
+conversation_id = { mask = "none" }
+message_type = { mask = "none" }
+created_at = { mask = "none" }
+updated_at = { mask = "none" }
+private = { mask = "none" }
+status = { mask = "none" }
+source_id = { type = "external_id" }
+content_type = { mask = "none" }
+sender_type = { mask = "none" }
+sender_id = { mask = "none" }
+processed_message_content = { mask = "redact" }
 
-[[column]]
-relation = "chatwoot.messages"
-column = "account_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "inbox_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "conversation_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "message_type"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "created_at"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "updated_at"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "private"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "status"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "source_id"
-type = "external_id"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "content_type"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "content_attributes"
+[columns."chatwoot.messages".content_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -633,39 +324,18 @@ json = [
   { pointer = "/cc_emails", mask = "redact" },
 ]
 
-[[column]]
-relation = "chatwoot.messages"
-column = "sender_type"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "sender_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "external_source_ids"
+[columns."chatwoot.messages".external_source_ids]
 mask = "json"
 json_unmatched = "type-placeholders"
 
-[[column]]
-relation = "chatwoot.messages"
-column = "additional_attributes"
+[columns."chatwoot.messages".additional_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
   { pointer = "/campaign_id", mask = "none" },
 ]
 
-[[column]]
-relation = "chatwoot.messages"
-column = "processed_message_content"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.messages"
-column = "sentiment"
+[columns."chatwoot.messages".sentiment]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -677,34 +347,15 @@ json = [
 # chatwoot.automation_rules
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.automation_rules"
-column = "id"
-mask = "none"
+[columns."chatwoot.automation_rules"]
+id = { mask = "none" }
+account_id = { mask = "none" }
+name = { mask = "redact" }
+description = { mask = "redact" }
+event_name = { mask = "none" }
+active = { mask = "none" }
 
-[[column]]
-relation = "chatwoot.automation_rules"
-column = "account_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.automation_rules"
-column = "name"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.automation_rules"
-column = "description"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.automation_rules"
-column = "event_name"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.automation_rules"
-column = "conditions"
+[columns."chatwoot.automation_rules".conditions]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -715,9 +366,7 @@ json = [
   { pointer = "/*/values/*", mask = "redact" },
 ]
 
-[[column]]
-relation = "chatwoot.automation_rules"
-column = "actions"
+[columns."chatwoot.automation_rules".actions]
 mask = "json"
 json_unmatched = "type-placeholders"
 # action_params hold send_message prose, emails, and labels. action_name
@@ -727,38 +376,17 @@ json = [
   { pointer = "/*/action_params/*", mask = "redact" },
 ]
 
-[[column]]
-relation = "chatwoot.automation_rules"
-column = "active"
-mask = "none"
-
 # ---------------------------------------------------------------------------
 # chatwoot.webhooks
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.webhooks"
-column = "id"
-mask = "none"
+[columns."chatwoot.webhooks"]
+id = { mask = "none" }
+account_id = { mask = "none" }
+url = { mask = "redact" }
+webhook_type = { mask = "none" }
 
-[[column]]
-relation = "chatwoot.webhooks"
-column = "account_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.webhooks"
-column = "url"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.webhooks"
-column = "webhook_type"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.webhooks"
-column = "subscriptions"
+[columns."chatwoot.webhooks".subscriptions]
 mask = "json"
 json_unmatched = "type-placeholders"
 
@@ -766,154 +394,51 @@ json_unmatched = "type-placeholders"
 # chatwoot.custom_attribute_definitions / tags / taggings
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "id"
-mask = "none"
+[columns."chatwoot.custom_attribute_definitions"]
+id = { mask = "none" }
+attribute_display_name = { mask = "redact" }
+attribute_key = { mask = "none" }
+attribute_display_type = { mask = "none" }
+default_value = { mask = "none" }
+attribute_model = { mask = "none" }
+account_id = { mask = "none" }
+created_at = { mask = "none" }
+updated_at = { mask = "none" }
+attribute_description = { mask = "redact" }
+regex_pattern = { mask = "redact" }
+regex_cue = { mask = "redact" }
 
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "attribute_display_name"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "attribute_key"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "attribute_display_type"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "default_value"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "attribute_model"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "account_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "created_at"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "updated_at"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "attribute_description"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "attribute_values"
+[columns."chatwoot.custom_attribute_definitions".attribute_values]
 mask = "json"
 json_unmatched = "type-placeholders"
 
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "regex_pattern"
-mask = "redact"
+[columns."chatwoot.tags"]
+id = { mask = "none" }
+name = { mask = "redact" }
+taggings_count = { mask = "none" }
 
-[[column]]
-relation = "chatwoot.custom_attribute_definitions"
-column = "regex_cue"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.tags"
-column = "id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.tags"
-column = "name"
-mask = "redact"
-
-[[column]]
-relation = "chatwoot.tags"
-column = "taggings_count"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.taggings"
-column = "id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.taggings"
-column = "tag_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.taggings"
-column = "taggable_type"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.taggings"
-column = "taggable_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.taggings"
-column = "tagger_type"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.taggings"
-column = "tagger_id"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.taggings"
-column = "context"
-mask = "none"
-
-[[column]]
-relation = "chatwoot.taggings"
-column = "created_at"
-mask = "none"
+[columns."chatwoot.taggings"]
+id = { mask = "none" }
+tag_id = { mask = "none" }
+taggable_type = { mask = "none" }
+taggable_id = { mask = "none" }
+tagger_type = { mask = "none" }
+tagger_id = { mask = "none" }
+context = { mask = "none" }
+created_at = { mask = "none" }
 
 # ---------------------------------------------------------------------------
 # chatwoot.contact_directory (VIEW — own OID, own rules)
 # ---------------------------------------------------------------------------
 
-[[column]]
-relation = "chatwoot.contact_directory"
-column = "id"
-mask = "none"
+[columns."chatwoot.contact_directory"]
+id = { mask = "none" }
+name = { type = "person_name" }
+email = { type = "email" }
+phone_number = { type = "phone" }
+account_name = { mask = "none" }
 
-[[column]]
-relation = "chatwoot.contact_directory"
-column = "name"
-type = "person_name"
-
-[[column]]
-relation = "chatwoot.contact_directory"
-column = "email"
-type = "email"
-
-[[column]]
-relation = "chatwoot.contact_directory"
-column = "phone_number"
-type = "phone"
-
-[[column]]
-relation = "chatwoot.contact_directory"
-column = "additional_attributes"
+[columns."chatwoot.contact_directory".additional_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -934,9 +459,7 @@ json = [
   { pointer = "/social_profiles/linkedin", mask = "redact" },
 ]
 
-[[column]]
-relation = "chatwoot.contact_directory"
-column = "custom_attributes"
+[columns."chatwoot.contact_directory".custom_attributes]
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
@@ -945,8 +468,3 @@ json = [
   { pointer = "/ssn", mask = "redact" },
   { pointer = "/internal_notes", mask = "redact" },
 ]
-
-[[column]]
-relation = "chatwoot.contact_directory"
-column = "account_name"
-mask = "none"

@@ -40,7 +40,7 @@ ids, SSNs, Stripe ids, device fingerprints, or checkout referer tokens.
 | `referer`, `mail_subject`, email subject, SSN, Stripe ids | redact |
 | Evolving custom keys | `json_unmatched = "type-placeholders"` |
 | Message/automation/free-text fields | redact (regex scrubbing cannot reliably find names) |
-| `contact_directory` view | **own** `[[column]]` rows — Postgres reports the view OID |
+| `contact_directory` view | **own** `[columns."chatwoot.contact_directory"]` rules — Postgres reports the view OID |
 
 `NOT NULL` keys are `mask = "none"` so `SELECT *` is a real JSON-masking path
 rather than a type-aware-fallback refusal.
