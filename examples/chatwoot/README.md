@@ -48,10 +48,30 @@ tokens (`alice.cw-canary@inbox.test`, `203.0.113.77`, `CANARYSTRIPE`, …).
 
 Chatwoot's Arel is unqualified (`FROM "contacts"`). Two cases cover that:
 
-1. As written against this fixture → Postgres `undefined_table`.
+1. As written against this fixture → Postgres `undefined_table`, and pgmask
+   **withholds** the error text (`SQL can choose it`).
 2. With `search_path=chatwoot` → pgmask refuses extract attribution (it does
    not guess `search_path`).
 3. Schema-qualified rewrite → served, city/company released, PII not.
 
 That is the debugging loop this dataset is for: take the SQL the app ran,
 qualify it, see whether the catalog answers the ops question without a leak.
+
+## What a first run showed
+
+Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.1.99 (33 cases):
+
+| Kind | Count | What happened |
+|---|---|---|
+| Served | 25 | Health checks, schema-qualified `->>'company_name'` / `->>'city'`, JSONB `['city']` / `['country']` (SyncAttributes), IP prefix, referer redact, nested `browser->os`, whole JSON blobs, `SELECT *`, the directory **view**, `GROUP BY` city extract, mixed `->` then `['browser_name']`, `json` `content_attributes` extracts, `additional_attributes->'campaign_id'` |
+| Refused | 7 | Unqualified extract even with `search_path`, `jsonb_pretty` / `jsonb_each` / `to_jsonb`, UNION, subquery alias of an extract, `(extract) IS NULL` |
+| Error | 1 | Unqualified `FROM "contacts"` with no search_path — backend `undefined_table`, message withheld |
+
+Canaries (`alice.cw-canary@inbox.test`, `203.0.113.77`, `078-05-4391`,
+`CANARYSTRIPE`, `CANARYREF`, `CANARYHOOK`, `555-867-5309`) did not appear in
+any proxied result. Message body became `Call me at <PHONE>.` under `scrub`.
+
+The `IS NULL` refusal is the useful debugging lesson: Chatwoot's
+`valid_first_reply?` SQL is an expression. Project
+`additional_attributes->'campaign_id'` and inspect the JSON `null`; do not wrap
+the extract in SQL.

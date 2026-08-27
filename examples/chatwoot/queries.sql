@@ -17,11 +17,11 @@ SELECT count(*) FROM chatwoot.contacts;
 
 -- Chatwoot's Arel emits unqualified "contacts" assuming search_path includes
 -- the app schema (usually public). In this fixture the tables live in
--- `chatwoot`, so the raw app SQL is a Postgres undefined-table error — the
--- query never becomes a result set.
+-- `chatwoot`, so Postgres raises undefined_table. pgmask withholds the
+-- backend error text (SQL can choose it).
 -- @id: chatwoot-unqualified-from
 -- @expect: error
--- @contains: does not exist
+-- @contains: withheld
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/contact.rb
 SELECT "contacts"."additional_attributes"->>'company_name'
 FROM "contacts"
@@ -131,12 +131,20 @@ FROM chatwoot.contacts
 WHERE id = 1001;
 
 -- Message.valid_first_reply? uses (additional_attributes->'campaign_id') IS NULL
--- plus a GIN on that extract in real Chatwoot.
+-- plus a GIN on that extract in real Chatwoot. The extract itself is attributed;
+-- wrapping it in IS NULL is an expression and is refused (no provenance).
 -- @id: first-reply-campaign-id-null
--- @expect: served
--- @contains: t
+-- @expect: refused
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/message.rb
 SELECT (additional_attributes->'campaign_id') IS NULL AS no_campaign
+FROM chatwoot.messages
+WHERE id = 9001;
+
+-- The operator rewrite: project the extract, do not compute on it.
+-- @id: first-reply-campaign-id-extract
+-- @expect: served
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/message.rb
+SELECT additional_attributes->'campaign_id' AS campaign_id
 FROM chatwoot.messages
 WHERE id = 9001;
 
