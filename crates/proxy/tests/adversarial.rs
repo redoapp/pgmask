@@ -242,6 +242,26 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
     let json_binary_msgs = json_binary_client.read_until_ready().await?;
     assert_served(&json_binary_msgs, "binary json");
     assert_no_canary(&json_binary_client, "structure-aware binary json");
+    let rows = data_rows(&json_binary_msgs)?;
+    let value = rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(Option::as_ref)
+        .expect("one non-NULL binary json field");
+    let value: serde_json::Value =
+        serde_json::from_slice(value).expect("binary json is unversioned JSON text");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "profile": {
+                "email": "***************b2c3",
+                "name": "***"
+            },
+            "public": "Portland",
+            "unknown": ""
+        }),
+        "binary json must carry the exact pointer masks"
+    );
     Ok(())
 }
 
@@ -467,6 +487,64 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
 
     let partial_email = "***************b2c3";
     let cases = vec![
+        JsonSqlValueCase {
+            name: "whole jsonb document",
+            sql: "SELECT payload FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "profile": {"email": CANARY_EMAIL, "name": CANARY_NAME},
+                "public": "Portland",
+                "unknown": CANARY_NOTE,
+                "items": [
+                    {"token": CANARY_TEMP, "city": "Denver"},
+                    {"token": CANARY_TEMP, "city": "Seattle"}
+                ],
+                "numeric_object": {
+                    "0": {"token": CANARY_TEMP},
+                    "*": {"token": CANARY_TEMP}
+                },
+                "a/b": {"~key": CANARY_NOTE},
+                "n": 99,
+                "enabled": true,
+                "nothing": null,
+                "empty_object": {},
+                "empty_array": []
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "profile": {"email": partial_email, "name": "***"},
+                "public": "Portland",
+                "unknown": "",
+                "items": [
+                    {"token": "***", "city": "Denver"},
+                    {"token": "***", "city": "Seattle"}
+                ],
+                "numeric_object": {
+                    "0": {"token": ""},
+                    "*": {"token": "***"}
+                },
+                "a/b": {"~key": "***"},
+                "n": 0,
+                "enabled": false,
+                "nothing": null,
+                "empty_object": {},
+                "empty_array": []
+            })),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "whole json document",
+            sql: "SELECT legacy FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "profile": {"email": CANARY_EMAIL, "name": CANARY_NAME},
+                "public": "Portland",
+                "unknown": CANARY_NOTE
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "profile": {"email": partial_email, "name": "***"},
+                "public": "Portland",
+                "unknown": ""
+            })),
+            poison: Some(CANARY_EMAIL),
+        },
         JsonSqlValueCase {
             name: "released text leaf",
             sql: "SELECT payload->>'public' FROM canary.documents",

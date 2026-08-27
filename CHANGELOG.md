@@ -87,7 +87,7 @@
   by using the same equally-specific overlap predicate, then calls
   `validate_json_spec`. Rule segments include `0` and `*` so exact-index vs
   array-wildcard pairs appear; path `*` covers the literal object key.
-- Add a live-Postgres JSON SQL value campaign. Forty-six operator, function,
+- Add a live-Postgres JSON SQL value campaign. Forty-eight operator, function,
   cast/collation, alias/join/view, object, array, `json`/`jsonb`, and unmatched
   leaf queries first run directly against PostgreSQL, requiring poison values
   where applicable, then decode pgmask's raw-wire DataRows and compare the
