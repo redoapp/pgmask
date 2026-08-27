@@ -77,6 +77,22 @@
   non-table-relation matrices use the same per-query isolation, including
   value checks on JSON extracts. Binary Bind of a document extract is covered
   alongside binary text extracts.
+- Add a Chatwoot-shaped golden fixture (`examples/chatwoot`) with a reduced
+  real schema, JSON/JSONB-heavy seed, operator catalog, and a sourced query
+  corpus. Its hostile policy withholds transcript prose, customer/device
+  identifiers, secrets and unknown JSON leaves while retaining status, inbox,
+  routing, automation-shape and timeline diagnostics. The pin covers realistic
+  app SQL, JSON/JSONB extracts, views, `SELECT *`, extended Bind, refusal
+  recovery, and reported native-JSON double encoding. Direct source controls
+  plus a deliberately releasing poison proxy prove the harness can see a leak;
+  per-query direct controls prove refusal-shaped attacks are valid. The raw
+  wire suite also pins that encoded-string shape in binary OID-114 results and
+  star expansion. Refusals remain refusals rather than driving an allowlist
+  expansion. A later red-team pass found parent `none` on widget
+  `/initiated_at`, released automation `action_params`, and unmasked
+  custom-attribute regex/cue fields forwarding nested PII; those grants
+  are now leaf-only or redact, with canaries for nested initiated_at
+  keys, send_message params, and regex samples.
 - Pin the JSON pointer trie and catalog overlap helpers with named lookup
   tables: exact beats `*`, object keys never take array wildcards, ambiguous
   text steps refuse at a `*` edge, nested wildcards need a proven array index

@@ -1,0 +1,949 @@
+# Operator catalog for the Chatwoot golden fixture.
+#
+# Relations and JSON keys are taken from Chatwoot's schema and models
+# (see SOURCES.md). This is a *policy* a support-engineering team might
+# actually write: keep the ops shape of widget/session JSON, mask PII
+# leaves, and fail closed on anything unclassified.
+#
+# `verify.sh` rewrites listen/backend/catalog_dsn to the Postgres it started.
+
+listen = "127.0.0.1:16432"
+backend = "127.0.0.1:55433"
+catalog_dsn = "postgres://postgres@127.0.0.1:55433/chatwoot_golden"
+
+pseudonym_key = "chatwoot-golden-not-for-production"
+
+unclassified = "mask"
+opaque = "reject"
+# This corpus is specifically for debugging without using predicates as a
+# character-by-character oracle over masked values. Released operational keys
+# remain filterable; masked PII in WHERE / ORDER BY / GROUP BY refuses.
+posture = "hostile"
+
+catalog_refresh_seconds = 30
+
+[[semantic_type]]
+name = "email"
+mask = "pseudonym"
+
+[[semantic_type]]
+name = "person_name"
+mask = "redact"
+
+[[semantic_type]]
+name = "phone"
+mask = "pseudonym"
+
+[[semantic_type]]
+name = "ip_address"
+mask = "ip-prefix"
+
+[[semantic_type]]
+name = "secret_token"
+mask = "null"
+
+[[semantic_type]]
+name = "external_id"
+mask = "pseudonym"
+
+[[semantic_type]]
+name = "order_id"
+mask = "pseudonym"
+
+# ---------------------------------------------------------------------------
+# chatwoot.accounts
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "name"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "locale"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "domain"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "support_email"
+type = "email"
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "settings"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/auto_resolve_after", mask = "none" },
+  { pointer = "/audio_transcriptions", mask = "none" },
+  { pointer = "/auto_resolve_ignore_waiting", mask = "none" },
+]
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "custom_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/industry", mask = "none" },
+  { pointer = "/plan", mask = "none" },
+]
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "limits"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/agents", mask = "none" },
+  { pointer = "/inboxes", mask = "none" },
+]
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "feature_flags"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.accounts"
+column = "status"
+mask = "none"
+
+# Billing identifiers live here in real Chatwoot installs.
+[[column]]
+relation = "chatwoot.accounts"
+column = "internal_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/onboarding_step", mask = "none" },
+  { pointer = "/stripe_customer_id", mask = "redact" },
+]
+
+# ---------------------------------------------------------------------------
+# chatwoot.users
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.users"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.users"
+column = "name"
+type = "person_name"
+
+[[column]]
+relation = "chatwoot.users"
+column = "display_name"
+type = "person_name"
+
+[[column]]
+relation = "chatwoot.users"
+column = "email"
+type = "email"
+
+[[column]]
+relation = "chatwoot.users"
+column = "pubsub_token"
+type = "secret_token"
+
+[[column]]
+relation = "chatwoot.users"
+column = "ui_settings"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/rtl_view", mask = "none" },
+  { pointer = "/is_conv_actions_open", mask = "none" },
+  { pointer = "/editor_message", mask = "redact" },
+]
+
+[[column]]
+relation = "chatwoot.users"
+column = "custom_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/language", mask = "none" },
+  { pointer = "/phone_number", mask = "pseudonym", domain = "phone" },
+]
+
+[[column]]
+relation = "chatwoot.users"
+column = "type"
+mask = "none"
+
+# ---------------------------------------------------------------------------
+# chatwoot.inboxes
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "channel_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "account_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "name"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "email_address"
+type = "email"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "greeting_enabled"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "greeting_message"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "enable_email_collect"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "csat_survey_enabled"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "auto_assignment_config"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/max_assignment_limit", mask = "none" },
+]
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "timezone"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "selected_feature_flags"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "lock_to_single_conversation"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.inboxes"
+column = "csat_config"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/display_type", mask = "none" },
+  { pointer = "/message", mask = "none" },
+]
+
+# ---------------------------------------------------------------------------
+# chatwoot.contacts
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "name"
+type = "person_name"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "email"
+type = "email"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "phone_number"
+type = "phone"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "account_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "identifier"
+type = "external_id"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "last_activity_at"
+mask = "none"
+
+# Custom attributes are tenant-defined. Public commerce keys are released;
+# everything else keeps type without value until an operator adds a pointer.
+[[column]]
+relation = "chatwoot.contacts"
+column = "custom_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/order_id", mask = "pseudonym", domain = "order_id" },
+  { pointer = "/signed_up_at", mask = "none" },
+  { pointer = "/ssn", mask = "redact" },
+  { pointer = "/internal_notes", mask = "redact" },
+]
+
+# Widget / CRM blob written by the Chatwoot JS SDK and Contact model.
+# Do not grant `/initiated_at` as `none`: that inherits to every future
+# child. Timestamp is the ops key; nested PII stays unmatched.
+[[column]]
+relation = "chatwoot.contacts"
+column = "additional_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/company_name", mask = "none" },
+  { pointer = "/city", mask = "none" },
+  { pointer = "/country", mask = "none" },
+  { pointer = "/country_code", mask = "none" },
+  { pointer = "/conversation_language", mask = "none" },
+  { pointer = "/browser/browser_name", mask = "none" },
+  { pointer = "/browser/browser_version", mask = "none" },
+  { pointer = "/browser/os", mask = "none" },
+  { pointer = "/browser/device_name", mask = "redact" },
+  { pointer = "/initiated_at/timestamp", mask = "none" },
+  { pointer = "/created_at_ip", mask = "ip-prefix" },
+  { pointer = "/updated_at_ip", mask = "ip-prefix" },
+  { pointer = "/referer", mask = "redact" },
+  { pointer = "/social_profiles/twitter", mask = "redact" },
+  { pointer = "/social_profiles/linkedin", mask = "redact" },
+]
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "contact_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "middle_name"
+type = "person_name"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "last_name"
+type = "person_name"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "location"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "country_code"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "blocked"
+mask = "none"
+
+# ---------------------------------------------------------------------------
+# chatwoot.conversations
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "account_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "inbox_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "status"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "assignee_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "contact_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "display_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "contact_last_seen_at"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "additional_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/browser/browser_name", mask = "none" },
+  { pointer = "/browser/browser_version", mask = "none" },
+  { pointer = "/browser/os", mask = "none" },
+  { pointer = "/browser/device_name", mask = "redact" },
+  { pointer = "/initiated_at/timestamp", mask = "none" },
+  { pointer = "/browser_language", mask = "none" },
+  { pointer = "/conversation_language", mask = "none" },
+  { pointer = "/type", mask = "none" },
+  { pointer = "/source", mask = "none" },
+  { pointer = "/auto_reply", mask = "none" },
+  { pointer = "/in_reply_to", mask = "redact" },
+  { pointer = "/referer", mask = "redact" },
+  { pointer = "/mail_subject", mask = "redact" },
+]
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "contact_inbox_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "uuid"
+type = "external_id"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "identifier"
+type = "external_id"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "last_activity_at"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "team_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "campaign_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "snoozed_until"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "custom_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/priority_reason", mask = "none" },
+  { pointer = "/stripe_charge", mask = "redact" },
+]
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "first_reply_created_at"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "priority"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "sla_policy_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.conversations"
+column = "label_list"
+mask = "none"
+
+# ---------------------------------------------------------------------------
+# chatwoot.contact_inboxes
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.contact_inboxes"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contact_inboxes"
+column = "contact_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contact_inboxes"
+column = "inbox_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contact_inboxes"
+column = "source_id"
+type = "external_id"
+
+[[column]]
+relation = "chatwoot.contact_inboxes"
+column = "hmac_verified"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contact_inboxes"
+column = "pubsub_token"
+type = "secret_token"
+
+# ---------------------------------------------------------------------------
+# chatwoot.messages
+# content_attributes is json (OID 114) in Chatwoot, not jsonb.
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.messages"
+column = "id"
+mask = "none"
+
+# Transcript text can contain names, addresses, and secrets that a recogniser
+# cannot identify reliably. Debug from metadata; do not release prose.
+[[column]]
+relation = "chatwoot.messages"
+column = "content"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "account_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "inbox_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "conversation_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "message_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "created_at"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "updated_at"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "private"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "status"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "source_id"
+type = "external_id"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "content_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "content_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/in_reply_to", mask = "none" },
+  { pointer = "/automation_rule_id", mask = "none" },
+  { pointer = "/submitted_email", mask = "pseudonym", domain = "email" },
+  { pointer = "/items/*/title", mask = "redact" },
+  { pointer = "/items/*/value", mask = "redact" },
+  { pointer = "/items/*/name", mask = "none" },
+  { pointer = "/email/subject", mask = "redact" },
+  { pointer = "/email/from", mask = "redact" },
+  { pointer = "/email/message_id", mask = "redact" },
+  { pointer = "/cc_emails", mask = "redact" },
+]
+
+[[column]]
+relation = "chatwoot.messages"
+column = "sender_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "sender_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "external_source_ids"
+mask = "json"
+json_unmatched = "type-placeholders"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "additional_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/campaign_id", mask = "none" },
+]
+
+[[column]]
+relation = "chatwoot.messages"
+column = "processed_message_content"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.messages"
+column = "sentiment"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/label", mask = "none" },
+  { pointer = "/score", mask = "none" },
+]
+
+# ---------------------------------------------------------------------------
+# chatwoot.automation_rules
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.automation_rules"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.automation_rules"
+column = "account_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.automation_rules"
+column = "name"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.automation_rules"
+column = "description"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.automation_rules"
+column = "event_name"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.automation_rules"
+column = "conditions"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/*/attribute_key", mask = "none" },
+  { pointer = "/*/query_operator", mask = "none" },
+  { pointer = "/*/filter_operator", mask = "none" },
+  { pointer = "/*/custom_attribute_type", mask = "none" },
+  { pointer = "/*/values/*", mask = "redact" },
+]
+
+[[column]]
+relation = "chatwoot.automation_rules"
+column = "actions"
+mask = "json"
+json_unmatched = "type-placeholders"
+# action_params hold send_message prose, emails, and labels. action_name
+# is the ops diagnostic; params are customer-controlled.
+json = [
+  { pointer = "/*/action_name", mask = "none" },
+  { pointer = "/*/action_params/*", mask = "redact" },
+]
+
+[[column]]
+relation = "chatwoot.automation_rules"
+column = "active"
+mask = "none"
+
+# ---------------------------------------------------------------------------
+# chatwoot.webhooks
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.webhooks"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.webhooks"
+column = "account_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.webhooks"
+column = "url"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.webhooks"
+column = "webhook_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.webhooks"
+column = "subscriptions"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/*", mask = "none" },
+]
+
+# ---------------------------------------------------------------------------
+# chatwoot.custom_attribute_definitions / tags / taggings
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_display_name"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_key"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_display_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "default_value"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_model"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "account_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "created_at"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "updated_at"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_description"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_values"
+mask = "json"
+json_unmatched = "type-placeholders"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "regex_pattern"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "regex_cue"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.tags"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.tags"
+column = "name"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.tags"
+column = "taggings_count"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "tag_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "taggable_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "taggable_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "tagger_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "tagger_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "context"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "created_at"
+mask = "none"
+
+# ---------------------------------------------------------------------------
+# chatwoot.contact_directory (VIEW — own OID, own rules)
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.contact_directory"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.contact_directory"
+column = "name"
+type = "person_name"
+
+[[column]]
+relation = "chatwoot.contact_directory"
+column = "email"
+type = "email"
+
+[[column]]
+relation = "chatwoot.contact_directory"
+column = "phone_number"
+type = "phone"
+
+[[column]]
+relation = "chatwoot.contact_directory"
+column = "additional_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/company_name", mask = "none" },
+  { pointer = "/city", mask = "none" },
+  { pointer = "/country", mask = "none" },
+  { pointer = "/country_code", mask = "none" },
+  { pointer = "/conversation_language", mask = "none" },
+  { pointer = "/browser/browser_name", mask = "none" },
+  { pointer = "/browser/browser_version", mask = "none" },
+  { pointer = "/browser/os", mask = "none" },
+  { pointer = "/browser/device_name", mask = "redact" },
+  { pointer = "/initiated_at/timestamp", mask = "none" },
+  { pointer = "/created_at_ip", mask = "ip-prefix" },
+  { pointer = "/updated_at_ip", mask = "ip-prefix" },
+  { pointer = "/referer", mask = "redact" },
+  { pointer = "/social_profiles/twitter", mask = "redact" },
+  { pointer = "/social_profiles/linkedin", mask = "redact" },
+]
+
+[[column]]
+relation = "chatwoot.contact_directory"
+column = "custom_attributes"
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/order_id", mask = "pseudonym", domain = "order_id" },
+  { pointer = "/signed_up_at", mask = "none" },
+  { pointer = "/ssn", mask = "redact" },
+  { pointer = "/internal_notes", mask = "redact" },
+]
+
+[[column]]
+relation = "chatwoot.contact_directory"
+column = "account_name"
+mask = "none"
