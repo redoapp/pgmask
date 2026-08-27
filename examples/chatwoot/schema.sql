@@ -408,7 +408,7 @@ INSERT INTO chatwoot.messages (
         )
     ),
     'Contact', 1001,
-    jsonb_build_object('campaign_id', NULL),
+    jsonb_build_object(),
     'Hi, my order ORD-9911 never arrived.',
     jsonb_build_object('label', 'negative', 'score', 0.82)
 ),

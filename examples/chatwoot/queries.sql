@@ -177,6 +177,7 @@ WHERE id = 9001;
 -- The operator rewrite: project the extract, do not compute on it.
 -- @id: first-reply-campaign-id-extract
 -- @expect: served
+-- @contains: [NULL]
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/message.rb
 SELECT additional_attributes->'campaign_id' AS campaign_id
 FROM chatwoot.messages
