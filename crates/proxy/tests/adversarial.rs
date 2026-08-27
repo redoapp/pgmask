@@ -1141,6 +1141,99 @@ async fn json_unlisted_pass_through_releases_only_unlisted_extracts_by_configura
     Ok(())
 }
 
+/// Denylist mode can protect an exact object-key name at every depth without
+/// changing JSON Pointer `*` or subtree inheritance. Direct controls prove
+/// each query reaches the planted value before the proxy masks or refuses it.
+#[tokio::test]
+async fn json_key_rules_protect_nested_values_in_pass_through_documents() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let mut rules = default_rules();
+    let mut document = json_rule(
+        "canary.documents",
+        "payload",
+        pgmask::mask::JsonUnlisted::PassThrough,
+        vec![
+            json_field("/items", pgmask::mask::Mask::None),
+            json_field("/numeric_object", pgmask::mask::Mask::Scrub),
+            json_field("/profile/email", pgmask::mask::Mask::Null),
+        ],
+    );
+    document.params.json_keys = Some(vec![
+        json_key("email", pgmask::mask::Mask::Redact),
+        json_key("token", pgmask::mask::Mask::Redact),
+    ]);
+    rules.push(document);
+    let proxy = start_proxy(DB, rules).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    let whole = simple_query_round(
+        &mut client,
+        "SELECT payload FROM canary.documents WHERE id = 1",
+    )
+    .await?;
+    assert_served(&whole.messages, "whole denylist document");
+    let rows = whole.text_rows()?;
+    let masked: serde_json::Value =
+        serde_json::from_str(rows[0][0].as_deref().expect("JSON cell")).expect("valid JSON");
+    assert_eq!(masked["profile"]["email"], serde_json::Value::Null);
+    assert_eq!(masked["items"][0]["token"], "***");
+    assert_eq!(masked["numeric_object"]["0"]["token"], "***");
+    assert_eq!(
+        masked["unknown"], CANARY_NOTE,
+        "unlisted values pass through"
+    );
+    assert!(!masked["profile"]["email"]
+        .to_string()
+        .contains(CANARY_EMAIL));
+    assert!(!masked["items"].to_string().contains(CANARY_TEMP));
+
+    for (name, sql, poison, expected) in [
+        (
+            "exact pointer overrides key rule",
+            "SELECT payload->'profile'->>'email' FROM canary.documents",
+            CANARY_EMAIL,
+            None,
+        ),
+        (
+            "key rule overrides inherited pointer release",
+            "SELECT payload->'items'->0->>'token' FROM canary.documents",
+            CANARY_TEMP,
+            Some("***"),
+        ),
+        (
+            "ambiguous hash path cannot bypass key rule",
+            "SELECT payload #>> '{items,0,token}' FROM canary.documents",
+            CANARY_TEMP,
+            Some("***"),
+        ),
+    ] {
+        let direct = simple_query_direct(DB, sql).await?;
+        assert_eq!(direct, vec![vec![Some(poison.into())]], "{name} control");
+        let masked = simple_query_round(&mut client, sql).await?;
+        assert_served(&masked.messages, name);
+        assert_no_canary_bytes(&masked.received, name);
+        assert_eq!(
+            masked.text_rows()?,
+            vec![vec![expected.map(str::to_string)]],
+            "{name} result"
+        );
+    }
+
+    let parent_sql = "SELECT payload->>'numeric_object' FROM canary.documents";
+    let direct = simple_query_direct(DB, parent_sql).await?;
+    assert!(
+        direct[0][0]
+            .as_deref()
+            .is_some_and(|value| value.contains(CANARY_TEMP)),
+        "serialized-parent poison control"
+    );
+    let refused = simple_query_round(&mut client, parent_sql).await?;
+    assert_refused_bytes(&refused.received, "serialized parent with key rules");
+    assert_no_canary_bytes(&refused.received, "serialized parent with key rules");
+    Ok(())
+}
+
 /// Every refused JSON shape is valid SQL that exposes a poison value on the
 /// backend. This distinguishes a pgmask refusal from a PostgreSQL parse/type
 /// error and from a query that never reached sensitive data.

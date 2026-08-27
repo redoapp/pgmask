@@ -17,7 +17,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pgmask::catalog::{
-    ColumnRule, Config, JsonFieldRule, Lineage, MaskParams, Opaque, SystemCatalogs, Unclassified,
+    ColumnRule, Config, JsonFieldRule, JsonKeyRule, Lineage, MaskParams, Opaque, SystemCatalogs,
+    Unclassified,
 };
 use pgmask::mask::{JsonUnlisted, Mask};
 use pgmask::protocol::{FrameReader, Message, StartupPacket};
@@ -39,7 +40,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 58
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 59
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -361,6 +362,14 @@ pub fn rule(relation: &str, column: &str, mask: Mask) -> ColumnRule {
 pub fn json_field(pointer: &str, mask: Mask) -> JsonFieldRule {
     JsonFieldRule {
         pointer: pointer.into(),
+        mask,
+        params: MaskParams::default(),
+    }
+}
+
+pub fn json_key(key: &str, mask: Mask) -> JsonKeyRule {
+    JsonKeyRule {
+        key: key.into(),
         mask,
         params: MaskParams::default(),
     }

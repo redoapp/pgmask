@@ -32,8 +32,8 @@ pub(crate) use crate::json_path::JsonPathNavigation;
 use json::JsonPolicyTrie;
 pub(crate) use json::JsonProjection;
 pub use json::{
-    JsonFieldSpec, JsonLimit, JsonUnlisted, DEFAULT_JSON_MAX_BYTES, DEFAULT_JSON_MAX_DEPTH,
-    MAX_JSON_MAX_DEPTH,
+    JsonFieldSpec, JsonKeySpec, JsonLimit, JsonUnlisted, DEFAULT_JSON_MAX_BYTES,
+    DEFAULT_JSON_MAX_DEPTH, MAX_JSON_MAX_DEPTH,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -407,6 +407,10 @@ pub struct MaskSpec {
     pub json: Arc<[JsonFieldSpec]>,
     /// Compiled form of `json`; rebuilt when the catalog compiles a rule.
     json_trie: Arc<JsonPolicyTrie>,
+    /// Exact object-key policies applied at any nesting depth.
+    pub json_keys: Arc<[JsonKeySpec]>,
+    /// Compiled form of `json_keys`.
+    json_key_policies: Arc<std::collections::HashMap<Arc<str>, MaskSpec>>,
     /// What to do with JSON scalars the catalog did not list.
     pub json_unlisted: JsonUnlisted,
     /// Maximum encoded JSON payload accepted before parsing.
@@ -427,6 +431,8 @@ impl Default for MaskSpec {
             domain: None,
             json: Arc::default(),
             json_trie: Arc::default(),
+            json_keys: Arc::default(),
+            json_key_policies: Arc::default(),
             json_unlisted: JsonUnlisted::Null,
             json_max_bytes: DEFAULT_JSON_MAX_BYTES,
             json_max_depth: DEFAULT_JSON_MAX_DEPTH,

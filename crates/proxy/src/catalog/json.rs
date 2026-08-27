@@ -2,7 +2,9 @@
 //!
 //! Duplicate pointers and equally-specific overlapping wildcards are startup
 //! errors: config order must not decide a disclosure. Recursive `json` as a
-//! nested pointer mask is refused because one walker already owns the document.
+//! nested pointer or key mask is refused because one walker already owns the
+//! document. Object-key rules are exact and case-sensitive; duplicates are
+//! errors.
 
 use anyhow::{bail, Result};
 
@@ -52,6 +54,23 @@ pub(crate) fn validate_json_spec(spec: &MaskSpec, what: &str) -> Result<()> {
             );
         }
     }
+    for (index, key) in spec.json_keys.iter().enumerate() {
+        if key.spec.kind == Mask::Json {
+            bail!(
+                "{what}: JSON key {:?} cannot recursively use mask `json`",
+                key.key
+            );
+        }
+        validate_spec(&key.spec, &format!("{what} JSON key {:?}", key.key))?;
+        if spec
+            .json_keys
+            .iter()
+            .take(index)
+            .any(|earlier| earlier.key == key.key)
+        {
+            bail!("{what}: duplicate JSON key {:?}", key.key);
+        }
+    }
     Ok(())
 }
 
@@ -59,7 +78,7 @@ pub(crate) fn validate_json_spec(spec: &MaskSpec, what: &str) -> Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use crate::mask::{JsonFieldSpec, Mask, MaskSpec};
+    use crate::mask::{JsonFieldSpec, JsonKeySpec, Mask, MaskSpec};
 
     fn field(pointer: &str) -> JsonFieldSpec {
         JsonFieldSpec::new(pointer, MaskSpec::new(Mask::Redact)).unwrap()
@@ -152,5 +171,27 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn duplicate_or_recursive_json_key_rules_are_refused() {
+        let duplicate = JsonKeySpec {
+            key: "email".into(),
+            spec: MaskSpec::new(Mask::Redact),
+        };
+        let mut spec = MaskSpec::new(Mask::Json);
+        spec.set_json_policies(Vec::new(), vec![duplicate.clone(), duplicate]);
+        let err = super::validate_json_spec(&spec, "s.t.payload")
+            .expect_err("duplicate key policies must not depend on order");
+        assert!(format!("{err:#}").contains("duplicate JSON key"));
+
+        let recursive = JsonKeySpec {
+            key: "payload".into(),
+            spec: MaskSpec::new(Mask::Json),
+        };
+        spec.set_json_policies(Vec::new(), vec![recursive]);
+        let err = super::validate_json_spec(&spec, "s.t.payload")
+            .expect_err("one document walker must own recursion");
+        assert!(format!("{err:#}").contains("cannot recursively use mask `json`"));
     }
 }

@@ -79,6 +79,9 @@ Classify stored `json` / `jsonb` columns with `mask = "json"` and JSON Pointer
 rules. Array policies use `/items/*/field` rather than one rule per index.
 Set `json_unlisted` to `null` (default, allowlist), `shape-only` (types
 without values), or `pass-through` (denylist: unlisted scalars are released).
+In denylist mode, `json_keys = [{ key = "email", mask = "redact" }]` protects
+that exact, case-sensitive object-key name at every depth; explicit pointers
+can override it for one path.
 `json_max_bytes` (1 MiB) and `json_max_depth` (64) refuse oversized documents
 before parsing; tune them per column for expected payloads.
 Literal extracts (`payload->>'email'`, `payload->'profile'`, and exact JSONB

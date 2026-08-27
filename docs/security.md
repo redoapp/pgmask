@@ -100,7 +100,9 @@ masking policy during the session.
 - Review `mask = "none"` like an access-control grant. A JSON pointer
   `{ pointer = "/profile", mask = "none" }` is the same grant for every
   current and future leaf under that path unless a narrower pointer
-  overrides it. See [JSON and JSONB masking](json-masking.md).
+  overrides it. A `json_keys` rule can protect one exact, case-sensitive key
+  name beneath such grants at every depth; it does not discover spelling
+  variants. See [JSON and JSONB masking](json-masking.md).
 - Use semantic types to keep repeated policy consistent.
 - Give unrelated identifiers different pseudonym domains.
 - Restart pgmask after changing the catalog file.
