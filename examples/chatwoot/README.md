@@ -48,7 +48,7 @@ rather than a type-aware-fallback refusal.
 ## Corpus
 
 [queries.sql](queries.sql) is the pin. Each case declares `@expect: served`,
-`refused`, or `error`. [probe.py](probe.py) first proves **55 forbidden source
+`refused`, or `error`. [probe.py](probe.py) first proves **56 forbidden source
 values** are observable directly, then scans every proxied result for them.
 `verify.sh` also starts a deliberately releasing second proxy: the poison
 control must expose the email or the leak detector is not trusted.
@@ -81,12 +81,12 @@ qualify it, see whether the catalog answers the ops question without a leak.
 ## What a first run showed
 
 Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.1.99
-(158 SQL cases):
+(165 SQL cases):
 
 | Kind | Count | What happened |
 |---|---|---|
-| Served | 92 | Queue/delivery/status counts, timeline envelopes, dashboard FILTER counts, message `today`/`chat`, pseudonym correlation, whole masked JSON, `SELECT *`, view OIDs, literal extract spellings, tag-id filtering, nested initiated_at placeholders, redacted automation params/regex samples, and documented order/cardinality disclosures |
-| Refused | 64 | Unqualified/app JSON ordering, containment/custom-attribute membership, label-name `EXISTS`, masked JOIN/NATURAL/LATERAL/HAVING/subqueries/windows/grouping, JSON casts/constructors/JSONPath/parent text, dynamic or ambiguous keys, aggregates/fingerprints/recursive CTEs, SRFs, COPY and set operations |
+| Served | 98 | Queue/delivery/status counts, timeline envelopes, dashboard FILTER counts, message `today`/`chat`, pseudonym correlation, whole masked JSON, `SELECT *`, view OIDs, literal extract spellings, tag-id filtering, nested initiated_at placeholders, redacted CSAT/item/domain/tag/priority surfaces, and documented order/cardinality disclosures |
+| Refused | 65 | Unqualified/app JSON ordering, containment/custom-attribute membership, label-name `EXISTS`, label-list membership, masked JOIN/NATURAL/LATERAL/HAVING/subqueries/windows/grouping, JSON casts/constructors/JSONPath/parent text, dynamic or ambiguous keys, aggregates/fingerprints/recursive CTEs, SRFs, COPY and set operations |
 | Error | 2 | Unqualified `FROM "contacts"` and JSON-only bracket subscripting — backend messages withheld |
 | Protocol | 6 | Extended binds for released extract, masked scalar/JSON predicates and masked ordering; same-session refusal recovery; mid-session `search_path` |
 | Poison control | 1 | A release-policy proxy exposes the source email, proving the detector can see a leak |
