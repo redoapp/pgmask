@@ -17,6 +17,12 @@ installers = ["shell"]
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+# cargo-dist 0.32.0 emits two CycloneDX bugs in release.yml (wrong
+# `output.paths` vs `outputs.paths`, and `find | mv` into the search
+# tree). We patch those by hand; this keeps `dist generate` from
+# overwriting them. Drop this, regenerate, and re-apply the hunks when
+# bumping cargo-dist-version.
+allow-dirty = ["ci"]
 # Which actions to run on pull requests
 pr-run-mode = "plan"
 # Whether to enable GitHub Attestations

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.4 — attach CycloneDX SBOMs to the GitHub Release
+
+- Patch cargo-dist 0.32.0's generated Release workflow: the SBOM upload used
+  `steps.cargo-cyclonedx.output.paths` (empty) instead of `outputs.paths`, so
+  the `.cdx.xml` files never entered the artifact set. Stop `find | mv` from
+  walking `target/distrib` after the move, which GNU `mv` rejects as a
+  same-file rename. `dist generate` is told not to overwrite CI until the
+  next dist bump.
+
 ## 0.2.3 — version flags and artifact supply chain
 
 - Print `pgmask --version` and `classify --version` from `CARGO_PKG_VERSION` so

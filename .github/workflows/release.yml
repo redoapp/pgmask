@@ -225,12 +225,16 @@ jobs:
             # Generate SBOM (.cdx.xml) files.
             cargo cyclonedx -v
 
-            # Move all SBOM (.cdx.xml) files under target/distrib/ since
-            # we expect all artifacts to be in that folder.
-            find . -name '*.cdx.xml' -exec mv '{}' target/distrib/ ';'
+            mkdir -p target/distrib
+            # cargo-dist 0.32.0 walks `.` after moving into target/distrib,
+            # so GNU mv can refuse to move a file onto itself. Skip the dest.
+            find . -path ./target/distrib -prune -o -name '*.cdx.xml' -print |
+              while IFS= read -r f; do
+                mv "$f" target/distrib/
+              done
 
             echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-            find . -name '*.cdx.xml' | tee -a "$GITHUB_OUTPUT"
+            find target/distrib -name '*.cdx.xml' | tee -a "$GITHUB_OUTPUT"
             echo "EOF" >> "$GITHUB_OUTPUT"
       - name: "Upload artifacts"
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -238,7 +242,7 @@ jobs:
           name: artifacts-build-global
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
-            ${{ steps.cargo-cyclonedx.output.paths }}
+            ${{ steps.cargo-cyclonedx.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
   # Determines if we should publish/announce
   host:
