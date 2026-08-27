@@ -46,6 +46,7 @@ FORBIDDEN_SOURCE_VALUES = (
     "missing parcel",
     "Track package",
     "When company is Canary Logistics, add billing label",
+    "tier-CANARYPRIVATE",
 )
 
 DIRECT_CONTROL_SQL = """
@@ -59,7 +60,11 @@ FROM (
     (SELECT json_agg(ci) FROM chatwoot.contact_inboxes ci) AS contact_inboxes,
     (SELECT json_agg(m) FROM chatwoot.messages m) AS messages,
     (SELECT json_agg(r) FROM chatwoot.automation_rules r) AS automation_rules,
-    (SELECT json_agg(w) FROM chatwoot.webhooks w) AS webhooks
+    (SELECT json_agg(w) FROM chatwoot.webhooks w) AS webhooks,
+    (SELECT json_agg(d) FROM chatwoot.custom_attribute_definitions d)
+      AS custom_attribute_definitions,
+    (SELECT json_agg(t) FROM chatwoot.tags t) AS tags,
+    (SELECT json_agg(tg) FROM chatwoot.taggings tg) AS taggings
 ) control
 """
 

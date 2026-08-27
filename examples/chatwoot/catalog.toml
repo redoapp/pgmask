@@ -756,6 +756,131 @@ json = [
 ]
 
 # ---------------------------------------------------------------------------
+# chatwoot.custom_attribute_definitions / tags / taggings
+# ---------------------------------------------------------------------------
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_display_name"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_key"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_display_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "default_value"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_model"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "account_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "created_at"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "updated_at"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_description"
+mask = "redact"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "attribute_values"
+mask = "json"
+json_unmatched = "type-placeholders"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "regex_pattern"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.custom_attribute_definitions"
+column = "regex_cue"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.tags"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.tags"
+column = "name"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.tags"
+column = "taggings_count"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "tag_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "taggable_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "taggable_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "tagger_type"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "tagger_id"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "context"
+mask = "none"
+
+[[column]]
+relation = "chatwoot.taggings"
+column = "created_at"
+mask = "none"
+
+# ---------------------------------------------------------------------------
 # chatwoot.contact_directory (VIEW — own OID, own rules)
 # ---------------------------------------------------------------------------
 

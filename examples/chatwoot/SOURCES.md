@@ -19,6 +19,8 @@ Pinned against Chatwoot `develop` as fetched 2026-08-27.
 | `automation_rules.conditions` / `actions` | Automation rule JSON (attribute_key / values / action_name) |
 | `LOWER(custom_attributes ->> key)::type` filters | [`app/services/filters/custom_attribute_filter_helper.rb`](https://github.com/chatwoot/chatwoot/blob/develop/app/services/filters/custom_attribute_filter_helper.rb) |
 | `COUNT(*) FILTER` conversation dashboard counts | [`app/services/filter_service.rb`](https://github.com/chatwoot/chatwoot/blob/develop/app/services/filter_service.rb) |
+| Custom-attribute metadata and enum meanings | [`app/models/custom_attribute_definition.rb`](https://github.com/chatwoot/chatwoot/blob/develop/app/models/custom_attribute_definition.rb) |
+| Tag/tagging `EXISTS` label filter | [`app/services/filter_service.rb`](https://github.com/chatwoot/chatwoot/blob/develop/app/services/filter_service.rb) (`tag_filter_query`) and `db/schema.rb` |
 | Message `today` and `chat` scopes | [`app/models/message.rb`](https://github.com/chatwoot/chatwoot/blob/develop/app/models/message.rb) |
 
 Rails typically emits unqualified `"contacts"` because the app lives in

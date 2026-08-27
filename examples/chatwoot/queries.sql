@@ -703,3 +703,43 @@ SELECT id, message_type, private
 FROM chatwoot.messages
 WHERE message_type <> 2 AND private = false
 ORDER BY id;
+
+-- FilterService looks up tenant-defined attribute metadata before it builds
+-- the JSON predicate. Keys/types are operational; labels/descriptions/values
+-- are user-authored and withheld.
+-- @id: custom-attribute-definition
+-- @expect: served
+-- @contains: order_id|0|1
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/custom_attribute_definition.rb
+SELECT attribute_key, attribute_display_type, attribute_model
+FROM chatwoot.custom_attribute_definitions
+WHERE account_id = 1
+ORDER BY id;
+
+-- @id: custom-attribute-definition-values
+-- @expect: served
+-- @refute: tier-CANARYPRIVATE
+SELECT attribute_display_name, attribute_description, attribute_values
+FROM chatwoot.custom_attribute_definitions
+WHERE id = 202;
+
+-- Exact label-filter EXISTS shape assembled by FilterService. Labels and ids
+-- are explicitly released operational routing metadata.
+-- @id: chatwoot-label-filter
+-- @expect: served
+-- @contains: 5001|0
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/services/filter_service.rb
+SELECT c.id, c.status
+FROM chatwoot.conversations c
+WHERE EXISTS (
+  SELECT *
+  FROM chatwoot.taggings
+  WHERE taggings.taggable_id = c.id
+    AND taggings.taggable_type = 'Conversation'
+    AND taggings.tag_id IN (
+      SELECT tags.id
+      FROM chatwoot.tags
+      WHERE tags.name IN ('billing')
+    )
+)
+ORDER BY c.id;

@@ -140,6 +140,39 @@ CREATE TABLE chatwoot.webhooks (
     subscriptions jsonb DEFAULT '[]'::jsonb
 );
 
+CREATE TABLE chatwoot.custom_attribute_definitions (
+    id bigint PRIMARY KEY,
+    attribute_display_name character varying,
+    attribute_key character varying,
+    attribute_display_type integer DEFAULT 0,
+    default_value integer,
+    attribute_model integer DEFAULT 0,
+    account_id bigint REFERENCES chatwoot.accounts (id),
+    created_at timestamp without time zone NOT NULL,
+    updated_at timestamp without time zone NOT NULL,
+    attribute_description text,
+    attribute_values jsonb DEFAULT '[]'::jsonb,
+    regex_pattern character varying,
+    regex_cue character varying
+);
+
+CREATE TABLE chatwoot.tags (
+    id serial PRIMARY KEY,
+    name character varying UNIQUE,
+    taggings_count integer DEFAULT 0
+);
+
+CREATE TABLE chatwoot.taggings (
+    id serial PRIMARY KEY,
+    tag_id integer REFERENCES chatwoot.tags (id),
+    taggable_type character varying,
+    taggable_id integer,
+    tagger_type character varying,
+    tagger_id integer,
+    context character varying(128),
+    created_at timestamp without time zone
+);
+
 -- Operator-facing directory: a view with its own OID, so catalog rows must
 -- name the view, not only the base table (pgmask D-2 / view-OID leak).
 CREATE VIEW chatwoot.contact_directory AS
@@ -485,3 +518,29 @@ VALUES (
     0,
     '["conversation_status_changed", "message_created"]'::jsonb
 );
+
+INSERT INTO chatwoot.custom_attribute_definitions (
+    id, attribute_display_name, attribute_key, attribute_display_type,
+    attribute_model, account_id, created_at, updated_at,
+    attribute_description, attribute_values, regex_pattern, regex_cue
+) VALUES
+(
+    201, 'Order reference', 'order_id', 0, 1, 1,
+    TIMESTAMP '2026-01-01 00:00:00', TIMESTAMP '2026-01-01 00:00:00',
+    'Commerce order supplied by the customer', '[]'::jsonb, NULL, NULL
+),
+(
+    202, 'Service tier', 'service_tier', 6, 0, 1,
+    TIMESTAMP '2026-01-01 00:00:00', TIMESTAMP '2026-01-01 00:00:00',
+    'Routing tier; values are tenant-defined',
+    '["standard", "priority", "tier-CANARYPRIVATE"]'::jsonb, NULL, NULL
+);
+
+INSERT INTO chatwoot.tags (id, name, taggings_count)
+VALUES (301, 'billing', 1), (302, 'shipping', 1);
+
+INSERT INTO chatwoot.taggings (
+    id, tag_id, taggable_type, taggable_id, tagger_type, tagger_id, context, created_at
+) VALUES
+(401, 301, 'Conversation', 5001, NULL, NULL, 'labels', TIMESTAMP '2026-03-14 09:23:00'),
+(402, 302, 'Conversation', 5001, NULL, NULL, 'labels', TIMESTAMP '2026-03-14 09:23:00');
