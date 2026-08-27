@@ -179,6 +179,12 @@ json = [
   # `*` applies to every array element; an exact index would override it.
   { pointer = "/items/*/account_id", mask = "pseudonym", domain = "account" },
 ]
+# Protect exact object-key names wherever they appear. The pointer above still
+# wins specifically at /profile/email.
+json_keys = [
+  { key = "email", mask = "redact" },
+  { key = "token", mask = "null" },
+]
 ```
 
 The compact `[columns."schema.relation"]` form groups simple rules by table;
@@ -235,7 +241,11 @@ free text is required and partial disclosure is acceptable.
 masks at JSON Pointers, including `/items/*` for every array element.
 `json_unlisted` is `null` by default (allowlist: strip unlisted values);
 `shape-only` keeps types without values; `pass-through` is denylist mode and
-releases unlisted scalars, including keys added later. Pointer policies are
+releases unlisted scalars, including keys added later. `json_keys` protects an
+exact, case-sensitive object-key name at any depth, making denylist catalogs
+practical without changing JSON Pointer or array-`*` semantics. A pointer at
+the current path overrides a key rule; a key rule overrides an inherited
+parent grant. Pointer policies are
 compiled into a trie. Documents over `json_max_bytes` (1 MiB by default) or
 `json_max_depth` (64 by default) refuse before parsing. Literal SQL extracts
 use the same pointer policy; construction stays opaque. See

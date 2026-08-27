@@ -16,6 +16,12 @@
   an operator may choose `json_unlisted = "pass-through"` when unmentioned
   values are intentionally public (denylist). A configured mask/type mismatch,
   malformed JSON, or unknown binary-jsonb version refuses the result set.
+- Add `json_keys` for exact, case-sensitive object-key policies at any depth,
+  including objects nested in arrays. This makes denylist catalogs concise
+  without changing RFC Pointer or array-`*` semantics. A pointer at the current
+  path wins, then a matching key rule, then inherited policy, then
+  `json_unlisted`. Text extraction refuses when serialization could hide a
+  protected nested key.
 - Add `*` array-element policies, so `/items/*/account_id` masks every item
   without enumerating indices; an exact index wins over the wildcard. Add the
   opt-in `json_unlisted = "shape-only"` debugging policy, which

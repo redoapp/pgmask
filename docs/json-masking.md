@@ -11,7 +11,8 @@ does not release on its own.
 
 pgmask walks the stored document, keeps every object key and array length, and
 applies ordinary masks at RFC 6901 JSON Pointers. A pointer's policy is
-inherited by its whole subtree until a more-specific pointer overrides it.
+inherited by its whole subtree until a more-specific pointer or an exact
+object-key rule overrides it.
 
 Masks apply only to a stored classified column that still has provenance in
 the result, and to **literal JSON extracts** of that column. `SELECT payload
@@ -37,6 +38,11 @@ json = [
   { pointer = "/profile/email", mask = "partial", keep = 4 },
   { pointer = "/profile/name", mask = "redact" },
   { pointer = "/items/*/account_id", mask = "pseudonym", domain = "account" },
+]
+# Exact object-key names to protect wherever they appear.
+json_keys = [
+  { key = "email", mask = "redact" },
+  { key = "token", mask = "null" },
 ]
 ```
 
@@ -80,11 +86,47 @@ index 0 under an array and key `"0"` under an object. If such a segment could
 enter a `*` pointer branch, pgmask refuses the extract rather than guess. Use
 an integer `-> 0` step when traversing a configured array wildcard.
 
+## Object keys at any depth
+
+`json_keys` applies a mask to an exact, case-sensitive object-key name wherever
+that key appears. It does not match array indices. It does match objects nested
+inside arrays. If the key's value is an object or array, its policy is inherited
+through that subtree unless a more-specific pointer or key rule overrides it:
+
+```toml
+json_unlisted = "pass-through"
+json_keys = [
+  { key = "email", mask = "redact" },
+  { key = "ssn", mask = "pseudonym", domain = "national-id" },
+]
+```
+
+This is the concise denylist form: all unlisted values pass through, while
+every object key named `email` or `ssn` is protected. `"Email"` is a different
+key and must be listed separately if producers use both spellings.
+
+Precedence is deterministic:
+
+1. A pointer at the current path wins.
+2. An exact `json_keys` rule at the current object key wins next.
+3. An inherited pointer or key policy applies next.
+4. `json_unlisted` handles everything else.
+
+That means a key rule can protect `email` beneath
+`{ pointer = "/profile", mask = "none" }`, while an exact
+`/profile/email` pointer can deliberately choose a different mask.
+
+There is one fail-closed extract consequence. With `json_keys` present, an
+unlisted or explicitly released `->>` result may be a serialized object that
+still contains a protected key. pgmask refuses that text extract because the
+JSON structure is already gone. Use `->` to keep the result as JSON so pgmask
+can walk it, or extract a protected scalar key directly.
+
 ## Keys you did not list
 
-Listed JSON Pointers always win, including inheritance to their subtree.
-`json_unlisted` is what happens to every other scalar — the allowlist /
-denylist switch for this column:
+A JSON Pointer at the current path wins. Otherwise, a matching key rule or an
+inherited parent policy applies. `json_unlisted` is what happens to every
+other scalar — the allowlist / denylist switch for this column:
 
 | Setting | String | number | boolean | JSON null |
 |---|---|---|---|---|

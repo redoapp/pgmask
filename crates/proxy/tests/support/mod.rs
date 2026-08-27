@@ -17,7 +17,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pgmask::catalog::{
-    ColumnRule, Config, JsonFieldRule, Lineage, MaskParams, Opaque, SystemCatalogs, Unclassified,
+    ColumnRule, Config, JsonFieldRule, JsonKeyRule, Lineage, MaskParams, Opaque, SystemCatalogs,
+    Unclassified,
 };
 use pgmask::mask::{JsonUnlisted, Mask};
 use pgmask::protocol::{FrameReader, Message, StartupPacket};
@@ -361,6 +362,14 @@ pub fn rule(relation: &str, column: &str, mask: Mask) -> ColumnRule {
 pub fn json_field(pointer: &str, mask: Mask) -> JsonFieldRule {
     JsonFieldRule {
         pointer: pointer.into(),
+        mask,
+        params: MaskParams::default(),
+    }
+}
+
+pub fn json_key(key: &str, mask: Mask) -> JsonKeyRule {
+    JsonKeyRule {
+        key: key.into(),
         mask,
         params: MaskParams::default(),
     }

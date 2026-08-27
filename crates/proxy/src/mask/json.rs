@@ -33,6 +33,17 @@ pub struct JsonFieldSpec {
     pub spec: MaskSpec,
 }
 
+/// One policy for an exact JSON object-key name at any nesting depth.
+///
+/// This is deliberately separate from JSON Pointer syntax. Pointer `*` keeps
+/// its array-only meaning, while a key rule can catch `"email"` inside any
+/// object, including objects nested in arrays.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonKeySpec {
+    pub key: Arc<str>,
+    pub spec: MaskSpec,
+}
+
 /// What to do with a JSON scalar the catalog did not list, and that does not
 /// inherit a parent pointer policy.
 ///
@@ -227,10 +238,49 @@ impl JsonPolicyTrie {
 }
 
 impl MaskSpec {
-    /// Install pointer rules and compile their lookup trie once.
-    pub(crate) fn set_json_fields(&mut self, fields: Vec<JsonFieldSpec>) {
+    /// Install pointer and object-key rules and compile their lookup tables.
+    pub(crate) fn set_json_policies(&mut self, fields: Vec<JsonFieldSpec>, keys: Vec<JsonKeySpec>) {
         self.json_trie = Arc::new(JsonPolicyTrie::compile(&fields));
         self.json = fields.into();
+        self.json_key_policies = Arc::new(
+            keys.iter()
+                .map(|rule| (rule.key.clone(), rule.spec.clone()))
+                .collect(),
+        );
+        self.json_keys = keys.into();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_json_fields(&mut self, fields: Vec<JsonFieldSpec>) {
+        self.set_json_policies(fields, Vec::new());
+    }
+
+    fn key_policy_at(&self, segment: Option<&JsonPathSegment>) -> Option<&MaskSpec> {
+        let segment = segment?;
+        if segment.navigation == JsonPathNavigation::ArrayIndex {
+            return None;
+        }
+        // Ambiguous extract syntax might address an object key at runtime.
+        // Applying the key policy to both possible shapes can over-mask an
+        // array index, but declining it could release the object-key value.
+        self.json_key_policies.get(segment.value.as_str())
+    }
+
+    /// Resolve policy at every step. A pointer at the current path is most
+    /// specific, then an exact object-key rule, then an inherited ancestor.
+    ///
+    /// Letting a key rule override an inherited parent grant is what makes
+    /// `json_unlisted = "pass-through"` useful as a denylist without changing
+    /// the intentional subtree inheritance of pointer policies.
+    fn policy_at_or_inherited<'a>(
+        &'a self,
+        path: &[JsonPathSegment],
+        inherited: Option<&'a MaskSpec>,
+    ) -> Option<&'a MaskSpec> {
+        self.json_trie
+            .policy_at(path)
+            .or_else(|| self.key_policy_at(path.last()))
+            .or(inherited)
     }
 
     /// Bind this JSON column policy to an extracted subtree (`payload->'a'`).
@@ -273,7 +323,16 @@ impl MaskSpec {
         }
         match self.policy_along(&segments) {
             Some(spec) if spec.kind == Mask::Json => None,
+            // A released text value may be a serialized object. The walker
+            // cannot apply a key rule inside bytes PostgreSQL already turned
+            // into text, so refuse rather than leak a nested matching key.
+            Some(spec) if spec.kind == Mask::None && !self.json_keys.is_empty() => None,
             Some(spec) => Some(spec.clone()),
+            None if !self.json_keys.is_empty()
+                && self.json_unlisted == JsonUnlisted::PassThrough =>
+            {
+                None
+            }
             None => match self.json_unlisted {
                 JsonUnlisted::PassThrough => Some(Self::new(Mask::None)),
                 JsonUnlisted::Null | JsonUnlisted::ShapeOnly => Some(Self::new(Mask::Null)),
@@ -286,7 +345,7 @@ impl MaskSpec {
         let mut walked = Vec::with_capacity(path.len());
         for segment in path {
             walked.push(segment.clone());
-            inherited = self.json_trie.policy_at(&walked).or(inherited);
+            inherited = self.policy_at_or_inherited(&walked, inherited);
         }
         inherited
     }
@@ -356,7 +415,7 @@ impl Masker {
         // The trie follows only path-relevant exact / array-wildcard edges.
         // Catalog validation rejects equally-specific overlap, so this lookup
         // cannot let configuration order choose disclosure.
-        let policy = json_spec.json_trie.policy_at(path).or(inherited);
+        let policy = json_spec.policy_at_or_inherited(path, inherited);
 
         match value {
             JsonValue::Object(map) => {
@@ -532,9 +591,9 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::{
-        json_nesting_exceeds, path_segments, JsonFieldSpec, JsonLimit, JsonPathNavigation,
-        JsonPolicyTrie, JsonProjection, JsonUnlisted, Mask, MaskError, MaskSpec, Masker,
-        FORMAT_BINARY, FORMAT_TEXT, OID_JSONB,
+        json_nesting_exceeds, path_segments, JsonFieldSpec, JsonKeySpec, JsonLimit,
+        JsonPathNavigation, JsonPolicyTrie, JsonProjection, JsonUnlisted, Mask, MaskError,
+        MaskSpec, Masker, FORMAT_BINARY, FORMAT_TEXT, OID_JSONB,
     };
     use crate::mask::OID_JSON;
     use bytes::Bytes;
@@ -650,6 +709,84 @@ mod tests {
                 "private": "***",
                 "arbitrary": {"nested": [1, true, "kept"]}
             })
+        );
+    }
+
+    #[test]
+    fn json_key_rules_mask_exact_object_keys_anywhere_and_have_stable_precedence() {
+        let fields = vec![
+            JsonFieldSpec::new("/released", MaskSpec::new(Mask::None)).unwrap(),
+            JsonFieldSpec::new("/released/email", MaskSpec::new(Mask::Partial)).unwrap(),
+        ];
+        let keys = vec![
+            JsonKeySpec {
+                key: "email".into(),
+                spec: MaskSpec::new(Mask::Redact),
+            },
+            JsonKeySpec {
+                key: "token".into(),
+                spec: MaskSpec::new(Mask::Null),
+            },
+        ];
+        let mut spec = MaskSpec::new(Mask::Json);
+        spec.json_unlisted = JsonUnlisted::PassThrough;
+        spec.set_json_policies(fields, keys);
+
+        let output = apply_json(
+            &spec,
+            OID_JSONB,
+            FORMAT_TEXT,
+            br#"{
+                "email":"root secret",
+                "Email":"case-sensitive public value",
+                "released":{
+                    "future":"public",
+                    "email":"pointer wins",
+                    "nested":{"email":"key beats inherited release"}
+                },
+                "items":[
+                    {"email":"array object secret","token":"one"},
+                    {"0":"index-looking object key"},
+                    "email"
+                ]
+            }"#,
+        );
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "email":"***",
+                "Email":"case-sensitive public value",
+                "released":{
+                    "future":"public",
+                    "email":"********wins",
+                    "nested":{"email":"***"}
+                },
+                "items":[
+                    {"email":"***","token":null},
+                    {"0":"index-looking object key"},
+                    "email"
+                ]
+            })
+        );
+
+        assert_eq!(
+            spec.json_text_extract_spec(&[("email".into(), JsonPathNavigation::ObjectKey)])
+                .unwrap()
+                .kind,
+            Mask::Redact,
+            "a direct text extract must use the key rule"
+        );
+        assert_eq!(
+            spec.json_text_extract_spec(&[("email".into(), JsonPathNavigation::Ambiguous)])
+                .unwrap()
+                .kind,
+            Mask::Redact,
+            "ambiguous extract syntax must not bypass a possible object-key rule"
+        );
+        assert!(
+            spec.json_text_extract_spec(&[("released".into(), JsonPathNavigation::ObjectKey)])
+                .is_none(),
+            "a released serialized object could contain a protected key"
         );
     }
 

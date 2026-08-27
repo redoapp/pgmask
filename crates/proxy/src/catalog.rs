@@ -22,7 +22,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::mask::{JsonFieldSpec, JsonUnlisted, Mask, MaskSpec};
+use crate::mask::{JsonFieldSpec, JsonKeySpec, JsonUnlisted, Mask, MaskSpec};
 
 pub(crate) mod json;
 
@@ -148,10 +148,13 @@ pub struct MaskParams {
     pub json_max_bytes: Option<usize>,
     /// Maximum object/array nesting accepted before parsing.
     pub json_max_depth: Option<usize>,
-    /// Inheritable JSON Pointer policies at arbitrary nesting depths. A more
-    /// specific pointer overrides its parent. `*` matches every element of an
-    /// array and remains a literal `*` when traversing an object.
+    /// Inheritable JSON Pointer policies at arbitrary nesting depths. A pointer
+    /// at the current path, then a matching object-key rule, overrides an
+    /// inherited parent. `*` matches every array element and remains a literal
+    /// `*` when traversing an object.
     pub json: Option<Vec<JsonFieldRule>>,
+    /// Exact object-key policies applied at any nesting depth.
+    pub json_keys: Option<Vec<JsonKeyRule>>,
 }
 
 impl MaskParams {
@@ -159,7 +162,8 @@ impl MaskParams {
         let has_json_params = self.json_unlisted.is_some()
             || self.json_max_bytes.is_some()
             || self.json_max_depth.is_some()
-            || self.json.is_some();
+            || self.json.is_some()
+            || self.json_keys.is_some();
         if has_json_params && spec.kind != Mask::Json {
             bail!("JSON parameters are valid only with mask `json`");
         }
@@ -190,18 +194,41 @@ impl MaskParams {
         if let Some(max_depth) = self.json_max_depth {
             spec.json_max_depth = max_depth;
         }
-        if let Some(fields) = &self.json {
-            let mut compiled = Vec::with_capacity(fields.len());
-            for field in fields {
-                let mut field_spec = MaskSpec::new(field.mask);
-                field.params.apply_to(&mut field_spec)?;
-                compiled.push(
-                    JsonFieldSpec::new(field.pointer.as_str(), field_spec).map_err(|reason| {
-                        anyhow::anyhow!("JSON pointer {:?}: {reason}", field.pointer)
-                    })?,
-                );
-            }
-            spec.set_json_fields(compiled);
+        if self.json.is_some() || self.json_keys.is_some() {
+            let compiled = match &self.json {
+                Some(fields) => {
+                    let mut compiled = Vec::with_capacity(fields.len());
+                    for field in fields {
+                        let mut field_spec = MaskSpec::new(field.mask);
+                        field.params.apply_to(&mut field_spec)?;
+                        compiled.push(
+                            JsonFieldSpec::new(field.pointer.as_str(), field_spec).map_err(
+                                |reason| {
+                                    anyhow::anyhow!("JSON pointer {:?}: {reason}", field.pointer)
+                                },
+                            )?,
+                        );
+                    }
+                    compiled
+                }
+                None => spec.json.iter().cloned().collect(),
+            };
+            let compiled_keys = match &self.json_keys {
+                Some(keys) => {
+                    let mut compiled = Vec::with_capacity(keys.len());
+                    for key in keys {
+                        let mut key_spec = MaskSpec::new(key.mask);
+                        key.params.apply_to(&mut key_spec)?;
+                        compiled.push(JsonKeySpec {
+                            key: key.key.as_str().into(),
+                            spec: key_spec,
+                        });
+                    }
+                    compiled
+                }
+                None => spec.json_keys.iter().cloned().collect(),
+            };
+            spec.set_json_policies(compiled, compiled_keys);
         }
         Ok(())
     }
@@ -212,6 +239,16 @@ impl MaskParams {
 #[serde(deny_unknown_fields)]
 pub struct JsonFieldRule {
     pub pointer: String,
+    pub mask: Mask,
+    #[serde(flatten)]
+    pub params: MaskParams,
+}
+
+/// A policy for one exact JSON object-key name wherever it appears.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonKeyRule {
+    pub key: String,
     pub mask: Mask,
     #[serde(flatten)]
     pub params: MaskParams,
@@ -2518,6 +2555,10 @@ json = [
   { pointer = "/profile/age", mask = "numeric-bucket", bucket = 10 },
   { pointer = "/flags/0", mask = "null" },
 ]
+json_keys = [
+  { key = "email", mask = "redact" },
+  { key = "ssn", mask = "pseudonym", domain = "national-id" },
+]
 "#;
         let cfg: crate::catalog::Config = toml::from_str(toml_src).expect("should parse");
         let classification =
@@ -2541,6 +2582,12 @@ json = [
         );
         assert_eq!(classification.default.json[1].spec.keep, 4);
         assert_eq!(classification.default.json[2].spec.bucket, 10);
+        assert_eq!(classification.default.json_keys.len(), 2);
+        assert_eq!(classification.default.json_keys[0].key.as_ref(), "email");
+        assert_eq!(
+            classification.default.json_keys[1].spec.domain.as_deref(),
+            Some("national-id")
+        );
     }
 
     #[test]
