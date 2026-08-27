@@ -12,7 +12,7 @@
 //! being masked.
 
 use arc_swap::ArcSwap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -270,6 +270,52 @@ impl ColumnRule {
     }
 }
 
+/// Compact TOML form grouped by relation and column name.
+///
+/// `[columns."app.events"]` removes the repeated `relation` / `column` pair
+/// from every rule without changing the rule model used by policy resolution.
+#[derive(Debug, Clone, Default)]
+pub struct CompactColumns {
+    rules: Vec<ColumnRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompactColumnRule {
+    #[serde(rename = "type", default)]
+    semantic_type: Option<String>,
+    #[serde(default)]
+    mask: Option<Mask>,
+    #[serde(flatten)]
+    params: MaskParams,
+    #[serde(default)]
+    by_role: HashMap<String, Mask>,
+}
+
+impl<'de> Deserialize<'de> for CompactColumns {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let grouped =
+            BTreeMap::<String, BTreeMap<String, CompactColumnRule>>::deserialize(deserializer)?;
+        let rules = grouped
+            .into_iter()
+            .flat_map(|(relation, columns)| {
+                columns.into_iter().map(move |(column, rule)| ColumnRule {
+                    relation: relation.clone(),
+                    column,
+                    semantic_type: rule.semantic_type,
+                    mask: rule.mask,
+                    params: rule.params,
+                    by_role: rule.by_role,
+                })
+            })
+            .collect();
+        Ok(Self { rules })
+    }
+}
+
 /// Everything needed to mask one classified column, per role.
 #[derive(Debug, Clone)]
 pub struct Classification {
@@ -368,6 +414,10 @@ pub struct Config {
     pub opaque: Opaque,
     #[serde(default)]
     pub column: Vec<ColumnRule>,
+    /// Compact equivalent of `[[column]]`, grouped as
+    /// `[columns."schema.relation"]`.
+    #[serde(default)]
+    pub columns: CompactColumns,
     #[serde(default)]
     pub semantic_type: Vec<SemanticType>,
     #[serde(default)]
@@ -510,6 +560,11 @@ impl Config {
         self.validate_rate_limit()
     }
 
+    /// Every column rule, independent of which TOML spelling authored it.
+    pub fn column_rules(&self) -> impl Iterator<Item = &ColumnRule> {
+        self.column.iter().chain(self.columns.rules.iter())
+    }
+
     /// A positive per-minute budget with a zero burst is a config that cannot
     /// admit a single statement. Prefer the explicit default (burst equals
     /// per-minute) over letting `governor` refuse construction with a less
@@ -611,7 +666,7 @@ impl Config {
         // `(relation, column)` keys, so the file order decides — and the second
         // one silently wins even when it is the more permissive. Nothing warned.
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        for rule in &self.column {
+        for rule in self.column_rules() {
             let key = (
                 rule.relation.to_ascii_lowercase(),
                 rule.column.to_ascii_lowercase(),
@@ -2234,6 +2289,104 @@ mask = "none"
             .validate()
             .expect_err("duplicate rules must be refused");
         assert!(format!("{err:#}").contains("duplicate rule"));
+    }
+
+    #[test]
+    fn compact_columns_expand_to_the_same_rules_as_repeated_tables() {
+        let config: Config = toml::from_str(
+            r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "a-long-enough-key"
+
+[columns."app.events"]
+id = { mask = "none" }
+email = { type = "email", by_role = { support = "partial" } }
+
+[columns."app.events".payload]
+mask = "json"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/profile/email", mask = "pseudonym", domain = "email" },
+]
+"#,
+        )
+        .expect("compact catalog parses");
+
+        let rules: Vec<_> = config.column_rules().collect();
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0].display(), "app.events.email");
+        assert_eq!(rules[0].semantic_type.as_deref(), Some("email"));
+        assert_eq!(rules[0].by_role.get("support"), Some(&Mask::Partial));
+        assert_eq!(rules[1].display(), "app.events.id");
+        assert_eq!(rules[1].mask, Some(Mask::None));
+        assert_eq!(rules[2].display(), "app.events.payload");
+        assert_eq!(rules[2].mask, Some(Mask::Json));
+        assert_eq!(
+            rules[2].params.json_unmatched,
+            Some(JsonUnmatched::TypePlaceholders)
+        );
+        assert_eq!(
+            rules[2]
+                .params
+                .json
+                .as_ref()
+                .and_then(|fields| fields.first())
+                .map(|field| field.pointer.as_str()),
+            Some("/profile/email")
+        );
+    }
+
+    #[test]
+    fn duplicate_column_across_long_and_compact_forms_is_refused() {
+        let config: Config = toml::from_str(
+            r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "a-long-enough-key"
+
+[[column]]
+relation = "app.events"
+column = "email"
+mask = "redact"
+
+[columns."APP.EVENTS"]
+EMAIL = { mask = "none" }
+"#,
+        )
+        .expect("both forms parse before whole-config validation");
+        let err = config
+            .validate()
+            .expect_err("mixed spelling must not make order decide policy");
+        assert!(format!("{err:#}").contains("duplicate rule"));
+    }
+
+    #[test]
+    fn compact_column_rejects_unknown_fields() {
+        let err = toml::from_str::<Config>(
+            r#"
+backend = "h:1"
+catalog_dsn = "d"
+pseudonym_key = "a-long-enough-key"
+
+[columns."app.events"]
+email = { mask = "redact", typo = true }
+"#,
+        )
+        .expect_err("an ignored compact field could be a missed mask");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn compact_demo_catalog_is_the_executable_example() {
+        let config: Config = toml::from_str(include_str!("../../../examples/demo/catalog.toml"))
+            .expect("demo catalog parses");
+        config.validate().expect("demo catalog validates");
+        assert_eq!(config.column_rules().count(), 21);
+        assert!(
+            config.column.is_empty(),
+            "the demo should keep exercising only the compact spelling"
+        );
     }
 
     /// Both edges of every parameter guard, including the values `classify`

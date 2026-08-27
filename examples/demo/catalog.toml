@@ -75,59 +75,22 @@ mask = "pseudonym"
 
 # --- demo.customers ---------------------------------------------------------
 
-[[column]]
-relation = "demo.customers"
-column = "id"
-mask = "none"
-
-[[column]]
-relation = "demo.customers"
-column = "email"
-type = "email"
+[columns."demo.customers"]
+id = { mask = "none" }
+email = { type = "email" }
 
 # The same addresses under a name that announces nothing. Declared because the
 # fixture holds it, and `classify --check` is right to fail a catalog that does
 # not — a column whose name hides its contents is exactly the one an operator
 # would otherwise miss.
-[[column]]
-relation = "demo.customers"
-column = "lookup_key"
-type = "email"
-
-[[column]]
-relation = "demo.customers"
-column = "name"
-type = "person_name"
-
-[[column]]
-relation = "demo.customers"
-column = "phone"
-type = "phone"
-
-[[column]]
-relation = "demo.customers"
-column = "city"
-mask = "none"           # explicitly allowed — a decision, not an omission
-
-[[column]]
-relation = "demo.customers"
-column = "birth_date"
-type = "birth_date"
-
-[[column]]
-relation = "demo.customers"
-column = "annual_salary"
-type = "salary"
-
-[[column]]
-relation = "demo.customers"
-column = "last_ip"
-type = "ip_address"
-
-[[column]]
-relation = "demo.customers"
-column = "account_uuid"
-type = "account_id"
+lookup_key = { type = "email" }
+name = { type = "person_name" }
+phone = { type = "phone" }
+city = { mask = "none" } # explicitly allowed — a decision, not an omission
+birth_date = { type = "birth_date" }
+annual_salary = { type = "salary" }
+last_ip = { type = "ip_address" }
+account_uuid = { type = "account_id" }
 
 # demo.customers.internal_note is deliberately absent: default-deny masks it.
 
@@ -135,64 +98,24 @@ type = "account_id"
 # Phase 0 finding: Postgres reports the VIEW's OID, not the base table's, so a
 # view needs its own entries or every column in it reads as unclassified.
 
-[[column]]
-relation = "demo.customer_directory"
-column = "id"
-mask = "none"
-
-[[column]]
-relation = "demo.customer_directory"
-column = "email"
-type = "email"
-
-[[column]]
-relation = "demo.customer_directory"
-column = "name"
-type = "person_name"
-
-[[column]]
-relation = "demo.customer_directory"
-column = "city"
-mask = "none"
+[columns."demo.customer_directory"]
+id = { mask = "none" }
+email = { type = "email" }
+name = { type = "person_name" }
+city = { mask = "none" }
 
 # --- demo.orders -------------------------------------------------------------
 # The join side. Note what is *not* classified: order_total, status, ship_city
 # and placed_at are business facts, not personal data, so they pass through and
 # stay aggregatable. That is what keeps debugging possible.
 
-[[column]]
-relation = "demo.orders"
-column = "id"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "customer_id"
-mask = "none"           # a surrogate key to a masked table; useless on its own
-
-[[column]]
-relation = "demo.orders"
-column = "status"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "order_total"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "ship_city"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "placed_at"
-mask = "none"
-
-[[column]]
-relation = "demo.orders"
-column = "ship_address"
-type = "street_address"
+[columns."demo.orders"]
+id = { mask = "none" }
+customer_id = { mask = "none" } # a surrogate key to a masked table; useless on its own
+status = { mask = "none" }
+order_total = { mask = "none" }
+ship_city = { mask = "none" }
+placed_at = { mask = "none" }
+ship_address = { type = "street_address" }
 
 # demo.orders.internal_note is deliberately absent: default-deny masks it.

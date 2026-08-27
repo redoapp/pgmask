@@ -40,8 +40,9 @@ async fn main() -> Result<()> {
 
     // Resolving the catalog before binding is deliberate: a proxy that starts
     // with a half-loaded catalog is a proxy with unknown coverage.
+    let column_rules: Vec<_> = config.column_rules().cloned().collect();
     let catalog = Arc::new(
-        Catalog::resolve(&config.column, &config.semantic_type, &config.catalog_dsn)
+        Catalog::resolve(&column_rules, &config.semantic_type, &config.catalog_dsn)
             .await
             .context("resolving the column catalog")?,
     );

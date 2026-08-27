@@ -784,7 +784,7 @@ async fn check(
         .collect();
 
     let mut incompatible: Vec<(String, String, String, String)> = Vec::new();
-    for rule in &config.column {
+    for rule in config.column_rules() {
         let key = (rule.relation.clone(), rule.column.clone());
         let Some(data_type) = live_type.get(&key) else {
             continue; // reported as a stale rule below
@@ -817,8 +817,7 @@ async fn check(
         })
         .collect();
     let ruled: BTreeSet<(String, String)> = config
-        .column
-        .iter()
+        .column_rules()
         .map(|r| (r.relation.clone(), r.column.clone()))
         .collect();
 
@@ -925,7 +924,7 @@ async fn check(
         );
     } else {
         let mut released_but_sensitive: Vec<(String, String, String)> = Vec::new();
-        for rule in &config.column {
+        for rule in config.column_rules() {
             if !rule.relation.starts_with(&prefix) {
                 continue;
             }
@@ -1239,17 +1238,34 @@ fn emit_catalog(proposals: &[Proposal], schema: &str) {
         }
         println!();
     }
-    for p in proposals {
-        let Some(t) = p.semantic_type else { continue };
-        let flag = if p.confidence == Confidence::NeedsReview {
-            "   # NEEDS REVIEW"
-        } else {
-            ""
-        };
-        println!("[[column]]{flag}");
-        println!("relation = \"{}.{}\"", p.column.schema, p.column.table);
-        println!("column   = \"{}\"", p.column.name);
-        println!("type     = \"{t}\"");
+    let mut by_relation: BTreeMap<String, Vec<&Proposal>> = BTreeMap::new();
+    for proposal in proposals {
+        if proposal.semantic_type.is_some() {
+            by_relation
+                .entry(format!(
+                    "{}.{}",
+                    proposal.column.schema, proposal.column.table
+                ))
+                .or_default()
+                .push(proposal);
+        }
+    }
+    for (relation, proposals) in by_relation {
+        println!("[columns.{relation:?}]");
+        for proposal in proposals {
+            let Some(semantic_type) = proposal.semantic_type else {
+                continue;
+            };
+            let flag = if proposal.confidence == Confidence::NeedsReview {
+                " # NEEDS REVIEW"
+            } else {
+                ""
+            };
+            println!(
+                "{:?} = {{ type = {:?} }}{flag}",
+                proposal.column.name, semantic_type
+            );
+        }
         println!();
     }
 }
