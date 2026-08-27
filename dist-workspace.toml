@@ -21,8 +21,9 @@ install-updater = false
 pr-run-mode = "plan"
 # Whether to enable GitHub Attestations
 github-attestations = true
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Target platforms to build apps for (Rust target-triple syntax). macOS is
+# Apple Silicon only; Intel macOS users can build from source.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
 # Lockstep workspace version, but only these two crates are shippable.
 packages = ["pgmask", "classify"]
 # Build only the required packages, and individually
