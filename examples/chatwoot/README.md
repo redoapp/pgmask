@@ -79,11 +79,11 @@ qualify it, see whether the catalog answers the ops question without a leak.
 ## What a first run showed
 
 Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.1.99
-(145 SQL cases):
+(158 SQL cases):
 
 | Kind | Count | What happened |
 |---|---|---|
-| Served | 79 | Queue/delivery/status counts, timeline envelopes, dashboard FILTER counts, message `today`/`chat`, pseudonym correlation, whole masked JSON, `SELECT *`, view OIDs, literal extract spellings, tag-id filtering, and documented order/cardinality disclosures |
+| Served | 92 | Queue/delivery/status counts, timeline envelopes, dashboard FILTER counts, message `today`/`chat`, pseudonym correlation, whole masked JSON, `SELECT *`, view OIDs, literal extract spellings, tag-id filtering, nested initiated_at placeholders, redacted automation params/regex samples, and documented order/cardinality disclosures |
 | Refused | 64 | Unqualified/app JSON ordering, containment/custom-attribute membership, label-name `EXISTS`, masked JOIN/NATURAL/LATERAL/HAVING/subqueries/windows/grouping, JSON casts/constructors/JSONPath/parent text, dynamic or ambiguous keys, aggregates/fingerprints/recursive CTEs, SRFs, COPY and set operations |
 | Error | 2 | Unqualified `FROM "contacts"` and JSON-only bracket subscripting — backend messages withheld |
 | Protocol | 6 | Extended binds for released extract, masked scalar/JSON predicates and masked ordering; same-session refusal recovery; mid-session `search_path` |

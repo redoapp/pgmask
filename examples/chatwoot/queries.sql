@@ -1390,7 +1390,8 @@ WHERE EXISTS (
 ORDER BY c.id;
 
 -- Parent `none` on `/initiated_at` would inherit into note/email children.
--- Timestamp is released; nested canaries must not be.
+-- Timestamp is released; nested canaries must not be. A text extract of an
+-- unmatched leaf is JSON-null (SQL NULL); the parent object walk keeps `""`.
 -- @id: initiated-at-timestamp
 -- @expect: served
 -- @contains: 2026-03-14T09:21:55.000Z

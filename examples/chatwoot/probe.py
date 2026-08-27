@@ -67,6 +67,7 @@ FROM (
   SELECT
     (SELECT json_agg(a) FROM chatwoot.accounts a) AS accounts,
     (SELECT json_agg(u) FROM chatwoot.users u) AS users,
+    (SELECT json_agg(i) FROM chatwoot.inboxes i) AS inboxes,
     (SELECT json_agg(c) FROM chatwoot.contacts c) AS contacts,
     (SELECT json_agg(c) FROM chatwoot.conversations c) AS conversations,
     (SELECT json_agg(ci) FROM chatwoot.contact_inboxes ci) AS contact_inboxes,
