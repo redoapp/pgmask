@@ -2,10 +2,11 @@
 //!
 //! Attribution (FROM ranges, unique owner) stays in the parent module. This
 //! file only decides whether an expression is a chain of literal `->` / `->>` /
-//! `#>` / `#>>` / `json[b]_extract_path[_text]` keys.
+//! `#>` / `#>>` / `json[b]_extract_path[_text]` keys, or the equivalent JSON
+//! subscript form (`payload['profile']['email']`).
 
 use pg_query::protobuf::node::Node as NodeEnum;
-use pg_query::protobuf::{AExpr, FuncCall, Node};
+use pg_query::protobuf::{AExpr, AIndirection, FuncCall, Node};
 
 use super::super::names::{function_name, JSON_EXTRACT_FUNCTIONS};
 use super::{JsonExtract, JsonExtractColumn, JsonExtractPathSegment, JsonPathNavigation};
@@ -29,7 +30,47 @@ pub(super) fn parse_extract(expr: &NodeEnum, depth: usize) -> Option<JsonExtract
             .and_then(|inner| parse_extract(inner, depth.saturating_add(1))),
         NodeEnum::AExpr(aexpr) => parse_operator_extract(aexpr, depth),
         NodeEnum::FuncCall(call) => parse_function_extract(call, depth),
+        NodeEnum::AIndirection(ind) => parse_indirection_extract(ind, depth),
         _ => None,
+    }
+}
+
+/// `payload['a'][0]` is the same literal path as `payload->'a'->0`.
+///
+/// PostgreSQL JSON subscripting returns `json`/`jsonb`, never text, so the
+/// result can still be walked. Slices (`[1:3]`) and composite field names
+/// (`(row).col`) are not pointer steps.
+fn parse_indirection_extract(ind: &AIndirection, depth: usize) -> Option<JsonExtract> {
+    let mut key_segments = Vec::with_capacity(ind.indirection.len());
+    for part in &ind.indirection {
+        key_segments.push(parse_subscript_index(part.node.as_ref()?)?);
+    }
+    if key_segments.is_empty() {
+        return None;
+    }
+    let left = ind.arg.as_ref()?.node.as_ref()?;
+    finish_extract(left, key_segments, false, depth)
+}
+
+fn parse_subscript_index(expr: &NodeEnum) -> Option<JsonExtractPathSegment> {
+    let NodeEnum::AIndices(idx) = expr else {
+        return None;
+    };
+    if idx.is_slice || idx.lidx.is_some() {
+        return None;
+    }
+    let mut key = idx.uidx.as_ref()?.node.as_ref()?;
+    loop {
+        match key {
+            NodeEnum::TypeCast(cast) => {
+                key = cast.arg.as_ref()?.node.as_ref()?;
+            }
+            NodeEnum::CollateClause(collate) => {
+                key = collate.arg.as_ref()?.node.as_ref()?;
+            }
+            NodeEnum::AConst(_) => return parse_single_key(key),
+            _ => return None,
+        }
     }
 }
 

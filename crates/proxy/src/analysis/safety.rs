@@ -551,6 +551,16 @@ fn classify(expr: &NodeEnum, allow: Relaxations) -> Safety {
             }
         }
 
+        NodeEnum::AIndirection(_) => {
+            // `payload['a'][0]` is parsed as indirection, not `AExpr`. Treat
+            // only literal JSON/JSONB subscripts as extracts; array slices and
+            // composite field names stay unknown.
+            if super::json_extract::expr_is_json_extract(expr) {
+                return Safety::JsonExtract;
+            }
+            Safety::Unknown
+        }
+
         _ => Safety::Unknown,
     }
 }

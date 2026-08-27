@@ -15,10 +15,11 @@ inherited by its whole subtree until a more-specific pointer overrides it.
 
 Masks apply only to a stored classified column that still has provenance in
 the result, and to **literal JSON extracts** of that column. `SELECT payload
-FROM app.events` is the stored-column path. `SELECT payload->>'email'` and
-`payload->'profile'` are attributed from the statement: the extract path must
-be literals, the relation must be schema-qualified, and the pointer policy of
-the stored column is applied to the result. JSON that Postgres constructs
+FROM app.events` is the stored-column path. `SELECT payload->>'email'`,
+`payload->'profile'`, and `payload['profile']['email']` are attributed from
+the statement: the extract path must be literals, the relation must be
+schema-qualified, and the pointer policy of the stored column is applied to
+the result. JSON that Postgres constructs
 (`json_agg(payload)`, `to_jsonb(t)`, `jsonb_path_query`) stays opaque.
 
 ## Configuration
@@ -77,7 +78,7 @@ parent value, and `payload->0` uses PostgreSQL's integer array operator. Text
 paths (`#>` / `#>>` and `json[b]_extract_path[_text]`) do not distinguish array
 index `0` from object key `"0"`. If such a segment could enter a `*` pointer
 branch, pgmask refuses the extract rather than guess. Use an integer `-> 0`
-step when traversing a configured array wildcard.
+or `[0]` step when traversing a configured array wildcard.
 
 ## Unmatched leaves
 
@@ -123,6 +124,8 @@ Literal extracts are served when the path can be mapped to a pointer:
 SELECT payload->>'public' FROM app.events;
 SELECT payload->'profile' FROM app.events;
 SELECT payload->'profile'->>'email' FROM app.events;
+SELECT payload['profile']['email'] FROM app.events;  -- jsonb, same pointer policy as ->
+SELECT payload['items'][0] FROM app.events;          -- integer index, like -> 0
 SELECT payload #>> '{profile,email}' FROM app.events;
 SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM app.events;
 

@@ -23,7 +23,7 @@
   configured rule. Add per-column `json_max_bytes` (1 MiB default) and
   `json_max_depth` (64 default, maximum 128); values over either limit refuse
   before `serde_json` parses or allocates the document tree.
-- Attribute literal JSON extracts (`->`, `->>`, `#>`/`#>>`,
+- Attribute literal JSON extracts (`->`, `->>`, `#>`/`#>>`, JSON subscripting,
   `json[b]_extract_path[_text]`) of a schema-qualified classified column.
   The stored column's pointer policy is applied to the extract; a text extract
   of a node that still has child pointer policies is refused because the
@@ -87,14 +87,14 @@
   by using the same equally-specific overlap predicate, then calls
   `validate_json_spec`. Rule segments include `0` and `*` so exact-index vs
   array-wildcard pairs appear; path `*` covers the literal object key.
-- Add a live-Postgres JSON SQL value campaign. Sixty-two operator, function,
+- Add a live-Postgres JSON SQL value campaign. Sixty-seven operator, function,
   cast/collation, alias/join/view/CTE/subquery, object, array, `json`/`jsonb`,
   unmatched-leaf, and whole-document queries first run directly against
   PostgreSQL, requiring poison values where applicable, then decode pgmask's
   raw-wire DataRows and compare the exact text, SQL NULL, or semantic JSON
   result; a five-field projection plus star expansion and a two-column view
   pin positional plan alignment. Forty-three refused construction, expansion,
-  JSONPath, dynamic/ambiguous path, mutation, subscripting, aggregate, wrapper,
+  JSONPath, dynamic/ambiguous path, mutation, aggregate, wrapper,
   and set-operation shapes likewise must expose a poison directly and produce
   pgmask's own refusal without one byte of poison. Binary Bind assertions now
   check the exact partial text mask and versioned masked jsonb document, not
@@ -104,6 +104,11 @@
   columns. Fold the earlier canary-only JSON extract, constructor, and
   provenance matrices into these campaigns so a served shape has one exact
   value pin and a refused shape has one poison control.
+- Attribute PostgreSQL JSON/JSONB subscripting (`payload['profile']['email']`,
+  `payload['items'][0]`) as the same literal extract as `->`. Quoted keys are
+  object navigation; integer indices are proven array steps. Slices and
+  computed keys stay opaque. Mixed forms such as `payload['profile']->>'email'`
+  chain onto the existing operator parser.
 
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 

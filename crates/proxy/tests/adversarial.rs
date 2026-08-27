@@ -734,6 +734,47 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             poison: Some(CANARY_EMAIL),
         },
         JsonSqlValueCase {
+            name: "subscripted profile object",
+            sql: "SELECT payload['profile'] FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "email": CANARY_EMAIL,
+                "name": CANARY_NAME
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "email": partial_email,
+                "name": "***"
+            })),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "chained subscripted email leaf stays json",
+            sql: "SELECT payload['profile']['email'] FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!(CANARY_EMAIL)),
+            masked: JsonSqlValue::Json(serde_json::json!(partial_email)),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "subscript then text operator",
+            sql: "SELECT payload['profile']->>'email' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "integer array subscript",
+            sql: "SELECT payload['items'][0]->>'token' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_TEMP),
+            masked: JsonSqlValue::Text("***"),
+            poison: Some(CANARY_TEMP),
+        },
+        JsonSqlValueCase {
+            name: "quoted-zero subscript never inherits array wildcard",
+            sql: "SELECT payload['numeric_object']['0']->>'token' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_TEMP),
+            masked: JsonSqlValue::Null,
+            poison: Some(CANARY_TEMP),
+        },
+        JsonSqlValueCase {
             name: "quoted numeric object key never inherits array wildcard",
             sql: "SELECT payload->'numeric_object'->'0'->>'token' FROM canary.documents",
             direct: JsonSqlValue::Text(CANARY_TEMP),
@@ -1176,9 +1217,10 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
             CANARY_EMAIL,
         ),
         (
-            "JSON subscripting",
-            "SELECT payload['profile']['email'] FROM canary.documents",
-            CANARY_EMAIL,
+            "JSON subscript dynamic key",
+            "SELECT payload[CASE WHEN id = 1 THEN 'unknown' ELSE 'public' END] \
+             FROM canary.documents",
+            CANARY_NOTE,
         ),
         (
             "json to jsonb cast",
