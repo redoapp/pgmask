@@ -1003,7 +1003,7 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
     assert_no_canary_bytes(&star.received, "star expansion");
     let star_rows = star.text_rows()?;
     assert_eq!(star_rows.len(), 1, "star expansion rows");
-    assert_eq!(star_rows[0].len(), 3, "id, payload, legacy");
+    assert_eq!(star_rows[0].len(), 4, "id, payload, legacy, encoded");
     assert_eq!(star_rows[0][0].as_deref(), Some("1"));
     assert_single_sql_value(
         &[vec![star_rows[0][1].clone()]],
@@ -1018,6 +1018,11 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             "unknown": ""
         })),
         "star legacy",
+    );
+    assert_single_sql_value(
+        &[vec![star_rows[0][3].clone()]],
+        &JsonSqlValue::Json(serde_json::json!("")),
+        "star double-encoded JSON",
     );
 
     let view = simple_query_round(
