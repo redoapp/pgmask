@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5 — Apple Silicon-only macOS releases
+
+- Stop building and attaching `x86_64-apple-darwin` binaries. Prebuilt macOS
+  releases now target Apple Silicon only; Linux remains available for amd64
+  and arm64.
+
 ## 0.2.4 — attach CycloneDX SBOMs to the GitHub Release
 
 - 0.2.3 claimed a CycloneDX SBOM on the GitHub Release. cargo-dist 0.32.0's
