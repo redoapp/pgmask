@@ -560,6 +560,13 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             poison: Some(CANARY_EMAIL),
         },
         JsonSqlValueCase {
+            name: "redacted chained text leaf",
+            sql: "SELECT payload->'profile'->>'name' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_NAME),
+            masked: JsonSqlValue::Text("***"),
+            poison: Some(CANARY_NAME),
+        },
+        JsonSqlValueCase {
             name: "qualified operator syntax masked text leaf",
             sql: "SELECT (payload OPERATOR(pg_catalog.->) 'profile') \
                   OPERATOR(pg_catalog.->>) 'email' FROM canary.documents",
@@ -629,6 +636,19 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             poison: Some(CANARY_EMAIL),
         },
         JsonSqlValueCase {
+            name: "legacy json extract-path document",
+            sql: "SELECT json_extract_path(legacy, 'profile') FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "email": CANARY_EMAIL,
+                "name": CANARY_NAME
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "email": partial_email,
+                "name": "***"
+            })),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
             name: "view-owned masked text leaf",
             sql: "SELECT payload->'profile'->>'email' FROM canary.documents_view",
             direct: JsonSqlValue::Text(CANARY_EMAIL),
@@ -639,6 +659,22 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             name: "aliased joined masked text leaf",
             sql: "SELECT d.payload->'profile'->>'email' FROM canary.documents d \
                   JOIN canary.subjects s ON s.id = d.id",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "bare extract has one owner across a join",
+            sql: "SELECT payload->'profile'->>'email' FROM canary.documents d \
+                  JOIN canary.subjects s ON s.id = d.id",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "qualified extract owner across a self join",
+            sql: "SELECT d1.payload->'profile'->>'email' FROM canary.documents d1 \
+                  JOIN canary.documents d2 ON d2.id = d1.id",
             direct: JsonSqlValue::Text(CANARY_EMAIL),
             masked: JsonSqlValue::Text(partial_email),
             poison: Some(CANARY_EMAIL),
@@ -804,6 +840,13 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
         JsonSqlValueCase {
             name: "masked array token text leaf",
             sql: "SELECT payload->'items'->0->>'token' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_TEMP),
+            masked: JsonSqlValue::Text("***"),
+            poison: Some(CANARY_TEMP),
+        },
+        JsonSqlValueCase {
+            name: "masked second array token text leaf",
+            sql: "SELECT payload->'items'->1->>'token' FROM canary.documents",
             direct: JsonSqlValue::Text(CANARY_TEMP),
             masked: JsonSqlValue::Text("***"),
             poison: Some(CANARY_TEMP),
@@ -980,6 +1023,55 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
     Ok(())
 }
 
+/// `json_unmatched = "none"` is a deliberate release grant, including text
+/// extracts. Pin that disclosure while proving a narrower pointer still wins.
+#[tokio::test]
+async fn json_unmatched_none_releases_only_unlisted_extracts_by_configuration() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let mut rules = default_rules();
+    rules.push(json_rule(
+        "canary.documents",
+        "payload",
+        pgmask::mask::JsonUnmatched::None,
+        vec![json_field("/profile/email", pgmask::mask::Mask::Redact)],
+    ));
+    let proxy = start_proxy(DB, rules).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    let unknown = simple_query_round(
+        &mut client,
+        "SELECT payload->>'unknown' FROM canary.documents",
+    )
+    .await?;
+    assert_served(&unknown.messages, "json_unmatched none release");
+    assert_eq!(
+        unknown.text_rows()?,
+        vec![vec![Some(CANARY_NOTE.into())]],
+        "unlisted text extract is intentionally public"
+    );
+
+    let email = simple_query_round(
+        &mut client,
+        "SELECT payload->'profile'->>'email' FROM canary.documents",
+    )
+    .await?;
+    assert_served(
+        &email.messages,
+        "pointer override under json_unmatched none",
+    );
+    assert_no_canary_bytes(
+        &email.received,
+        "pointer override under json_unmatched none",
+    );
+    assert_eq!(
+        email.text_rows()?,
+        vec![vec![Some("***".into())]],
+        "explicit pointer must override unmatched release"
+    );
+    Ok(())
+}
+
 /// Every refused JSON shape is valid SQL that exposes a poison value on the
 /// backend. This distinguishes a pgmask refusal from a PostgreSQL parse/type
 /// error and from a query that never reached sensitive data.
@@ -1007,6 +1099,11 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
             "runtime operator key",
             "SELECT payload->>(CASE WHEN id = 1 THEN 'unknown' ELSE 'public' END) \
              FROM canary.documents",
+            CANARY_NOTE,
+        ),
+        (
+            "scalar-subquery operator key",
+            "SELECT payload->>(SELECT 'unknown') FROM canary.documents",
             CANARY_NOTE,
         ),
         (
@@ -1047,6 +1144,11 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
             CANARY_EMAIL,
         ),
         (
+            "legacy protected object serialized by text operator",
+            "SELECT legacy->>'profile' FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
             "JSONPath query first",
             "SELECT jsonb_path_query_first(payload, '$.profile.email') \
              FROM canary.documents",
@@ -1055,6 +1157,12 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
         (
             "JSONPath set-returning query",
             "SELECT jsonb_path_query(payload, '$.items[*].token') \
+             FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "JSONPath query array",
+            "SELECT jsonb_path_query_array(payload, '$.items[*].token') \
              FROM canary.documents",
             CANARY_TEMP,
         ),
@@ -1090,6 +1198,11 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
             CANARY_EMAIL,
         ),
         (
+            "document path deletion",
+            "SELECT payload #- '{public}' FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
             "document mutation",
             "SELECT jsonb_set(payload, '{public}', '\"changed\"') FROM canary.documents",
             CANARY_EMAIL,
@@ -1097,6 +1210,28 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
         (
             "document text cast",
             "SELECT payload::text FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "coalesce wrapper around extract",
+            "SELECT COALESCE(payload->'profile'->>'email', '') FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "case wrapper around extract",
+            "SELECT CASE WHEN id = 1 THEN payload->'profile'->>'email' END \
+             FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "upper wrapper around extract",
+            "SELECT upper(payload->'profile'->>'email') FROM canary.documents",
+            "CANARY_EMAIL_",
+        ),
+        (
+            "scalar subquery projection",
+            "SELECT (SELECT payload->'profile'->>'email' \
+             FROM canary.documents LIMIT 1)",
             CANARY_EMAIL,
         ),
         (
@@ -1108,6 +1243,12 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
             "JSON set operation",
             "SELECT payload FROM canary.documents \
              UNION ALL SELECT payload FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "JSON EXCEPT operation",
+            "SELECT payload FROM canary.documents \
+             EXCEPT SELECT payload FROM canary.documents WHERE id = 0",
             CANARY_EMAIL,
         ),
         (
@@ -1607,6 +1748,15 @@ async fn json_document_byte_and_depth_limits_refuse_before_rows_cross() -> Resul
     assert_refused(&byte_client, "JSON byte limit");
     assert_no_canary(&byte_client, "JSON byte limit");
 
+    let mut byte_extract_client = RawClient::connect(byte_limited.addr, DB).await?;
+    let byte_extract = simple_query_round(
+        &mut byte_extract_client,
+        "SELECT payload->'profile' FROM canary.documents",
+    )
+    .await?;
+    assert_refused_bytes(&byte_extract.received, "JSON extract byte limit");
+    assert_no_canary_bytes(&byte_extract.received, "JSON extract byte limit");
+
     let depth_limited = start_proxy(DB, make_rules(1_048_576, 2)).await?;
     let mut depth_client = RawClient::connect(depth_limited.addr, DB).await?;
     depth_client
@@ -1614,6 +1764,16 @@ async fn json_document_byte_and_depth_limits_refuse_before_rows_cross() -> Resul
         .await?;
     assert_refused(&depth_client, "JSON depth limit");
     assert_no_canary(&depth_client, "JSON depth limit");
+
+    let extract_depth_limited = start_proxy(DB, make_rules(1_048_576, 1)).await?;
+    let mut depth_extract_client = RawClient::connect(extract_depth_limited.addr, DB).await?;
+    let depth_extract = simple_query_round(
+        &mut depth_extract_client,
+        "SELECT payload->'items' FROM canary.documents",
+    )
+    .await?;
+    assert_refused_bytes(&depth_extract.received, "JSON extract depth limit");
+    assert_no_canary_bytes(&depth_extract.received, "JSON extract depth limit");
     Ok(())
 }
 

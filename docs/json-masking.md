@@ -126,12 +126,20 @@ SELECT payload->'profile'->>'email' FROM app.events;
 SELECT payload #>> '{profile,email}' FROM app.events;
 SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM app.events;
 
--- Also served when provenance survives: aliases, joins of named ranges, CTEs,
--- subqueries, views with their own rules, and a same-type no-op `payload::jsonb`.
+-- Whole stored columns are also served when RowDescription provenance
+-- survives: aliases, joins, CTEs, subqueries, views with their own rules, and
+-- a same-type no-op `payload::jsonb`.
 SELECT payload
 FROM app.events
 WHERE payload @> '{"kind":"checkout"}';
 ```
+
+Literal extracts are attributed from the SQL text, so their owner must be a
+schema-qualified named relation. An extract *inside* a CTE or subquery may be
+served when the outer query uses `SELECT *`, preserving the analyzed target
+slot. Extracting from a CTE/subquery-owned JSON column, or selecting a named
+extract alias through that outer range, is refused rather than guessing its
+base relation.
 
 A text extract (`->>`, `#>>`, `*_extract_path_text`) of a node that still has
 **child** pointer policies is refused: PostgreSQL has already serialized the
