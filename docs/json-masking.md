@@ -116,11 +116,14 @@ That means a key rule can protect `email` beneath
 `{ pointer = "/profile", mask = "none" }`, while an exact
 `/profile/email` pointer can deliberately choose a different mask.
 
-There is one fail-closed extract consequence. With `json_keys` present, an
-unlisted or explicitly released `->>` result may be a serialized object that
-still contains a protected key. pgmask refuses that text extract because the
-JSON structure is already gone. Use `->` to keep the result as JSON so pgmask
-can walk it, or extract a protected scalar key directly.
+There is one fail-closed extract consequence. With `json_keys` present, a
+`->>` result governed by pass-through or a mask that retains source substrings
+(`partial`, `inner`, `outer`, `range`, `scrub`, or a pseudonym with
+`keep_domain`) may be a serialized object that still contains a protected key.
+pgmask refuses that text extract because the JSON structure is already gone.
+Use `->` to keep the result as JSON so pgmask can walk it, or extract a
+protected scalar key directly. Fully withholding masks such as `redact`,
+`null`, and `hash` remain safe on a direct text extract.
 
 ## Keys you did not list
 

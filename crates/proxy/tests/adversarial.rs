@@ -1155,6 +1155,7 @@ async fn json_key_rules_protect_nested_values_in_pass_through_documents() -> Res
         pgmask::mask::JsonUnlisted::PassThrough,
         vec![
             json_field("/items", pgmask::mask::Mask::None),
+            json_field("/numeric_object", pgmask::mask::Mask::Scrub),
             json_field("/profile/email", pgmask::mask::Mask::Null),
         ],
     );
@@ -1219,12 +1220,12 @@ async fn json_key_rules_protect_nested_values_in_pass_through_documents() -> Res
         );
     }
 
-    let parent_sql = "SELECT payload->>'profile' FROM canary.documents";
+    let parent_sql = "SELECT payload->>'numeric_object' FROM canary.documents";
     let direct = simple_query_direct(DB, parent_sql).await?;
     assert!(
         direct[0][0]
             .as_deref()
-            .is_some_and(|value| value.contains(CANARY_EMAIL)),
+            .is_some_and(|value| value.contains(CANARY_TEMP)),
         "serialized-parent poison control"
     );
     let refused = simple_query_round(&mut client, parent_sql).await?;

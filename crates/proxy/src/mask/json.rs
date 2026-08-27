@@ -283,6 +283,16 @@ impl MaskSpec {
             .or(inherited)
     }
 
+    /// Whether applying this mask to PostgreSQL's serialized text can retain
+    /// source substrings from a container whose protected descendants are no
+    /// longer individually addressable.
+    fn may_reveal_serialized_children(spec: &MaskSpec) -> bool {
+        matches!(
+            spec.kind,
+            Mask::None | Mask::Partial | Mask::Inner | Mask::Outer | Mask::Range | Mask::Scrub
+        ) || (spec.kind == Mask::Pseudonym && spec.keep_domain)
+    }
+
     /// Bind this JSON column policy to an extracted subtree (`payload->'a'`).
     ///
     /// The stored document's pointer table is kept; the walk starts at `path`
@@ -323,10 +333,14 @@ impl MaskSpec {
         }
         match self.policy_along(&segments) {
             Some(spec) if spec.kind == Mask::Json => None,
-            // A released text value may be a serialized object. The walker
-            // cannot apply a key rule inside bytes PostgreSQL already turned
-            // into text, so refuse rather than leak a nested matching key.
-            Some(spec) if spec.kind == Mask::None && !self.json_keys.is_empty() => None,
+            // A text value may be a serialized object. A mask that retains
+            // source substrings cannot substitute for walking protected keys
+            // inside bytes PostgreSQL already flattened, so refuse.
+            Some(spec)
+                if !self.json_keys.is_empty() && Self::may_reveal_serialized_children(spec) =>
+            {
+                None
+            }
             Some(spec) => Some(spec.clone()),
             None if !self.json_keys.is_empty()
                 && self.json_unlisted == JsonUnlisted::PassThrough =>
@@ -717,6 +731,7 @@ mod tests {
         let fields = vec![
             JsonFieldSpec::new("/released", MaskSpec::new(Mask::None)).unwrap(),
             JsonFieldSpec::new("/released/email", MaskSpec::new(Mask::Partial)).unwrap(),
+            JsonFieldSpec::new("/scrubbed", MaskSpec::new(Mask::Scrub)).unwrap(),
         ];
         let keys = vec![
             JsonKeySpec {
@@ -787,6 +802,11 @@ mod tests {
             spec.json_text_extract_spec(&[("released".into(), JsonPathNavigation::ObjectKey)])
                 .is_none(),
             "a released serialized object could contain a protected key"
+        );
+        assert!(
+            spec.json_text_extract_spec(&[("scrubbed".into(), JsonPathNavigation::ObjectKey)])
+                .is_none(),
+            "a scrubbed serialized object could retain a protected key verbatim"
         );
     }
 
