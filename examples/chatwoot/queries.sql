@@ -595,11 +595,10 @@ SELECT additional_attributes->>(id::text)
 FROM chatwoot.contacts
 WHERE id = 1001;
 
--- Whole-column CTE keeps the backend OID and is masked at the outer result.
+-- The reusable alias loses enough syntactic evidence for hostile posture to
+-- refuse before the outer RowDescription can rescue it.
 -- @id: contact-json-through-cte
--- @expect: served
--- @contains: Austin
--- @refute: 203.0.113.77
+-- @expect: refused
 WITH c AS (
   SELECT additional_attributes
   FROM chatwoot.contacts

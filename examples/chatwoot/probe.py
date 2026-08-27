@@ -156,6 +156,36 @@ def run_psql(
     return proc.returncode, out
 
 
+def run_psql_script(
+    host: str, port: str, db: str, user: str, script: str
+) -> tuple[int, str]:
+    env = os.environ.copy()
+    env.setdefault("PGPASSWORD", "")
+    proc = subprocess.run(
+        [
+            "psql",
+            "-h",
+            host,
+            "-p",
+            port,
+            "-U",
+            user,
+            "-d",
+            db,
+            "-X",
+            "-v",
+            "ON_ERROR_STOP=0",
+            "-tA",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        input=script,
+        env=env,
+    )
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
 def is_refused(output: str) -> bool:
     return "pgmask:" in output.lower()
 
@@ -185,6 +215,66 @@ def assert_direct_controls(host: str, port: str, db: str, user: str) -> bool:
     return True
 
 
+def run_protocol_checks(host: str, port: str, db: str, user: str) -> bool:
+    checks = [
+        (
+            "extended-bind-json-extract",
+            """
+SELECT additional_attributes->>'city'
+FROM chatwoot.contacts
+WHERE id = $1
+\\bind 1001
+\\g
+""",
+            ("Austin",),
+            (),
+        ),
+        (
+            "session-survives-refusal",
+            """
+SELECT jsonb_pretty(additional_attributes)
+FROM chatwoot.contacts WHERE id = 1001;
+SELECT additional_attributes->>'city'
+FROM chatwoot.contacts WHERE id = 1001;
+""",
+            ("pgmask:", "Austin"),
+            (),
+        ),
+        (
+            "mid-session-search-path-refusal",
+            """
+SET search_path TO chatwoot;
+SELECT contacts.additional_attributes->>'city' FROM contacts WHERE id = 1001;
+SELECT additional_attributes->>'city'
+FROM chatwoot.contacts WHERE id = 1001;
+""",
+            ("pgmask:", "Austin"),
+            (),
+        ),
+    ]
+    failed = 0
+    for name, script, required, forbidden in checks:
+        _code, output = run_psql_script(host, port, db, user, script)
+        problems = [f"missing {value!r}" for value in required if value not in output]
+        problems.extend(
+            f"unexpected {value!r}" for value in forbidden if value in output
+        )
+        problems.extend(
+            f"forbidden source value leaked: {value}"
+            for value in FORBIDDEN_SOURCE_VALUES
+            if value in output
+        )
+        if problems:
+            failed += 1
+            print(f"protocol {name}: FAIL")
+            for problem in problems:
+                print(f"    {problem}")
+        else:
+            print(f"protocol {name}: PASS")
+    print(f"protocol checks: {len(checks) - failed}/{len(checks)} passed")
+    return failed == 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=os.environ.get("PGHOST", "127.0.0.1"))
@@ -207,6 +297,10 @@ def main() -> int:
         )
     else:
         print("direct control: skipped (set --direct-port to prove canaries exist)")
+
+    protocols_ok = run_protocol_checks(
+        args.host, args.port, args.dbname, args.user
+    )
 
     cases = parse_queries(args.queries)
     if not cases:
@@ -274,7 +368,7 @@ def main() -> int:
         f"passed {passed}, failed {failed}; served {served}, refused {refused}, "
         f"errors {errors} of {len(cases)}"
     )
-    return 0 if failed == 0 and controls_ok else 1
+    return 0 if failed == 0 and controls_ok and protocols_ok else 1
 
 
 if __name__ == "__main__":

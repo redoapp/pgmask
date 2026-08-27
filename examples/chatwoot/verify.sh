@@ -15,12 +15,14 @@ source scripts/lib/local-postgres.sh
 
 PG_PORT=55433
 PROXY_PORT="${PGMASK_CHATWOOT_PORT:-16432}"
+POISON_PORT="${PGMASK_CHATWOOT_POISON_PORT:-16433}"
 DB=chatwoot_golden
 CONTAINER=pgmask-chatwoot-golden
 BACKEND=
 
 cleanup() {
   [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null || true
+  [[ -n "${POISON_PID:-}" ]] && kill "$POISON_PID" 2>/dev/null || true
   if [[ "${KEEP:-0}" != "1" ]]; then
     case "${BACKEND:-}" in
       podman) podman rm -f -v "$CONTAINER" >/dev/null 2>&1 || true ;;
@@ -100,3 +102,34 @@ await_proxy "$PROXY_PORT" /tmp/pgmask-chatwoot-golden.log "$PROXY_PID"
 echo "==> running query corpus"
 PGMASK_PORT="$PROXY_PORT" PGMASK_DIRECT_PORT="$PG_PORT" PGDATABASE="$DB" \
   python3 examples/chatwoot/probe.py
+
+# Negative control: the same proxy path must visibly leak the fixture's email
+# when policy explicitly releases it. Without this, a broken query, empty row
+# or driver decode could make every "no canary" assertion pass vacuously.
+POISON_CFG=/tmp/pgmask-chatwoot-poison.toml
+cat >"$POISON_CFG" <<EOF
+listen = "127.0.0.1:${POISON_PORT}"
+backend = "127.0.0.1:${PG_PORT}"
+catalog_dsn = "postgres://postgres@127.0.0.1:${PG_PORT}/${DB}"
+pseudonym_key = "chatwoot-poison-control"
+unclassified = "allow"
+opaque = "reject"
+
+[[column]]
+relation = "chatwoot.contacts"
+column = "email"
+mask = "none"
+EOF
+
+./target/debug/pgmask "$POISON_CFG" >/tmp/pgmask-chatwoot-poison.log 2>&1 &
+POISON_PID=$!
+await_proxy "$POISON_PORT" /tmp/pgmask-chatwoot-poison.log "$POISON_PID"
+poison="$(
+  psql -h 127.0.0.1 -p "$POISON_PORT" -U postgres -d "$DB" -X -tAq \
+    -c 'SELECT email FROM chatwoot.contacts WHERE id = 1001;' 2>&1
+)"
+if [[ "$poison" != *"alice.cw-canary@inbox.test"* ]]; then
+  echo "FAIL: release-policy poison control could not observe the canary"
+  exit 1
+fi
+echo "release-policy poison control: PASS (canary observable; value withheld)"
