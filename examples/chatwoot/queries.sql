@@ -43,14 +43,23 @@ ORDER BY 1;
 
 -- The operator rewrite: schema-qualify what Chatwoot generated.
 -- @id: contact-order-on-company-name
--- @expect: served
--- @contains: Canary Logistics
--- @refute: alice.cw-canary
+-- @expect: refused
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/contact.rb
 SELECT chatwoot.contacts.additional_attributes->>'company_name' AS company_name
 FROM chatwoot.contacts
 WHERE chatwoot.contacts.account_id = 1
 ORDER BY chatwoot.contacts.additional_attributes->>'company_name';
+
+-- Hostile posture knows the JSON document is masked but does not use pointer
+-- release policy to bless ORDER BY expressions. Projecting the public value
+-- without sorting is the conservative debugging rewrite.
+-- @id: contact-company-name-unsorted
+-- @expect: served
+-- @contains: Canary Logistics
+-- @refute: alice.cw-canary
+SELECT chatwoot.contacts.additional_attributes->>'company_name' AS company_name
+FROM chatwoot.contacts
+WHERE chatwoot.contacts.account_id = 1;
 
 -- @id: contact-order-on-city
 -- @expect: served
@@ -118,7 +127,7 @@ WHERE id = 1001;
 -- Custom-attribute commerce key vs SSN.
 -- @id: contact-order-id
 -- @expect: served
--- @contains: ORD-9911
+-- @refute: ORD-9911
 SELECT custom_attributes->>'order_id'
 FROM chatwoot.contacts
 WHERE id = 1001;
@@ -166,13 +175,14 @@ WHERE id = 9004;
 
 -- @id: message-email-subject
 -- @expect: served
--- @contains: missing parcel
+-- @refute: missing parcel
 SELECT content_attributes->'email'->>'subject'
 FROM chatwoot.messages
 WHERE id = 9004;
 
--- Transcript. Scrub must catch the phone; the given name in prose may remain.
--- @id: message-content-scrub
+-- Transcript text may contain names and addresses a recogniser cannot find.
+-- Metadata stays useful; the prose is wholly redacted.
+-- @id: message-content-redact
 -- @expect: served
 -- @refute: 555-867-5309
 -- @refute: alice.cw-canary
@@ -279,3 +289,177 @@ SELECT additional_attributes->>'city' AS city, count(*)
 FROM chatwoot.contacts
 GROUP BY 1
 ORDER BY 1;
+
+-- ---------------------------------------------------------------------------
+-- Incident-debugging questions: enough operational metadata to debug queues,
+-- delivery failures, routing and automations without opening transcript/PII.
+-- ---------------------------------------------------------------------------
+
+-- "Are messages failing, and which content type is affected?"
+-- @id: message-delivery-status-counts
+-- @expect: served
+-- @contains: 3|0|1
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/models/message.rb
+SELECT status, content_type, count(*)
+FROM chatwoot.messages
+GROUP BY status, content_type
+ORDER BY status, content_type;
+
+-- "Which failed row should I trace in jobs/logs?" No message body is needed.
+-- @id: failed-message-metadata
+-- @expect: served
+-- @contains: 9005|5001|3|0|User
+SELECT id, conversation_id, status, content_type, sender_type, created_at
+FROM chatwoot.messages
+WHERE status = 3
+ORDER BY created_at;
+
+-- "Is one inbox failing?" Join only released operational columns.
+-- @id: delivery-counts-by-inbox
+-- @expect: refused
+SELECT i.name, m.status, count(*)
+FROM chatwoot.messages m
+JOIN chatwoot.inboxes i ON i.id = m.inbox_id
+GROUP BY i.name, m.status
+ORDER BY i.name, m.status;
+
+-- `name` is masked on other relations, and hostile posture deliberately
+-- over-refuses by identifier spelling before result OIDs are available.
+-- Group by the released inbox id and read its name in a separate projection.
+-- @id: delivery-counts-by-inbox-id
+-- @expect: served
+-- @contains: 100|3|1
+SELECT m.inbox_id, m.status, count(*)
+FROM chatwoot.messages m
+GROUP BY m.inbox_id, m.status
+ORDER BY m.inbox_id, m.status;
+
+-- @id: inbox-name-by-id
+-- @expect: served
+-- @contains: 100|Website Widget
+SELECT id, name
+FROM chatwoot.inboxes
+WHERE id = 100;
+
+-- "How many conversations are in each workflow status?"
+-- @id: conversation-status-counts
+-- @expect: served
+-- @contains: 0|1
+SELECT status, count(*)
+FROM chatwoot.conversations
+GROUP BY status
+ORDER BY status;
+
+-- "Show the timeline envelope, not transcript contents."
+-- @id: conversation-message-envelope
+-- @expect: served
+-- @contains: 42|9001|0|0
+-- @contains: 42|9005|3|0
+SELECT c.display_id, m.id, m.status, m.content_type, m.message_type, m.created_at
+FROM chatwoot.conversations c
+JOIN chatwoot.messages m ON m.conversation_id = c.id
+WHERE c.id = 5001
+ORDER BY m.created_at;
+
+-- "What action should this automation take?" Array wildcard policy is entered
+-- through a proven integer array step.
+-- @id: automation-action-name
+-- @expect: served
+-- @contains: add_label
+SELECT actions->0->>'action_name'
+FROM chatwoot.automation_rules
+WHERE id = 70;
+
+-- Condition values can name people or customer records. The diagnostic shape
+-- (attribute/operator) is visible; the configured value is not.
+-- @id: automation-condition-shape
+-- @expect: served
+-- @contains: company_name|equal_to
+-- @refute: Canary Logistics
+SELECT conditions->0->>'attribute_key', conditions->0->>'filter_operator'
+FROM chatwoot.automation_rules
+WHERE id = 70;
+
+-- ---------------------------------------------------------------------------
+-- A real Chatwoot storage bug: `store ..., coder: JSON` can double-encode a
+-- native json/jsonb column as a JSON string scalar (chatwoot#14660).
+-- ---------------------------------------------------------------------------
+
+-- The whole cell must not reveal the encoded object. Type-placeholders emit
+-- an empty string scalar, which is enough to notice the wrong shape.
+-- @id: legacy-double-encoded-content-cell
+-- @expect: served
+-- @refute: legacy.cw-canary@inbox.test
+-- @source: https://github.com/chatwoot/chatwoot/issues/14660
+SELECT content_attributes
+FROM chatwoot.messages
+WHERE id = 9005;
+
+-- PostgreSQL extraction from the string scalar silently yields SQL NULL,
+-- matching the production bug report.
+-- @id: legacy-double-encoded-extract
+-- @expect: served
+-- @refute: legacy.cw-canary@inbox.test
+-- @source: https://github.com/chatwoot/chatwoot/issues/14660
+SELECT content_attributes->>'automation_rule_id'
+FROM chatwoot.messages
+WHERE id = 9005;
+
+-- The same Rails coder pattern is used on external_source_ids (jsonb).
+-- @id: legacy-double-encoded-external-source
+-- @expect: served
+-- @refute: slack-CANARYEXTERNAL
+-- @source: https://github.com/chatwoot/chatwoot/issues/14660
+SELECT external_source_ids
+FROM chatwoot.messages
+WHERE id = 9005;
+
+-- ---------------------------------------------------------------------------
+-- Hostile posture: projections are not the only disclosure route. These
+-- controls prove that masked PII cannot be inferred with predicates, sorting
+-- or grouping while released operational JSON remains filterable.
+-- ---------------------------------------------------------------------------
+
+-- @id: hostile-email-equality-oracle
+-- @expect: refused
+SELECT count(*)
+FROM chatwoot.contacts
+WHERE email = 'alice.cw-canary@inbox.test';
+
+-- @id: hostile-phone-order-oracle
+-- @expect: served
+-- @contains: 1002
+-- @contains: 1001
+SELECT id
+FROM chatwoot.contacts
+ORDER BY phone_number;
+
+-- @id: hostile-email-group-oracle
+-- @expect: refused
+SELECT email, count(*)
+FROM chatwoot.contacts
+GROUP BY email;
+
+-- @id: hostile-json-ip-predicate
+-- @expect: refused
+SELECT id
+FROM chatwoot.contacts
+WHERE additional_attributes->>'created_at_ip' = '203.0.113.77';
+
+-- A released operational key remains usable in the same posture.
+-- @id: hostile-released-city-predicate
+-- @expect: refused
+SELECT id, additional_attributes->>'city'
+FROM chatwoot.contacts
+WHERE additional_attributes->>'city' = 'Austin';
+
+-- Hostile posture does not reason from a JSON pointer's `none` policy while
+-- scanning predicates. Chatwoot mirrors city into a released scalar column,
+-- so this equivalent operator query remains available.
+-- @id: hostile-city-scalar-workaround
+-- @expect: served
+-- @contains: 1001|Austin
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/services/contacts/sync_attributes.rb
+SELECT id, location
+FROM chatwoot.contacts
+WHERE location = 'Austin';

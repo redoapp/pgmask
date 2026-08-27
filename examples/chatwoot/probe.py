@@ -10,19 +10,50 @@ import sys
 from dataclasses import dataclass, field
 
 
-CANARIES = (
+FORBIDDEN_SOURCE_VALUES = (
+    "Alice Canary",
     "alice.cw-canary@inbox.test",
+    "legacy.cw-canary@inbox.test",
+    "Jordan Agent",
+    "jordan.agent@acme.example",
     "+15558675309",
     "555-867-5309",
+    "widget-alice-1",
+    "conv-CANARYIDENTIFIER",
+    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "ORD-9911",
     "203.0.113.77",
-    "CANARYSTRIPE",
     "078-05-4391",
+    "VIP — billing dispute",
+    "alice_canary",
+    "alice-canary",
     "CANARYREF",
     "ch_CANARYCHARGE",
+    "tok_agent_pubsub",
     "tok_contact_pubsub_CANARY",
+    "cw-canary-msgid@inbox.test",
+    "ops@acme.example",
+    "msg-CANARYSOURCE",
+    "slack-CANARYEXTERNAL",
     "CANARYHOOK",
     "cus_CANARYSTRIPE",
+    "draft about Alice",
 )
+
+DIRECT_CONTROL_SQL = """
+SELECT row_to_json(control)::text
+FROM (
+  SELECT
+    (SELECT json_agg(a) FROM chatwoot.accounts a) AS accounts,
+    (SELECT json_agg(u) FROM chatwoot.users u) AS users,
+    (SELECT json_agg(c) FROM chatwoot.contacts c) AS contacts,
+    (SELECT json_agg(c) FROM chatwoot.conversations c) AS conversations,
+    (SELECT json_agg(ci) FROM chatwoot.contact_inboxes ci) AS contact_inboxes,
+    (SELECT json_agg(m) FROM chatwoot.messages m) AS messages,
+    (SELECT json_agg(r) FROM chatwoot.automation_rules r) AS automation_rules,
+    (SELECT json_agg(w) FROM chatwoot.webhooks w) AS webhooks
+) control
+"""
 
 
 @dataclass
@@ -128,11 +159,31 @@ def classify(output: str, code: int) -> str:
         return "error"
     return "served"
 
+def assert_direct_controls(host: str, port: str, db: str, user: str) -> bool:
+    code, output = run_psql(host, port, db, user, DIRECT_CONTROL_SQL)
+    if code != 0:
+        print(f"FAIL: direct canary control query failed: {' '.join(output.split())}")
+        return False
+    missing = [token for token in FORBIDDEN_SOURCE_VALUES if token not in output]
+    if missing:
+        print("FAIL: direct control cannot observe source values:")
+        for token in missing:
+            print(f"    {token!r}")
+        return False
+    print(
+        f"direct control: exercised {len(FORBIDDEN_SOURCE_VALUES)} "
+        "forbidden source values"
+    )
+    return True
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=os.environ.get("PGHOST", "127.0.0.1"))
     parser.add_argument("--port", default=os.environ.get("PGMASK_PORT", "16432"))
+    parser.add_argument(
+        "--direct-port", default=os.environ.get("PGMASK_DIRECT_PORT", "")
+    )
     parser.add_argument("--dbname", default=os.environ.get("PGDATABASE", "chatwoot_golden"))
     parser.add_argument("--user", default=os.environ.get("PGUSER", "postgres"))
     parser.add_argument(
@@ -140,6 +191,14 @@ def main() -> int:
         default=os.path.join(os.path.dirname(__file__), "queries.sql"),
     )
     args = parser.parse_args()
+
+    controls_ok = True
+    if args.direct_port:
+        controls_ok = assert_direct_controls(
+            args.host, args.direct_port, args.dbname, args.user
+        )
+    else:
+        print("direct control: skipped (set --direct-port to prove canaries exist)")
 
     cases = parse_queries(args.queries)
     if not cases:
@@ -150,7 +209,7 @@ def main() -> int:
     failed = 0
     served = 0
     refused = 0
-    rows = []
+    errors = 0
 
     print(f"{'id':<36} {'expect':<8} {'got':<8} result")
     print("-" * 88)
@@ -169,13 +228,15 @@ def main() -> int:
             served += 1
         elif got == "refused":
             refused += 1
+        else:
+            errors += 1
 
         problems: list[str] = []
         if got != case.expect:
             problems.append(f"expected {case.expect}, got {got}")
-        for token in CANARIES:
+        for token in FORBIDDEN_SOURCE_VALUES:
             if token in output:
-                problems.append(f"canary leaked: {token}")
+                problems.append(f"forbidden source value leaked: {token}")
         if got == "served":
             for needle in case.contains:
                 if needle not in output:
@@ -200,14 +261,12 @@ def main() -> int:
         if problems:
             for p in problems:
                 print(f"    {p}")
-        rows.append((case, got, ok, output))
-
     print("-" * 88)
     print(
-        f"passed {passed}, failed {failed}; served {served}, refused {refused} "
-        f"of {len(cases)}"
+        f"passed {passed}, failed {failed}; served {served}, refused {refused}, "
+        f"errors {errors} of {len(cases)}"
     )
-    return 0 if failed == 0 else 1
+    return 0 if failed == 0 and controls_ok else 1
 
 
 if __name__ == "__main__":

@@ -279,7 +279,7 @@ INSERT INTO chatwoot.contacts (
     ),
     0,
     'Canary',
-    'Austin, TX',
+    'Austin',
     'US'
 ),
 (
@@ -303,7 +303,7 @@ INSERT INTO chatwoot.contacts (
     ),
     0,
     'Public',
-    'Denver, CO',
+    'Denver',
     'US'
 );
 
@@ -333,7 +333,7 @@ INSERT INTO chatwoot.conversations (
         'mail_subject', 'Order ORD-9911 never arrived — Alice Canary'
     ),
     'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid,
-    NULL,
+    'conv-CANARYIDENTIFIER',
     TIMESTAMP '2026-03-14 09:30:00',
     jsonb_build_object(
         'priority_reason', 'lost_package',
@@ -422,6 +422,30 @@ INSERT INTO chatwoot.messages (
     jsonb_build_object(),
     'missing parcel',
     '{}'::jsonb
+);
+
+-- Chatwoot currently declares `store ..., coder: JSON` over native PostgreSQL
+-- json/jsonb columns. Real self-hosted data can therefore contain a JSON
+-- *string scalar* holding an encoded object (chatwoot/chatwoot#14660). Keep
+-- one such row: ordinary ->> silently returns SQL NULL, while the whole cell
+-- still contains sensitive bytes that pgmask must withhold.
+INSERT INTO chatwoot.messages (
+    id, content, account_id, inbox_id, conversation_id, message_type,
+    created_at, private, status, source_id, content_type, content_attributes,
+    sender_type, sender_id, external_source_ids, additional_attributes,
+    processed_message_content, sentiment
+) VALUES (
+    9005,
+    'Legacy automation failure for Alice Canary at alice.cw-canary@inbox.test',
+    1, 100, 5001, 1,
+    TIMESTAMP '2026-03-14 09:28:00',
+    false, 3, 'msg-CANARYSOURCE', 0,
+    to_json('{"automation_rule_id":70,"submitted_email":"legacy.cw-canary@inbox.test"}'::text),
+    'User', 10,
+    to_jsonb('{"slack":"slack-CANARYEXTERNAL"}'::text),
+    jsonb_build_object('campaign_id', NULL),
+    'Legacy automation failure for Alice Canary at alice.cw-canary@inbox.test',
+    jsonb_build_object('label', 'negative', 'score', 0.95)
 );
 
 INSERT INTO chatwoot.automation_rules (id, account_id, name, description, event_name, conditions, actions, active)

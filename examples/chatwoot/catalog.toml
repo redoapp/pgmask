@@ -15,29 +15,24 @@ pseudonym_key = "chatwoot-golden-not-for-production"
 
 unclassified = "mask"
 opaque = "reject"
+# This corpus is specifically for debugging without using predicates as a
+# character-by-character oracle over masked values. Released operational keys
+# remain filterable; masked PII in WHERE / ORDER BY / GROUP BY refuses.
+posture = "hostile"
 
 catalog_refresh_seconds = 30
-
-[[role]]
-name = "support"
-members = ["support_sam"]
 
 [[semantic_type]]
 name = "email"
 mask = "pseudonym"
-by_role = { support = "inner" }
-keep = 3
 
 [[semantic_type]]
 name = "person_name"
 mask = "redact"
-by_role = { support = "none" }
 
 [[semantic_type]]
 name = "phone"
-mask = "partial"
-keep = 4
-by_role = { support = "none" }
+mask = "pseudonym"
 
 [[semantic_type]]
 name = "ip_address"
@@ -46,6 +41,14 @@ mask = "ip-prefix"
 [[semantic_type]]
 name = "secret_token"
 mask = "null"
+
+[[semantic_type]]
+name = "external_id"
+mask = "pseudonym"
+
+[[semantic_type]]
+name = "order_id"
+mask = "pseudonym"
 
 # ---------------------------------------------------------------------------
 # chatwoot.accounts
@@ -220,7 +223,7 @@ mask = "none"
 [[column]]
 relation = "chatwoot.inboxes"
 column = "greeting_message"
-mask = "none"
+mask = "redact"
 
 [[column]]
 relation = "chatwoot.inboxes"
@@ -298,7 +301,7 @@ mask = "none"
 [[column]]
 relation = "chatwoot.contacts"
 column = "identifier"
-mask = "none"
+type = "external_id"
 
 [[column]]
 relation = "chatwoot.contacts"
@@ -313,7 +316,7 @@ column = "custom_attributes"
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
-  { pointer = "/order_id", mask = "none" },
+  { pointer = "/order_id", mask = "pseudonym", domain = "order_id" },
   { pointer = "/signed_up_at", mask = "none" },
   { pointer = "/ssn", mask = "redact" },
   { pointer = "/internal_notes", mask = "redact" },
@@ -436,12 +439,12 @@ mask = "none"
 [[column]]
 relation = "chatwoot.conversations"
 column = "uuid"
-mask = "none"
+type = "external_id"
 
 [[column]]
 relation = "chatwoot.conversations"
 column = "identifier"
-mask = "none"
+type = "external_id"
 
 [[column]]
 relation = "chatwoot.conversations"
@@ -515,7 +518,7 @@ mask = "none"
 [[column]]
 relation = "chatwoot.contact_inboxes"
 column = "source_id"
-mask = "none"
+type = "external_id"
 
 [[column]]
 relation = "chatwoot.contact_inboxes"
@@ -537,13 +540,12 @@ relation = "chatwoot.messages"
 column = "id"
 mask = "none"
 
-# Scrub is the honest mask for a support transcript: the sentence stays, the
-# identifiers it recognised do not. Names in prose still leak; that is documented
-# on the mask, not a surprise in this fixture.
+# Transcript text can contain names, addresses, and secrets that a recogniser
+# cannot identify reliably. Debug from metadata; do not release prose.
 [[column]]
 relation = "chatwoot.messages"
 column = "content"
-mask = "scrub"
+mask = "redact"
 
 [[column]]
 relation = "chatwoot.messages"
@@ -588,7 +590,7 @@ mask = "none"
 [[column]]
 relation = "chatwoot.messages"
 column = "source_id"
-mask = "none"
+type = "external_id"
 
 [[column]]
 relation = "chatwoot.messages"
@@ -603,10 +605,10 @@ json_unmatched = "type-placeholders"
 json = [
   { pointer = "/in_reply_to", mask = "none" },
   { pointer = "/submitted_email", mask = "pseudonym", domain = "email" },
-  { pointer = "/items/*/title", mask = "none" },
+  { pointer = "/items/*/title", mask = "redact" },
   { pointer = "/items/*/value", mask = "redact" },
   { pointer = "/items/*/name", mask = "none" },
-  { pointer = "/email/subject", mask = "none" },
+  { pointer = "/email/subject", mask = "redact" },
   { pointer = "/email/from", mask = "redact" },
   { pointer = "/email/message_id", mask = "redact" },
   { pointer = "/cc_emails", mask = "redact" },
@@ -640,7 +642,7 @@ json = [
 [[column]]
 relation = "chatwoot.messages"
 column = "processed_message_content"
-mask = "scrub"
+mask = "redact"
 
 [[column]]
 relation = "chatwoot.messages"
@@ -669,12 +671,12 @@ mask = "none"
 [[column]]
 relation = "chatwoot.automation_rules"
 column = "name"
-mask = "none"
+mask = "redact"
 
 [[column]]
 relation = "chatwoot.automation_rules"
 column = "description"
-mask = "none"
+mask = "redact"
 
 [[column]]
 relation = "chatwoot.automation_rules"
@@ -788,7 +790,7 @@ column = "custom_attributes"
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
-  { pointer = "/order_id", mask = "none" },
+  { pointer = "/order_id", mask = "pseudonym", domain = "order_id" },
   { pointer = "/signed_up_at", mask = "none" },
   { pointer = "/ssn", mask = "redact" },
   { pointer = "/internal_notes", mask = "redact" },

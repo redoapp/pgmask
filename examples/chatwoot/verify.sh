@@ -14,7 +14,7 @@ source scripts/lib/container.sh
 source scripts/lib/local-postgres.sh
 
 PG_PORT=55433
-PROXY_PORT=16432
+PROXY_PORT="${PGMASK_CHATWOOT_PORT:-16432}"
 DB=chatwoot_golden
 CONTAINER=pgmask-chatwoot-golden
 BACKEND=
@@ -61,16 +61,6 @@ echo "==> loading Chatwoot fixture"
 psql -h 127.0.0.1 -p "$PG_PORT" -U postgres -d "$DB" -v ON_ERROR_STOP=1 -q \
   -f examples/chatwoot/schema.sql
 
-psql -h 127.0.0.1 -p "$PG_PORT" -U postgres -d "$DB" -v ON_ERROR_STOP=1 -q -c "
-  DO \$\$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'support_sam') THEN
-      CREATE ROLE support_sam LOGIN;
-    END IF;
-  END \$\$;
-  GRANT USAGE ON SCHEMA chatwoot TO support_sam;
-  GRANT SELECT ON ALL TABLES IN SCHEMA chatwoot TO support_sam;
-"
-
 echo "==> building pgmask"
 cargo build -q -p pgmask
 
@@ -85,8 +75,16 @@ echo "==> starting pgmask on :$PROXY_PORT"
 PROXY_PID=$!
 
 await_proxy() {
-  local port="$1" log="$2"
+  local port="$1" log="$2" pid="$3"
   for _ in $(seq 1 120); do
+    # A stale listener used to make this pass even when the pgmask process
+    # above had already died with EADDRINUSE, so the corpus silently exercised
+    # an old catalog. Readiness belongs to this exact child.
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "FAIL: pgmask exited before becoming ready; $log:"
+      tail -20 "$log"
+      exit 1
+    fi
     if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
       exec 3>&- 3<&-
       return 0
@@ -97,7 +95,8 @@ await_proxy() {
   tail -20 "$log"
   exit 1
 }
-await_proxy "$PROXY_PORT" /tmp/pgmask-chatwoot-golden.log
+await_proxy "$PROXY_PORT" /tmp/pgmask-chatwoot-golden.log "$PROXY_PID"
 
 echo "==> running query corpus"
-PGMASK_PORT="$PROXY_PORT" PGDATABASE="$DB" python3 examples/chatwoot/probe.py
+PGMASK_PORT="$PROXY_PORT" PGMASK_DIRECT_PORT="$PG_PORT" PGDATABASE="$DB" \
+  python3 examples/chatwoot/probe.py
