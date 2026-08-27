@@ -197,7 +197,7 @@ VALUES (
     1,
     'Acme Support',
     0,
-    'acme.example',
+    'RT2CANARY-tenant.example',
     'help@acme.example',
     jsonb_build_object(
         'auto_resolve_after', 120,
@@ -254,7 +254,7 @@ VALUES (
     ),
     jsonb_build_object(
         'display_type', 'emoji',
-        'message', 'How was your chat?'
+        'message', 'Rate us RT2CANARY-csat-email@leak.test'
     )
 ),
 (
@@ -379,11 +379,11 @@ INSERT INTO chatwoot.conversations (
     'conv-CANARYIDENTIFIER',
     TIMESTAMP '2026-03-14 09:30:00',
     jsonb_build_object(
-        'priority_reason', 'lost_package',
+        'priority_reason', 'lost_package RT2CANARY-priority',
         'stripe_charge', 'ch_CANARYCHARGE'
     ),
     TIMESTAMP '2026-03-14 09:25:00',
-    ARRAY['billing', 'shipping']::character varying[]
+    ARRAY['billing', 'shipping', 'RT2CANARY-alice-label']::character varying[]
 );
 
 INSERT INTO chatwoot.contact_inboxes (id, contact_id, inbox_id, source_id, hmac_verified, pubsub_token)
@@ -408,9 +408,9 @@ INSERT INTO chatwoot.messages (
     TIMESTAMP '2026-03-14 09:22:10',
     false, 0, 0,
     json_build_object(
-        'in_reply_to', NULL,
-        'items', json_build_array(
-            json_build_object('title', 'Track package', 'value', 'track')
+        'in_reply_to', json_build_object('thread', 'INREPLY-NESTED-CANARY'),
+        'items',         json_build_array(
+            json_build_object('title', 'Track package', 'value', 'track', 'name', 'RT2CANARY-item-name@leak.test')
         )
     ),
     'Contact', 1001,
@@ -528,7 +528,7 @@ VALUES (
     1,
     'https://hooks.acme.example/chatwoot?secret=CANARYHOOK',
     0,
-    '["conversation_status_changed", "message_created"]'::jsonb
+    '["conversation_status_changed", "RT2CANARY-hook-event"]'::jsonb
 );
 
 INSERT INTO chatwoot.custom_attribute_definitions (
@@ -552,7 +552,7 @@ INSERT INTO chatwoot.custom_attribute_definitions (
 );
 
 INSERT INTO chatwoot.tags (id, name, taggings_count)
-VALUES (301, 'billing', 1), (302, 'shipping', 1);
+VALUES (301, 'billing', 1), (302, 'shipping', 1), (303, 'RT2CANARY-customer-tag', 0);
 
 INSERT INTO chatwoot.taggings (
     id, tag_id, taggable_type, taggable_id, tagger_type, tagger_id, context, created_at

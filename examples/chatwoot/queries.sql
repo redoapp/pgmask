@@ -210,7 +210,7 @@ WHERE id = 9004;
 -- not. This is the pre-chat form shape used by Message store accessors.
 -- @id: message-content-attributes-blob
 -- @expect: served
--- @contains: "name":"email"
+-- @contains: "name":"***"
 -- @refute: alice.cw-canary@inbox.test
 SELECT content_attributes
 FROM chatwoot.messages
@@ -266,10 +266,11 @@ FROM chatwoot.conversations
 WHERE id = 5001;
 
 -- IMAP threading data is useful as a presence/shape diagnosis but the message
--- id itself is external customer data.
+-- id itself is external customer data. Channel `source` is unmatched so a
+-- later object-shaped value cannot inherit `none`.
 -- @id: conversation-email-routing-json
 -- @expect: served
--- @contains: email
+-- @contains: false
 -- @refute: thread-CANARY@inbox.test
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/mailboxes/imap/imap_mailbox.rb
 SELECT additional_attributes->>'source',
@@ -828,10 +829,11 @@ FROM chatwoot.contacts
 WHERE id = 1001;
 
 -- Known inbox config remains useful after changing unknown leaves to
--- type-placeholders.
+-- type-placeholders. CSAT copy is tenant prose and is redacted.
 -- @id: inbox-csat-config
 -- @expect: served
--- @contains: emoji|How was your chat?
+-- @contains: emoji|***
+-- @refute: RT2CANARY-csat-email@leak.test
 SELECT csat_config->>'display_type', csat_config->>'message'
 FROM chatwoot.inboxes
 WHERE id = 100;
@@ -1319,10 +1321,12 @@ WITH contact_row AS (
 )
 SELECT additional_attributes FROM contact_row;
 
--- Released array predicates remain useful; only SRF/expression output refuses.
+-- Labels are tenant-controlled and often customer-identifying. The array
+-- is nulled (varchar[] cannot use redact); membership is a hostile oracle.
 -- @id: label-list-any
--- @expect: served
--- @contains: 5001
+-- @expect: refused
+-- @direct_expect: served
+-- @direct_contains: 5001
 SELECT id
 FROM chatwoot.conversations
 WHERE 'billing' = ANY (label_list);
@@ -1498,3 +1502,52 @@ SELECT support_email FROM chatwoot.accounts WHERE id = 1;
 -- @expect: served
 -- @refute: bob.ops@vendor.example
 SELECT email FROM chatwoot.contacts WHERE id = 1002;
+
+-- Second-pass catalog grants: tenant-controlled `none` leaves.
+-- @id: account-domain-redact
+-- @expect: served
+-- @contains: ***
+-- @refute: RT2CANARY-tenant.example
+SELECT domain FROM chatwoot.accounts WHERE id = 1;
+
+-- @id: items-name-redact
+-- @expect: served
+-- @contains: ***
+-- @refute: RT2CANARY-item-name@leak.test
+SELECT content_attributes->'items'->0->>'name'
+FROM chatwoot.messages
+WHERE id = 9001;
+
+-- @id: in-reply-to-unmatched-object
+-- @expect: served
+-- @contains: "thread":""
+-- @refute: INREPLY-NESTED-CANARY
+SELECT content_attributes->'in_reply_to'
+FROM chatwoot.messages
+WHERE id = 9001;
+
+-- @id: webhook-subscriptions-placeholder
+-- @expect: served
+-- @contains: ""
+-- @refute: RT2CANARY-hook-event
+SELECT subscriptions FROM chatwoot.webhooks WHERE id = 3;
+
+-- @id: conversation-label-list-null
+-- @expect: served
+-- @contains: [NULL]
+-- @refute: RT2CANARY-alice-label
+SELECT label_list FROM chatwoot.conversations WHERE id = 5001;
+
+-- @id: tag-name-redact
+-- @expect: served
+-- @contains: ***
+-- @refute: RT2CANARY-customer-tag
+SELECT name FROM chatwoot.tags WHERE id = 303;
+
+-- @id: priority-reason-redact
+-- @expect: served
+-- @contains: ***
+-- @refute: RT2CANARY-priority
+SELECT custom_attributes->>'priority_reason'
+FROM chatwoot.conversations
+WHERE id = 5001;

@@ -34,6 +34,8 @@ ids, SSNs, Stripe ids, device fingerprints, or checkout referer tokens.
 | Contact/channel/conversation/message/order ids | domain-separated pseudonyms |
 | Widget public keys (`company_name`, `city`, browser family/version, …) | `mask = "json"` pointer `none` |
 | Widget device name | redact |
+| CSAT `/message`, pre-chat item `name`, conversation `/source` | redact / unmatched (not parent `none`) |
+| Widget device name | redact |
 | `created_at_ip` | `ip-prefix` |
 | `referer`, `mail_subject`, email subject, SSN, Stripe ids | redact |
 | Evolving custom keys | `json_unmatched = "type-placeholders"` |
@@ -46,7 +48,7 @@ rather than a type-aware-fallback refusal.
 ## Corpus
 
 [queries.sql](queries.sql) is the pin. Each case declares `@expect: served`,
-`refused`, or `error`. [probe.py](probe.py) first proves **48 forbidden source
+`refused`, or `error`. [probe.py](probe.py) first proves **55 forbidden source
 values** are observable directly, then scans every proxied result for them.
 `verify.sh` also starts a deliberately releasing second proxy: the poison
 control must expose the email or the leak detector is not trusted.
@@ -121,3 +123,7 @@ Other runbook lessons found by the live corpus:
   the widget later grew. Release `/initiated_at/timestamp` only.
   `action_params` cannot be released just because `add_label` is ops-shaped;
   Chatwoot also stores `send_message` prose there.
+- CSAT `/message`, pre-chat `/items/*/name`, conversation `/source`, and
+  webhook `subscriptions/*` were the same parent-`none` class. Column
+  `none` on `label_list` (varchar[] → `null`), `tags.name`, `accounts.domain`,
+  and `priority_reason` forwarded tenant free text. Filter labels by tag id.
