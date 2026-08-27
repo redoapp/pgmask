@@ -8,6 +8,10 @@
   `publish = false` is unchanged: this is an application, not a crates.io
   crate. Internal binaries (`spike`, `bench`, `corpus`, `fuzz`) are not
   shipped.
+- Stop treating a `@` byte in the full wire transcript as an email leak.
+  `BackendKeyData`'s cancel secret is random; a 0x40 there failed
+  `multi_statement_simple_query_stays_masked` on CI. The pin is the email
+  canary.
 
 ## 0.2.0 — structure-aware JSON and JSONB masking
 

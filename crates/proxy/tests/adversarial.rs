@@ -2491,11 +2491,12 @@ async fn multi_statement_simple_query_stays_masked() -> Result<()> {
         "multi-statement is fail-closed today; a served result set here is a \
          mispairing that must be proven masked, not assumed:\n{text}"
     );
-    // And the leak direction, named explicitly: the released `city` in the
-    // first set must not become the plan that serves `email` in the second.
+    // The email canary has no `@`. Scanning the whole buffer for `@` also
+    // matches BackendKeyData: the cancel secret is eight random bytes, and a
+    // 0x40 there failed this test on CI while no DataRow had crossed.
     assert!(
-        !text.contains("@"),
-        "no address slot may carry a value:\n{text}"
+        !text.contains(CANARY_EMAIL),
+        "the email statement must not serve its canary under the city plan:\n{text}"
     );
     Ok(())
 }
