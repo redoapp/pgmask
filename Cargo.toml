@@ -17,6 +17,11 @@ exclude = ["fuzz"]
 # a panic kills one session, a wrapped integer silently masks the wrong value.
 overflow-checks = true
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [workspace.lints.rust]
 # Zero today, and there is no reason for this crate ever to need it.
 unsafe_code = "forbid"
@@ -34,11 +39,12 @@ indexing_slicing = "warn"
 arithmetic_side_effects = "warn"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT"
 publish = false
+repository = "https://github.com/redoapp/pgmask"
 
 [workspace.dependencies]
 anyhow = "1"

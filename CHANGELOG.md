@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — GitHub Releases with attested binaries
+
+- Ship `pgmask` and `classify` on GitHub Releases via cargo-dist. Pushing a
+  `vX.Y.Z` tag builds native archives for `x86_64` and `aarch64` Linux (gnu)
+  and macOS, a shell installer, checksums, and GitHub artifact attestations.
+  `publish = false` is unchanged: this is an application, not a crates.io
+  crate. Internal binaries (`spike`, `bench`, `corpus`, `fuzz`) are not
+  shipped.
+
 ## 0.2.0 — structure-aware JSON and JSONB masking
 
 - Ship the unreleased 0.1.99 JSON and catalog work as a minor version.
