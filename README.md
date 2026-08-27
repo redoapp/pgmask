@@ -12,24 +12,29 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.2.2**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.2.3**. Licensed under the [MIT License](LICENSE).
 
 ## Install
 
 Prebuilt `pgmask` and `classify` binaries for Linux and macOS (amd64 and
 arm64) are attached to [GitHub Releases](https://github.com/redoapp/pgmask/releases).
-The shell installer places them in `CARGO_HOME/bin` (`~/.cargo/bin` by default):
+The shell installer places them in `CARGO_HOME/bin` (`~/.cargo/bin` by default).
+Pin the tag, then confirm the binary:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/redoapp/pgmask/releases/latest/download/pgmask-installer.sh | sh
+  https://github.com/redoapp/pgmask/releases/download/v0.2.3/pgmask-installer.sh | sh
+pgmask --version
 ```
 
 `classify` is a separate artifact (`classify-installer.sh` on the same
-release). Verify a downloaded archive against GitHub's build provenance:
+release). Each GitHub Release also carries a CycloneDX SBOM. Verify an
+archive against GitHub's build provenance, and the ELF against rustsec
+once you have `cargo audit`:
 
 ```bash
 gh attestation verify pgmask-x86_64-unknown-linux-gnu.tar.xz --repo redoapp/pgmask
+cargo audit bin pgmask
 ```
 
 Or build from source with Rust 1.97.1 (`rust-toolchain.toml` pins that

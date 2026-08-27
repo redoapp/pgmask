@@ -23,6 +23,7 @@
 //! catalog belongs to whoever deploys the proxy, see docs/responsibilities.md.
 //!
 //! Usage:
+//!   classify --version
 //!   DSN=postgres://... cargo run -p classify -- --schema public [--sample 200]
 //!   DSN=postgres://... cargo run -p classify -- --check --catalog catalog.toml --schema public
 
@@ -516,8 +517,19 @@ struct Proposal {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let dsn = std::env::var("DSN").context("DSN is required")?;
     let args: Vec<String> = std::env::args().collect();
+    if wants_version(&args) {
+        println!("classify {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if wants_help(&args) {
+        println!(
+            "usage: classify [--version] [--schema NAME] [--sample N]\n       \
+             classify --check --catalog PATH [--schema NAME]"
+        );
+        return Ok(());
+    }
+    let dsn = std::env::var("DSN").context("DSN is required")?;
     let schema = arg(&args, "--schema").unwrap_or_else(|| "public".into());
     let sample: usize = arg(&args, "--sample")
         .and_then(|v| v.parse().ok())
@@ -1298,6 +1310,18 @@ fn toml_basic_string(value: &str) -> String {
     quoted
 }
 
+fn wants_flag(args: &[String], long: &str, short: &str) -> bool {
+    args.iter().skip(1).any(|a| a == long || a == short)
+}
+
+fn wants_version(args: &[String]) -> bool {
+    wants_flag(args, "--version", "-V")
+}
+
+fn wants_help(args: &[String]) -> bool {
+    wants_flag(args, "--help", "-h")
+}
+
 fn arg(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
@@ -1315,6 +1339,17 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::*;
+
+    #[test]
+    fn version_and_help_flags_are_recognised_without_a_dsn() {
+        assert!(wants_version(&["classify".into(), "--version".into()]));
+        assert!(wants_help(&["classify".into(), "-h".into()]));
+        assert!(!wants_version(&[
+            "classify".into(),
+            "--schema".into(),
+            "public".into()
+        ]));
+    }
 
     #[test]
     fn toml_identifier_quoting_handles_postgres_quoted_names() {

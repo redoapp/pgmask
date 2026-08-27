@@ -37,3 +37,11 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
+
+# Vulnerabilities already fail this check when `[advisories]` is omitted.
+# Spell the rest so yanked crates and unmaintained/unsound deps cannot
+# quietly warn their way into a release binary.
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"

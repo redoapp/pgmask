@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 — version flags and artifact supply chain
+
+- Print `pgmask --version` and `classify --version` from `CARGO_PKG_VERSION` so
+  an installed binary names the release it came from without a config file or
+  DSN.
+- Embed the crate graph in release ELFs (`cargo auditable`) and attach a
+  CycloneDX SBOM to the GitHub Release. `cargo deny` now fails on yanked,
+  unmaintained, and unsound crates, not only on vulnerabilities, unknown
+  licenses, and unknown sources.
+
 ## 0.2.2 — smaller dist binaries
 
 - Build GitHub Release artifacts with fat LTO, one codegen unit, and symbol

@@ -27,6 +27,11 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 packages = ["pgmask", "classify"]
 # Build only the required packages, and individually
 precise-builds = true
+# Embed the crate graph in each ELF (`cargo audit bin`) and attach a CycloneDX
+# SBOM to the GitHub Release. Size cost is small; both are for the artifact,
+# not only the checkout.
+cargo-auditable = true
+cargo-cyclonedx = true
 
 # Pin the same checkout action the rest of CI already uses.
 [dist.github-action-commits]
