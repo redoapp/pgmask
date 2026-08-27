@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2 — smaller dist binaries
+
+- Build GitHub Release artifacts with fat LTO, one codegen unit, and symbol
+  stripping. On x86_64-linux-gnu that takes `pgmask` from 23 MiB unstripped
+  (18 MiB after a post-link strip) to 12 MiB, and `classify` from 7.7 MiB to
+  4.4 MiB. Overflow checks and unwinding stay on: a panic still kills one
+  session, and wrapping integer arithmetic is how `floor_to` silently masked
+  the wrong value.
+
 ## 0.2.1 — GitHub Releases with attested binaries
 
 - Ship `pgmask` and `classify` on GitHub Releases via cargo-dist. Pushing a

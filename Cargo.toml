@@ -17,10 +17,18 @@ exclude = ["fuzz"]
 # a panic kills one session, a wrapped integer silently masks the wrong value.
 overflow-checks = true
 
-# The profile that 'dist' will build with
+# The profile that 'dist' will build with.
+# Thin LTO left a 23 MiB unstripped ELF (18 MiB after `strip --strip-unneeded`).
+# Most of .text is libpg_query's bison tables plus sqlparser (lineage) and
+# ring. Fat LTO + one codegen unit lets LLVM drop more of that; strip removes
+# the symbol table operators do not need. Keep unwind and overflow-checks:
+# a panic still kills one session, and wrapping integer arithmetic is how
+# floor_to silently masked the wrong value.
 [profile.dist]
 inherits = "release"
-lto = "thin"
+lto = "fat"
+codegen-units = 1
+strip = true
 
 [workspace.lints.rust]
 # Zero today, and there is no reason for this crate ever to need it.
@@ -39,7 +47,7 @@ indexing_slicing = "warn"
 arithmetic_side_effects = "warn"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT"
