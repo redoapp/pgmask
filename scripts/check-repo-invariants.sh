@@ -172,6 +172,22 @@ for v in $released; do
 done
 [ -z "$missing" ] || note "released versions with no tag:$missing"
 
+# cargo-dist 0.32.0's generated cyclonedx step never uploads SBOMs
+# (`steps.cargo-cyclonedx.output.paths` is empty). Dist extra-artifacts
+# carry ours instead; turning the generator back on would regenerate
+# the broken step, and a missing script would fail a tag build after
+# the binaries are already compiled.
+if grep -q 'cargo-cyclonedx' .github/workflows/release.yml; then
+  note "release.yml still contains cargo-dist's cyclonedx job; that 0.32 path does not upload SBOMs"
+fi
+if grep -q '^cargo-cyclonedx = true' dist-workspace.toml; then
+  note "cargo-cyclonedx = true regenerates the broken SBOM upload in release.yml"
+fi
+if grep -q 'generate-sboms' dist-workspace.toml; then
+  [ -x scripts/generate-sboms.sh ] ||
+    note "dist extra-artifacts name generate-sboms.sh, which is missing or not executable"
+fi
+
 [ "$fail" = 0 ] &&
   echo "repo invariants ok: v$cargo_version, $total entries, descending, seeds tracked"
 exit "$fail"

@@ -28,9 +28,10 @@ pgmask --version
 ```
 
 `classify` is a separate artifact (`classify-installer.sh` on the same
-release). Each GitHub Release also carries a CycloneDX SBOM. Verify an
-archive against GitHub's build provenance, and the ELF against rustsec
-once you have `cargo audit`:
+release). Each GitHub Release also carries CycloneDX SBOMs
+(`pgmask.cdx.xml`, `classify.cdx.xml`). Verify an archive against
+GitHub's build provenance, and the ELF against rustsec once you have
+`cargo audit`:
 
 ```bash
 gh attestation verify pgmask-x86_64-unknown-linux-gnu.tar.xz --repo redoapp/pgmask
