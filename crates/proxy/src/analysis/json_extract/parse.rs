@@ -2,10 +2,12 @@
 //!
 //! Attribution (FROM ranges, unique owner) stays in the parent module. This
 //! file only decides whether an expression is a chain of literal `->` / `->>` /
-//! `#>` / `#>>` / `json[b]_extract_path[_text]` keys.
+//! `#>` / `#>>` / `json[b]_extract_path[_text]` keys, or a literal JSONB
+//! subscript form (`payload['profile']['email']`). Subscript navigation stays
+//! ambiguous because PostgreSQL dispatches it from the runtime parent.
 
 use pg_query::protobuf::node::Node as NodeEnum;
-use pg_query::protobuf::{AExpr, FuncCall, Node};
+use pg_query::protobuf::{AExpr, AIndirection, FuncCall, Node};
 
 use super::super::names::{function_name, JSON_EXTRACT_FUNCTIONS};
 use super::{JsonExtract, JsonExtractColumn, JsonExtractPathSegment, JsonPathNavigation};
@@ -29,8 +31,49 @@ pub(super) fn parse_extract(expr: &NodeEnum, depth: usize) -> Option<JsonExtract
             .and_then(|inner| parse_extract(inner, depth.saturating_add(1))),
         NodeEnum::AExpr(aexpr) => parse_operator_extract(aexpr, depth),
         NodeEnum::FuncCall(call) => parse_function_extract(call, depth),
+        NodeEnum::AIndirection(ind) => parse_indirection_extract(ind, depth),
         _ => None,
     }
+}
+
+/// Parse the literal path from `payload['a'][0]`.
+///
+/// PostgreSQL JSONB subscripting returns `jsonb`, not text, so the result can
+/// still be walked. Slices (`[1:3]`) and composite field names (`(row).col`)
+/// are not pointer steps.
+fn parse_indirection_extract(ind: &AIndirection, depth: usize) -> Option<JsonExtract> {
+    let mut key_segments = Vec::with_capacity(ind.indirection.len());
+    for part in &ind.indirection {
+        key_segments.push(parse_subscript_index(part.node.as_ref()?)?);
+    }
+    if key_segments.is_empty() {
+        return None;
+    }
+    let left = ind.arg.as_ref()?.node.as_ref()?;
+    finish_extract(left, key_segments, false, depth)
+}
+
+fn parse_subscript_index(expr: &NodeEnum) -> Option<JsonExtractPathSegment> {
+    let NodeEnum::AIndices(idx) = expr else {
+        return None;
+    };
+    if idx.is_slice || idx.lidx.is_some() {
+        return None;
+    }
+    // Do not peel casts here. PostgreSQL dispatches subscripting by the
+    // post-cast type: `'0'::int` is array navigation, while `0::text` is an
+    // object key. Classifying from the inner AConst would invert that fact and
+    // could skip an array-wildcard policy. Bare constants are the complete
+    // allowlist until the cast target itself is interpreted.
+    parse_single_key(idx.uidx.as_ref()?.node.as_ref()?).map(|mut segment| {
+        // Unlike `->`, JSONB subscripting dispatches both bare `0` and `'0'`
+        // from the runtime parent: on an array they select index 0; on an
+        // object they select key "0". Syntax therefore proves neither shape.
+        // The trie may follow exact edges, but any reachable `*` edge makes
+        // planning refuse rather than guess.
+        segment.navigation = JsonPathNavigation::Ambiguous;
+        segment
+    })
 }
 
 fn parse_operator_extract(aexpr: &AExpr, depth: usize) -> Option<JsonExtract> {

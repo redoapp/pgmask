@@ -269,7 +269,8 @@ mapping.
   functions are rejected unless a conservative rule proves them safe. JSON
   operators (`->`, `->>`, JSONPath), constructors, and aggregates over a
   classified JSON column are refused unless they are a **literal extract**
-  (`->`, `->>`, `#>`/`#>>`, `json[b]_extract_path[_text]`) of one
+  (`->`, `->>`, `#>`/`#>>`, JSONB subscripting,
+  `json[b]_extract_path[_text]`) of one
   schema-qualified column, in which case that column's pointer policy is
   applied to the result. JSONPath, constructors, and aggregates stay refused.
   See [JSON and JSONB masking](docs/json-masking.md).

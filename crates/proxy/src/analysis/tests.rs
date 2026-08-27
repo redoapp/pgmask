@@ -1059,6 +1059,121 @@ fn collated_json_extract_keeps_the_same_shape_and_attribution() {
 }
 
 #[test]
+fn json_subscripting_keeps_runtime_dependent_navigation_ambiguous() {
+    let inspection =
+        StatementInspection::new("SELECT payload['profile']['email'] FROM canary.documents");
+    assert_eq!(
+        inspection.output_safety(1, ALLOW_ALL),
+        vec![Safety::JsonExtract]
+    );
+    let resolution = inspection.json_extract_resolution(1).unwrap();
+    match &resolution.fields()[0] {
+        JsonExtractArgument::Extract(extract) => {
+            assert!(
+                !extract.as_text,
+                "JSON subscripting returns json/jsonb, not text"
+            );
+            assert_eq!(extract.column.column_name(), "payload");
+            assert_eq!(
+                extract
+                    .path
+                    .iter()
+                    .map(|s| (s.value.as_str(), s.navigation))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("profile", JsonPathNavigation::Ambiguous),
+                    ("email", JsonPathNavigation::Ambiguous)
+                ]
+            );
+        }
+        JsonExtractArgument::Unattributable => panic!("expected subscript extract"),
+    }
+
+    let inspection = StatementInspection::new("SELECT payload['items'][0] FROM canary.documents");
+    match &inspection.json_extract_resolution(1).unwrap().fields()[0] {
+        JsonExtractArgument::Extract(extract) => {
+            assert_eq!(extract.path[0].navigation, JsonPathNavigation::Ambiguous);
+            assert_eq!(extract.path[1].value, "0");
+            assert_eq!(extract.path[1].navigation, JsonPathNavigation::Ambiguous);
+        }
+        JsonExtractArgument::Unattributable => panic!("expected integer subscript"),
+    }
+
+    let inspection = StatementInspection::new("SELECT payload['items']['0'] FROM canary.documents");
+    match &inspection.json_extract_resolution(1).unwrap().fields()[0] {
+        JsonExtractArgument::Extract(extract) => {
+            assert_eq!(extract.path[1].navigation, JsonPathNavigation::Ambiguous);
+        }
+        JsonExtractArgument::Unattributable => panic!("expected quoted-zero subscript"),
+    }
+
+    let mixed =
+        StatementInspection::new("SELECT payload['profile']->>'email' FROM canary.documents");
+    match &mixed.json_extract_resolution(1).unwrap().fields()[0] {
+        JsonExtractArgument::Extract(extract) => {
+            assert!(extract.as_text);
+            assert_eq!(
+                extract
+                    .path
+                    .iter()
+                    .map(|s| s.value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["profile", "email"]
+            );
+        }
+        JsonExtractArgument::Unattributable => panic!("expected mixed subscript then ->>"),
+    }
+
+    let mixed =
+        StatementInspection::new("SELECT (payload->'profile')['email'] FROM canary.documents");
+    match &mixed.json_extract_resolution(1).unwrap().fields()[0] {
+        JsonExtractArgument::Extract(extract) => {
+            assert!(!extract.as_text);
+            assert_eq!(
+                extract
+                    .path
+                    .iter()
+                    .map(|s| s.value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["profile", "email"]
+            );
+        }
+        JsonExtractArgument::Unattributable => panic!("expected mixed -> then subscript"),
+    }
+
+    assert_eq!(
+        StatementInspection::new("SELECT payload[1:3] FROM canary.documents")
+            .output_safety(1, ALLOW_ALL),
+        vec![Safety::Unknown]
+    );
+    assert_eq!(
+        StatementInspection::new("SELECT payload[id::text] FROM canary.documents")
+            .json_extract_resolution(1)
+            .unwrap()
+            .fields(),
+        vec![JsonExtractArgument::Unattributable]
+    );
+    for sql in [
+        "SELECT payload['items']['0'::int] FROM canary.documents",
+        "SELECT payload['numeric_object'][0::text] FROM canary.documents",
+    ] {
+        assert_eq!(
+            StatementInspection::new(sql).output_safety(1, ALLOW_ALL),
+            vec![Safety::Unknown],
+            "post-cast subscript type must not be inferred from its literal: {sql}"
+        );
+        assert_eq!(
+            StatementInspection::new(sql)
+                .json_extract_resolution(1)
+                .unwrap()
+                .fields(),
+            vec![JsonExtractArgument::Unattributable],
+            "casted subscript must remain opaque: {sql}"
+        );
+    }
+}
+
+#[test]
 fn json_extract_resolution_requires_schema_and_literal_keys() {
     assert!(
         StatementInspection::new("SELECT payload->>'x' FROM documents")

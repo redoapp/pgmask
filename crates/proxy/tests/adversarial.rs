@@ -734,6 +734,40 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             poison: Some(CANARY_EMAIL),
         },
         JsonSqlValueCase {
+            name: "subscripted profile object",
+            sql: "SELECT payload['profile'] FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!({
+                "email": CANARY_EMAIL,
+                "name": CANARY_NAME
+            })),
+            masked: JsonSqlValue::Json(serde_json::json!({
+                "email": partial_email,
+                "name": "***"
+            })),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "chained subscripted email leaf stays json",
+            sql: "SELECT payload['profile']['email'] FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!(CANARY_EMAIL)),
+            masked: JsonSqlValue::Json(serde_json::json!(partial_email)),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "subscript then text operator",
+            sql: "SELECT payload['profile']->>'email' FROM canary.documents",
+            direct: JsonSqlValue::Text(CANARY_EMAIL),
+            masked: JsonSqlValue::Text(partial_email),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "operator then subscript",
+            sql: "SELECT (payload->'profile')['email'] FROM canary.documents",
+            direct: JsonSqlValue::Json(serde_json::json!(CANARY_EMAIL)),
+            masked: JsonSqlValue::Json(serde_json::json!(partial_email)),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
             name: "quoted numeric object key never inherits array wildcard",
             sql: "SELECT payload->'numeric_object'->'0'->>'token' FROM canary.documents",
             direct: JsonSqlValue::Text(CANARY_TEMP),
@@ -946,7 +980,11 @@ async fn json_unmatched_none_releases_only_unlisted_extracts_by_configuration() 
         "canary.documents",
         "payload",
         pgmask::mask::JsonUnmatched::None,
-        vec![json_field("/profile/email", pgmask::mask::Mask::Redact)],
+        vec![
+            json_field("/profile/email", pgmask::mask::Mask::Redact),
+            json_field("/items/*/token", pgmask::mask::Mask::Redact),
+            json_field("/numeric_object/*/token", pgmask::mask::Mask::Redact),
+        ],
     ));
     let proxy = start_proxy(DB, rules).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
@@ -981,6 +1019,41 @@ async fn json_unmatched_none_releases_only_unlisted_extracts_by_configuration() 
         vec![vec![Some("***".into())]],
         "explicit pointer must override unmatched release"
     );
+
+    // The runtime parent and post-cast type decide subscript navigation.
+    // PostgreSQL uses both bare `0` and `'0'` as index 0 under an array and key
+    // "0" under an object. Casts add another inversion: `'0'::int` is an array
+    // index while `0::text` is an object key. Under this unmatched-release
+    // policy, claiming either shape can release the token instead of applying
+    // the explicit wildcard or refusing.
+    for (name, sql) in [
+        (
+            "quoted integer under runtime array",
+            "SELECT payload['items']['0']->>'token' FROM canary.documents",
+        ),
+        (
+            "integer under runtime object",
+            "SELECT payload['numeric_object'][0]->>'token' FROM canary.documents",
+        ),
+        (
+            "string literal cast to array index",
+            "SELECT payload['items']['0'::int]->>'token' FROM canary.documents",
+        ),
+        (
+            "integer literal cast to object key",
+            "SELECT payload['numeric_object'][0::text]->>'token' FROM canary.documents",
+        ),
+    ] {
+        let direct = simple_query_direct(DB, sql).await?;
+        assert_eq!(
+            direct,
+            vec![vec![Some(CANARY_TEMP.into())]],
+            "{name} poison control"
+        );
+        let refused = simple_query_round(&mut client, sql).await?;
+        assert_refused_bytes(&refused.received, name);
+        assert_no_canary_bytes(&refused.received, name);
+    }
     Ok(())
 }
 
@@ -1038,6 +1111,11 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
         (
             "negative array index",
             "SELECT payload->'items'->-1->>'token' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "negative array subscript",
+            "SELECT payload['items'][-1]->>'token' FROM canary.documents",
             CANARY_TEMP,
         ),
         (
@@ -1176,9 +1254,30 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
             CANARY_EMAIL,
         ),
         (
-            "JSON subscripting",
-            "SELECT payload['profile']['email'] FROM canary.documents",
-            CANARY_EMAIL,
+            "JSON subscript dynamic key",
+            "SELECT payload[CASE WHEN id = 1 THEN 'unknown' ELSE 'public' END] \
+             FROM canary.documents",
+            CANARY_NOTE,
+        ),
+        (
+            "integer subscript at array wildcard",
+            "SELECT payload['items'][0]->>'token' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "quoted integer subscript at array wildcard",
+            "SELECT payload['items']['0']->>'token' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "integer subscript at numeric object wildcard",
+            "SELECT payload['numeric_object'][0]->>'token' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "quoted integer subscript at numeric object wildcard",
+            "SELECT payload['numeric_object']['0']->>'token' FROM canary.documents",
+            CANARY_TEMP,
         ),
         (
             "json to jsonb cast",
@@ -1375,6 +1474,25 @@ async fn json_sql_search_path_binary_and_hostile_posture() -> Result<()> {
         projection.text_rows()?,
         vec![vec![Some("***************b2c3".into())]],
         "hostile posture must still return the exact pointer mask"
+    );
+
+    let subscript_projection = simple_query_round(
+        &mut hostile_client,
+        "SELECT payload['profile']->>'email' FROM canary.documents",
+    )
+    .await?;
+    assert_served(
+        &subscript_projection.messages,
+        "hostile literal JSON subscript",
+    );
+    assert_no_canary_bytes(
+        &subscript_projection.received,
+        "hostile literal JSON subscript",
+    );
+    assert_eq!(
+        subscript_projection.text_rows()?,
+        vec![vec![Some("***************b2c3".into())]],
+        "hostile posture must credit the subscript's source column"
     );
 
     let predicate_sql = "SELECT payload->'profile'->>'email' FROM canary.documents \

@@ -1,13 +1,15 @@
 //! Allowlisted JSON/JSONB extraction shapes.
 //!
-//! `->` / `->>` / `#>` / `#>>` and the `json[b]_extract_path[_text]` names erase
-//! `RowDescription` provenance, so a classified document would otherwise be
-//! refused as opaque. This module names the shapes whose extract path is a
-//! sequence of *literals*, so policy can apply the same pointer rule the
-//! stored column would have used.
+//! `->` / `->>` / `#>` / `#>>`, JSONB subscripting (`payload['a']`), and the
+//! `json[b]_extract_path[_text]` names erase `RowDescription` provenance, so a
+//! classified document would otherwise be refused as opaque. This module names
+//! the shapes whose extract path is a sequence of *literals*, so policy can
+//! apply the same pointer rule the stored column would have used. Subscript
+//! steps stay runtime-shape-ambiguous and refuse at a reachable array wildcard.
 //!
-//! Incomplete analysis stays refusal. Dynamic keys (`payload->col`), JSONPath,
-//! set-returning unnesting, and constructors are not on the list.
+//! Incomplete analysis stays refusal. Dynamic keys (`payload->col`,
+//! `payload[col]`), slices, JSONPath, set-returning unnesting, and constructors
+//! are not on the list.
 
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{Node, SelectStmt};
