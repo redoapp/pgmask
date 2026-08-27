@@ -111,6 +111,10 @@ sleep 4
 # parse on Postgres and not on CockroachDB, so they would show up here as
 # "one served, one errored" — an engine difference wearing a defect's clothes.
 ./target/release/shapegen 777 "$COUNT" portable > /tmp/pgmask-diff.sql
+# Pseudonym equality is the highest-value cross-engine property, so do not
+# leave its presence to the generated corpus. This bare classified projection
+# is served on both engines and must produce byte-identical masked output.
+printf '%s\n' 'SELECT email FROM fz.people WHERE id = 1;' >> /tmp/pgmask-diff.sql
 if grep -qE 'ROLLUP\(|CUBE\(|GROUPING SETS' /tmp/pgmask-diff.sql; then
   echo "FAIL: the corpus contains Postgres-only syntax; the comparison would be"
   echo "      measuring which engine can parse it, not what the proxy masked."
@@ -129,14 +133,22 @@ if ! A_NAME=postgres B_NAME=cockroach A_URL="$A" B_URL="$B" \
 fi
 grep -E 'both served|both refused|one served|RESULT' /tmp/pgmask-diff.out | sed 's/^/  /'
 
+pg_email=$(psql -w "$A" -X -tAq -c 'SELECT email FROM fz.people WHERE id = 1' 2>&1)
+crdb_email=$(psql -w "$B" -X -tAq -c 'SELECT email FROM fz.people WHERE id = 1' 2>&1)
+[[ "$pg_email" =~ ^[0-9a-f]{16}@[0-9a-f]{8}\.invalid$ ]] \
+  || { echo "FAIL: explicit Postgres pseudonym has the wrong shape: $pg_email"; exit 1; }
+[[ "$crdb_email" == "$pg_email" ]] \
+  || { echo "FAIL: explicit cross-engine pseudonyms differ: $pg_email vs $crdb_email"; exit 1; }
+echo "  explicit pseudonym is well-formed and identical on both engines"
+
 # --- the control -------------------------------------------------------------
 # A comparison that cannot fail is not comparing. Point the second side at a
 # proxy whose catalog masks one column differently and the values must diverge.
 echo "==> control: a deliberately skewed catalog must produce mismatches"
 mkcfg "$SKEW_PROXY" "$CRDB_PORT" "$CDB" /tmp/pgmask-diff-skew.toml \
-  's|^mask = "redact"|mask = "null"|'
-grep -q '^mask = "null"' /tmp/pgmask-diff-skew.toml \
-  || { echo "FAIL: could not skew the catalog"; exit 1; }
+  '/^name = "email"$/,/^$/ s|^mask = "pseudonym"|mask = "null"|'
+grep -A2 '^name = "email"' /tmp/pgmask-diff-skew.toml | grep -q '^mask = "null"' \
+  || { echo "FAIL: could not skew the explicit pseudonym case"; exit 1; }
 ./target/release/pgmask /tmp/pgmask-diff-skew.toml >/tmp/pgmask-diff-skew.log 2>&1 &
 SKEW_PID=$!
 sleep 3

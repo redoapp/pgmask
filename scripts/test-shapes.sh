@@ -174,10 +174,15 @@ SQL
   # The catalog releases city and note, masks email. `id` is released so joins
   # and ORDER BY have something to work with.
   local cat="/tmp/pgmask-shapes-$engine.toml"
-  cat > "$cat" <<CFG
-listen = "127.0.0.1:$proxy_port"
-backend = "127.0.0.1:$port"
-catalog_dsn = "$dsn"
+  # Keep the body literal. An unquoted heredoc executes command substitutions
+  # hidden in comments, so only these four explicit placeholders may vary.
+  sed -e "s|@PROXY_PORT@|$proxy_port|g" \
+      -e "s|@BACKEND_PORT@|$port|g" \
+      -e "s|@CATALOG_DSN@|$dsn|g" \
+      -e "s|@EMAIL_MASK@|$EMAIL_MASK|g" > "$cat" <<'CFG'
+listen = "127.0.0.1:@PROXY_PORT@"
+backend = "127.0.0.1:@BACKEND_PORT@"
+catalog_dsn = "@CATALOG_DSN@"
 pseudonym_key = "shape-sweep-key-1"
 unclassified = "mask"
 opaque = "reject"
@@ -196,7 +201,7 @@ mask = "none"
 [[column]]
 relation = "sw.t"
 column = "email"
-mask = "$EMAIL_MASK"
+mask = "@EMAIL_MASK@"
 
 [[column]]
 relation = "sw.u"

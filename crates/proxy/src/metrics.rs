@@ -75,11 +75,6 @@ pub enum Cause {
     ChannelBinding,
     /// A client that had not negotiated TLS, refused because one is required.
     PlaintextRefused,
-    /// A plaintext session that policy allows. Counted so that "we run with
-    /// TLS" is a claim the operator can check rather than assume: this is the
-    /// only signal distinguishing a certificate that is configured from one
-    /// that is used.
-    PlaintextSession,
     /// `posture = "hostile"` refused a statement that named a masked column
     /// outside a bare outermost projection.
     HostileMaskedUse,
@@ -117,7 +112,6 @@ impl Cause {
         Cause::Malformed,
         Cause::ChannelBinding,
         Cause::PlaintextRefused,
-        Cause::PlaintextSession,
         Cause::HostileMaskedUse,
         Cause::RateLimited,
         Cause::NoticeFlood,
@@ -142,7 +136,6 @@ impl Cause {
             Cause::Malformed => "malformed",
             Cause::ChannelBinding => "channel_binding",
             Cause::PlaintextRefused => "plaintext_refused",
-            Cause::PlaintextSession => "plaintext_session",
             Cause::HostileMaskedUse => "hostile_masked_use",
             Cause::RateLimited => "rate_limited",
             Cause::NoticeFlood => "notice_flood",
@@ -196,6 +189,10 @@ pub fn describe() {
     );
     metrics::describe_counter!("pgmask_sessions_total", "Client connections closed");
     metrics::describe_counter!(
+        "pgmask_plaintext_sessions_total",
+        "Client connections accepted without TLS"
+    );
+    metrics::describe_counter!(
         "pgmask_rejections_total",
         "Result sets refused, labelled by cause"
     );
@@ -219,6 +216,10 @@ pub struct Metrics {
     // and the failure would have been a panic on the rejection path — the one
     // place the proxy most needs to keep working.
     counters: [AtomicU64; Cause::ALL.len()],
+    /// Accepted plaintext connections are transport observations, not refused
+    /// result sets. Keeping them out of `counters` makes the metric family and
+    /// `total_rejections` safe to aggregate without label-specific exceptions.
+    plaintext_sessions: AtomicU64,
     result_sets_masked: AtomicU64,
     fields_masked: AtomicU64,
     /// Opaque fields passed through because they were positively identified as
@@ -239,6 +240,16 @@ impl Metrics {
     pub fn record_rescued(&self) {
         self.fields_rescued.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("pgmask_fields_rescued_total").increment(1);
+    }
+
+    /// Record a connection accepted without TLS because policy permits it.
+    ///
+    /// This is deliberately not a `Cause`: the connection was accepted, so
+    /// putting it in `pgmask_rejections_total` makes totals lie to every
+    /// dashboard and test that correctly sums that metric family.
+    pub fn record_plaintext_session(&self) {
+        self.plaintext_sessions.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("pgmask_plaintext_sessions_total").increment(1);
     }
 
     /// Emitted once per session rather than per value.
@@ -279,7 +290,8 @@ impl Metrics {
     pub fn report(&self) -> Option<String> {
         let total = self.total_rejections();
         let masked = self.result_sets_masked.load(Ordering::Relaxed);
-        if total == 0 && masked == 0 {
+        let plaintext = self.plaintext_sessions.load(Ordering::Relaxed);
+        if total == 0 && masked == 0 && plaintext == 0 {
             return None;
         }
         let mut parts = vec![
@@ -289,6 +301,7 @@ impl Metrics {
                 self.fields_masked.load(Ordering::Relaxed)
             ),
             format!("rejections={total}"),
+            format!("plaintext_sessions={plaintext}"),
             format!(
                 "fields_rescued={}",
                 self.fields_rescued.load(Ordering::Relaxed)
@@ -403,5 +416,17 @@ mod tests {
         m.record(Cause::OpaqueAnonymous);
         let line = m.report().unwrap();
         assert!(line.contains("set_op_like_share=75%"), "got: {line}");
+    }
+
+    #[test]
+    fn an_allowed_plaintext_session_is_observed_but_not_rejected() {
+        let m = Metrics::default();
+        m.record_plaintext_session();
+
+        assert_eq!(m.total_rejections(), 0);
+        let line = m.report().expect("transport observation should report");
+        assert!(line.contains("plaintext_sessions=1"), "got: {line}");
+        assert!(line.contains("rejections=0"), "got: {line}");
+        assert!(!line.contains("set_op_like_share"), "got: {line}");
     }
 }

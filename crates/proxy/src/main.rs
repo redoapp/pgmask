@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
         tracing::warn!(
             "require_client_tls = false — a certificate is configured but not required, \
              so any client may connect with sslmode=disable and read masked output in \
-             plaintext. Such sessions are counted as plaintext_session"
+             plaintext. Such sessions are counted by pgmask_plaintext_sessions_total"
         );
     }
     if catalog.is_empty() {

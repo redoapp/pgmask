@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.6 — non-vacuous adversarial harnesses
+
+- Keep accepted plaintext transport observations out of
+  `pgmask_rejections_total`; expose them through the dedicated
+  `pgmask_plaintext_sessions_total` counter.
+- Make generated-SQL campaigns aggregate only the requested run's seeds and
+  fail closed when metrics disagree.
+- Exercise notification suppression by injecting a backend frame directly,
+  and replace brittle prose or digest checks with stable protocol and
+  pseudonym-shape assertions.
+
 ## 0.2.5 — Apple Silicon-only macOS releases
 
 - Stop building and attaching `x86_64-apple-darwin` binaries. Prebuilt macOS

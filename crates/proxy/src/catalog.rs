@@ -477,8 +477,8 @@ pub struct Config {
     /// design — the last four digits of a card, a pseudonym that is a stable
     /// identifier across queries — and the SCRAM exchange and the client's own
     /// SQL cross the same wire. Set this to `false` to allow plaintext
-    /// deliberately; those sessions are then counted under
-    /// `plaintext_session`, not silent.
+    /// deliberately; those sessions are then counted by
+    /// `pgmask_plaintext_sessions_total`, not silent.
     #[serde(default)]
     pub require_client_tls: Option<bool>,
     /// Whether to encrypt the proxy-to-Postgres leg.
