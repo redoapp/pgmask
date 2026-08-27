@@ -980,10 +980,10 @@ GROUP BY 1
 ORDER BY 1;
 
 -- Redaction hides values but not distinct plaintext cardinality: four
--- non-NULL bodies become four identical `***` rows.
+-- non-NULL bodies become four identical `***` rows plus one SQL NULL.
 -- @id: distinct-redacted-content
 -- @expect: served
--- @rows: 4
+-- @rows: 5
 -- @contains: ***
 SELECT DISTINCT content
 FROM chatwoot.messages
