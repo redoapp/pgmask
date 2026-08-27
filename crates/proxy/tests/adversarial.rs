@@ -768,20 +768,6 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             poison: Some(CANARY_EMAIL),
         },
         JsonSqlValueCase {
-            name: "integer array subscript",
-            sql: "SELECT payload['items'][0]->>'token' FROM canary.documents",
-            direct: JsonSqlValue::Text(CANARY_TEMP),
-            masked: JsonSqlValue::Text("***"),
-            poison: Some(CANARY_TEMP),
-        },
-        JsonSqlValueCase {
-            name: "quoted-zero subscript never inherits array wildcard",
-            sql: "SELECT payload['numeric_object']['0']->>'token' FROM canary.documents",
-            direct: JsonSqlValue::Text(CANARY_TEMP),
-            masked: JsonSqlValue::Null,
-            poison: Some(CANARY_TEMP),
-        },
-        JsonSqlValueCase {
             name: "quoted numeric object key never inherits array wildcard",
             sql: "SELECT payload->'numeric_object'->'0'->>'token' FROM canary.documents",
             direct: JsonSqlValue::Text(CANARY_TEMP),
@@ -997,6 +983,7 @@ async fn json_unmatched_none_releases_only_unlisted_extracts_by_configuration() 
         vec![
             json_field("/profile/email", pgmask::mask::Mask::Redact),
             json_field("/items/*/token", pgmask::mask::Mask::Redact),
+            json_field("/numeric_object/*/token", pgmask::mask::Mask::Redact),
         ],
     ));
     let proxy = start_proxy(DB, rules).await?;
@@ -1033,12 +1020,21 @@ async fn json_unmatched_none_releases_only_unlisted_extracts_by_configuration() 
         "explicit pointer must override unmatched release"
     );
 
-    // The runtime subscript type decides navigation. Peeling these casts and
-    // classifying the inner literal would invert object-key vs array-index:
-    // `'0'::int` enters /items/*, while `0::text` names object key "0".
-    // Under this unmatched-release policy, a wrong classification can release
-    // the token instead of applying the explicit wildcard or refusing.
+    // The runtime parent and post-cast type decide subscript navigation.
+    // PostgreSQL uses both bare `0` and `'0'` as index 0 under an array and key
+    // "0" under an object. Casts add another inversion: `'0'::int` is an array
+    // index while `0::text` is an object key. Under this unmatched-release
+    // policy, claiming either shape can release the token instead of applying
+    // the explicit wildcard or refusing.
     for (name, sql) in [
+        (
+            "quoted integer under runtime array",
+            "SELECT payload['items']['0']->>'token' FROM canary.documents",
+        ),
+        (
+            "integer under runtime object",
+            "SELECT payload['numeric_object'][0]->>'token' FROM canary.documents",
+        ),
         (
             "string literal cast to array index",
             "SELECT payload['items']['0'::int]->>'token' FROM canary.documents",
@@ -1262,6 +1258,26 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
             "SELECT payload[CASE WHEN id = 1 THEN 'unknown' ELSE 'public' END] \
              FROM canary.documents",
             CANARY_NOTE,
+        ),
+        (
+            "integer subscript at array wildcard",
+            "SELECT payload['items'][0]->>'token' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "quoted integer subscript at array wildcard",
+            "SELECT payload['items']['0']->>'token' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "integer subscript at numeric object wildcard",
+            "SELECT payload['numeric_object'][0]->>'token' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "quoted integer subscript at numeric object wildcard",
+            "SELECT payload['numeric_object']['0']->>'token' FROM canary.documents",
+            CANARY_TEMP,
         ),
         (
             "json to jsonb cast",

@@ -1059,7 +1059,7 @@ fn collated_json_extract_keeps_the_same_shape_and_attribution() {
 }
 
 #[test]
-fn json_subscripting_is_the_same_literal_path_as_the_arrow_operators() {
+fn json_subscripting_keeps_runtime_dependent_navigation_ambiguous() {
     let inspection =
         StatementInspection::new("SELECT payload['profile']['email'] FROM canary.documents");
     assert_eq!(
@@ -1081,8 +1081,8 @@ fn json_subscripting_is_the_same_literal_path_as_the_arrow_operators() {
                     .map(|s| (s.value.as_str(), s.navigation))
                     .collect::<Vec<_>>(),
                 vec![
-                    ("profile", JsonPathNavigation::ObjectKey),
-                    ("email", JsonPathNavigation::ObjectKey)
+                    ("profile", JsonPathNavigation::Ambiguous),
+                    ("email", JsonPathNavigation::Ambiguous)
                 ]
             );
         }
@@ -1092,9 +1092,9 @@ fn json_subscripting_is_the_same_literal_path_as_the_arrow_operators() {
     let inspection = StatementInspection::new("SELECT payload['items'][0] FROM canary.documents");
     match &inspection.json_extract_resolution(1).unwrap().fields()[0] {
         JsonExtractArgument::Extract(extract) => {
-            assert_eq!(extract.path[0].navigation, JsonPathNavigation::ObjectKey);
+            assert_eq!(extract.path[0].navigation, JsonPathNavigation::Ambiguous);
             assert_eq!(extract.path[1].value, "0");
-            assert_eq!(extract.path[1].navigation, JsonPathNavigation::ArrayIndex);
+            assert_eq!(extract.path[1].navigation, JsonPathNavigation::Ambiguous);
         }
         JsonExtractArgument::Unattributable => panic!("expected integer subscript"),
     }
@@ -1102,7 +1102,7 @@ fn json_subscripting_is_the_same_literal_path_as_the_arrow_operators() {
     let inspection = StatementInspection::new("SELECT payload['items']['0'] FROM canary.documents");
     match &inspection.json_extract_resolution(1).unwrap().fields()[0] {
         JsonExtractArgument::Extract(extract) => {
-            assert_eq!(extract.path[1].navigation, JsonPathNavigation::ObjectKey);
+            assert_eq!(extract.path[1].navigation, JsonPathNavigation::Ambiguous);
         }
         JsonExtractArgument::Unattributable => panic!("expected quoted-zero subscript"),
     }

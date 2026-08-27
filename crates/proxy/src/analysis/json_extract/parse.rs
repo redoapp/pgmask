@@ -2,8 +2,9 @@
 //!
 //! Attribution (FROM ranges, unique owner) stays in the parent module. This
 //! file only decides whether an expression is a chain of literal `->` / `->>` /
-//! `#>` / `#>>` / `json[b]_extract_path[_text]` keys, or the equivalent JSON
-//! subscript form (`payload['profile']['email']`).
+//! `#>` / `#>>` / `json[b]_extract_path[_text]` keys, or a literal JSONB
+//! subscript form (`payload['profile']['email']`). Subscript navigation stays
+//! ambiguous because PostgreSQL dispatches it from the runtime parent.
 
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{AExpr, AIndirection, FuncCall, Node};
@@ -35,11 +36,11 @@ pub(super) fn parse_extract(expr: &NodeEnum, depth: usize) -> Option<JsonExtract
     }
 }
 
-/// `payload['a'][0]` is the same literal path as `payload->'a'->0`.
+/// Parse the literal path from `payload['a'][0]`.
 ///
-/// PostgreSQL JSON subscripting returns `json`/`jsonb`, never text, so the
-/// result can still be walked. Slices (`[1:3]`) and composite field names
-/// (`(row).col`) are not pointer steps.
+/// PostgreSQL JSONB subscripting returns `jsonb`, not text, so the result can
+/// still be walked. Slices (`[1:3]`) and composite field names (`(row).col`)
+/// are not pointer steps.
 fn parse_indirection_extract(ind: &AIndirection, depth: usize) -> Option<JsonExtract> {
     let mut key_segments = Vec::with_capacity(ind.indirection.len());
     for part in &ind.indirection {
@@ -64,7 +65,15 @@ fn parse_subscript_index(expr: &NodeEnum) -> Option<JsonExtractPathSegment> {
     // object key. Classifying from the inner AConst would invert that fact and
     // could skip an array-wildcard policy. Bare constants are the complete
     // allowlist until the cast target itself is interpreted.
-    parse_single_key(idx.uidx.as_ref()?.node.as_ref()?)
+    parse_single_key(idx.uidx.as_ref()?.node.as_ref()?).map(|mut segment| {
+        // Unlike `->`, JSONB subscripting dispatches both bare `0` and `'0'`
+        // from the runtime parent: on an array they select index 0; on an
+        // object they select key "0". Syntax therefore proves neither shape.
+        // The trie may follow exact edges, but any reachable `*` edge makes
+        // planning refuse rather than guess.
+        segment.navigation = JsonPathNavigation::Ambiguous;
+        segment
+    })
 }
 
 fn parse_operator_extract(aexpr: &AExpr, depth: usize) -> Option<JsonExtract> {

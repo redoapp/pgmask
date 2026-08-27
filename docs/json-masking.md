@@ -76,9 +76,11 @@ disclosure.
 Array wildcards require runtime array evidence. A document walk has the actual
 parent value, and `payload->0` uses PostgreSQL's integer array operator. Text
 paths (`#>` / `#>>` and `json[b]_extract_path[_text]`) do not distinguish array
-index `0` from object key `"0"`. If such a segment could enter a `*` pointer
-branch, pgmask refuses the extract rather than guess. Use an integer `-> 0`
-or `[0]` step when traversing a configured array wildcard.
+index `0` from object key `"0"`. JSONB subscripting does not either:
+PostgreSQL resolves both `[0]` and `['0']` from the runtime parent, selecting
+index 0 under an array and key `"0"` under an object. If such a segment could
+enter a `*` pointer branch, pgmask refuses the extract rather than guess. Use
+an integer `-> 0` step when traversing a configured array wildcard.
 
 ## Unmatched leaves
 
@@ -124,8 +126,7 @@ Literal extracts are served when the path can be mapped to a pointer:
 SELECT payload->>'public' FROM app.events;
 SELECT payload->'profile' FROM app.events;
 SELECT payload->'profile'->>'email' FROM app.events;
-SELECT payload['profile']['email'] FROM app.events;  -- json/jsonb, same policy as ->
-SELECT payload['items'][0] FROM app.events;          -- integer index, like -> 0
+SELECT payload['profile']['email'] FROM app.events;  -- exact JSONB object path
 SELECT payload #>> '{profile,email}' FROM app.events;
 SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM app.events;
 
@@ -161,6 +162,8 @@ SELECT json_agg(payload) FROM app.events;
 SELECT payload::text FROM app.events;
 SELECT payload FROM app.events UNION ALL SELECT payload FROM app.events;
 SELECT payload->>'email' FROM events; -- relation is not schema-qualified
+SELECT payload['items'][0] FROM app.events; -- runtime shape could enter `*`
+SELECT payload[CASE WHEN id = 1 THEN 'a' ELSE 'b' END] FROM app.events;
 ```
 
 `WHERE` predicates still run on the backend. Containment filters such as `@>`
