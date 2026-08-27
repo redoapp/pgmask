@@ -261,6 +261,7 @@ INSERT INTO chatwoot.contacts (
         'country', 'US',
         'country_code', 'US',
         'created_at_ip', '203.0.113.77',
+        'updated_at_ip', '203.0.113.88',
         'social_profiles', jsonb_build_object(
             'twitter', 'alice_canary',
             'linkedin', 'alice-canary'
@@ -330,6 +331,9 @@ INSERT INTO chatwoot.conversations (
         'browser_language', 'en-US',
         'conversation_language', 'en',
         'type', 'widget',
+        'source', 'email',
+        'in_reply_to', '<thread-CANARY@inbox.test>',
+        'auto_reply', false,
         'mail_subject', 'Order ORD-9911 never arrived — Alice Canary'
     ),
     'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid,

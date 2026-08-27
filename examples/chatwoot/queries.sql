@@ -96,6 +96,16 @@ SELECT chatwoot.contacts.additional_attributes->>'created_at_ip'
 FROM chatwoot.contacts
 WHERE chatwoot.contacts.id = 1001;
 
+-- ContactIpLookupJob writes both created_at_ip and updated_at_ip.
+-- @id: contact-updated-at-ip
+-- @expect: served
+-- @contains: 203.0.113.0
+-- @refute: 203.0.113.88
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/jobs/contact_ip_lookup_job.rb
+SELECT chatwoot.contacts.additional_attributes->>'updated_at_ip'
+FROM chatwoot.contacts
+WHERE chatwoot.contacts.id = 1001;
+
 -- Referer holds a checkout token. Redact, do not pass.
 -- @id: contact-referer
 -- @expect: served
@@ -109,6 +119,15 @@ WHERE chatwoot.contacts.id = 1001;
 -- @expect: served
 -- @contains: macOS
 SELECT chatwoot.contacts.additional_attributes->'browser'->>'os'
+FROM chatwoot.contacts
+WHERE chatwoot.contacts.id = 1001;
+
+-- Keep browser family/version for compatibility diagnosis, redact the device
+-- fingerprint.
+-- @id: contact-browser-device
+-- @expect: served
+-- @refute: MacIntel
+SELECT chatwoot.contacts.additional_attributes->'browser'->>'device_name'
 FROM chatwoot.contacts
 WHERE chatwoot.contacts.id = 1001;
 
@@ -207,6 +226,14 @@ SELECT content FROM chatwoot.messages WHERE id = 9001;
 -- @refute: +15558675309
 SELECT * FROM chatwoot.contacts WHERE id = 1001;
 
+-- Message SELECT * is equally common during incident response. Transcript,
+-- source ids and nested submitted values must all remain hidden.
+-- @id: select-star-message
+-- @expect: served
+-- @refute: alice.cw-canary@inbox.test
+-- @refute: cw-canary-msgid@inbox.test
+SELECT * FROM chatwoot.messages WHERE id = 9003;
+
 -- View OID must have its own catalog rows (pgmask D-2).
 -- @id: contact-directory-view
 -- @expect: served
@@ -231,10 +258,65 @@ SELECT additional_attributes->>'mail_subject'
 FROM chatwoot.conversations
 WHERE id = 5001;
 
+-- IMAP threading data is useful as a presence/shape diagnosis but the message
+-- id itself is external customer data.
+-- @id: conversation-email-routing-json
+-- @expect: served
+-- @contains: email
+-- @refute: thread-CANARY@inbox.test
+-- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/mailboxes/imap/imap_mailbox.rb
+SELECT additional_attributes->>'source',
+       additional_attributes->>'in_reply_to',
+       additional_attributes->>'auto_reply'
+FROM chatwoot.conversations
+WHERE id = 5001;
+
 -- @id: webhook-url
 -- @expect: served
 -- @refute: CANARYHOOK
 SELECT url FROM chatwoot.webhooks WHERE id = 3;
+
+-- Stable external identifiers remain correlatable without source bytes.
+-- @id: contact-identifier-pseudonym
+-- @expect: served
+-- @refute: widget-alice-1
+SELECT identifier FROM chatwoot.contacts WHERE id = 1001;
+
+-- @id: conversation-identifiers-pseudonym
+-- @expect: served
+-- @refute: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+-- @refute: conv-CANARYIDENTIFIER
+SELECT uuid, identifier FROM chatwoot.conversations WHERE id = 5001;
+
+-- @id: contact-inbox-identifiers
+-- @expect: served
+-- @refute: widget-src-alice
+-- @refute: tok_contact_pubsub_CANARY
+SELECT source_id, pubsub_token
+FROM chatwoot.contact_inboxes
+WHERE id = 8001;
+
+-- @id: user-custom-phone
+-- @expect: served
+-- @refute: +15558675309
+SELECT custom_attributes->>'phone_number'
+FROM chatwoot.users
+WHERE id = 10;
+
+-- @id: conversation-stripe-charge
+-- @expect: served
+-- @refute: ch_CANARYCHARGE
+SELECT custom_attributes->>'stripe_charge'
+FROM chatwoot.conversations
+WHERE id = 5001;
+
+-- User-authored automation names/descriptions can contain customer data.
+-- @id: automation-free-text
+-- @expect: served
+-- @refute: When company is Canary Logistics, add billing label
+SELECT name, description
+FROM chatwoot.automation_rules
+WHERE id = 70;
 
 -- Automation condition values name a customer company — redact the values,
 -- keep the operator-visible keys.
@@ -324,6 +406,22 @@ FROM chatwoot.messages
 WHERE status = 3
 ORDER BY created_at;
 
+-- The failed row's prose remains unavailable even though its envelope serves.
+-- @id: failed-message-content-redact
+-- @expect: served
+-- @refute: Alice Canary
+-- @refute: legacy.cw-canary@inbox.test
+SELECT content, processed_message_content
+FROM chatwoot.messages
+WHERE id = 9005;
+
+-- Sentiment is deliberately released operational metadata.
+-- @id: message-sentiment
+-- @expect: served
+-- @contains: negative
+-- @contains: 0.95
+SELECT sentiment FROM chatwoot.messages WHERE id = 9005;
+
 -- "Is one inbox failing?" Join only released operational columns.
 -- @id: delivery-counts-by-inbox
 -- @expect: refused
@@ -370,6 +468,22 @@ FROM chatwoot.conversations c
 JOIN chatwoot.messages m ON m.conversation_id = c.id
 WHERE c.id = 5001
 ORDER BY m.created_at;
+
+-- One-screen triage: released company/city plus the non-PII message envelope.
+-- No contact name, email, phone or transcript is selected.
+-- @id: conversation-company-message-envelope
+-- @expect: served
+-- @contains: 42|Canary Logistics|Austin|9005|3
+SELECT c.display_id,
+       ct.additional_attributes->>'company_name',
+       ct.additional_attributes->>'city',
+       m.id,
+       m.status
+FROM chatwoot.conversations c
+JOIN chatwoot.contacts ct ON ct.id = c.contact_id
+JOIN chatwoot.messages m ON m.conversation_id = c.id
+WHERE c.id = 5001
+ORDER BY m.id;
 
 -- "What action should this automation take?" Array wildcard policy is entered
 -- through a proven integer array step.
@@ -444,6 +558,55 @@ SELECT external_source_ids
 FROM chatwoot.messages
 WHERE id = 9005;
 
+-- Alternate literal JSON extract spellings used at the SQL console.
+-- @id: contact-city-hash-path
+-- @expect: served
+-- @contains: Austin
+SELECT additional_attributes #>> '{city}'
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- @id: contact-city-extract-function
+-- @expect: served
+-- @contains: Austin
+SELECT jsonb_extract_path_text(additional_attributes, 'city')
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- OID 114 `json` function form.
+-- @id: message-email-extract-function
+-- @expect: served
+-- @refute: alice.cw-canary@inbox.test
+SELECT json_extract_path_text(content_attributes, 'submitted_email')
+FROM chatwoot.messages
+WHERE id = 9003;
+
+-- A text extract of an object with child policies cannot be safely walked.
+-- @id: contact-browser-parent-text
+-- @expect: refused
+SELECT additional_attributes->>'browser'
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- Runtime/dynamic keys stay opaque.
+-- @id: contact-dynamic-json-key
+-- @expect: refused
+SELECT additional_attributes->>(id::text)
+FROM chatwoot.contacts
+WHERE id = 1001;
+
+-- Whole-column CTE keeps the backend OID and is masked at the outer result.
+-- @id: contact-json-through-cte
+-- @expect: served
+-- @contains: Austin
+-- @refute: 203.0.113.77
+WITH c AS (
+  SELECT additional_attributes
+  FROM chatwoot.contacts
+  WHERE id = 1001
+)
+SELECT additional_attributes FROM c;
+
 -- ---------------------------------------------------------------------------
 -- Hostile posture: projections are not the only disclosure route. These
 -- controls prove that masked PII cannot be inferred with predicates, sorting
@@ -509,10 +672,11 @@ FROM chatwoot.contacts
 WHERE LOWER(custom_attributes->>'order_id')::text IN ('ord-9911');
 
 -- Conversations::FilterService computes these three dashboard counts in one
--- scan with COUNT(*) FILTER. Hostile posture disables reducing summaries; the
--- simpler per-status operational counts above remain available.
+-- scan with COUNT(*) FILTER. Every predicate column is explicitly released,
+-- so the real dashboard query remains available under hostile posture.
 -- @id: chatwoot-conversation-dashboard-counts
--- @expect: refused
+-- @expect: served
+-- @contains: 1|0|1
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/services/filter_service.rb
 SELECT
   count(*) FILTER (WHERE assignee_id = 10),

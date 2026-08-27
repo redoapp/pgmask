@@ -83,7 +83,7 @@ type = "email"
 relation = "chatwoot.accounts"
 column = "settings"
 mask = "json"
-json_unmatched = "none"
+json_unmatched = "type-placeholders"
 json = [
   { pointer = "/auto_resolve_after", mask = "none" },
   { pointer = "/audio_transcriptions", mask = "none" },
@@ -94,7 +94,7 @@ json = [
 relation = "chatwoot.accounts"
 column = "custom_attributes"
 mask = "json"
-json_unmatched = "none"
+json_unmatched = "type-placeholders"
 json = [
   { pointer = "/industry", mask = "none" },
   { pointer = "/plan", mask = "none" },
@@ -104,7 +104,7 @@ json = [
 relation = "chatwoot.accounts"
 column = "limits"
 mask = "json"
-json_unmatched = "none"
+json_unmatched = "type-placeholders"
 json = [
   { pointer = "/agents", mask = "none" },
   { pointer = "/inboxes", mask = "none" },
@@ -178,7 +178,7 @@ mask = "json"
 json_unmatched = "type-placeholders"
 json = [
   { pointer = "/language", mask = "none" },
-  { pointer = "/phone_number", mask = "partial", keep = 4 },
+  { pointer = "/phone_number", mask = "pseudonym", domain = "phone" },
 ]
 
 [[column]]
@@ -239,7 +239,7 @@ mask = "none"
 relation = "chatwoot.inboxes"
 column = "auto_assignment_config"
 mask = "json"
-json_unmatched = "none"
+json_unmatched = "type-placeholders"
 json = [
   { pointer = "/max_assignment_limit", mask = "none" },
 ]
@@ -263,7 +263,7 @@ mask = "none"
 relation = "chatwoot.inboxes"
 column = "csat_config"
 mask = "json"
-json_unmatched = "none"
+json_unmatched = "type-placeholders"
 json = [
   { pointer = "/display_type", mask = "none" },
   { pointer = "/message", mask = "none" },
@@ -334,9 +334,13 @@ json = [
   { pointer = "/country", mask = "none" },
   { pointer = "/country_code", mask = "none" },
   { pointer = "/conversation_language", mask = "none" },
-  { pointer = "/browser", mask = "none" },
+  { pointer = "/browser/browser_name", mask = "none" },
+  { pointer = "/browser/browser_version", mask = "none" },
+  { pointer = "/browser/os", mask = "none" },
+  { pointer = "/browser/device_name", mask = "redact" },
   { pointer = "/initiated_at", mask = "none" },
   { pointer = "/created_at_ip", mask = "ip-prefix" },
+  { pointer = "/updated_at_ip", mask = "ip-prefix" },
   { pointer = "/referer", mask = "redact" },
   { pointer = "/social_profiles/twitter", mask = "redact" },
   { pointer = "/social_profiles/linkedin", mask = "redact" },
@@ -422,11 +426,17 @@ column = "additional_attributes"
 mask = "json"
 json_unmatched = "type-placeholders"
 json = [
-  { pointer = "/browser", mask = "none" },
+  { pointer = "/browser/browser_name", mask = "none" },
+  { pointer = "/browser/browser_version", mask = "none" },
+  { pointer = "/browser/os", mask = "none" },
+  { pointer = "/browser/device_name", mask = "redact" },
   { pointer = "/initiated_at", mask = "none" },
   { pointer = "/browser_language", mask = "none" },
   { pointer = "/conversation_language", mask = "none" },
   { pointer = "/type", mask = "none" },
+  { pointer = "/source", mask = "none" },
+  { pointer = "/auto_reply", mask = "none" },
+  { pointer = "/in_reply_to", mask = "redact" },
   { pointer = "/referer", mask = "redact" },
   { pointer = "/mail_subject", mask = "redact" },
 ]
@@ -604,6 +614,7 @@ mask = "json"
 json_unmatched = "type-placeholders"
 json = [
   { pointer = "/in_reply_to", mask = "none" },
+  { pointer = "/automation_rule_id", mask = "none" },
   { pointer = "/submitted_email", mask = "pseudonym", domain = "email" },
   { pointer = "/items/*/title", mask = "redact" },
   { pointer = "/items/*/value", mask = "redact" },
@@ -634,7 +645,7 @@ json_unmatched = "type-placeholders"
 relation = "chatwoot.messages"
 column = "additional_attributes"
 mask = "json"
-json_unmatched = "none"
+json_unmatched = "type-placeholders"
 json = [
   { pointer = "/campaign_id", mask = "none" },
 ]
@@ -648,7 +659,7 @@ mask = "redact"
 relation = "chatwoot.messages"
 column = "sentiment"
 mask = "json"
-json_unmatched = "none"
+json_unmatched = "type-placeholders"
 json = [
   { pointer = "/label", mask = "none" },
   { pointer = "/score", mask = "none" },
@@ -700,7 +711,7 @@ json = [
 relation = "chatwoot.automation_rules"
 column = "actions"
 mask = "json"
-json_unmatched = "none"
+json_unmatched = "type-placeholders"
 json = [
   { pointer = "/*/action_name", mask = "none" },
   { pointer = "/*/action_params/*", mask = "none" },
@@ -739,7 +750,10 @@ mask = "none"
 relation = "chatwoot.webhooks"
 column = "subscriptions"
 mask = "json"
-json_unmatched = "none"
+json_unmatched = "type-placeholders"
+json = [
+  { pointer = "/*", mask = "none" },
+]
 
 # ---------------------------------------------------------------------------
 # chatwoot.contact_directory (VIEW — own OID, own rules)
@@ -776,9 +790,13 @@ json = [
   { pointer = "/country", mask = "none" },
   { pointer = "/country_code", mask = "none" },
   { pointer = "/conversation_language", mask = "none" },
-  { pointer = "/browser", mask = "none" },
+  { pointer = "/browser/browser_name", mask = "none" },
+  { pointer = "/browser/browser_version", mask = "none" },
+  { pointer = "/browser/os", mask = "none" },
+  { pointer = "/browser/device_name", mask = "redact" },
   { pointer = "/initiated_at", mask = "none" },
   { pointer = "/created_at_ip", mask = "ip-prefix" },
+  { pointer = "/updated_at_ip", mask = "ip-prefix" },
   { pointer = "/referer", mask = "redact" },
   { pointer = "/social_profiles/twitter", mask = "redact" },
   { pointer = "/social_profiles/linkedin", mask = "redact" },
