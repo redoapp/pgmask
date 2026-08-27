@@ -265,211 +265,6 @@ async fn structure_aware_json_masks_arbitrary_nesting_in_text_and_binary_formats
     Ok(())
 }
 
-#[tokio::test]
-async fn json_extracts_constructors_and_set_operations_cannot_leak() -> Result<()> {
-    require_pg!();
-    load_schema(DB).await?;
-    let proxy = start_proxy(DB, classified_json_document_rules()).await?;
-    let mut client = RawClient::connect(proxy.addr, DB).await?;
-    // Operators and constructors lose stored-column provenance. Structure-aware
-    // JSON masking must not apply to the extracted/constructed field — refuse
-    // rather than serve the inner canary, or serve a whole-column JSON plan
-    // against a scalar that is not the document.
-    assert_sql_cases(
-        &mut client,
-        &[
-            SqlCase::refused(
-                "JSONPath query",
-                "SELECT jsonb_path_query(payload, '$.profile.email') FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "jsonb serialized as text",
-                "SELECT payload::text FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "json cast to jsonb",
-                "SELECT legacy::jsonb FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "JSON union",
-                "SELECT payload FROM canary.documents UNION ALL \
-                 SELECT payload FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "JSON intersection",
-                "SELECT payload FROM canary.documents INTERSECT \
-                 SELECT payload FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "json aggregate",
-                "SELECT json_agg(payload) FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "jsonb aggregate",
-                "SELECT jsonb_agg(payload) FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "to_jsonb constructor",
-                "SELECT to_jsonb(payload) FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "to_json row constructor",
-                "SELECT to_json(d) FROM canary.documents d",
-            ),
-            SqlCase::refused(
-                "row_to_json constructor",
-                "SELECT row_to_json(d) FROM canary.documents d",
-            ),
-            SqlCase::refused(
-                "jsonb_build_object constructor",
-                "SELECT jsonb_build_object('p', payload) FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "jsonb_pretty serialization",
-                "SELECT jsonb_pretty(payload) FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "jsonb concatenation",
-                "SELECT payload || '{\"x\":1}'::jsonb FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "lateral array expansion",
-                "SELECT * FROM canary.documents, \
-                 LATERAL jsonb_array_elements(payload->'items') AS elem",
-            ),
-            SqlCase::refused(
-                "jsonb_each expansion",
-                "SELECT jsonb_each(payload) FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "jsonb_array_elements expansion",
-                "SELECT jsonb_array_elements(payload->'items') FROM canary.documents",
-            ),
-            // Text extract of a node that still has child pointer policies: the
-            // backend serializes the object, so child masks cannot be applied.
-            SqlCase::refused(
-                "operator text serialization of protected subtree",
-                "SELECT payload->>'profile' FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "path text serialization of protected subtree",
-                "SELECT payload #>> '{profile}' FROM canary.documents",
-            ),
-            // A text[] path does not reveal whether `0` is an array index or an
-            // object key. It must not select the permissive `/items/*` policy.
-            SqlCase::refused(
-                "ambiguous text path through array wildcard",
-                "SELECT payload #>> '{items,0,token}' FROM canary.documents",
-            ),
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn json_extracts_with_literal_paths_are_masked() -> Result<()> {
-    require_pg!();
-    load_schema(DB).await?;
-
-    // Poison control: the same extract exposes the canary when the document
-    // column is released. Without this, a refusal of every extract would pass.
-    let mut released_rules = default_rules();
-    released_rules.push(rule(
-        "canary.documents",
-        "payload",
-        pgmask::mask::Mask::None,
-    ));
-    let released = start_proxy(DB, released_rules).await?;
-    let mut control = RawClient::connect(released.addr, DB).await?;
-    control
-        .simple_query("SELECT payload->>'profile' FROM canary.documents")
-        .await?;
-    assert_canary_present(&control, CANARY_EMAIL);
-
-    let proxy = start_proxy(DB, classified_json_document_rules()).await?;
-    let mut client = RawClient::connect(proxy.addr, DB).await?;
-
-    let public = simple_query_round(
-        &mut client,
-        "SELECT payload->>'public' FROM canary.documents",
-    )
-    .await?;
-    assert_served(&public.messages, "text extract of a released leaf");
-    assert!(public.text().contains("Portland"), "{}", public.text());
-    assert_no_canary_bytes(&public.received, "released JSON leaf extract");
-
-    let email = simple_query_round(
-        &mut client,
-        "SELECT payload->'profile'->>'email' FROM canary.documents",
-    )
-    .await?;
-    assert_served(&email.messages, "chained text extract");
-    let email_text = email.text();
-    assert!(
-        email_text.contains("***************b2c3"),
-        "partial email extract: {email_text}"
-    );
-    assert_no_canary_bytes(&email.received, "chained JSON email extract");
-
-    let array_token = simple_query_round(
-        &mut client,
-        "SELECT payload->'items'->0->>'token' FROM canary.documents",
-    )
-    .await?;
-    assert_served(&array_token.messages, "integer array extract");
-    assert!(array_token.text().contains("***"), "{}", array_token.text());
-    assert_no_canary_bytes(&array_token.received, "proven array wildcard extract");
-
-    let hash = simple_query_round(
-        &mut client,
-        "SELECT payload #>> '{profile,email}' FROM canary.documents",
-    )
-    .await?;
-    assert_served(&hash.messages, "hash-path text extract");
-    assert_no_canary_bytes(&hash.received, "#>> email extract");
-
-    let profile = simple_query_round(
-        &mut client,
-        "SELECT payload->'profile' FROM canary.documents",
-    )
-    .await?;
-    assert_served(&profile.messages, "json extract of an object");
-    let profile_text = profile.text();
-    assert!(
-        profile_text.contains(r#""email":"***************b2c3""#),
-        "{profile_text}"
-    );
-    assert!(profile_text.contains(r#""name":"***""#), "{profile_text}");
-    assert_no_canary_bytes(&profile.received, "json object extract");
-
-    let func = simple_query_round(
-        &mut client,
-        "SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM canary.documents",
-    )
-    .await?;
-    assert_served(&func.messages, "jsonb_extract_path_text");
-    assert_no_canary_bytes(&func.received, "extract_path_text");
-
-    let joined = simple_query_round(
-        &mut client,
-        "SELECT d.payload->>'public' FROM canary.documents d \
-         JOIN canary.subjects s ON s.id = d.id",
-    )
-    .await?;
-    assert_served(&joined.messages, "extract through a join");
-    assert_no_canary_bytes(&joined.received, "joined JSON extract");
-
-    let unknown = simple_query_round(
-        &mut client,
-        "SELECT payload->>'unknown' FROM canary.documents",
-    )
-    .await?;
-    assert_served(&unknown.messages, "unmatched text extract is SQL NULL");
-    assert_no_canary_bytes(&unknown.received, "unmatched JSON extract");
-    Ok(())
-}
-
 /// Analyst-facing JSON queries return the useful value implied by pointer
 /// policy, not merely "something without a canary".
 ///
@@ -486,48 +281,50 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
     let mut client = RawClient::connect(proxy.addr, DB).await?;
 
     let partial_email = "***************b2c3";
+    let direct_payload = serde_json::json!({
+        "profile": {"email": CANARY_EMAIL, "name": CANARY_NAME},
+        "public": "Portland",
+        "unknown": CANARY_NOTE,
+        "items": [
+            {"token": CANARY_TEMP, "city": "Denver"},
+            {"token": CANARY_TEMP, "city": "Seattle"}
+        ],
+        "numeric_object": {
+            "0": {"token": CANARY_TEMP},
+            "*": {"token": CANARY_TEMP}
+        },
+        "a/b": {"~key": CANARY_NOTE},
+        "n": 99,
+        "enabled": true,
+        "nothing": null,
+        "empty_object": {},
+        "empty_array": []
+    });
+    let masked_payload = serde_json::json!({
+        "profile": {"email": partial_email, "name": "***"},
+        "public": "Portland",
+        "unknown": "",
+        "items": [
+            {"token": "***", "city": "Denver"},
+            {"token": "***", "city": "Seattle"}
+        ],
+        "numeric_object": {
+            "0": {"token": ""},
+            "*": {"token": "***"}
+        },
+        "a/b": {"~key": "***"},
+        "n": 0,
+        "enabled": false,
+        "nothing": null,
+        "empty_object": {},
+        "empty_array": []
+    });
     let cases = vec![
         JsonSqlValueCase {
             name: "whole jsonb document",
             sql: "SELECT payload FROM canary.documents",
-            direct: JsonSqlValue::Json(serde_json::json!({
-                "profile": {"email": CANARY_EMAIL, "name": CANARY_NAME},
-                "public": "Portland",
-                "unknown": CANARY_NOTE,
-                "items": [
-                    {"token": CANARY_TEMP, "city": "Denver"},
-                    {"token": CANARY_TEMP, "city": "Seattle"}
-                ],
-                "numeric_object": {
-                    "0": {"token": CANARY_TEMP},
-                    "*": {"token": CANARY_TEMP}
-                },
-                "a/b": {"~key": CANARY_NOTE},
-                "n": 99,
-                "enabled": true,
-                "nothing": null,
-                "empty_object": {},
-                "empty_array": []
-            })),
-            masked: JsonSqlValue::Json(serde_json::json!({
-                "profile": {"email": partial_email, "name": "***"},
-                "public": "Portland",
-                "unknown": "",
-                "items": [
-                    {"token": "***", "city": "Denver"},
-                    {"token": "***", "city": "Seattle"}
-                ],
-                "numeric_object": {
-                    "0": {"token": ""},
-                    "*": {"token": "***"}
-                },
-                "a/b": {"~key": "***"},
-                "n": 0,
-                "enabled": false,
-                "nothing": null,
-                "empty_object": {},
-                "empty_array": []
-            })),
+            direct: JsonSqlValue::Json(direct_payload.clone()),
+            masked: JsonSqlValue::Json(masked_payload.clone()),
             poison: Some(CANARY_EMAIL),
         },
         JsonSqlValueCase {
@@ -957,6 +754,71 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             masked: JsonSqlValue::Text("***"),
             poison: Some(CANARY_NOTE),
         },
+        JsonSqlValueCase {
+            name: "relation-qualified extract owner",
+            sql: "SELECT canary.documents.payload->>'public' FROM canary.documents",
+            direct: JsonSqlValue::Text("Portland"),
+            masked: JsonSqlValue::Text("Portland"),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "extract wrapped by subquery keeps the projected value",
+            sql: "SELECT * FROM (SELECT payload->>'public' FROM canary.documents) q",
+            direct: JsonSqlValue::Text("Portland"),
+            masked: JsonSqlValue::Text("Portland"),
+            poison: None,
+        },
+        JsonSqlValueCase {
+            name: "aliased JSON column",
+            sql: "SELECT payload AS p FROM canary.documents",
+            direct: JsonSqlValue::Json(direct_payload.clone()),
+            masked: JsonSqlValue::Json(masked_payload.clone()),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "table-aliased JSON column",
+            sql: "SELECT d.payload FROM canary.documents d",
+            direct: JsonSqlValue::Json(direct_payload.clone()),
+            masked: JsonSqlValue::Json(masked_payload.clone()),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "JSON column through join",
+            sql: "SELECT d.payload FROM canary.documents d \
+                  JOIN canary.subjects s ON s.id = d.id",
+            direct: JsonSqlValue::Json(direct_payload.clone()),
+            masked: JsonSqlValue::Json(masked_payload.clone()),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "JSON column through subquery",
+            sql: "SELECT payload FROM (SELECT payload FROM canary.documents OFFSET 0) q",
+            direct: JsonSqlValue::Json(direct_payload.clone()),
+            masked: JsonSqlValue::Json(masked_payload.clone()),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "JSON column through CTE",
+            sql: "WITH c AS (SELECT payload FROM canary.documents) SELECT payload FROM c",
+            direct: JsonSqlValue::Json(direct_payload.clone()),
+            masked: JsonSqlValue::Json(masked_payload.clone()),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "identity jsonb cast",
+            sql: "SELECT payload::jsonb FROM canary.documents",
+            direct: JsonSqlValue::Json(direct_payload.clone()),
+            masked: JsonSqlValue::Json(masked_payload.clone()),
+            poison: Some(CANARY_EMAIL),
+        },
+        JsonSqlValueCase {
+            name: "JSON column with containment predicate in default posture",
+            sql: "SELECT payload FROM canary.documents \
+                  WHERE payload @> '{\"public\":\"Portland\"}'",
+            direct: JsonSqlValue::Json(direct_payload.clone()),
+            masked: JsonSqlValue::Json(masked_payload.clone()),
+            poison: Some(CANARY_EMAIL),
+        },
     ];
 
     for case in cases {
@@ -1019,6 +881,56 @@ async fn json_sql_queries_return_exact_masked_values_with_poison_controls() -> R
             Some("***".into()),
         ]],
         "JSON expression plans must align with RowDescription positions"
+    );
+
+    // Star expansion and a two-column view keep table OID + attnum on every
+    // JSON field. The campaign above is one-field; these pin the same pointer
+    // policy across a multi-column RowDescription.
+    let star = simple_query_round(&mut client, "SELECT * FROM canary.documents").await?;
+    assert_served(&star.messages, "star expansion");
+    assert_no_canary_bytes(&star.received, "star expansion");
+    let star_rows = star.text_rows()?;
+    assert_eq!(star_rows.len(), 1, "star expansion rows");
+    assert_eq!(star_rows[0].len(), 3, "id, payload, legacy");
+    assert_eq!(star_rows[0][0].as_deref(), Some("1"));
+    assert_single_sql_value(
+        &[vec![star_rows[0][1].clone()]],
+        &JsonSqlValue::Json(masked_payload.clone()),
+        "star payload",
+    );
+    assert_single_sql_value(
+        &[vec![star_rows[0][2].clone()]],
+        &JsonSqlValue::Json(serde_json::json!({
+            "profile": {"email": partial_email, "name": "***"},
+            "public": "Portland",
+            "unknown": ""
+        })),
+        "star legacy",
+    );
+
+    let view = simple_query_round(
+        &mut client,
+        "SELECT payload, legacy FROM canary.documents_view",
+    )
+    .await?;
+    assert_served(&view.messages, "JSON columns through view");
+    assert_no_canary_bytes(&view.received, "JSON columns through view");
+    let view_rows = view.text_rows()?;
+    assert_eq!(view_rows.len(), 1, "view rows");
+    assert_eq!(view_rows[0].len(), 2, "payload, legacy");
+    assert_single_sql_value(
+        &[vec![view_rows[0][0].clone()]],
+        &JsonSqlValue::Json(masked_payload),
+        "view payload",
+    );
+    assert_single_sql_value(
+        &[vec![view_rows[0][1].clone()]],
+        &JsonSqlValue::Json(serde_json::json!({
+            "profile": {"email": partial_email, "name": "***"},
+            "public": "Portland",
+            "unknown": ""
+        })),
+        "view legacy",
     );
     Ok(())
 }
@@ -1252,9 +1164,67 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
             CANARY_EMAIL,
         ),
         (
+            "JSON INTERSECT operation",
+            "SELECT payload FROM canary.documents INTERSECT \
+             SELECT payload FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "extract set operation",
+            "SELECT payload->'profile'->>'email' FROM canary.documents \
+             UNION ALL SELECT payload->'profile'->>'email' FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
             "JSON subscripting",
             "SELECT payload['profile']['email'] FROM canary.documents",
             CANARY_EMAIL,
+        ),
+        (
+            "json to jsonb cast",
+            "SELECT legacy::jsonb FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "json aggregate",
+            "SELECT json_agg(payload) FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "to_jsonb constructor",
+            "SELECT to_jsonb(payload) FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "to_json row constructor",
+            "SELECT to_json(d) FROM canary.documents d",
+            CANARY_EMAIL,
+        ),
+        (
+            "row_to_json constructor",
+            "SELECT row_to_json(d) FROM canary.documents d",
+            CANARY_EMAIL,
+        ),
+        (
+            "jsonb_build_object around a document",
+            "SELECT jsonb_build_object('p', payload) FROM canary.documents",
+            CANARY_EMAIL,
+        ),
+        (
+            "lateral array expansion",
+            "SELECT * FROM canary.documents, \
+             LATERAL jsonb_array_elements(payload->'items') AS elem",
+            CANARY_TEMP,
+        ),
+        (
+            "ambiguous document array path",
+            "SELECT payload #> '{items,0}' FROM canary.documents",
+            CANARY_TEMP,
+        ),
+        (
+            "ambiguous numeric object path",
+            "SELECT payload #>> '{numeric_object,0,token}' FROM canary.documents",
+            CANARY_TEMP,
         ),
     ];
 
@@ -1276,222 +1246,46 @@ async fn json_sql_refusals_have_direct_poison_controls() -> Result<()> {
     Ok(())
 }
 
-/// One live-server matrix for the JSON SQL surface.
-///
-/// Unit tests pin parser nodes and trie branches; this test asks PostgreSQL to
-/// parse, type, describe, and execute each form through pgwire. Every served
-/// case has a concrete analyst use, every refused case is a shape whose source
-/// or runtime navigation cannot be justified from RowDescription + catalog.
+/// Protocol and posture leftovers that the simple-query value/refusal
+/// campaigns cannot cover: `search_path` resolution, a dynamic key that
+/// yields SQL NULL on the backend (so it has no poison token), binary Bind,
+/// and hostile-posture predicate oracles.
 #[tokio::test]
-async fn json_sql_surface_is_useful_without_guessing_provenance_or_shape() -> Result<()> {
+async fn json_sql_search_path_binary_and_hostile_posture() -> Result<()> {
     require_pg!();
     load_schema(DB).await?;
     let rules = classified_json_document_rules();
     let proxy = start_proxy(DB, rules.clone()).await?;
     let mut client = RawClient::connect(proxy.addr, DB).await?;
 
-    assert_sql_cases(
-        &mut client,
-        &[
-            // Scalar leaves: released, masked, and unmatched.
-            SqlCase::served(
-                "released scalar leaf",
-                "SELECT payload->>'public' FROM canary.documents",
-            ),
-            SqlCase::served(
-                "masked scalar leaf",
-                "SELECT payload->'profile'->>'email' FROM canary.documents",
-            ),
-            SqlCase::served(
-                "unmatched scalar leaf",
-                "SELECT payload->>'unknown' FROM canary.documents",
-            ),
-            // Document subtrees retain child pointer policy.
-            SqlCase::served(
-                "operator document subtree",
-                "SELECT payload->'profile' FROM canary.documents",
-            ),
-            SqlCase::served(
-                "path operator document subtree",
-                "SELECT payload #> '{profile}' FROM canary.documents",
-            ),
-            SqlCase::served(
-                "function document subtree",
-                "SELECT jsonb_extract_path(payload, 'profile') FROM canary.documents",
-            ),
-            // Exact text paths do not need an array wildcard.
-            SqlCase::served(
-                "exact text path operator",
-                "SELECT payload #>> '{profile,email}' FROM canary.documents",
-            ),
-            SqlCase::served(
-                "exact text path function",
-                "SELECT jsonb_extract_path_text(payload, 'profile', 'email') \
-                 FROM canary.documents",
-            ),
-            SqlCase::served(
-                "qualified exact text path function",
-                "SELECT pg_catalog.jsonb_extract_path_text(payload, 'profile', 'email') \
-                 FROM canary.documents",
-            ),
-            // Integer -> proves array navigation; both scalar and subtree forms
-            // may therefore enter /items/*.
-            SqlCase::served(
-                "proven array scalar",
-                "SELECT payload->'items'->0->>'token' FROM canary.documents",
-            ),
-            SqlCase::served(
-                "proven array subtree",
-                "SELECT payload->'items'->0 FROM canary.documents",
-            ),
-            // Quoted \"0\" is an object key, so it never inherits array-only `*`.
-            SqlCase::served(
-                "numeric object key",
-                "SELECT payload->'numeric_object'->'0'->>'token' FROM canary.documents",
-            ),
-            // Attribution variants that remain unique and schema-qualified.
-            SqlCase::served(
-                "relation-qualified owner",
-                "SELECT canary.documents.payload->>'public' FROM canary.documents",
-            ),
-            SqlCase::served(
-                "aliased owner",
-                "SELECT d.payload->>'public' FROM canary.documents AS d",
-            ),
-            SqlCase::served(
-                "owner through join",
-                "SELECT d.payload->>'public' FROM canary.documents d \
-                 JOIN canary.subjects s ON s.id = d.id",
-            ),
-            SqlCase::served(
-                "owner through view",
-                "SELECT payload->>'public' FROM canary.documents_view",
-            ),
-            SqlCase::served(
-                "extract wrapped by subquery",
-                "SELECT * FROM (SELECT payload->>'public' FROM canary.documents) q",
-            ),
-            // Wrappers explicitly peeled by the allowlist.
-            SqlCase::served(
-                "cast wrapper",
-                "SELECT CAST(payload->>'public' AS text) FROM canary.documents",
-            ),
-            SqlCase::served(
-                "collation wrapper",
-                "SELECT (payload->>'public') COLLATE \"C\" FROM canary.documents",
-            ),
-            // Predicates do not change the projection policy in default posture.
-            SqlCase::served(
-                "JSON predicate in default posture",
-                "SELECT payload->>'public' FROM canary.documents \
-                 WHERE payload @> '{\"public\":\"Portland\"}'",
-            ),
-        ],
-    )
-    .await?;
-
     // Make the unqualified relation real on this backend session. Otherwise
     // PostgreSQL's own undefined-table error would pass the no-canary check
     // without exercising pgmask's search_path refusal.
     client.simple_query("SET search_path = canary").await?;
+    let unqualified = "SELECT payload->'profile'->>'email' FROM documents";
+    let direct =
+        simple_query_direct(DB, &format!("SET search_path = canary; {unqualified}")).await?;
+    assert!(
+        direct
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|value| value.contains(CANARY_EMAIL)),
+        "unqualified relation poison control: {direct:?}"
+    );
+    let refused = simple_query_round(&mut client, unqualified).await?;
+    assert_refused_bytes(&refused.received, "unqualified relation");
+    assert_no_canary_bytes(&refused.received, "unqualified relation");
 
-    assert_sql_cases(
+    // Dynamic keys are opaque. The backend returns SQL NULL here (id::text is
+    // "1", and payload has no such key), so there is no poison token to demand.
+    let dynamic = simple_query_round(
         &mut client,
-        &[
-            // Source ownership is unresolved.
-            SqlCase::refused(
-                "unqualified relation",
-                "SELECT payload->>'public' FROM documents",
-            ),
-            SqlCase::refused(
-                "extract owned by CTE",
-                "WITH c AS (SELECT payload FROM canary.documents) \
-                 SELECT payload->>'public' FROM c",
-            ),
-            SqlCase::refused(
-                "extract owned by subquery",
-                "SELECT q.payload->>'public' \
-                 FROM (SELECT payload FROM canary.documents) q",
-            ),
-            SqlCase::refused(
-                "dynamic key",
-                // This must name a real expression. The old `column_name` did
-                // not exist, so PostgreSQL returned 42703; a refusal from an
-                // earlier matrix row in the cumulative receive buffer made
-                // that vacuous case pass until diagnostics became per-query.
-                "SELECT payload->(id::text) FROM canary.documents",
-            ),
-            // PostgreSQL text paths decide object-vs-array from the runtime value.
-            // They cannot enter an array-only wildcard at plan time.
-            SqlCase::refused(
-                "ambiguous scalar array path",
-                "SELECT payload #>> '{items,0,token}' FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "ambiguous document array path",
-                "SELECT payload #> '{items,0}' FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "ambiguous function array path",
-                "SELECT jsonb_extract_path_text(payload, 'items', '0', 'token') \
-                 FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "ambiguous numeric object path",
-                "SELECT payload #>> '{numeric_object,0,token}' FROM canary.documents",
-            ),
-            // Unsupported path syntax and text serialization of protected subtrees.
-            SqlCase::refused(
-                "negative array index",
-                "SELECT payload->-1 FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "operator protected subtree as text",
-                "SELECT payload->>'profile' FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "path protected subtree as text",
-                "SELECT payload #>> '{profile}' FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "JSONPath query first",
-                "SELECT jsonb_path_query_first(payload, '$.profile.email') \
-                 FROM canary.documents",
-            ),
-            // Reshaping, construction, and set operations stay opaque.
-            SqlCase::refused(
-                "pretty serialization",
-                "SELECT jsonb_pretty(payload) FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "object expansion",
-                "SELECT jsonb_each(payload) FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "array expansion",
-                "SELECT jsonb_array_elements(payload->'items') FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "object construction",
-                "SELECT jsonb_build_object('value', payload->>'public') \
-                 FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "document concatenation",
-                "SELECT payload || '{\"public\":\"other\"}'::jsonb FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "document text cast",
-                "SELECT payload::text FROM canary.documents",
-            ),
-            SqlCase::refused(
-                "extract set operation",
-                "SELECT payload->>'public' FROM canary.documents \
-                 UNION ALL SELECT payload->>'public' FROM canary.documents",
-            ),
-        ],
+        "SELECT payload->(id::text) FROM canary.documents",
     )
     .await?;
+    assert_refused_bytes(&dynamic.received, "dynamic key");
+    assert_no_canary_bytes(&dynamic.received, "dynamic key");
 
     // Text-family binary results use the same bytes, but this goes through
     // Parse/Describe/Bind so format planning is exercised on an extract.
@@ -1597,59 +1391,6 @@ async fn json_sql_surface_is_useful_without_guessing_provenance_or_shape() -> Re
     let predicate = simple_query_round(&mut hostile_client, predicate_sql).await?;
     assert_refused_bytes(&predicate.received, "hostile JSON predicate oracle");
     assert_no_canary_bytes(&predicate.received, "hostile JSON predicate oracle");
-    Ok(())
-}
-
-#[tokio::test]
-async fn json_columns_stay_masked_through_joins_ctes_subqueries_and_views() -> Result<()> {
-    require_pg!();
-    load_schema(DB).await?;
-    let proxy = start_proxy(DB, classified_json_document_rules()).await?;
-    let mut client = RawClient::connect(proxy.addr, DB).await?;
-    // These shapes keep table OID + attnum on the described field. They must
-    // be served under the JSON pointer policy, not refused as opaque and not
-    // released as a blob.
-    assert_sql_cases(
-        &mut client,
-        &[
-            SqlCase::served(
-                "aliased JSON column",
-                "SELECT payload AS p FROM canary.documents",
-            ),
-            SqlCase::served(
-                "table-aliased JSON column",
-                "SELECT d.payload FROM canary.documents d",
-            ),
-            SqlCase::served(
-                "JSON column through join",
-                "SELECT d.payload FROM canary.documents d \
-                 JOIN canary.subjects s ON s.id = d.id",
-            ),
-            SqlCase::served(
-                "JSON column through subquery",
-                "SELECT payload FROM (SELECT payload FROM canary.documents OFFSET 0) q",
-            ),
-            SqlCase::served(
-                "JSON column through CTE",
-                "WITH c AS (SELECT payload FROM canary.documents) SELECT payload FROM c",
-            ),
-            SqlCase::served(
-                "identity jsonb cast",
-                "SELECT payload::jsonb FROM canary.documents",
-            ),
-            SqlCase::served("star expansion", "SELECT * FROM canary.documents"),
-            SqlCase::served(
-                "JSON columns through view",
-                "SELECT payload, legacy FROM canary.documents_view",
-            ),
-            SqlCase::served(
-                "JSON column with predicate",
-                "SELECT payload FROM canary.documents \
-                 WHERE payload @> '{\"public\":\"Portland\"}'",
-            ),
-        ],
-    )
-    .await?;
     Ok(())
 }
 
