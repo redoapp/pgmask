@@ -23,18 +23,21 @@ finds one, and a `pgmask` binary (the script `cargo build`s it).
 
 ## What the catalog is trying to do
 
-A support engineer still has to answer "which city is this contact in?" and
-"did this message come from a campaign?" without reading emails, phones, IPs,
-SSNs, Stripe ids, or checkout referer tokens.
+A support engineer still has to answer "which inbox is failing?", "what
+content type is affected?", "which automation shape ran?", and "which city is
+this contact in?" without reading emails, phones, names, transcripts, external
+ids, SSNs, Stripe ids, device fingerprints, or checkout referer tokens.
 
 | Surface | Policy |
 |---|---|
-| `contacts.email` / `phone_number` / `name` | semantic types (pseudonym / partial / redact) |
-| Widget public keys (`company_name`, `city`, `browser`, …) | `mask = "json"` pointer `none` |
+| `contacts.email` / `phone_number` / `name` | semantic types (pseudonym / pseudonym / redact) |
+| Contact/channel/conversation/message/order ids | domain-separated pseudonyms |
+| Widget public keys (`company_name`, `city`, browser family/version, …) | `mask = "json"` pointer `none` |
+| Widget device name | redact |
 | `created_at_ip` | `ip-prefix` |
-| `referer`, `mail_subject`, `ssn`, Stripe ids | `redact` |
+| `referer`, `mail_subject`, email subject, SSN, Stripe ids | redact |
 | Evolving custom keys | `json_unmatched = "type-placeholders"` |
-| `messages.content` | `scrub` (identifiers, not names in prose) |
+| Message/automation/free-text fields | redact (regex scrubbing cannot reliably find names) |
 | `contact_directory` view | **own** `[[column]]` rows — Postgres reports the view OID |
 
 `NOT NULL` keys are `mask = "none"` so `SELECT *` is a real JSON-masking path
@@ -43,8 +46,17 @@ rather than a type-aware-fallback refusal.
 ## Corpus
 
 [queries.sql](queries.sql) is the pin. Each case declares `@expect: served`,
-`refused`, or `error`. [probe.py](probe.py) also scans every result for canary
-tokens (`alice.cw-canary@inbox.test`, `203.0.113.77`, `CANARYSTRIPE`, …).
+`refused`, or `error`. [probe.py](probe.py) first proves **36 forbidden source
+values** are observable directly, then scans every proxied result for them.
+`verify.sh` also starts a deliberately releasing second proxy: the poison
+control must expose the email or the leak detector is not trusted.
+
+The main policy uses `posture = "hostile"`. Email equality/grouping and masked
+JSON predicates refuse. This is stronger than result-byte masking, but it is
+not a general information-flow proof: simple `ORDER BY` on a masked column is
+allowed and exposes relative order, and deterministic pseudonyms expose
+equality/frequency. Production still needs rate limiting and no route around
+the proxy; see [the security model](../../docs/security.md).
 
 Chatwoot's Arel is unqualified (`FROM "contacts"`). Two cases cover that:
 
@@ -52,26 +64,44 @@ Chatwoot's Arel is unqualified (`FROM "contacts"`). Two cases cover that:
    **withholds** the error text (`SQL can choose it`).
 2. With `search_path=chatwoot` → pgmask refuses extract attribution (it does
    not guess `search_path`).
-3. Schema-qualified rewrite → served, city/company released, PII not.
+3. Schema-qualified unsorted projection → served, city/company released, PII
+   not. The app's `ORDER BY` JSON expression refuses under hostile posture.
 
 That is the debugging loop this dataset is for: take the SQL the app ran,
 qualify it, see whether the catalog answers the ops question without a leak.
 
 ## What a first run showed
 
-Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.1.99 (33 cases):
+Pinned by `./examples/chatwoot/verify.sh` against pgmask 0.1.99:
 
 | Kind | Count | What happened |
 |---|---|---|
-| Served | 25 | Health checks, schema-qualified `->>'company_name'` / `->>'city'`, JSONB `['city']` / `['country']` (SyncAttributes), IP prefix, referer redact, nested `browser->os`, whole JSON blobs, `SELECT *`, the directory **view**, `GROUP BY` city extract, mixed `->` then `['browser_name']`, `json` `content_attributes` extracts, `additional_attributes->'campaign_id'` |
-| Refused | 7 | Unqualified extract even with `search_path`, `jsonb_pretty` / `jsonb_each` / `to_jsonb`, UNION, subquery alias of an extract, `(extract) IS NULL` |
+| Served | 62 | Queue/delivery/status counts, timeline envelopes, dashboard FILTER counts, message `today`/`chat`, pseudonym correlation, whole masked JSON, `SELECT *`, view OIDs, literal extract spellings, tag-id filtering |
+| Refused | 19 | Unqualified/app JSON ordering, custom-attribute membership, label-name `EXISTS`, masked predicates/grouping, JSON parent text, dynamic key/subscript ambiguity, CTE alias, `jsonb_pretty` / `jsonb_each` / `to_jsonb`, UNION |
 | Error | 1 | Unqualified `FROM "contacts"` with no search_path — backend `undefined_table`, message withheld |
+| Protocol | 3 | Extended bind, same-session recovery after refusal, and mid-session `search_path` all pass |
+| Poison control | 1 | A release-policy proxy exposes the source email, proving the detector can see a leak |
 
-Canaries (`alice.cw-canary@inbox.test`, `203.0.113.77`, `078-05-4391`,
-`CANARYSTRIPE`, `CANARYREF`, `CANARYHOOK`, `555-867-5309`) did not appear in
-any proxied result. Message body became `Call me at <PHONE>.` under `scrub`.
+No forbidden source value appeared through the main proxy. Message bodies and
+subjects become `***`; email/phone/order/external ids become deterministic
+pseudonyms; IPs become prefixes; unknown JSON leaves retain only type/shape.
 
 The `IS NULL` refusal is the useful debugging lesson: Chatwoot's
 `valid_first_reply?` SQL is an expression. Project
 `additional_attributes->'campaign_id'` and inspect the JSON `null`; do not wrap
 the extract in SQL.
+
+Other runbook lessons found by the live corpus:
+
+- Hostile posture is conservative by **identifier spelling** before result
+  OIDs exist. `inboxes.name` grouping and Chatwoot's label-name `EXISTS` query
+  refuse because `name` is sensitive on other relations. Group by inbox/tag id
+  and resolve the released label/name separately.
+- A released JSON pointer is not used to bless hostile predicates. Filtering
+  `additional_attributes->>'city'` refuses; Chatwoot's synchronized scalar
+  `location` is the safe configured workaround.
+- `store ..., coder: JSON` over Chatwoot's native `json`/`jsonb` columns has
+  been reported to create string scalars. The fixture reproduces it: whole
+  cells reveal only `""`, while `->>` silently returns SQL NULL.
+- `conditions[0]['attribute_key']` refuses at the runtime-shape-ambiguous
+  subscript; `conditions->0->>'attribute_key'` proves the array step and serves.

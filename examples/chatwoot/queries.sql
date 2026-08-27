@@ -724,10 +724,10 @@ FROM chatwoot.custom_attribute_definitions
 WHERE id = 202;
 
 -- Exact label-filter EXISTS shape assembled by FilterService. Labels and ids
--- are explicitly released operational routing metadata.
+-- are explicitly released, but `name` is masked on other relations and the
+-- hostile preflight conservatively refuses by identifier spelling.
 -- @id: chatwoot-label-filter
--- @expect: served
--- @contains: 5001|0
+-- @expect: refused
 -- @source: https://github.com/chatwoot/chatwoot/blob/develop/app/services/filter_service.rb
 SELECT c.id, c.status
 FROM chatwoot.conversations c
@@ -741,5 +741,20 @@ WHERE EXISTS (
       FROM chatwoot.tags
       WHERE tags.name IN ('billing')
     )
+)
+ORDER BY c.id;
+
+-- Operator workaround after resolving "billing" to tag id 301.
+-- @id: chatwoot-label-filter-by-id
+-- @expect: served
+-- @contains: 5001|0
+SELECT c.id, c.status
+FROM chatwoot.conversations c
+WHERE EXISTS (
+  SELECT *
+  FROM chatwoot.taggings
+  WHERE taggings.taggable_id = c.id
+    AND taggings.taggable_type = 'Conversation'
+    AND taggings.tag_id = 301
 )
 ORDER BY c.id;

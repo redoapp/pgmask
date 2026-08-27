@@ -79,10 +79,13 @@
   alongside binary text extracts.
 - Add a Chatwoot-shaped golden fixture (`examples/chatwoot`) with a reduced
   real schema, JSON/JSONB-heavy seed, operator catalog, and a sourced query
-  corpus. The pin is realistic support-inbox SQL (widget extracts, JSONB
-  subscripts, `json` `content_attributes`, views, `SELECT *`) through pgmask,
-  including Chatwoot's unqualified `FROM "contacts"` friction — not an
-  allowlist expansion.
+  corpus. Its hostile policy withholds transcript prose, customer/device
+  identifiers, secrets and unknown JSON leaves while retaining status, inbox,
+  routing, automation-shape and timeline diagnostics. The pin covers realistic
+  app SQL, JSON/JSONB extracts, views, `SELECT *`, extended Bind, refusal
+  recovery, and reported native-JSON double encoding. Direct source controls
+  plus a deliberately releasing poison proxy prove the harness can see a leak;
+  refusals remain refusals rather than driving an allowlist expansion.
 - Pin the JSON pointer trie and catalog overlap helpers with named lookup
   tables: exact beats `*`, object keys never take array wildcards, ambiguous
   text steps refuse at a `*` edge, nested wildcards need a proven array index
