@@ -124,7 +124,7 @@ Literal extracts are served when the path can be mapped to a pointer:
 SELECT payload->>'public' FROM app.events;
 SELECT payload->'profile' FROM app.events;
 SELECT payload->'profile'->>'email' FROM app.events;
-SELECT payload['profile']['email'] FROM app.events;  -- jsonb, same pointer policy as ->
+SELECT payload['profile']['email'] FROM app.events;  -- json/jsonb, same policy as ->
 SELECT payload['items'][0] FROM app.events;          -- integer index, like -> 0
 SELECT payload #>> '{profile,email}' FROM app.events;
 SELECT jsonb_extract_path_text(payload, 'profile', 'email') FROM app.events;
@@ -177,6 +177,8 @@ pgmask refuses the result set rather than passing a value it cannot honour:
 - A leaf mask that cannot apply to the JSON type (`partial` on a number,
   `numeric-bucket` on a string).
 - A `->>` / `#>>` extract of a path that still has child pointer policies.
+- A casted JSON subscript key. Its post-cast type, not its literal spelling,
+  decides object-key versus array-index navigation.
 - `mask = "json"` on a non-json column (plan-time type mismatch).
 - Recursive `json` as a nested pointer mask.
 

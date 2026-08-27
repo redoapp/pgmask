@@ -1124,6 +1124,23 @@ fn json_subscripting_is_the_same_literal_path_as_the_arrow_operators() {
         JsonExtractArgument::Unattributable => panic!("expected mixed subscript then ->>"),
     }
 
+    let mixed =
+        StatementInspection::new("SELECT (payload->'profile')['email'] FROM canary.documents");
+    match &mixed.json_extract_resolution(1).unwrap().fields()[0] {
+        JsonExtractArgument::Extract(extract) => {
+            assert!(!extract.as_text);
+            assert_eq!(
+                extract
+                    .path
+                    .iter()
+                    .map(|s| s.value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["profile", "email"]
+            );
+        }
+        JsonExtractArgument::Unattributable => panic!("expected mixed -> then subscript"),
+    }
+
     assert_eq!(
         StatementInspection::new("SELECT payload[1:3] FROM canary.documents")
             .output_safety(1, ALLOW_ALL),
@@ -1136,6 +1153,24 @@ fn json_subscripting_is_the_same_literal_path_as_the_arrow_operators() {
             .fields(),
         vec![JsonExtractArgument::Unattributable]
     );
+    for sql in [
+        "SELECT payload['items']['0'::int] FROM canary.documents",
+        "SELECT payload['numeric_object'][0::text] FROM canary.documents",
+    ] {
+        assert_eq!(
+            StatementInspection::new(sql).output_safety(1, ALLOW_ALL),
+            vec![Safety::Unknown],
+            "post-cast subscript type must not be inferred from its literal: {sql}"
+        );
+        assert_eq!(
+            StatementInspection::new(sql)
+                .json_extract_resolution(1)
+                .unwrap()
+                .fields(),
+            vec![JsonExtractArgument::Unattributable],
+            "casted subscript must remain opaque: {sql}"
+        );
+    }
 }
 
 #[test]

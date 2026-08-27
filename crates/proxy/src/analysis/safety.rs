@@ -552,9 +552,11 @@ fn classify(expr: &NodeEnum, allow: Relaxations) -> Safety {
         }
 
         NodeEnum::AIndirection(_) => {
-            // `payload['a'][0]` is parsed as indirection, not `AExpr`. Treat
-            // only literal JSON/JSONB subscripts as extracts; array slices and
-            // composite field names stay unknown.
+            // `payload['a'][0]` is parsed as indirection, not `AExpr`. Analysis
+            // has no type OID here, so this recognizes only the literal JSON
+            // *shape*; catalog resolution later admits Mask::Json (or an
+            // explicitly public source) and keeps masked non-JSON arrays
+            // opaque. Slices and composite field names stay unknown.
             if super::json_extract::expr_is_json_extract(expr) {
                 return Safety::JsonExtract;
             }

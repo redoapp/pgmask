@@ -32,11 +32,12 @@
 - Split JSON masking, extract parsing, extract policy, and catalog pointer
   validation into their own modules so those seams stay reviewable as the
   walker and allowlist grow.
-- Keep SQL attribution separate from JSON navigation. Integer `-> 0` is proven
-  array navigation; quoted keys are object navigation; text-path segments from
-  `#>` / `#>>` and `json[b]_extract_path[_text]` remain ambiguous. An ambiguous
-  segment that could enter a `*` policy now refuses instead of letting a
-  numeric object key inherit an array-only release. Summaries and JSON extracts
+- Keep SQL attribution separate from JSON navigation. Integer `-> 0` and `[0]`
+  are proven array navigation; quoted keys are object navigation; text-path
+  segments from `#>` / `#>>` and `json[b]_extract_path[_text]` remain
+  ambiguous. An ambiguous segment that could enter a `*` policy now refuses
+  instead of letting a numeric object key inherit an array-only release.
+  Summaries and JSON extracts
   now enter `plan_for` through one resolved-expression policy slot rather than
   a feature-specific fallback ladder.
 - Keep extract provenance out of reusable column policy. `MaskSpec` no longer
@@ -87,13 +88,13 @@
   by using the same equally-specific overlap predicate, then calls
   `validate_json_spec`. Rule segments include `0` and `*` so exact-index vs
   array-wildcard pairs appear; path `*` covers the literal object key.
-- Add a live-Postgres JSON SQL value campaign. Sixty-seven operator, function,
+- Add a live-Postgres JSON SQL value campaign. Sixty-eight operator, function,
   cast/collation, alias/join/view/CTE/subquery, object, array, `json`/`jsonb`,
   unmatched-leaf, and whole-document queries first run directly against
   PostgreSQL, requiring poison values where applicable, then decode pgmask's
   raw-wire DataRows and compare the exact text, SQL NULL, or semantic JSON
   result; a five-field projection plus star expansion and a two-column view
-  pin positional plan alignment. Forty-three refused construction, expansion,
+  pin positional plan alignment. Forty-four refused construction, expansion,
   JSONPath, dynamic/ambiguous path, mutation, aggregate, wrapper,
   and set-operation shapes likewise must expose a poison directly and produce
   pgmask's own refusal without one byte of poison. Binary Bind assertions now
@@ -107,8 +108,10 @@
 - Attribute PostgreSQL JSON/JSONB subscripting (`payload['profile']['email']`,
   `payload['items'][0]`) as the same literal extract as `->`. Quoted keys are
   object navigation; integer indices are proven array steps. Slices and
-  computed keys stay opaque. Mixed forms such as `payload['profile']->>'email'`
-  chain onto the existing operator parser.
+  computed or casted keys stay opaque. Casts are deliberately refused because
+  PostgreSQL dispatches by the post-cast type: `'0'::int` is array navigation
+  while `0::text` is an object key. Mixed forms such as
+  `payload['profile']->>'email'` chain onto the existing operator parser.
 
 ## 0.1.98 — Close then Bind of the same portal name does not inherit the rebound plan
 

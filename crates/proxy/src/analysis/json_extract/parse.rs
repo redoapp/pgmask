@@ -59,19 +59,12 @@ fn parse_subscript_index(expr: &NodeEnum) -> Option<JsonExtractPathSegment> {
     if idx.is_slice || idx.lidx.is_some() {
         return None;
     }
-    let mut key = idx.uidx.as_ref()?.node.as_ref()?;
-    loop {
-        match key {
-            NodeEnum::TypeCast(cast) => {
-                key = cast.arg.as_ref()?.node.as_ref()?;
-            }
-            NodeEnum::CollateClause(collate) => {
-                key = collate.arg.as_ref()?.node.as_ref()?;
-            }
-            NodeEnum::AConst(_) => return parse_single_key(key),
-            _ => return None,
-        }
-    }
+    // Do not peel casts here. PostgreSQL dispatches subscripting by the
+    // post-cast type: `'0'::int` is array navigation, while `0::text` is an
+    // object key. Classifying from the inner AConst would invert that fact and
+    // could skip an array-wildcard policy. Bare constants are the complete
+    // allowlist until the cast target itself is interpreted.
+    parse_single_key(idx.uidx.as_ref()?.node.as_ref()?)
 }
 
 fn parse_operator_extract(aexpr: &AExpr, depth: usize) -> Option<JsonExtract> {
