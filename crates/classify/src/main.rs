@@ -1251,7 +1251,7 @@ fn emit_catalog(proposals: &[Proposal], schema: &str) {
         }
     }
     for (relation, proposals) in by_relation {
-        println!("[columns.{relation:?}]");
+        println!("[columns.{}]", toml_basic_string(&relation));
         for proposal in proposals {
             let Some(semantic_type) = proposal.semantic_type else {
                 continue;
@@ -1262,12 +1262,40 @@ fn emit_catalog(proposals: &[Proposal], schema: &str) {
                 ""
             };
             println!(
-                "{:?} = {{ type = {:?} }}{flag}",
-                proposal.column.name, semantic_type
+                "{} = {{ type = {} }}{flag}",
+                toml_basic_string(&proposal.column.name),
+                toml_basic_string(semantic_type)
             );
         }
         println!();
     }
+}
+
+/// Quote an arbitrary PostgreSQL identifier as a TOML basic string.
+///
+/// Rust's `Debug` strings are close, but encode controls as `\u{7f}`, which
+/// TOML does not accept. A classifier must not emit an unusable catalog merely
+/// because PostgreSQL allowed an unusual quoted identifier.
+fn toml_basic_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len().saturating_add(2));
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\u{0008}' => quoted.push_str("\\b"),
+            '\t' => quoted.push_str("\\t"),
+            '\n' => quoted.push_str("\\n"),
+            '\u{000c}' => quoted.push_str("\\f"),
+            '\r' => quoted.push_str("\\r"),
+            character if character.is_control() => {
+                quoted.push_str(&format!("\\u{:04X}", u32::from(character)));
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn arg(args: &[String], flag: &str) -> Option<String> {
@@ -1287,6 +1315,14 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::*;
+
+    #[test]
+    fn toml_identifier_quoting_handles_postgres_quoted_names() {
+        let quoted = toml_basic_string("odd\"\\\n\u{007f}");
+        assert_eq!(quoted, "\"odd\\\"\\\\\\n\\u007F\"");
+        let document = format!("[columns.{quoted}]\n{quoted} = {{ mask = \"redact\" }}\n");
+        toml::from_str::<toml::Table>(&document).expect("generated TOML must parse");
+    }
 
     /// Sampling confirms a shape, not a type.
     ///
