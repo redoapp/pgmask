@@ -23,7 +23,7 @@
   configured rule. Add per-column `json_max_bytes` (1 MiB default) and
   `json_max_depth` (64 default, maximum 128); values over either limit refuse
   before `serde_json` parses or allocates the document tree.
-- Attribute literal JSON extracts (`->`, `->>`, `#>`/`#>>`, JSON subscripting,
+- Attribute literal JSON extracts (`->`, `->>`, `#>`/`#>>`, JSONB subscripting,
   `json[b]_extract_path[_text]`) of a schema-qualified classified column.
   The stored column's pointer policy is applied to the extract; a text extract
   of a node that still has child pointer policies is refused because the
