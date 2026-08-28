@@ -582,10 +582,22 @@ fn default_summaries() -> Summaries {
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-        let config: Self = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
-        config.validate()?;
+        let (config, _) = Self::load_with_bytes(path)?;
         Ok(config)
+    }
+
+    /// Parse `path` and return the exact bytes that were parsed.
+    ///
+    /// SIGHUP identity hashes those bytes. A second `read` after the catalog
+    /// round-trip can see a rewritten file and record a SHA that never ran,
+    /// so the next hangup of that file would skip the real reload.
+    pub fn load_with_bytes(path: &str) -> Result<(Self, Vec<u8>)> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+        let text =
+            std::str::from_utf8(&bytes).with_context(|| format!("{path} is not valid UTF-8"))?;
+        let config: Self = toml::from_str(text).with_context(|| format!("parsing {path}"))?;
+        config.validate()?;
+        Ok((config, bytes))
     }
 
     /// Whole-config checks that a per-field deserialiser cannot make.
@@ -1434,10 +1446,18 @@ impl Catalog {
     }
 
     pub fn set_refresh_schedule(&self, interval: Duration, min_interval: Duration) {
-        self.interval_secs
-            .store(interval.as_secs(), Ordering::Relaxed);
-        self.min_interval_secs
-            .store(min_interval.as_secs(), Ordering::Relaxed);
+        let prev_interval = self
+            .interval_secs
+            .swap(interval.as_secs(), Ordering::Relaxed);
+        let prev_min = self
+            .min_interval_secs
+            .swap(min_interval.as_secs(), Ordering::Relaxed);
+        // A zero-interval refresher is parked on `notified()`, not a sleep.
+        // Changing the schedule without waking it would leave timed refresh
+        // off until an unknown-OID nudge. Same for shrinking the floor.
+        if prev_interval != interval.as_secs() || prev_min != min_interval.as_secs() {
+            self.refresh_wanted.notify_one();
+        }
     }
 
     /// Re-resolve and swap. Logs every difference, because a silent change in
@@ -1473,9 +1493,16 @@ impl Catalog {
             let interval_secs = self.interval_secs.load(Ordering::Relaxed);
             let min_interval = Duration::from_secs(self.min_interval_secs.load(Ordering::Relaxed));
             if interval_secs == 0 {
-                // 0 means "no timer": only an unknown-OID nudge refreshes.
-                // Sleeping zero would spin the loop and storm pg_class.
+                // 0 means "no timer": only an unknown-OID nudge (or a
+                // schedule change) refreshes. Sleeping zero would spin the
+                // loop and storm pg_class. The min-interval floor still
+                // applies: a burst of unknown OIDs must not re-query
+                // `pg_class` back-to-back.
                 self.refresh_wanted.notified().await;
+                let since = last.elapsed();
+                if since < min_interval {
+                    tokio::time::sleep(min_interval.saturating_sub(since)).await;
+                }
             } else {
                 let interval = Duration::from_secs(interval_secs);
                 tokio::select! {
@@ -3042,5 +3069,16 @@ rate_limit_burst = 5
 "#,
         );
         assert_eq!(with_burst.effective_rate_limit_burst(), 5);
+    }
+
+    #[tokio::test]
+    async fn changing_the_refresh_interval_wakes_a_parked_wait() {
+        let catalog = Catalog::default();
+        catalog.set_refresh_schedule(Duration::ZERO, Duration::from_secs(5));
+        let notified = catalog.refresh_wanted.notified();
+        catalog.set_refresh_schedule(Duration::from_secs(30), Duration::from_secs(5));
+        tokio::time::timeout(Duration::from_millis(200), notified)
+            .await
+            .expect("a reload that turns the timer back on must wake the parked refresher");
     }
 }

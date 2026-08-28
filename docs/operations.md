@@ -75,7 +75,12 @@ The policy file is reloaded on `SIGHUP`. Parse, validation, TLS, and catalog
 resolution all happen before any live snapshot is swapped: a bad file keeps
 the previous policy. Cached statement and portal plans are dropped, so the next
 Describe rebuilds against the new rules; an in-flight result set keeps the plan
-it was already described with.
+it was already described with. The SHA used to skip an unchanged file is the
+bytes that were parsed, not a later re-read.
+
+`catalog_refresh_seconds = 0` disables the timer and refreshes only on an
+unknown-OID nudge or a later reload that turns the timer back on. The
+`catalog_refresh_min_seconds` floor still applies.
 
 `listen`, `backend`, `catalog_dsn`, and `metrics_listen` cannot change in
 process. A reload that edits those still applies every other setting and logs
