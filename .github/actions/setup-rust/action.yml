@@ -1,0 +1,61 @@
+name: Setup Rust
+description: Pin the toolchain, restore crates.io, and wrap rustc with sccache.
+
+inputs:
+  components:
+    description: Extra rustup components (comma-separated).
+    required: false
+    default: ""
+  cache-key:
+    description: rust-cache key suffix. Share this across jobs with the same cargo profile.
+    required: false
+    default: debug
+  save-cache:
+    description: Whether this job should write the cargo registry cache.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      with:
+        toolchain: 1.97.1
+        components: ${{ inputs.components }}
+
+    # Registry only. Compilation units go through sccache so clippy, nextest,
+    # and the Postgres matrix share work without uploading a multi-gigabyte
+    # target/ on every job. cache-bin is off: taiki-e/install-action owns
+    # ~/.cargo/bin, and a restored nextest/deny has clobbered those pins.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: ${{ inputs.cache-key }}
+        add-job-id-key: "false"
+        cache-bin: "false"
+        cache-targets: "false"
+        cache-on-failure: "true"
+        save-if: ${{ inputs.save-cache }}
+
+    - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      with:
+        version: v0.17.0
+        disable_annotations: true
+
+    # Do not set RUSTC_WRAPPER on the job: rust-cache runs rustc before
+    # sccache is on PATH, and a wrapper that cannot exec fails the restore.
+    - name: Wrap rustc with sccache
+      shell: bash
+      run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+    # ubuntu-24.04 images ship Clang 18; ld.lld is the linker rustc can
+    # drive without an apt round-trip. mold is faster still, but not on
+    # the image, and installing it costs more than it saves on this graph.
+    - name: Use lld
+      shell: bash
+      run: |
+        if command -v ld.lld >/dev/null; then
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+        elif [[ -x /usr/lib/llvm-18/bin/ld.lld ]]; then
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+        fi
