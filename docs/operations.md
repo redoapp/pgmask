@@ -118,7 +118,8 @@ expressions. Views need their own JSON rules. See
 
 `SIGTERM` stops new connections and closes existing sessions without draining.
 Run multiple instances behind a TCP load balancer if sessions must survive a
-rolling deployment.
+rolling deployment. A hardened systemd unit and a non-root container image
+are in [`deploy/`](../deploy/README.md).
 
 Use a health check that opens a PostgreSQL connection through pgmask. A process
 check alone does not verify backend connectivity or catalog loading.
@@ -143,7 +144,8 @@ Alert on:
 ## Metrics
 
 Set `metrics_listen` to expose Prometheus text at `/metrics`. No metrics port is
-opened by default.
+opened by default. Bind loopback (`127.0.0.1:9464`). A non-loopback address is
+warned at start: the scrape is unauthenticated and the counters name SQL shapes.
 
 Useful metrics include:
 

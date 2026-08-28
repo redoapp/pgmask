@@ -25,6 +25,8 @@ readme_version=$(grep -om1 '\*\*v[0-9][0-9.]*\*\*' README.md | tr -d '*v')
 [ "$readme_version" = "$cargo_version" ] ||
   note "README says v$readme_version, Cargo.toml says $cargo_version"
 
+[ -f SECURITY.md ] || note "SECURITY.md is missing; GitHub needs it for private reports."
+
 # Newest first. `sort -V -r` gives the order these should already be in, so any
 # difference is a heading out of place.
 versions=$(grep '^## ' CHANGELOG.md | sed 's/^## \([0-9.]*\).*/\1/')

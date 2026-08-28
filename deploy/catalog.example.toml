@@ -1,0 +1,12 @@
+# Skeleton catalog for deploy/compose.yaml. Replace the pseudonym key,
+# classify real columns, and require client TLS before this faces a network.
+listen = "0.0.0.0:6432"
+backend = "postgres:5432"
+catalog_dsn = "postgres://postgres@postgres:5432/app"
+pseudonym_key = "replace-this-with-a-long-random-key"
+unclassified = "mask"
+opaque = "reject"
+
+# Metrics stay off in the example. Binding them on 0.0.0.0 publishes
+# rejection causes (which name SQL shapes) without authentication.
+# metrics_listen = "127.0.0.1:9464"

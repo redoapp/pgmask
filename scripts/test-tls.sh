@@ -10,6 +10,7 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib/engine.sh"
 source "$(dirname "$0")/lib/container.sh"
 
 CONTAINER=pgmask-tls
@@ -27,7 +28,7 @@ fail=0
 
 cleanup() {
   [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null
-  podman rm -f -v "$CONTAINER" >/dev/null 2>&1
+  "$CONTAINER_ENGINE" rm -f -v "$CONTAINER" >/dev/null 2>&1
   rm -rf "$CERTS"
 }
 trap cleanup EXIT
@@ -64,8 +65,8 @@ refute() {
 await_pg() { pg_await "$CONTAINER" "$PG_PORT" "$1" || exit 1; }
 
 echo "==> starting postgres"
-podman rm -f -v "$CONTAINER" >/dev/null 2>&1
-podman run -d --name "$CONTAINER" \
+"$CONTAINER_ENGINE" rm -f -v "$CONTAINER" >/dev/null 2>&1
+"$CONTAINER_ENGINE" run -d --name "$CONTAINER" \
   -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=demo \
   -p "$PG_PORT":5432 docker.io/library/postgres:17 >/dev/null
 await_pg "initial boot"
@@ -73,21 +74,21 @@ await_pg "initial boot"
 echo "==> generating the backend cert inside the container"
 # Postgres refuses a key that is group- or world-readable, and refuses one it
 # does not own. Generating in place as the postgres user sidesteps both.
-podman exec -u postgres "$CONTAINER" bash -c '
+"$CONTAINER_ENGINE" exec -u postgres "$CONTAINER" bash -c '
   cd /var/lib/postgresql/data &&
   openssl req -new -x509 -days 1 -nodes -text \
     -out server.crt -keyout server.key -subj "/CN=localhost" 2>/dev/null &&
   chmod 600 server.key
 ' || { echo "could not generate backend cert"; exit 1; }
-podman exec -u postgres "$CONTAINER" psql -U postgres -c "ALTER SYSTEM SET ssl = on" >/dev/null ||
+"$CONTAINER_ENGINE" exec -u postgres "$CONTAINER" psql -U postgres -c "ALTER SYSTEM SET ssl = on" >/dev/null ||
   { echo "FATAL: could not set ssl = on"; exit 1; }
-podman restart "$CONTAINER" >/dev/null
+"$CONTAINER_ENGINE" restart "$CONTAINER" >/dev/null
 await_pg "after enabling ssl"
 
 # And confirm it took, rather than trusting the ALTER. This is the setting the
 # channel-binding assertion at the end depends on; if it is off, that assertion
 # reports a proxy failure for a database reason.
-ssl_state="$(podman exec -u postgres "$CONTAINER" psql -U postgres -tAc 'SHOW ssl' 2>&1)"
+ssl_state="$("$CONTAINER_ENGINE" exec -u postgres "$CONTAINER" psql -U postgres -tAc 'SHOW ssl' 2>&1)"
 [[ "$ssl_state" == "on" ]] || {
   echo "FATAL: the backend reports ssl = $ssl_state after being told to enable it"
   exit 1

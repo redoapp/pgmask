@@ -1,7 +1,8 @@
 # Security model
 
-Read this before deploying pgmask. The detailed findings and test history are
-in the [safety assessment](safety-assessment.md).
+Read this before deploying pgmask. Report a suspected disclosure through
+[SECURITY.md](../SECURITY.md), not a public issue. The detailed findings and test
+history are in the [safety assessment](safety-assessment.md).
 
 ## Security property
 

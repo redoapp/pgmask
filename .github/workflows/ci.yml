@@ -1,7 +1,8 @@
 name: CI
 
-# CI covers Rust checks and the real-Postgres tests. Releases still require
-# ./scripts/test-all.sh for the generated and cross-engine campaigns.
+# PR CI is the static policy plus real-Postgres (two majors) and the TLS
+# suite. Generated SQL, Cockroach, mutants, and sqlsmith stay on
+# ./scripts/test-all.sh for a release.
 on:
   push:
     branches: [main]
@@ -48,12 +49,20 @@ jobs:
       - run: ./scripts/check-repo-invariants.sh
 
   test:
-    name: tests (real Postgres)
+    name: tests (Postgres ${{ matrix.pg }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pg: "17"
+            image: postgres:17@sha256:a65e6a841f6c4dbc4abda3d67fa3bc21824e9611064fcd82e87ea67aad60a0c3
+          - pg: "14"
+            image: postgres:14
     services:
       postgres:
-        image: postgres:17@sha256:a65e6a841f6c4dbc4abda3d67fa3bc21824e9611064fcd82e87ea67aad60a0c3
+        image: ${{ matrix.image }}
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
@@ -79,3 +88,23 @@ jobs:
         env:
           PGMASK_TEST_PG: 127.0.0.1:5432
         run: cargo nextest run --workspace --all-features --locked --profile ci
+
+  tls:
+    name: TLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: packages
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            postgresql-client openssl
+      - name: TLS suite
+        env:
+          CONTAINER_ENGINE: docker
+        run: ./scripts/test-tls.sh
