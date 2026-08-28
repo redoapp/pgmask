@@ -1189,6 +1189,35 @@ unclassified = "{unclassified}"
     }
 
     #[tokio::test]
+    async fn a_file_rewritten_after_parse_is_not_skipped_on_sighup() {
+        let dir = std::env::temp_dir().join(format!("pgmask-reload-sha-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("catalog.toml");
+        let first = r#"
+backend = "127.0.0.1:1"
+listen = "127.0.0.1:0"
+catalog_dsn = "postgres://unused"
+pseudonym_key = "a-long-enough-key"
+unclassified = "allow"
+"#;
+        std::fs::write(&path, first).unwrap();
+        let (config, bytes) = Config::load_with_bytes(path.to_str().unwrap()).unwrap();
+        let policy = Policy::from_config(&config, Arc::new(Catalog::default())).unwrap();
+        policy.remember_file_bytes(&bytes);
+        std::fs::write(&path, first.replace("allow", "mask")).unwrap();
+        let report = policy
+            .reload_from_path(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !report.unchanged,
+            "the SHA of the parsed boot bytes must not skip a rewritten file"
+        );
+        assert_eq!(policy.unclassified(), Unclassified::Mask);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn listen_change_is_reported_and_other_knobs_still_apply() {
         let config = minimal_config(Unclassified::Allow);
         let policy = Policy::from_config(&config, Arc::new(Catalog::default())).unwrap();

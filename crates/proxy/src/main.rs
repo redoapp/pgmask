@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
 
     init_logging();
 
-    let config = Config::load(&path)?;
+    let (config, loaded_bytes) = Config::load_with_bytes(&path)?;
 
     // Resolving the catalog before binding is deliberate: a proxy that starts
     // with a half-loaded catalog is a proxy with unknown coverage.
@@ -62,9 +62,7 @@ async fn main() -> Result<()> {
     );
 
     let policy = Arc::new(Policy::from_config(&config, catalog.clone())?);
-    if let Ok(bytes) = std::fs::read(&path) {
-        policy.remember_file_bytes(&bytes);
-    }
+    policy.remember_file_bytes(&loaded_bytes);
     let listener = TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;

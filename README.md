@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.2.7**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.2.8**. Licensed under the [MIT License](LICENSE).
 
 ## Install
 

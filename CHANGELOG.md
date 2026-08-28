@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.8 — SIGHUP reload follow-ups
+
+- Hash the catalog bytes that were parsed at boot, not a second read after
+  `pg_class` resolve, so a rewrite in that window cannot skip the next SIGHUP.
+- Honour `catalog_refresh_min_seconds` when the timer is off (`0`).
+- Wake the catalog refresher when a reload changes its schedule, so turning
+  the timer back on does not wait for an unknown OID.
+
 ## 0.2.7 — SIGHUP config reload
 
 - Reload the catalog file on `SIGHUP` without dropping sessions. Parse,
