@@ -8,6 +8,7 @@ Use the shortest document that answers your question.
 - [Security model](security.md): guarantees, threat postures, deployment controls,
   and known limits.
 - [Operations](operations.md): schema changes, CI, restarts, logs, and metrics.
+- [Deploy](../deploy/README.md): systemd unit, container image, and compose.
 - [JSON and JSONB masking](json-masking.md): pointer policies, array wildcards,
   type placeholders, and how to inspect large documents.
 - [Policy ownership](responsibilities.md): catalog review and team responsibilities.

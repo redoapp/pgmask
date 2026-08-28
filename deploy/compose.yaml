@@ -1,0 +1,40 @@
+# Example: pgmask in front of a local Postgres. Metrics and the proxy port are
+# bound to loopback on the host. This is not a production topology — it is the
+# smallest compose file that cannot accidentally publish unmasked Postgres or
+# unauthenticated metrics on a public interface.
+#
+#   docker compose -f deploy/compose.yaml up --build
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: app
+    # Not published to the host. Clients reach Postgres only through pgmask.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  pgmask:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:6432:6432"
+    volumes:
+      - ./catalog.example.toml:/etc/pgmask/catalog.toml:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp

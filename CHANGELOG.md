@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.10 — production packaging
+
+- Add `SECURITY.md` with a private GitHub advisory reporting path, and what
+  is in or out of scope.
+- Ship a hardened systemd unit, a non-root container image, and a compose
+  file that does not publish Postgres or metrics on a public interface.
+- Warn when `metrics_listen` is not loopback; refuse a value that is not a
+  socket address.
+- Run the adversarial suite on PostgreSQL 14 as well as 17, and the TLS
+  suite, on every pull request. The TLS script talks to Docker when podman
+  is absent.
+
 ## 0.2.9 — the SIGHUP path is tested against the real binary
 
 - Log the byte-identical reload. It was silent, so an operator who sent

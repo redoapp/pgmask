@@ -1,0 +1,43 @@
+[Unit]
+Description=pgmask PostgreSQL column-masking proxy
+Documentation=https://github.com/redoapp/pgmask
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pgmask
+Group=pgmask
+ExecStart=/usr/local/bin/pgmask /etc/pgmask/catalog.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+# SIGTERM stops accepting and drops in-flight sessions. Put more than one
+# instance behind a TCP load balancer if a rolling restart must not cut a query.
+KillMode=mixed
+TimeoutStopSec=10
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/etc/pgmask
+
+LimitNOFILE=65536
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -125,6 +125,14 @@ async fn main() -> Result<()> {
         let socket: std::net::SocketAddr = addr
             .parse()
             .with_context(|| format!("parsing metrics_listen {addr:?}"))?;
+        if config.metrics_listen_is_public() {
+            tracing::warn!(
+                %socket,
+                "metrics_listen is not loopback — /metrics is unauthenticated and \
+                 the counters name SQL shapes. Bind 127.0.0.1, or put a scrape \
+                 proxy in front"
+            );
+        }
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .with_http_listener(socket)
             .install()

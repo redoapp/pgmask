@@ -13,6 +13,7 @@
 
 use arc_swap::ArcSwap;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -606,7 +607,35 @@ impl Config {
         self.validate_backend_tls()?;
         self.validate_pseudonym_key()?;
         self.validate_unique_column_rules()?;
-        self.validate_rate_limit()
+        self.validate_rate_limit()?;
+        self.validate_metrics_listen()
+    }
+
+    /// `metrics_listen` is a plaintext Prometheus scrape. Binding it on a
+    /// routable address publishes rejection causes (SQL shapes) without a
+    /// token. Loopback is the intended default; anything else must parse and
+    /// is warned at start, not refused — an operator may scrape from another
+    /// host on a private network.
+    fn validate_metrics_listen(&self) -> Result<()> {
+        let Some(addr) = &self.metrics_listen else {
+            return Ok(());
+        };
+        let _: SocketAddr = addr
+            .parse()
+            .with_context(|| format!("parsing metrics_listen {addr:?}"))?;
+        Ok(())
+    }
+
+    /// Whether a configured scrape address is reachable from other hosts.
+    ///
+    /// Loopback is the intended bind. A public address is still valid config
+    /// (an operator may scrape across a private network) and is warned at
+    /// start rather than refused.
+    pub fn metrics_listen_is_public(&self) -> bool {
+        self.metrics_listen
+            .as_deref()
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
+            .is_some_and(|socket| !socket.ip().is_loopback())
     }
 
     /// Every column rule, independent of which TOML spelling authored it.
@@ -3080,5 +3109,30 @@ rate_limit_burst = 5
         tokio::time::timeout(Duration::from_millis(200), notified)
             .await
             .expect("a reload that turns the timer back on must wake the parked refresher");
+    }
+
+    #[test]
+    fn metrics_on_loopback_is_not_public() {
+        let config = tls_test_config("metrics_listen = \"127.0.0.1:9464\"\n");
+        config.validate().expect("loopback metrics must load");
+        assert!(!config.metrics_listen_is_public());
+    }
+
+    #[test]
+    fn metrics_on_all_interfaces_is_public() {
+        let config = tls_test_config("metrics_listen = \"0.0.0.0:9464\"\n");
+        config
+            .validate()
+            .expect("a public scrape address still parses");
+        assert!(config.metrics_listen_is_public());
+    }
+
+    #[test]
+    fn metrics_listen_must_be_a_socket_address() {
+        let config = tls_test_config("metrics_listen = \"not-a-socket\"\n");
+        let err = config
+            .validate()
+            .expect_err("a scrape path is not a listen address");
+        assert!(err.to_string().contains("metrics_listen"), "got: {err}");
     }
 }

@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.2.9**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.2.10**. Licensed under the [MIT License](LICENSE).
 
 ## Install
 
@@ -23,7 +23,7 @@ Pin the tag, then confirm the binary:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/redoapp/pgmask/releases/download/v0.2.7/pgmask-installer.sh | sh
+  https://github.com/redoapp/pgmask/releases/download/v0.2.9/pgmask-installer.sh | sh
 pgmask --version
 ```
 
@@ -57,6 +57,8 @@ cargo build --release -p pgmask
 - Optional lineage for expressions and optional metadata access for GUI clients.
 - Structured logs, Prometheus metrics, catalog refresh, SIGHUP config reload, and a catalog drift
   check for CI.
+- A hardened systemd unit and a non-root container image in [`deploy/`](deploy/README.md).
+  Report vulnerabilities via [SECURITY.md](SECURITY.md).
 
 pgmask is tested against PostgreSQL 13–17 and CockroachDB 25.4. See the
 [engine notes](docs/engines.md) for compatibility details.

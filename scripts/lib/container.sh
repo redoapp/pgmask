@@ -56,7 +56,7 @@ pg_await() {
   done
   echo "FATAL: postgres in $container was not answering on 127.0.0.1:$port after ${budget}s ($label)"
   echo "       This is the real server, not the init server — see scripts/lib/container.sh."
-  podman logs "$container" 2>&1 | tail -15
+  "${CONTAINER_ENGINE:-podman}" logs "$container" 2>&1 | tail -15
   return 1
 }
 
@@ -77,7 +77,7 @@ crdb_await() {
     sleep 1
   done
   echo "FATAL: CockroachDB in $container was not answering on 127.0.0.1:$port after ${budget}s ($label)"
-  podman logs "$container" 2>&1 | tail -20
+  "${CONTAINER_ENGINE:-podman}" logs "$container" 2>&1 | tail -20
   return 1
 }
 
