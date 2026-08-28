@@ -467,19 +467,9 @@ impl Policy {
 
     /// Decide the plan for a described result set, or refuse it.
     ///
-    /// Takes the principal's roles because the same column can resolve to
-    /// different masks for different people — so a plan is only ever valid for
-    /// the session that built it.
-    pub(crate) fn plan_for(
-        &self,
-        snapshot: &Snapshot,
-        fields: &[protocol::FieldDescription],
-        roles: &HashSet<String>,
-        analysis: &FieldAnalysis,
-    ) -> Result<Plan, Rejection> {
-        self.plan_for_with(&self.live.load(), snapshot, fields, roles, analysis)
-    }
-
+    /// The session loads one [`LivePolicy`] for the whole `RowDescription` and
+    /// passes it in so hostile/summary/opaque/unclassified cannot tear across
+    /// a reload mid-plan. A plan is only valid for the roles it was built with.
     pub(crate) fn plan_for_with(
         &self,
         live: &LivePolicy,
@@ -643,6 +633,17 @@ impl Policy {
             });
         }
         Ok(Arc::new(plan))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plan_for(
+        &self,
+        snapshot: &Snapshot,
+        fields: &[protocol::FieldDescription],
+        roles: &HashSet<String>,
+        analysis: &FieldAnalysis,
+    ) -> Result<Plan, Rejection> {
+        self.plan_for_with(&self.live.load(), snapshot, fields, roles, analysis)
     }
 
     fn plan_opaque_field(
