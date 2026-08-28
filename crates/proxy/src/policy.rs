@@ -126,6 +126,29 @@ pub struct Policy {
     reload: tokio::sync::Mutex<()>,
 }
 
+/// Brackets a policy swap with two distinct generations.
+///
+/// The first invalidates decisions made before the swap starts. The `Drop`
+/// bump invalidates a decision rebuilt while catalog resolution was in flight.
+/// Making the second bump structural avoids an early return or future `?`
+/// silently reopening that race.
+pub(crate) struct PolicyChange<'a> {
+    epoch: &'a AtomicU64,
+}
+
+impl<'a> PolicyChange<'a> {
+    fn begin(epoch: &'a AtomicU64) -> Self {
+        epoch.fetch_add(1, Ordering::Relaxed);
+        Self { epoch }
+    }
+}
+
+impl Drop for PolicyChange<'_> {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Why a result set was refused: the words the client sees, plus the bucket the
 /// counters see.
 pub(crate) struct Rejection {
@@ -331,13 +354,11 @@ impl Policy {
         //    fresh; after-only leaves old caches matching until the bump,
         //    while the new live is already loaded.
         //
-        // If catalog resolution then fails, only (1) has run: sessions
-        // rebuild against the previous snapshot — over-refusal, not a
-        // release.
+        // If catalog resolution then fails, both bumps still run: sessions
+        // rebuild against the previous snapshot twice — over-invalidation,
+        // not a release.
         let bump = catalog_re_resolved || live_changed || key_changed;
-        if bump {
-            self.epoch.fetch_add(1, Ordering::Relaxed);
-        }
+        let _change = bump.then(|| PolicyChange::begin(&self.epoch));
         if catalog_re_resolved {
             let types: HashMap<String, SemanticType> = config
                 .semantic_type
@@ -357,9 +378,6 @@ impl Policy {
         }
         self.live.store(Arc::new(live));
         self.tls.store(Arc::new(tls));
-        if bump {
-            self.epoch.fetch_add(1, Ordering::Relaxed);
-        }
         Ok(ReloadReport {
             unchanged: false,
             catalog_re_resolved,
@@ -452,6 +470,18 @@ impl Policy {
         let mut live = (**self.live.load()).clone();
         live.unclassified_mask = mask;
         self.live.store(Arc::new(live));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_unclassified_for_test(&self, unclassified: Unclassified) {
+        let mut live = (**self.live.load()).clone();
+        live.unclassified = unclassified;
+        self.live.store(Arc::new(live));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_change_for_test(&self) -> PolicyChange<'_> {
+        PolicyChange::begin(&self.epoch)
     }
 
     #[cfg(test)]

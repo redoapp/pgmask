@@ -2102,6 +2102,80 @@ mod tests {
         assert!(session.plans.active_plan().is_none(), "fail closed");
     }
 
+    /// A reload is not one atomic instruction: changing column rules can wait
+    /// on `pg_class` between its pre-swap and post-swap generations. A
+    /// RowDescription arriving in that window rebuilds a plan from the old
+    /// policy but stamps it with the pre-swap generation.
+    ///
+    /// The post-swap bump must invalidate that exact plan before Bind/Execute.
+    /// This is a deterministic wire-state reproduction of the race; removing
+    /// `PolicyChange::drop` makes `LEAKME` reach `to_client`.
+    #[test]
+    fn a_plan_built_during_reload_cannot_survive_the_swap() {
+        let policy = policy(Unclassified::Allow, Opaque::Reject);
+        let mut session = Session::new(policy.clone());
+
+        session.handle_frontend(
+            Message::new(
+                protocol::F_PARSE,
+                parse_body(b"s\0SELECT secret FROM public.t\0"),
+            ),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_DESCRIBE, Bytes::from_static(b"Ss\0")),
+            &mut Batch::default(),
+        );
+
+        // This is the point at which a real reload can be waiting on
+        // Catalog::replace_spec. The RowDescription misses the empty test
+        // catalog and `unclassified = allow` therefore builds passthrough.
+        let change = policy.begin_change_for_test();
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut Batch::default(),
+        );
+        session.handle_backend(
+            row_description(&[("secret", 16_384, 1, 25)]),
+            &mut Batch::default(),
+        );
+
+        // The actual swap tightens default-deny, then dropping the bracket
+        // publishes the post-swap generation.
+        policy.set_unclassified_for_test(Unclassified::Mask);
+        drop(change);
+
+        let mut bind = bytes::BytesMut::new();
+        bytes::BufMut::put_slice(&mut bind, b"p\0s\0");
+        session.handle_frontend(
+            Message::new(protocol::F_BIND, bind.freeze()),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_EXECUTE, exec_body(b"p")),
+            &mut Batch::default(),
+        );
+
+        let canary = Bytes::from_static(b"LEAKME");
+        let mut out = Batch::default();
+        session.handle_backend(
+            Message::new(protocol::B_BIND_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(protocol::build_data_row(&[Some(canary.clone())]), &mut out);
+        assert!(
+            !out.to_client
+                .windows(canary.len())
+                .any(|window| window == &canary[..]),
+            "a plan built from the old policy during reload survived the swap"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.to_client).contains("no described result set"),
+            "the stale plan must be absent, so Execute fails closed: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+    }
+
     fn parse_body(name_sql: &[u8]) -> Bytes {
         let mut body = bytes::BytesMut::new();
         bytes::BufMut::put_slice(&mut body, name_sql);
