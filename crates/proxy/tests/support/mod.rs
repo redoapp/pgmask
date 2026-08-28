@@ -40,7 +40,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 59
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 61
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -392,6 +392,8 @@ pub fn json_rule(
 pub struct ProxyHandle {
     pub addr: SocketAddr,
     pub metrics: Arc<pgmask::metrics::Metrics>,
+    pub policy: Arc<Policy>,
+    pub config: Config,
 }
 
 struct TestPolicy {
@@ -563,28 +565,34 @@ async fn start_proxy_at_full(
     let catalog = Arc::new(
         Catalog::resolve(&column_rules, &config.semantic_type, &config.catalog_dsn).await?,
     );
-    tokio::spawn(catalog.clone().run_refresher(
-        std::time::Duration::from_secs(config.catalog_refresh_seconds),
-        std::time::Duration::from_secs(config.catalog_refresh_min_seconds),
-    ));
+    tokio::spawn(catalog.clone().run_refresher());
     let policy = Arc::new(Policy::from_config(&config, catalog)?);
     let metrics = policy.metrics();
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        loop {
-            let Ok((client, _)) = listener.accept().await else {
-                return;
-            };
-            let policy = policy.clone();
-            let backend = backend.clone();
-            tokio::spawn(async move {
-                let _ = pgmask::handle_connection(client, &backend, policy).await;
-            });
+    tokio::spawn({
+        let policy = policy.clone();
+        let backend = backend.clone();
+        async move {
+            loop {
+                let Ok((client, _)) = listener.accept().await else {
+                    return;
+                };
+                let policy = policy.clone();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    let _ = pgmask::handle_connection(client, &backend, policy).await;
+                });
+            }
         }
     });
-    Ok(ProxyHandle { addr, metrics })
+    Ok(ProxyHandle {
+        addr,
+        metrics,
+        policy,
+        config,
+    })
 }
 
 // --- Raw wire client --------------------------------------------------------

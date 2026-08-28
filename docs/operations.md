@@ -71,7 +71,18 @@ unknown OID, limited by `catalog_refresh_min_seconds`.
 If a refresh fails, pgmask keeps the previous snapshot. If a rule stops
 resolving, pgmask logs a coverage warning and applies the unclassified policy.
 
-The policy file is not reloaded. Restart pgmask after changing it.
+The policy file is reloaded on `SIGHUP`. Parse, validation, TLS, and catalog
+resolution all happen before any live snapshot is swapped: a bad file keeps
+the previous policy. Cached statement and portal plans are dropped, so the next
+Describe rebuilds against the new rules; an in-flight result set keeps the plan
+it was already described with.
+
+`listen`, `backend`, `catalog_dsn`, and `metrics_listen` cannot change in
+process. A reload that edits those still applies every other setting and logs
+that a restart is required for the bind-time ones.
+
+Send `kill -HUP <pid>` after editing the file. Rotating `tls_cert` / `tls_key`
+at the same paths also takes effect on SIGHUP even when the TOML is unchanged.
 
 ## JSON columns
 

@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.2.6**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.2.7**. Licensed under the [MIT License](LICENSE).
 
 ## Install
 
@@ -23,7 +23,7 @@ Pin the tag, then confirm the binary:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/redoapp/pgmask/releases/download/v0.2.6/pgmask-installer.sh | sh
+  https://github.com/redoapp/pgmask/releases/download/v0.2.7/pgmask-installer.sh | sh
 pgmask --version
 ```
 
@@ -55,7 +55,7 @@ cargo build --release -p pgmask
 - Read-only SQL enforcement and fail-closed handling of unsupported query
   shapes and protocol messages.
 - Optional lineage for expressions and optional metadata access for GUI clients.
-- Structured logs, Prometheus metrics, catalog refresh, and a catalog drift
+- Structured logs, Prometheus metrics, catalog refresh, SIGHUP config reload, and a catalog drift
   check for CI.
 
 pgmask is tested against PostgreSQL 13–17 and CockroachDB 25.4. See the
@@ -225,6 +225,10 @@ the same column twice is a startup error.
 
 Unknown configuration keys, invalid mask parameters, duplicate column rules,
 and unresolved configured columns are startup errors.
+
+Send `SIGHUP` to reload the file without dropping connections. A parse or
+resolution failure keeps the previous policy. `listen`, `backend`,
+`catalog_dsn`, and `metrics_listen` still need a restart.
 
 ### Policy controls
 

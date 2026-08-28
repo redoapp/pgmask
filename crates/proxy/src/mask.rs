@@ -605,6 +605,8 @@ pub struct Masker {
     /// functions on every call. Cloning the initialised state instead skips that
     /// per row, which is most of the pseudonym cost at bulk sizes.
     mac: HmacSha256,
+    /// Retained so a config reload can detect a rotation without logging the key.
+    key: Vec<u8>,
 }
 
 /// HMAC state with a spec's domain separator already absorbed.
@@ -632,7 +634,12 @@ impl Masker {
         let key = key.into();
         Self {
             mac: HmacSha256::new_from_slice(&key).expect("hmac accepts any key length"),
+            key,
         }
+    }
+
+    pub(crate) fn key_bytes(&self) -> &[u8] {
+        &self.key
     }
 
     /// Apply a mask to one field value.

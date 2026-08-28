@@ -200,6 +200,14 @@ pub fn describe() {
         "pgmask_fields_rescued_total",
         "Opaque fields released as provably carrying no column value; each is a rejection that did not happen"
     );
+    metrics::describe_counter!(
+        "pgmask_config_reloads_total",
+        "Successful SIGHUP / apply_config reloads of the catalog file"
+    );
+    metrics::describe_counter!(
+        "pgmask_config_reload_failures_total",
+        "Refused config reloads; the previous policy stayed in effect"
+    );
 }
 
 /// Process-wide counters. Cheap enough to touch on every rejection.

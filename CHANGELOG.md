@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.7 — SIGHUP config reload
+
+- Reload the catalog file on `SIGHUP` without dropping sessions. Parse,
+  validation, TLS material, and `pg_class` resolution all finish before the
+  live snapshot is swapped, so a bad file keeps the previous policy. Cached
+  statement and portal plans are dropped; an in-flight result set keeps the
+  plan it was described with. Identical file bytes skip the catalog
+  round-trip and still re-read `tls_cert` / `tls_key` for certificate
+  rotation. `listen`, `backend`, `catalog_dsn`, and `metrics_listen` still
+  need a restart.
+
 ## 0.2.6 — non-vacuous adversarial harnesses
 
 - Keep accepted plaintext transport observations out of

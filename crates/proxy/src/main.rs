@@ -62,6 +62,9 @@ async fn main() -> Result<()> {
     );
 
     let policy = Arc::new(Policy::from_config(&config, catalog.clone())?);
+    if let Ok(bytes) = std::fs::read(&path) {
+        policy.remember_file_bytes(&bytes);
+    }
     let listener = TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
@@ -108,10 +111,14 @@ async fn main() -> Result<()> {
     // Keep the catalog current. OIDs are not stable across DDL: DROP+CREATE of
     // a view hands it a new OID, and a catalog pinned at boot then silently
     // stops classifying those columns.
-    tokio::spawn(catalog.clone().run_refresher(
-        Duration::from_secs(config.catalog_refresh_seconds),
-        Duration::from_secs(config.catalog_refresh_min_seconds),
-    ));
+    tokio::spawn(catalog.clone().run_refresher());
+    tokio::spawn({
+        let policy = policy.clone();
+        let config_path = path.clone();
+        async move {
+            config_reload_loop(policy, config_path).await;
+        }
+    });
 
     // A Prometheus scrape endpoint, when one is configured. The periodic log
     // line below stays regardless: it needs no scraper, and reading it is how
@@ -175,6 +182,29 @@ async fn main() -> Result<()> {
 
 fn usage() -> &'static str {
     "usage: pgmask [--version] <config.toml>"
+}
+
+/// Re-read the catalog file on SIGHUP. A failed reload keeps the previous policy.
+async fn config_reload_loop(policy: Arc<Policy>, path: String) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut hangup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot listen for SIGHUP");
+            return;
+        }
+    };
+    loop {
+        let Some(()) = hangup.recv().await else {
+            return;
+        };
+        if let Err(err) = policy.reload_from_path(&path).await {
+            tracing::error!(
+                error = format!("{err:#}"),
+                "config reload refused; keeping the previous policy"
+            );
+        }
+    }
 }
 
 /// Resolves on SIGTERM or SIGINT.

@@ -242,18 +242,19 @@ pub(crate) struct PlanState {
 }
 
 impl PlanState {
-    /// Drop cached plans built before a catalog refresh.
+    /// Drop cached plans built before a catalog refresh or a config reload.
     ///
     /// A plan is a decision made against one snapshot, and statement and portal
     /// plans outlive the result set they were described for — that is the point
     /// of caching them.
     ///
-    /// A refresh does not re-read the catalog *file* (that needs a restart), so
-    /// this is not about an operator editing a rule. It re-resolves names to
-    /// OIDs, and DDL moves those: `DROP TABLE; CREATE TABLE` gives a new OID,
-    /// and PostgreSQL reuses OIDs. A plan cached across that boundary applies
-    /// the previous mapping's classification — which, when an OID has been
-    /// recycled onto a different relation, is the wrong column's mask.
+    /// A catalog refresh re-resolves names to OIDs, and DDL moves those:
+    /// `DROP TABLE; CREATE TABLE` gives a new OID, and PostgreSQL reuses OIDs.
+    /// A SIGHUP reload re-reads the catalog *file*, so a newly classified column
+    /// or a tightened mask is the same kind of generation change. A plan cached
+    /// across either boundary applies the previous mapping's classification —
+    /// which, when an OID has been recycled onto a different relation, is the wrong
+    /// column's mask, and when a rule was added, is an unclassified release.
     ///
     /// The in-flight `active_plan` is deliberately kept: its rows are already
     /// being described and served, and that is bounded by one result set. What

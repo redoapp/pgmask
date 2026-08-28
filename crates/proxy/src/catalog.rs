@@ -3,13 +3,13 @@
 //! The catalog is keyed on `(pg_class OID, attnum)` because that is what the
 //! wire gives us — never on output column name, which any query can rename.
 //!
-//! Names are resolved to OIDs at startup and **re-resolved periodically**,
-//! because OIDs are not stable across DDL. `CREATE OR REPLACE VIEW` keeps a
-//! relation's OID but `DROP VIEW; CREATE VIEW` does not, and plenty of migration
-//! tooling does the latter. A catalog pinned at boot silently loses coverage the
-//! first time that happens: with `unclassified = "mask"` the columns quietly use
-//! the type-aware fallback, and with `unclassified = "allow"` they quietly stop
-//! being masked.
+//! Names are resolved to OIDs at startup, on `SIGHUP`, and **re-resolved
+//! periodically**, because OIDs are not stable across DDL. `CREATE OR REPLACE VIEW`
+//! keeps a relation's OID but `DROP VIEW; CREATE VIEW` does not, and plenty of
+//! migration tooling does the latter. A catalog pinned at boot silently loses
+//! coverage the first time that happens: with `unclassified = "mask"` the
+//! columns quietly use the type-aware fallback, and with
+//! `unclassified = "allow"` they quietly stop being masked.
 
 use arc_swap::ArcSwap;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -126,7 +126,7 @@ pub enum Opaque {
 }
 
 /// Parameters shared by column rules and semantic types.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaskParams {
     /// Characters kept by `partial` / `inner` / `outer`.
@@ -235,7 +235,7 @@ impl MaskParams {
 }
 
 /// One inheritable JSON Pointer policy inside a structure-aware JSON mask.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct JsonFieldRule {
     pub pointer: String,
@@ -245,7 +245,7 @@ pub struct JsonFieldRule {
 }
 
 /// A policy for one exact JSON object-key name wherever it appears.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct JsonKeyRule {
     pub key: String,
@@ -257,7 +257,7 @@ pub struct JsonKeyRule {
 /// A named classification with a default mask, so `email` is described once and
 /// referenced everywhere. Borrowed from Bytebase's semantic types, and the thing
 /// that keeps a real catalog from being thousands of hand-written rules.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticType {
     pub name: String,
@@ -271,7 +271,7 @@ pub struct SemanticType {
 
 /// Maps principals to roles. The principal is the username Postgres verified
 /// during authentication, never one the client merely claimed.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Role {
     pub name: String,
@@ -279,7 +279,7 @@ pub struct Role {
     pub members: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnRule {
     /// Schema-qualified, e.g. `demo.customers`.
@@ -311,7 +311,7 @@ impl ColumnRule {
 ///
 /// `[columns."app.events"]` removes the repeated `relation` / `column` pair
 /// from every rule without changing the rule model used by policy resolution.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactColumns {
     rules: Vec<ColumnRule>,
 }
@@ -423,7 +423,7 @@ fn restrictiveness(mask: Mask) -> u8 {
 /// written after a `[[column]]` block *inside* that block, so an appended
 /// `tls_cert` silently became a ColumnRule field and the proxy came up in
 /// plaintext with no complaint. Found while writing the TLS test.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_listen")]
@@ -1211,32 +1211,48 @@ impl Snapshot {
     }
 }
 
-/// The live catalog: a swappable snapshot plus the machinery to keep it current.
-pub struct Catalog {
+/// Column rules and semantic types the snapshot was resolved from.
+///
+/// Swapped atomically with the snapshot on a file reload so a timer refresh
+/// cannot install a resolution of the *previous* file over a just-applied one.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CatalogSpec {
     rules: Vec<ColumnRule>,
     types: HashMap<String, SemanticType>,
+}
+
+/// The live catalog: a swappable snapshot plus the machinery to keep it current.
+pub struct Catalog {
+    spec: ArcSwap<CatalogSpec>,
     dsn: String,
     /// `ArcSwap` rather than `RwLock<Arc<_>>`: every result set takes this on
     /// the hot path and the refresher writes it every 30 seconds, so readers
     /// should not queue behind a writer. It also removes the poisoned-lock
     /// `expect` from a path that must not panic mid-stream.
     snapshot: ArcSwap<Snapshot>,
+    /// Serialises resolve-and-swap so a SIGHUP and a timer tick cannot interleave
+    /// two resolutions and install the older one last.
+    apply: tokio::sync::Mutex<()>,
     /// Woken when the hot path sees a relation OID we do not recognise.
     refresh_wanted: Notify,
     pub refreshes: AtomicU64,
     pub failed_refreshes: AtomicU64,
+    interval_secs: AtomicU64,
+    min_interval_secs: AtomicU64,
 }
 
 impl Default for Catalog {
     fn default() -> Self {
         Self {
-            rules: Vec::new(),
-            types: HashMap::new(),
+            spec: ArcSwap::from_pointee(CatalogSpec::default()),
             dsn: String::new(),
             snapshot: ArcSwap::from_pointee(Snapshot::default()),
+            apply: tokio::sync::Mutex::new(()),
             refresh_wanted: Notify::new(),
             refreshes: AtomicU64::new(0),
             failed_refreshes: AtomicU64::new(0),
+            interval_secs: AtomicU64::new(default_refresh_seconds()),
+            min_interval_secs: AtomicU64::new(default_refresh_min_seconds()),
         }
     }
 }
@@ -1263,8 +1279,10 @@ impl Catalog {
             );
         }
         Ok(Self {
-            rules: rules.to_vec(),
-            types,
+            spec: ArcSwap::from_pointee(CatalogSpec {
+                rules: rules.to_vec(),
+                types,
+            }),
             dsn: dsn.to_string(),
             snapshot: ArcSwap::from_pointee(resolved),
             ..Default::default()
@@ -1308,27 +1326,71 @@ impl Catalog {
         self.refresh_wanted.notify_one();
     }
 
-    /// Re-resolve and swap. Logs every difference, because a silent change in
-    /// coverage is the exact failure this mechanism exists to prevent.
-    pub async fn refresh(&self) -> Result<()> {
-        let previous = self.snapshot();
-        let next = match resolve_snapshot_retrying(&self.rules, &self.types, &self.dsn).await {
+    /// Whether a reload would re-resolve a different set of names.
+    ///
+    /// Order-insensitive: rewriting `[[column]]` as the compact table form is
+    /// not a classification change and must not pay a catalog round-trip.
+    pub(crate) fn spec_matches(&self, rules: &[ColumnRule], types: &[SemanticType]) -> bool {
+        let current = self.spec.load();
+        if current.rules.len() != rules.len() || current.types.len() != types.len() {
+            return false;
+        }
+        let mut have: Vec<&ColumnRule> = current.rules.iter().collect();
+        let mut want: Vec<&ColumnRule> = rules.iter().collect();
+        have.sort_by_key(|rule| rule.key());
+        want.sort_by_key(|rule| rule.key());
+        if have != want {
+            return false;
+        }
+        types.iter().all(|semantic| {
+            current
+                .types
+                .get(&semantic.name)
+                .is_some_and(|have| have == semantic)
+        })
+    }
+
+    /// Re-resolve `rules` against `pg_class` and swap the snapshot.
+    ///
+    /// Unlike [`Catalog::resolve`], unresolved names are accepted: a reload
+    /// after `DROP COLUMN` must not refuse the whole file and leave the
+    /// previous, now-wrong, mapping in place. Coverage loss is logged the same
+    /// way a timer refresh logs it.
+    pub(crate) async fn replace_spec(
+        &self,
+        rules: Vec<ColumnRule>,
+        types: HashMap<String, SemanticType>,
+    ) -> Result<()> {
+        let _apply = self.apply.lock().await;
+        self.replace_spec_locked(rules, types).await
+    }
+
+    async fn replace_spec_locked(
+        &self,
+        rules: Vec<ColumnRule>,
+        types: HashMap<String, SemanticType>,
+    ) -> Result<()> {
+        let next = match resolve_snapshot_retrying(&rules, &types, &self.dsn).await {
             Ok(next) => next,
             Err(err) => {
                 self.failed_refreshes.fetch_add(1, Ordering::Relaxed);
-                // Deliberately keep the old snapshot. Clearing it would be
-                // fail-closed in the narrow sense and would mask every column in
-                // the database the moment Postgres blinked.
                 tracing::error!(
                     error = format!("{err:#}"),
-                    "catalog refresh failed, continuing with the previous snapshot ({} classified columns)",
-                    previous.len()
+                    "catalog reload failed, continuing with the previous snapshot ({} classified columns)",
+                    self.snapshot().len()
                 );
                 return Err(err);
             }
         };
+        let spec = CatalogSpec { rules, types };
+        self.install_snapshot(&spec, next);
+        self.spec.store(Arc::new(spec));
+        Ok(())
+    }
 
-        for rule in &self.rules {
+    fn install_snapshot(&self, spec: &CatalogSpec, next: Snapshot) {
+        let previous = self.snapshot();
+        for rule in &spec.rules {
             let locate = |snap: &Snapshot| {
                 snap.names
                     .iter()
@@ -1369,14 +1431,47 @@ impl Catalog {
         if changed {
             tracing::debug!(classified_columns = count, "catalog refreshed");
         }
+    }
+
+    pub fn set_refresh_schedule(&self, interval: Duration, min_interval: Duration) {
+        self.interval_secs
+            .store(interval.as_secs(), Ordering::Relaxed);
+        self.min_interval_secs
+            .store(min_interval.as_secs(), Ordering::Relaxed);
+    }
+
+    /// Re-resolve and swap. Logs every difference, because a silent change in
+    /// coverage is the exact failure this mechanism exists to prevent.
+    pub async fn refresh(&self) -> Result<()> {
+        let _apply = self.apply.lock().await;
+        let spec = self.spec.load_full();
+        let previous = self.snapshot();
+        let next = match resolve_snapshot_retrying(&spec.rules, &spec.types, &self.dsn).await {
+            Ok(next) => next,
+            Err(err) => {
+                self.failed_refreshes.fetch_add(1, Ordering::Relaxed);
+                // Deliberately keep the old snapshot. Clearing it would be
+                // fail-closed in the narrow sense and would mask every column in
+                // the database the moment Postgres blinked.
+                tracing::error!(
+                    error = format!("{err:#}"),
+                    "catalog refresh failed, continuing with the previous snapshot ({} classified columns)",
+                    previous.len()
+                );
+                return Err(err);
+            }
+        };
+        self.install_snapshot(&spec, next);
         Ok(())
     }
 
     /// Background loop: refresh on a timer, or sooner when the hot path saw a
     /// relation it did not recognise, but never more often than `min_interval`.
-    pub async fn run_refresher(self: Arc<Self>, interval: Duration, min_interval: Duration) {
+    pub async fn run_refresher(self: Arc<Self>) {
         let mut last = Instant::now();
         loop {
+            let interval = Duration::from_secs(self.interval_secs.load(Ordering::Relaxed));
+            let min_interval = Duration::from_secs(self.min_interval_secs.load(Ordering::Relaxed));
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = self.refresh_wanted.notified() => {

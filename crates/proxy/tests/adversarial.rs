@@ -3886,6 +3886,98 @@ async fn a_reshaped_masked_column_stays_masked_under_default_deny() -> Result<()
     assert_served(&msgs, "reshape: immediately after ALTER");
     assert_no_canary(&after, "reshape: immediately after ALTER");
 
-    exec_direct(DB, "DROP TABLE IF EXISTS canary.reshape").await?;
+    Ok(())
+}
+
+/// A SIGHUP-style reload must take effect on a live session, including
+/// prepared statements that were described against the previous file.
+#[tokio::test]
+async fn config_reload_applies_to_a_live_session() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    let before =
+        simple_query_round(&mut client, "SELECT email FROM canary.subjects LIMIT 1").await?;
+    assert_served(&before.messages, "before reload");
+    assert_no_canary_bytes(&before.received, "email classified before reload");
+
+    let mut loosened = proxy.config.clone();
+    for rule in &mut loosened.column {
+        if rule.relation == "canary.subjects" && rule.column == "email" {
+            rule.mask = Some(pgmask::mask::Mask::None);
+        }
+    }
+    proxy
+        .policy
+        .apply_config(&loosened)
+        .await
+        .expect("loosening email must reload");
+
+    let after =
+        simple_query_round(&mut client, "SELECT email FROM canary.subjects LIMIT 1").await?;
+    assert_served(&after.messages, "after loosening");
+    assert!(
+        after.text().contains(CANARY_EMAIL),
+        "reload must take effect on the live session, got: {}",
+        after.text()
+    );
+
+    proxy
+        .policy
+        .apply_config(&proxy.config)
+        .await
+        .expect("restoring the original catalog");
+    let tight =
+        simple_query_round(&mut client, "SELECT email FROM canary.subjects LIMIT 1").await?;
+    assert_served(&tight.messages, "after tightening");
+    assert_no_canary_bytes(&tight.received, "email re-classified after reload");
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_reload_invalidates_a_described_plan() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let mut released = default_rules();
+    for rule in &mut released {
+        if rule.relation == "canary.subjects" && rule.column == "email" {
+            rule.mask = Some(pgmask::mask::Mask::None);
+        }
+    }
+    let proxy = start_proxy(DB, released).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    client
+        .send(parse_msg("s1", "SELECT email FROM canary.subjects"))
+        .await?;
+    client.send(describe_statement("s1")).await?;
+    client.send(sync_msg()).await?;
+    client.read_until_ready_or_eof().await?;
+
+    proxy
+        .policy
+        .apply_config(&{
+            let mut tight = proxy.config.clone();
+            for rule in &mut tight.column {
+                if rule.relation == "canary.subjects" && rule.column == "email" {
+                    rule.mask = Some(pgmask::mask::Mask::Pseudonym);
+                }
+            }
+            tight
+        })
+        .await
+        .expect("tightening after Describe");
+
+    client.send(bind_msg("p1", "s1")).await?;
+    client.send(execute_msg("p1", 0)).await?;
+    client.send(sync_msg()).await?;
+    let msgs = client.read_until_ready_or_eof().await?;
+    assert_exercised(&msgs, &client, "Execute after reload");
+    assert_no_canary(
+        &client,
+        "Execute after reload must not reuse the released plan",
+    );
     Ok(())
 }
