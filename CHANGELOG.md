@@ -8,6 +8,8 @@
   Postgres matrix, wrap `rustc` with sccache, link with lld, and drop
   full debuginfo on CI debug builds. fmt/deny/machete/invariants run in
   their own job so they no longer wait on clippy.
+- Move `chacha20` to 0.10.2 after 0.10.1 was yanked; `cargo deny` fails
+  closed on yanked crates.
 - Add `SECURITY.md` with a private GitHub advisory reporting path, and what
   is in or out of scope.
 - Ship a hardened systemd unit, a non-root container image, and a compose
