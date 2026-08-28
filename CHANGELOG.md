@@ -9,7 +9,8 @@
   plan it was described with. Identical file bytes skip the catalog
   round-trip and still re-read `tls_cert` / `tls_key` for certificate
   rotation. `listen`, `backend`, `catalog_dsn`, and `metrics_listen` still
-  need a restart.
+  need a restart. Reloading `require_client_tls = false` or
+  `backend_tls = "disable"` is honoured (new sessions only) and logged.
 
 ## 0.2.6 — non-vacuous adversarial harnesses
 

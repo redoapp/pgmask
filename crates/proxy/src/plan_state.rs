@@ -261,9 +261,12 @@ impl PlanState {
     /// is dropped is everything a *later* Bind or Execute would reuse, so the
     /// next one has no plan and fails closed until a fresh Describe rebuilds
     /// it against the new snapshot.
-    pub(crate) fn invalidate_if_stale(&mut self, current: u64) {
+    ///
+    /// Returns whether the generation moved, so callers can refresh anything
+    /// else that is only valid for one generation (principal roles).
+    pub(crate) fn invalidate_if_stale(&mut self, current: u64) -> bool {
         if self.generation == current {
-            return;
+            return false;
         }
         self.generation = current;
         self.statement_plans.clear();
@@ -272,6 +275,7 @@ impl PlanState {
         // formats the client chose. What a refresh invalidates is the
         // classification, which a fresh Describe rebuilds — and that rebuild
         // needs these formats to stamp the new plan correctly.
+        true
     }
 
     pub(crate) fn active_plan(&self) -> Option<Plan> {

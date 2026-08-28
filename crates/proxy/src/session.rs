@@ -432,13 +432,17 @@ impl Session {
         }
     }
 
+    /// Drop cached plans and refresh roles when catalog or file generation moved.
+    fn sync_policy(&mut self) {
+        if self.plans.invalidate_if_stale(self.policy.generation()) && self.authenticated {
+            self.roles = self.policy.roles_of(&self.principal);
+        }
+    }
+
     fn handle_frontend(&mut self, msg: Message, out: &mut Batch) {
         // A cached plan is a decision made against one catalog snapshot; a
         // refresh can tighten a classification underneath it.
-        self.plans.invalidate_if_stale(self.policy.generation());
-        if self.authenticated {
-            self.roles = self.policy.roles_of(&self.principal);
-        }
+        self.sync_policy();
         match msg.tag {
             // Emits rows with no RowDescription. One of exactly two such paths.
             protocol::F_FUNCTION_CALL => {
@@ -787,10 +791,8 @@ impl Session {
 
     fn handle_row_description(&mut self, msg: Message, out: &mut Batch) {
         // A reload can land after Query/Parse and before this description.
-        self.plans.invalidate_if_stale(self.policy.generation());
-        if self.authenticated {
-            self.roles = self.policy.roles_of(&self.principal);
-        }
+        self.sync_policy();
+        let live = self.policy.live();
         let fields = match protocol::parse_row_description(&msg.body) {
             Ok(fields) => fields,
             Err(err) => {
@@ -838,7 +840,7 @@ impl Session {
             .as_deref()
             .map(analysis::StatementInspection::new);
 
-        let system_catalog = self.policy.system_catalogs() == SystemCatalogs::Allow
+        let system_catalog = live.system_catalogs == SystemCatalogs::Allow
             && inspection
                 .as_ref()
                 .is_some_and(analysis::StatementInspection::reads_only_server_metadata)
@@ -918,7 +920,7 @@ impl Session {
                 },
             }
         });
-        let allow_summaries = self.policy.summaries() == Summaries::Allow && !singleton_groups;
+        let allow_summaries = live.summaries == Summaries::Allow && !singleton_groups;
 
         // Hostile posture: a masked column may only appear as a bare outermost
         // SELECT-list ColumnRef (ORDER BY mentions are credited — cleartext
@@ -926,7 +928,7 @@ impl Session {
         // (`t::text`) are refused — they embed cleartext without naming
         // columns. Closes WHERE/LIKE, single-row aggregates and the
         // error-channel CASE — see analysis/.
-        if self.policy.posture() == Posture::Hostile {
+        if live.posture == Posture::Hostile {
             let masked = snapshot.masked_bare_names_for_roles(&self.roles);
             let relations = snapshot.relation_columns_map();
             let empty = analysis::StatementInspection::new("");
@@ -1004,7 +1006,7 @@ impl Session {
         // as a genuinely computed one. Asking only the first question left
         // CockroachDB refusing unions that Postgres serves, because there the
         // fields carry provenance right up until we decline to believe it.
-        let needs_lineage = self.policy.lineage() == Lineage::Allow
+        let needs_lineage = live.lineage == Lineage::Allow
             && fields.iter().zip(&safety).any(|(field, safety)| {
                 (!field.has_provenance() || !trust_provenance) && *safety != Safety::Releasable
             });
@@ -1041,7 +1043,8 @@ impl Session {
                     .collect::<Vec<_>>(),
             ))
         } else {
-            self.policy.plan_for(
+            self.policy.plan_for_with(
+                &live,
                 &snapshot,
                 &fields,
                 &self.roles,

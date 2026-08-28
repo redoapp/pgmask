@@ -1297,7 +1297,6 @@ impl Catalog {
         }
     }
 
-    /// A stable view for the duration of one `RowDescription`.
     /// How many times the catalog has been re-resolved.
     ///
     /// Doubles as a generation number: a plan built under one generation is not
@@ -1306,6 +1305,7 @@ impl Catalog {
         self.refreshes.load(Ordering::Relaxed)
     }
 
+    /// A stable view for the duration of one `RowDescription`.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot.load_full()
     }
@@ -1470,19 +1470,25 @@ impl Catalog {
     pub async fn run_refresher(self: Arc<Self>) {
         let mut last = Instant::now();
         loop {
-            let interval = Duration::from_secs(self.interval_secs.load(Ordering::Relaxed));
+            let interval_secs = self.interval_secs.load(Ordering::Relaxed);
             let min_interval = Duration::from_secs(self.min_interval_secs.load(Ordering::Relaxed));
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                _ = self.refresh_wanted.notified() => {
-                    // `saturating_sub`: the guard above already establishes
-                    // `since < min_interval`, but Duration subtraction panics
-                    // on underflow and a panic here would stop the refresher
-                    // for the life of the process — the catalog would then
-                    // silently stop tracking DDL.
-                    let since = last.elapsed();
-                    if since < min_interval {
-                        tokio::time::sleep(min_interval.saturating_sub(since)).await;
+            if interval_secs == 0 {
+                // 0 means "no timer": only an unknown-OID nudge refreshes.
+                // Sleeping zero would spin the loop and storm pg_class.
+                self.refresh_wanted.notified().await;
+            } else {
+                let interval = Duration::from_secs(interval_secs);
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = self.refresh_wanted.notified() => {
+                        // `saturating_sub`: Duration subtraction panics on
+                        // underflow and a panic here would stop the refresher
+                        // for the life of the process — the catalog would then
+                        // silently stop tracking DDL.
+                        let since = last.elapsed();
+                        if since < min_interval {
+                            tokio::time::sleep(min_interval.saturating_sub(since)).await;
+                        }
                     }
                 }
             }

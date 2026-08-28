@@ -83,6 +83,9 @@ that a restart is required for the bind-time ones.
 
 Send `kill -HUP <pid>` after editing the file. Rotating `tls_cert` / `tls_key`
 at the same paths also takes effect on SIGHUP even when the TOML is unchanged.
+A reload that turns off required client TLS or backend TLS is applied to new
+sessions and warned in the log; existing connections keep the transport they
+already negotiated.
 
 ## JSON columns
 

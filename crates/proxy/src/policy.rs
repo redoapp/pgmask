@@ -90,14 +90,14 @@ pub struct ReloadReport {
 
 /// Reloadable knobs every session observes on the next decision, not at accept.
 #[derive(Clone)]
-struct LivePolicy {
-    unclassified: Unclassified,
-    unclassified_mask: UnclassifiedMask,
-    opaque: Opaque,
-    summaries: Summaries,
-    posture: Posture,
-    system_catalogs: SystemCatalogs,
-    lineage: Lineage,
+pub(crate) struct LivePolicy {
+    pub(crate) unclassified: Unclassified,
+    pub(crate) unclassified_mask: UnclassifiedMask,
+    pub(crate) opaque: Opaque,
+    pub(crate) summaries: Summaries,
+    pub(crate) posture: Posture,
+    pub(crate) system_catalogs: SystemCatalogs,
+    pub(crate) lineage: Lineage,
     roles: HashMap<String, HashSet<String>>,
     require_client_tls: bool,
     backend_tls: BackendTls,
@@ -231,17 +231,17 @@ impl Policy {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) => {
-                self.failed_reloads.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!("pgmask_config_reload_failures_total").increment(1);
+                self.note_reload_failure();
                 anyhow::bail!("reading {path}: {err}");
             }
         };
         let sha = sha256_bytes(text.as_bytes());
         if **self.last_file_sha.load() == Some(sha) {
             if let Err(err) = self.refresh_tls_from_live_paths() {
-                self.failed_reloads.fetch_add(1, Ordering::Relaxed);
+                self.note_reload_failure();
                 return Err(err);
             }
+            self.note_reload_success();
             return Ok(ReloadReport {
                 unchanged: true,
                 ..ReloadReport::default()
@@ -250,15 +250,14 @@ impl Policy {
         let config: Config = match toml::from_str(&text) {
             Ok(config) => config,
             Err(err) => {
-                self.failed_reloads.fetch_add(1, Ordering::Relaxed);
+                self.note_reload_failure();
                 anyhow::bail!("parsing {path}: {err}");
             }
         };
         match self.apply_config_locked(&config).await {
             Ok(mut report) => {
                 self.last_file_sha.store(Arc::new(Some(sha)));
-                self.reloads.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!("pgmask_config_reloads_total").increment(1);
+                self.note_reload_success();
                 if !report.restart_required.is_empty() {
                     tracing::warn!(
                         ignored = ?report.restart_required,
@@ -274,7 +273,7 @@ impl Policy {
                 Ok(report)
             }
             Err(err) => {
-                self.failed_reloads.fetch_add(1, Ordering::Relaxed);
+                self.note_reload_failure();
                 Err(err)
             }
         }
@@ -285,11 +284,11 @@ impl Policy {
         let _serialise = self.reload.lock().await;
         match self.apply_config_locked(config).await {
             Ok(report) => {
-                self.reloads.fetch_add(1, Ordering::Relaxed);
+                self.note_reload_success();
                 Ok(report)
             }
             Err(err) => {
-                self.failed_reloads.fetch_add(1, Ordering::Relaxed);
+                self.note_reload_failure();
                 Err(err)
             }
         }
@@ -299,10 +298,34 @@ impl Policy {
         config.validate()?;
         let restart_required = self.identity.mismatches(config);
         let tls = tls_from_config(config)?;
-        let previous_rate = self.live.load().rate_limit.clone();
-        let live = live_from_config(config, previous_rate.as_ref())?;
+        let previous = self.live.load_full();
+        let live = live_from_config(config, previous.rate_limit.as_ref())?;
         let rules: Vec<ColumnRule> = config.column_rules().cloned().collect();
         let catalog_re_resolved = !self.catalog.spec_matches(&rules, &config.semantic_type);
+        let key_changed =
+            self.masker.load().key_bytes() != config.pseudonym_key.expose_secret().as_bytes();
+        let live_changed = live_differs(&previous, &live);
+        warn_if_transport_relaxed(&previous, &live, tls.is_some());
+
+        // Two bumps when anything observable changes:
+        //
+        // 1. Before the swap, so a cached plan cannot outlive the old file
+        //    once a loosened rule is about to become visible. `replace_spec`
+        //    talks to Postgres; that window is long.
+        // 2. After the swap, so a plan rebuilt in that window — old live
+        //    knobs, already stamped with bump (1)'s generation — cannot be
+        //    reused against the new snapshot. One bump only, on either side,
+        //    leaves a reusable cache: before-only stamps old decisions as
+        //    fresh; after-only leaves old caches matching until the bump,
+        //    while the new live is already loaded.
+        //
+        // If catalog resolution then fails, only (1) has run: sessions
+        // rebuild against the previous snapshot — over-refusal, not a
+        // release.
+        let bump = catalog_re_resolved || live_changed || key_changed;
+        if bump {
+            self.epoch.fetch_add(1, Ordering::Relaxed);
+        }
         if catalog_re_resolved {
             let types: HashMap<String, SemanticType> = config
                 .semantic_type
@@ -315,17 +338,14 @@ impl Policy {
             Duration::from_secs(config.catalog_refresh_seconds),
             Duration::from_secs(config.catalog_refresh_min_seconds),
         );
-        let key_changed =
-            self.masker.load().key_bytes() != config.pseudonym_key.expose_secret().as_bytes();
         if key_changed {
             self.masker.store(Arc::new(Masker::new(
                 config.pseudonym_key.expose_secret().as_bytes().to_vec(),
             )));
         }
-        let live_changed = live_differs(&self.live.load(), &live);
         self.live.store(Arc::new(live));
         self.tls.store(Arc::new(tls));
-        if catalog_re_resolved || live_changed || key_changed {
+        if bump {
             self.epoch.fetch_add(1, Ordering::Relaxed);
         }
         Ok(ReloadReport {
@@ -333,6 +353,16 @@ impl Policy {
             catalog_re_resolved,
             restart_required,
         })
+    }
+
+    fn note_reload_success(&self) {
+        self.reloads.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("pgmask_config_reloads_total").increment(1);
+    }
+
+    fn note_reload_failure(&self) {
+        self.failed_reloads.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("pgmask_config_reload_failures_total").increment(1);
     }
 
     fn refresh_tls_from_live_paths(&self) -> Result<()> {
@@ -368,20 +398,12 @@ impl Policy {
         self.live.load().roles.len()
     }
 
+    pub(crate) fn live(&self) -> Arc<LivePolicy> {
+        self.live.load_full()
+    }
+
     pub(crate) fn posture(&self) -> Posture {
         self.live.load().posture
-    }
-
-    pub(crate) fn system_catalogs(&self) -> SystemCatalogs {
-        self.live.load().system_catalogs
-    }
-
-    pub(crate) fn summaries(&self) -> Summaries {
-        self.live.load().summaries
-    }
-
-    pub(crate) fn lineage(&self) -> Lineage {
-        self.live.load().lineage
     }
 
     pub(crate) fn rate_limit(&self) -> Option<PrincipalRateLimit> {
@@ -455,7 +477,17 @@ impl Policy {
         roles: &HashSet<String>,
         analysis: &FieldAnalysis,
     ) -> Result<Plan, Rejection> {
-        let live = self.live.load();
+        self.plan_for_with(&self.live.load(), snapshot, fields, roles, analysis)
+    }
+
+    pub(crate) fn plan_for_with(
+        &self,
+        live: &LivePolicy,
+        snapshot: &Snapshot,
+        fields: &[protocol::FieldDescription],
+        roles: &HashSet<String>,
+        analysis: &FieldAnalysis,
+    ) -> Result<Plan, Rejection> {
         let masker = self.masker.load();
         let mut plan = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
@@ -495,9 +527,13 @@ impl Policy {
                             json_projection = projection;
                             spec
                         }
-                        ExpressionPolicy::NotApplicable | ExpressionPolicy::Opaque => {
-                            self.plan_opaque_field(snapshot, field, analysis.lineage.get(index))?
-                        }
+                        ExpressionPolicy::NotApplicable | ExpressionPolicy::Opaque => self
+                            .plan_opaque_field(
+                                snapshot,
+                                field,
+                                analysis.lineage.get(index),
+                                live.opaque,
+                            )?,
                     }
                 }
             } else {
@@ -614,8 +650,9 @@ impl Policy {
         snapshot: &Snapshot,
         field: &protocol::FieldDescription,
         lineage: Option<&Verdict>,
+        opaque: Opaque,
     ) -> Result<MaskSpec, Rejection> {
-        if self.live.load().opaque == Opaque::Mask {
+        if opaque == Opaque::Mask {
             return Ok(MaskSpec::new(Mask::Null));
         }
         if let Some(Verdict::Blocked(source)) = lineage {
@@ -647,6 +684,26 @@ impl Policy {
                     .into(),
             ),
         })
+    }
+}
+
+fn warn_if_transport_relaxed(previous: &LivePolicy, next: &LivePolicy, tls_configured: bool) {
+    if previous.require_client_tls && !next.require_client_tls {
+        tracing::warn!(
+            "config reload set require_client_tls = false — new clients may connect \
+             in plaintext; existing sessions are unchanged"
+        );
+    }
+    if previous.tls_cert.is_some() && !tls_configured {
+        tracing::warn!(
+            "config reload removed tls_cert/tls_key — new clients will not negotiate TLS"
+        );
+    }
+    if previous.backend_tls != BackendTls::Disable && next.backend_tls == BackendTls::Disable {
+        tracing::warn!(
+            "config reload set backend_tls = disable — new sessions send unmasked rows \
+             to Postgres in the clear"
+        );
     }
 }
 
@@ -1109,7 +1166,11 @@ unclassified = "{unclassified}"
             "unchanged column rules must skip pg_class"
         );
         assert_eq!(policy.unclassified(), Unclassified::Mask);
-        assert!(policy.generation() > 0, "live changes must bump generation");
+        assert_eq!(
+            policy.generation(),
+            2,
+            "a live change bumps generation before and after the swap"
+        );
     }
 
     #[tokio::test]
