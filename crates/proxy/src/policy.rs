@@ -126,6 +126,29 @@ pub struct Policy {
     reload: tokio::sync::Mutex<()>,
 }
 
+/// Brackets a policy swap with two distinct generations.
+///
+/// The first invalidates decisions made before the swap starts. The `Drop`
+/// bump invalidates a decision rebuilt while catalog resolution was in flight.
+/// Making the second bump structural avoids an early return or future `?`
+/// silently reopening that race.
+pub(crate) struct PolicyChange<'a> {
+    epoch: &'a AtomicU64,
+}
+
+impl<'a> PolicyChange<'a> {
+    fn begin(epoch: &'a AtomicU64) -> Self {
+        epoch.fetch_add(1, Ordering::Relaxed);
+        Self { epoch }
+    }
+}
+
+impl Drop for PolicyChange<'_> {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Why a result set was refused: the words the client sees, plus the bucket the
 /// counters see.
 pub(crate) struct Rejection {
@@ -242,6 +265,18 @@ impl Policy {
                 return Err(err);
             }
             self.note_reload_success();
+            // Say so. An operator edits a file and sends SIGHUP; if the bytes
+            // did not change, the reload is a no-op and the only other
+            // evidence is a counter nobody watches to confirm a manual
+            // action. Silence here reads exactly like "the signal went
+            // nowhere", so editing the wrong path — a copy, a stale symlink,
+            // the wrong container mount — looked identical to success. This
+            // is also the certificate-rotation path, where "did it take?" is
+            // the whole question.
+            tracing::info!(
+                "config reload: {path} is byte-identical, so policy is unchanged; \
+                 tls_cert/tls_key were re-read"
+            );
             return Ok(ReloadReport {
                 unchanged: true,
                 ..ReloadReport::default()
@@ -319,13 +354,11 @@ impl Policy {
         //    fresh; after-only leaves old caches matching until the bump,
         //    while the new live is already loaded.
         //
-        // If catalog resolution then fails, only (1) has run: sessions
-        // rebuild against the previous snapshot — over-refusal, not a
-        // release.
+        // If catalog resolution then fails, both bumps still run: sessions
+        // rebuild against the previous snapshot twice — over-invalidation,
+        // not a release.
         let bump = catalog_re_resolved || live_changed || key_changed;
-        if bump {
-            self.epoch.fetch_add(1, Ordering::Relaxed);
-        }
+        let _change = bump.then(|| PolicyChange::begin(&self.epoch));
         if catalog_re_resolved {
             let types: HashMap<String, SemanticType> = config
                 .semantic_type
@@ -345,9 +378,6 @@ impl Policy {
         }
         self.live.store(Arc::new(live));
         self.tls.store(Arc::new(tls));
-        if bump {
-            self.epoch.fetch_add(1, Ordering::Relaxed);
-        }
         Ok(ReloadReport {
             unchanged: false,
             catalog_re_resolved,
@@ -440,6 +470,18 @@ impl Policy {
         let mut live = (**self.live.load()).clone();
         live.unclassified_mask = mask;
         self.live.store(Arc::new(live));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_unclassified_for_test(&self, unclassified: Unclassified) {
+        let mut live = (**self.live.load()).clone();
+        live.unclassified = unclassified;
+        self.live.store(Arc::new(live));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_change_for_test(&self) -> PolicyChange<'_> {
+        PolicyChange::begin(&self.epoch)
     }
 
     #[cfg(test)]
@@ -1214,6 +1256,52 @@ unclassified = "allow"
             "the SHA of the parsed boot bytes must not skip a rewritten file"
         );
         assert_eq!(policy.unclassified(), Unclassified::Mask);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A SIGHUP with no edit is a no-op, and it must still count as a reload:
+    /// it is the certificate-rotation path, and an operator who sees neither a
+    /// log line nor a counter cannot tell it from a signal that went nowhere.
+    #[tokio::test]
+    async fn an_unedited_file_reports_unchanged_and_still_counts() {
+        let dir = std::env::temp_dir().join(format!("pgmask-reload-same-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("catalog.toml");
+        std::fs::write(
+            &path,
+            r#"
+backend = "127.0.0.1:1"
+listen = "127.0.0.1:0"
+catalog_dsn = "postgres://unused"
+pseudonym_key = "a-long-enough-key"
+unclassified = "allow"
+"#,
+        )
+        .unwrap();
+        let (config, bytes) = Config::load_with_bytes(path.to_str().unwrap()).unwrap();
+        let policy = Policy::from_config(&config, Arc::new(Catalog::default())).unwrap();
+        policy.remember_file_bytes(&bytes);
+        let generation = policy.generation();
+
+        let report = policy
+            .reload_from_path(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(report.unchanged, "identical bytes must short-circuit");
+        assert!(
+            !report.catalog_re_resolved,
+            "an unchanged file must not pay a pg_class round-trip"
+        );
+        assert_eq!(
+            policy.generation(),
+            generation,
+            "a no-op reload must not invalidate cached plans"
+        );
+        assert_eq!(
+            policy.reloads.load(Ordering::Relaxed),
+            1,
+            "a no-op reload is still an observed reload"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
