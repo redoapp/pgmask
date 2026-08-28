@@ -11,6 +11,7 @@
 
 mod support;
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -306,6 +307,174 @@ async fn a_dropped_relation_is_reported_not_silent() -> Result<()> {
     assert!(client.received_text().contains("Portland"));
     assert_no_canary(&client, "while coverage is degraded");
     Ok(())
+}
+
+// --- SIGHUP reload, against the real binary ----------------------------------
+
+/// Everything else about reload is tested in-process by calling
+/// `Policy::apply_config` / `Policy::reload_from_path` directly. That skips the
+/// two things only the shipped binary does: install a SIGHUP handler, and read
+/// the operator's file off disk. Both were untested when reload shipped, so
+/// this drives `kill -HUP` at a spawned `pgmask` and watches one already-open
+/// session's bytes change.
+///
+/// The session is deliberately held open across the signal: "reconnect and the
+/// new policy applies" is a much weaker claim than the documented one.
+#[tokio::test]
+async fn sighup_reloads_the_real_binary_on_a_live_session() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+
+    let dir = std::env::temp_dir().join(format!("pgmask-sighup-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let catalog_path = dir.join("catalog.toml");
+    let port = reserve_port().await?;
+
+    // `email` masked to start with; `city` released so a served row is
+    // distinguishable from a refused one.
+    let catalog = |email_mask: &str| {
+        format!(
+            r#"
+listen = "127.0.0.1:{port}"
+backend = "{backend}"
+catalog_dsn = "{dsn}"
+pseudonym_key = "a-long-enough-key-for-the-sighup-test"
+unclassified = "mask"
+
+[[column]]
+relation = "canary.subjects"
+column = "id"
+mask = "none"
+
+[[column]]
+relation = "canary.subjects"
+column = "city"
+mask = "none"
+
+[[column]]
+relation = "canary.subjects"
+column = "email"
+mask = "{email_mask}"
+"#,
+            backend = backend_addr().expect("PGMASK_TEST_PG"),
+            dsn = backend_dsn(DB),
+        )
+    };
+    std::fs::write(&catalog_path, catalog("redact"))?;
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pgmask"))
+        .arg(&catalog_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    // Kill the child even if an assertion below panics, or a failing run leaves
+    // a proxy holding the port for the rest of the suite.
+    let guard = ChildGuard(&mut child);
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    wait_until_listening(addr).await?;
+
+    let mut client = RawClient::connect(addr, DB).await?;
+    let before = simple_query_round(&mut client, SIGHUP_SQL).await?;
+    assert_served(&before.messages, "before SIGHUP");
+    assert_no_canary_bytes(&before.received, "email masked before SIGHUP");
+
+    // Loosen on disk, then signal. Nothing else touches the process.
+    std::fs::write(&catalog_path, catalog("none"))?;
+    hangup(guard.0.id())?;
+
+    // The reload is asynchronous with respect to the signal, so allow the
+    // handler to run. Poll rather than sleeping a fixed time: a single long
+    // sleep is what makes a signal test flaky under load.
+    let mut loosened = None;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let round = simple_query_round(&mut client, SIGHUP_SQL).await?;
+        if round.text().contains(CANARY_EMAIL) {
+            loosened = Some(round);
+            break;
+        }
+    }
+    let loosened = loosened.expect(
+        "SIGHUP never applied the loosened file to the open session — the signal \
+         handler, or the on-disk re-read, is not wired up",
+    );
+    assert_served(&loosened.messages, "after loosening SIGHUP");
+
+    // And the direction that matters: tighten on disk, signal, and the same
+    // session must stop emitting the value it was just allowed to emit.
+    std::fs::write(&catalog_path, catalog("redact"))?;
+    hangup(guard.0.id())?;
+    let mut tightened = None;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let round = simple_query_round(&mut client, SIGHUP_SQL).await?;
+        if !round.text().contains(CANARY_EMAIL) {
+            tightened = Some(round);
+            break;
+        }
+    }
+    let tightened = tightened.expect(
+        "SIGHUP never re-masked the open session after the file was tightened — \
+         a live session kept serving a value the policy no longer allows",
+    );
+    assert_served(&tightened.messages, "after tightening SIGHUP");
+
+    // A file that cannot be parsed must leave the tightened policy standing.
+    std::fs::write(&catalog_path, "this is not = = valid toml [[[\n")?;
+    hangup(guard.0.id())?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after_bad = simple_query_round(&mut client, SIGHUP_SQL).await?;
+    assert_served(&after_bad.messages, "after an unparseable file");
+    assert_no_canary_bytes(
+        &after_bad.received,
+        "an unparseable reload must keep the previous policy",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+const SIGHUP_SQL: &str = "SELECT id, email, city FROM canary.subjects WHERE id = 1";
+
+/// Kills the spawned proxy on drop, including on an assertion panic.
+struct ChildGuard<'a>(&'a mut std::process::Child);
+
+impl Drop for ChildGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `kill -HUP`, via the command rather than a `libc` dependency the proxy does
+/// not otherwise need.
+fn hangup(pid: u32) -> Result<()> {
+    let status = std::process::Command::new("kill")
+        .arg("-HUP")
+        .arg(pid.to_string())
+        .status()?;
+    anyhow::ensure!(status.success(), "kill -HUP {pid} failed: {status}");
+    Ok(())
+}
+
+/// A port the proxy can bind. Bound and released, so this races with any other
+/// listener on the machine; the alternative is asking the proxy to report its
+/// own port, which it has no channel for.
+async fn reserve_port() -> Result<u16> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+async fn wait_until_listening(addr: SocketAddr) -> Result<()> {
+    for _ in 0..100 {
+        if TcpStream::connect(addr).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("the spawned pgmask never listened on {addr}")
 }
 
 // --- Rejection instrumentation ----------------------------------------------

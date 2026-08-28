@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.9 — the SIGHUP path is tested against the real binary
+
+- Log the byte-identical reload. It was silent, so an operator who sent
+  `SIGHUP` after editing the wrong path — a copy, a stale symlink, the wrong
+  container mount — saw exactly what a working reload looks like: nothing.
+  This is also the certificate-rotation path.
+- Test reload end to end against the shipped binary: spawn `pgmask`, hold one
+  session open, edit the file on disk and `kill -HUP`. Loosening, tightening,
+  and an unparseable file are each asserted on that live session's bytes.
+  Every reload test until now called `Policy::apply_config` in-process, which
+  exercises neither the signal handler nor the on-disk re-read.
+
 ## 0.2.8 — SIGHUP reload follow-ups
 
 - Hash the catalog bytes that were parsed at boot, not a second read after

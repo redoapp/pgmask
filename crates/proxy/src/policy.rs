@@ -242,6 +242,18 @@ impl Policy {
                 return Err(err);
             }
             self.note_reload_success();
+            // Say so. An operator edits a file and sends SIGHUP; if the bytes
+            // did not change, the reload is a no-op and the only other
+            // evidence is a counter nobody watches to confirm a manual
+            // action. Silence here reads exactly like "the signal went
+            // nowhere", so editing the wrong path — a copy, a stale symlink,
+            // the wrong container mount — looked identical to success. This
+            // is also the certificate-rotation path, where "did it take?" is
+            // the whole question.
+            tracing::info!(
+                "config reload: {path} is byte-identical, so policy is unchanged; \
+                 tls_cert/tls_key were re-read"
+            );
             return Ok(ReloadReport {
                 unchanged: true,
                 ..ReloadReport::default()
@@ -1214,6 +1226,52 @@ unclassified = "allow"
             "the SHA of the parsed boot bytes must not skip a rewritten file"
         );
         assert_eq!(policy.unclassified(), Unclassified::Mask);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A SIGHUP with no edit is a no-op, and it must still count as a reload:
+    /// it is the certificate-rotation path, and an operator who sees neither a
+    /// log line nor a counter cannot tell it from a signal that went nowhere.
+    #[tokio::test]
+    async fn an_unedited_file_reports_unchanged_and_still_counts() {
+        let dir = std::env::temp_dir().join(format!("pgmask-reload-same-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("catalog.toml");
+        std::fs::write(
+            &path,
+            r#"
+backend = "127.0.0.1:1"
+listen = "127.0.0.1:0"
+catalog_dsn = "postgres://unused"
+pseudonym_key = "a-long-enough-key"
+unclassified = "allow"
+"#,
+        )
+        .unwrap();
+        let (config, bytes) = Config::load_with_bytes(path.to_str().unwrap()).unwrap();
+        let policy = Policy::from_config(&config, Arc::new(Catalog::default())).unwrap();
+        policy.remember_file_bytes(&bytes);
+        let generation = policy.generation();
+
+        let report = policy
+            .reload_from_path(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(report.unchanged, "identical bytes must short-circuit");
+        assert!(
+            !report.catalog_re_resolved,
+            "an unchanged file must not pay a pg_class round-trip"
+        );
+        assert_eq!(
+            policy.generation(),
+            generation,
+            "a no-op reload must not invalidate cached plans"
+        );
+        assert_eq!(
+            policy.reloads.load(Ordering::Relaxed),
+            1,
+            "a no-op reload is still an observed reload"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
