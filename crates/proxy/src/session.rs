@@ -241,7 +241,7 @@ impl Session {
     /// charged: burning the victim's budget before `AuthenticationOk` would
     /// turn a failed login into a DoS against a real session.
     fn allow_statement(&self) -> bool {
-        match &self.policy.rate_limit {
+        match &self.policy.rate_limit() {
             None => true,
             Some(_) if !self.authenticated || self.principal.is_empty() => true,
             Some(lim) => lim.try_acquire(&self.principal),
@@ -350,7 +350,7 @@ impl Session {
         // on RowDescription still ran the statement (timing / error-presence
         // oracles on WHERE and CASE). Refuse here with the same rule the
         // RowDescription path uses.
-        if self.policy.posture == Posture::Hostile {
+        if self.policy.posture() == Posture::Hostile {
             let snapshot = self.policy.catalog.snapshot();
             let masked = snapshot.masked_bare_names_for_roles(&self.roles);
             let relations = snapshot.relation_columns_map();
@@ -416,7 +416,7 @@ impl Session {
         // Saturating: a u32 cannot overflow from notices in any real session,
         // and wrapping would re-admit traffic after a flood.
         self.notices_this_exchange = self.notices_this_exchange.saturating_add(1);
-        if let Some(max) = self.policy.max_notices_per_exchange {
+        if let Some(max) = self.policy.max_notices_per_exchange() {
             if self.notices_this_exchange > max {
                 // One metric event per crossing, not per dropped notice — a
                 // 1600-notice DO would otherwise drown the counters.
@@ -432,11 +432,17 @@ impl Session {
         }
     }
 
+    /// Drop cached plans and refresh roles when catalog or file generation moved.
+    fn sync_policy(&mut self) {
+        if self.plans.invalidate_if_stale(self.policy.generation()) && self.authenticated {
+            self.roles = self.policy.roles_of(&self.principal);
+        }
+    }
+
     fn handle_frontend(&mut self, msg: Message, out: &mut Batch) {
         // A cached plan is a decision made against one catalog snapshot; a
         // refresh can tighten a classification underneath it.
-        self.plans
-            .invalidate_if_stale(self.policy.catalog.generation());
+        self.sync_policy();
         match msg.tag {
             // Emits rows with no RowDescription. One of exactly two such paths.
             protocol::F_FUNCTION_CALL => {
@@ -784,6 +790,9 @@ impl Session {
     }
 
     fn handle_row_description(&mut self, msg: Message, out: &mut Batch) {
+        // A reload can land after Query/Parse and before this description.
+        self.sync_policy();
+        let live = self.policy.live();
         let fields = match protocol::parse_row_description(&msg.body) {
             Ok(fields) => fields,
             Err(err) => {
@@ -831,7 +840,7 @@ impl Session {
             .as_deref()
             .map(analysis::StatementInspection::new);
 
-        let system_catalog = self.policy.system_catalogs == SystemCatalogs::Allow
+        let system_catalog = live.system_catalogs == SystemCatalogs::Allow
             && inspection
                 .as_ref()
                 .is_some_and(analysis::StatementInspection::reads_only_server_metadata)
@@ -911,7 +920,7 @@ impl Session {
                 },
             }
         });
-        let allow_summaries = self.policy.summaries == Summaries::Allow && !singleton_groups;
+        let allow_summaries = live.summaries == Summaries::Allow && !singleton_groups;
 
         // Hostile posture: a masked column may only appear as a bare outermost
         // SELECT-list ColumnRef (ORDER BY mentions are credited — cleartext
@@ -919,7 +928,7 @@ impl Session {
         // (`t::text`) are refused — they embed cleartext without naming
         // columns. Closes WHERE/LIKE, single-row aggregates and the
         // error-channel CASE — see analysis/.
-        if self.policy.posture == Posture::Hostile {
+        if live.posture == Posture::Hostile {
             let masked = snapshot.masked_bare_names_for_roles(&self.roles);
             let relations = snapshot.relation_columns_map();
             let empty = analysis::StatementInspection::new("");
@@ -997,7 +1006,7 @@ impl Session {
         // as a genuinely computed one. Asking only the first question left
         // CockroachDB refusing unions that Postgres serves, because there the
         // fields carry provenance right up until we decline to believe it.
-        let needs_lineage = self.policy.lineage == Lineage::Allow
+        let needs_lineage = live.lineage == Lineage::Allow
             && fields.iter().zip(&safety).any(|(field, safety)| {
                 (!field.has_provenance() || !trust_provenance) && *safety != Safety::Releasable
             });
@@ -1034,7 +1043,8 @@ impl Session {
                     .collect::<Vec<_>>(),
             ))
         } else {
-            self.policy.plan_for(
+            self.policy.plan_for_with(
+                &live,
                 &snapshot,
                 &fields,
                 &self.roles,
@@ -1181,7 +1191,7 @@ impl Session {
             let masked = if field.spec.is_passthrough() {
                 value
             } else {
-                match self.policy.masker.apply_planned(
+                match self.policy.masker().apply_planned(
                     &field.spec,
                     field.primed.as_ref(),
                     field.json_projection.as_ref(),
@@ -1335,7 +1345,7 @@ pub async fn handle_connection(
             return Ok(());
         };
         match packet.code {
-            protocol::SSL_REQUEST_CODE => match policy.tls.clone() {
+            protocol::SSL_REQUEST_CODE => match policy.tls_acceptor() {
                 Some(acceptor) => {
                     client_stream.write_all(b"S").await?;
                     client_stream.flush().await?;
@@ -1409,20 +1419,16 @@ pub async fn handle_connection(
         .await
         .with_context(|| format!("connecting to backend {backend_addr}"))?;
     backend.set_nodelay(true).ok();
-    let mut backend_stream: BoxStream = match policy.backend_tls {
+    let backend_tls = policy.backend_tls();
+    let backend_ca = policy.backend_ca();
+    let mut backend_stream: BoxStream = match backend_tls {
         BackendTls::Disable => Box::new(backend),
         BackendTls::Require | BackendTls::VerifyFull => {
             // Strip the port: SNI carries a hostname, never host:port.
             let host = backend_addr
                 .rsplit_once(':')
                 .map_or(backend_addr, |(h, _)| h);
-            crate::tls::upgrade_backend(
-                backend,
-                host,
-                policy.backend_tls,
-                policy.backend_ca.as_deref(),
-            )
-            .await?
+            crate::tls::upgrade_backend(backend, host, backend_tls, backend_ca.as_deref()).await?
         }
     };
 
@@ -1564,11 +1570,11 @@ mod tests {
     fn authentication_ok_is_detected_even_when_it_is_not_the_first_message() {
         use crate::catalog::Role;
 
-        let mut p = policy(Unclassified::Allow, Opaque::Reject);
-        Arc::get_mut(&mut p).unwrap().roles = roles_by_principal(&[Role {
+        let p = policy(Unclassified::Allow, Opaque::Reject);
+        p.set_roles_for_test(roles_by_principal(&[Role {
             name: "support".into(),
             members: vec!["sam".into()],
-        }]);
+        }]));
 
         let mut session = Session::new(p).with_principal("sam");
         let mut out = Batch::default();
@@ -1600,11 +1606,11 @@ mod tests {
     #[test]
     fn an_unclaimed_principal_gets_no_roles() {
         use crate::catalog::Role;
-        let mut p = policy(Unclassified::Allow, Opaque::Reject);
-        Arc::get_mut(&mut p).unwrap().roles = roles_by_principal(&[Role {
+        let p = policy(Unclassified::Allow, Opaque::Reject);
+        p.set_roles_for_test(roles_by_principal(&[Role {
             name: "support".into(),
             members: vec!["sam".into()],
-        }]);
+        }]));
         let mut session = Session::new(p).with_principal("mallory");
         let mut ok = bytes::BytesMut::new();
         bytes::BufMut::put_i32(&mut ok, 0);

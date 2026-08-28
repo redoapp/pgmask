@@ -242,27 +242,31 @@ pub(crate) struct PlanState {
 }
 
 impl PlanState {
-    /// Drop cached plans built before a catalog refresh.
+    /// Drop cached plans built before a catalog refresh or a config reload.
     ///
     /// A plan is a decision made against one snapshot, and statement and portal
     /// plans outlive the result set they were described for — that is the point
     /// of caching them.
     ///
-    /// A refresh does not re-read the catalog *file* (that needs a restart), so
-    /// this is not about an operator editing a rule. It re-resolves names to
-    /// OIDs, and DDL moves those: `DROP TABLE; CREATE TABLE` gives a new OID,
-    /// and PostgreSQL reuses OIDs. A plan cached across that boundary applies
-    /// the previous mapping's classification — which, when an OID has been
-    /// recycled onto a different relation, is the wrong column's mask.
+    /// A catalog refresh re-resolves names to OIDs, and DDL moves those:
+    /// `DROP TABLE; CREATE TABLE` gives a new OID, and PostgreSQL reuses OIDs.
+    /// A SIGHUP reload re-reads the catalog *file*, so a newly classified column
+    /// or a tightened mask is the same kind of generation change. A plan cached
+    /// across either boundary applies the previous mapping's classification —
+    /// which, when an OID has been recycled onto a different relation, is the wrong
+    /// column's mask, and when a rule was added, is an unclassified release.
     ///
     /// The in-flight `active_plan` is deliberately kept: its rows are already
     /// being described and served, and that is bounded by one result set. What
     /// is dropped is everything a *later* Bind or Execute would reuse, so the
     /// next one has no plan and fails closed until a fresh Describe rebuilds
     /// it against the new snapshot.
-    pub(crate) fn invalidate_if_stale(&mut self, current: u64) {
+    ///
+    /// Returns whether the generation moved, so callers can refresh anything
+    /// else that is only valid for one generation (principal roles).
+    pub(crate) fn invalidate_if_stale(&mut self, current: u64) -> bool {
         if self.generation == current {
-            return;
+            return false;
         }
         self.generation = current;
         self.statement_plans.clear();
@@ -271,6 +275,7 @@ impl PlanState {
         // formats the client chose. What a refresh invalidates is the
         // classification, which a fresh Describe rebuilds — and that rebuild
         // needs these formats to stamp the new plan correctly.
+        true
     }
 
     pub(crate) fn active_plan(&self) -> Option<Plan> {

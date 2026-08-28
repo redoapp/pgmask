@@ -18,7 +18,7 @@ pub mod session;
 pub mod tls;
 
 pub use catalog::{Catalog, Config};
-pub use policy::Policy;
+pub use policy::{Policy, ReloadReport};
 pub use session::handle_connection;
 
 /// Extended-query protocol state machine, exposed for the sequence fuzzer.
