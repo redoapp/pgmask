@@ -1266,6 +1266,7 @@ struct CatalogSpec {
 pub struct Catalog {
     spec: ArcSwap<CatalogSpec>,
     dsn: String,
+    backend_ca: Option<String>,
     /// `ArcSwap` rather than `RwLock<Arc<_>>`: every result set takes this on
     /// the hot path and the refresher writes it every 30 seconds, so readers
     /// should not queue behind a writer. It also removes the poisoned-lock
@@ -1287,6 +1288,7 @@ impl Default for Catalog {
         Self {
             spec: ArcSwap::from_pointee(CatalogSpec::default()),
             dsn: String::new(),
+            backend_ca: None,
             snapshot: ArcSwap::from_pointee(Snapshot::default()),
             apply: tokio::sync::Mutex::new(()),
             refresh_wanted: Notify::new(),
@@ -1305,12 +1307,13 @@ impl Catalog {
         rules: &[ColumnRule],
         semantic_types: &[SemanticType],
         dsn: &str,
+        backend_ca: Option<&str>,
     ) -> Result<Self> {
         let types: HashMap<String, SemanticType> = semantic_types
             .iter()
             .map(|t| (t.name.clone(), t.clone()))
             .collect();
-        let resolved = resolve_snapshot_retrying(rules, &types, dsn).await?;
+        let resolved = resolve_snapshot_retrying(rules, &types, dsn, backend_ca).await?;
         if !resolved.unresolved.is_empty() {
             bail!(
                 "catalog references {} column(s) that do not exist: {}. \
@@ -1325,6 +1328,7 @@ impl Catalog {
                 types,
             }),
             dsn: dsn.to_string(),
+            backend_ca: backend_ca.map(str::to_owned),
             snapshot: ArcSwap::from_pointee(resolved),
             ..Default::default()
         })
@@ -1411,7 +1415,14 @@ impl Catalog {
         rules: Vec<ColumnRule>,
         types: HashMap<String, SemanticType>,
     ) -> Result<()> {
-        let next = match resolve_snapshot_retrying(&rules, &types, &self.dsn).await {
+        let next = match resolve_snapshot_retrying(
+            &rules,
+            &types,
+            &self.dsn,
+            self.backend_ca.as_deref(),
+        )
+        .await
+        {
             Ok(next) => next,
             Err(err) => {
                 self.failed_refreshes.fetch_add(1, Ordering::Relaxed);
@@ -1495,7 +1506,14 @@ impl Catalog {
         let _apply = self.apply.lock().await;
         let spec = self.spec.load_full();
         let previous = self.snapshot();
-        let next = match resolve_snapshot_retrying(&spec.rules, &spec.types, &self.dsn).await {
+        let next = match resolve_snapshot_retrying(
+            &spec.rules,
+            &spec.types,
+            &self.dsn,
+            self.backend_ca.as_deref(),
+        )
+        .await
+        {
             Ok(next) => next,
             Err(err) => {
                 self.failed_refreshes.fetch_add(1, Ordering::Relaxed);
@@ -1785,6 +1803,7 @@ async fn resolve_snapshot_retrying(
     rules: &[ColumnRule],
     types: &HashMap<String, SemanticType>,
     dsn: &str,
+    backend_ca: Option<&str>,
 ) -> Result<Snapshot> {
     // One entry per retry, so the attempt count and the backoff cannot drift
     // apart. Written as a table rather than as `100 * attempt` because this
@@ -1793,7 +1812,7 @@ async fn resolve_snapshot_retrying(
     const BACKOFF_MS: &[u64] = &[100, 200, 400];
     let mut backoff = BACKOFF_MS.iter();
     loop {
-        match resolve_snapshot(rules, types, dsn).await {
+        match resolve_snapshot(rules, types, dsn, backend_ca).await {
             Ok(snapshot) => return Ok(snapshot),
             Err(err) => match backoff.next() {
                 Some(&delay_ms) if is_concurrent_ddl_race(&err) => {
@@ -1814,6 +1833,7 @@ async fn resolve_snapshot(
     rules: &[ColumnRule],
     types: &HashMap<String, SemanticType>,
     dsn: &str,
+    backend_ca: Option<&str>,
 ) -> Result<Snapshot> {
     // TLS-capable, because managed Postgres generally refuses plaintext. A
     // NoTls connector here meant the catalog could not be resolved against Neon
@@ -1829,7 +1849,7 @@ async fn resolve_snapshot(
         crate::tls::BackendTls::Require
     };
     let connector = tokio_postgres_rustls::MakeRustlsConnect::new(
-        crate::tls::backend_client_config(tls_mode, None)?,
+        crate::tls::backend_client_config(tls_mode, backend_ca)?,
     );
     let (dsn, note) = sanitize_catalog_dsn(dsn);
     if let Some(note) = note {

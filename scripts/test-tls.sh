@@ -77,9 +77,12 @@ echo "==> generating the backend cert inside the container"
 "$CONTAINER_ENGINE" exec -u postgres "$CONTAINER" bash -c '
   cd /var/lib/postgresql/data &&
   openssl req -new -x509 -days 1 -nodes -text \
-    -out server.crt -keyout server.key -subj "/CN=localhost" 2>/dev/null &&
+    -out server.crt -keyout server.key -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null &&
   chmod 600 server.key
 ' || { echo "could not generate backend cert"; exit 1; }
+"$CONTAINER_ENGINE" cp "$CONTAINER:/var/lib/postgresql/data/server.crt" \
+  "$CERTS/backend.crt" || { echo "could not copy backend CA"; exit 1; }
 "$CONTAINER_ENGINE" exec -u postgres "$CONTAINER" psql -U postgres -c "ALTER SYSTEM SET ssl = on" >/dev/null ||
   { echo "FATAL: could not set ssl = on"; exit 1; }
 "$CONTAINER_ENGINE" restart "$CONTAINER" >/dev/null
@@ -129,6 +132,7 @@ if ! cargo build --release -q; then
   echo "FATAL: could not build pgmask"
   exit 1
 fi
+
 # Wait for the listener, not a fixed two seconds.
 #
 # pgmask resolves the whole catalog before it binds, so on a loaded machine it
@@ -147,6 +151,29 @@ await_listener() { # port
   echo "FAIL: nothing listening on :$1 after 30s"
   return 1
 }
+
+# The catalog lookup is a separate PostgreSQL connection made before pgmask
+# binds. It must trust the same private CA as proxied backend sessions; otherwise
+# a verify-full deployment fails closed at startup even though the runtime path
+# itself is configured correctly.
+sed -e 's|^backend_tls = .*|backend_tls = "verify-full"|' \
+    -e "/^catalog_dsn = / s|/demo\"|/demo?sslmode=verify-full\"|" \
+    "$CERTS/tls.toml" |
+  awk -v ca="$CERTS/backend.crt" '
+    { print }
+    /^backend_tls = / { print "backend_ca = \"" ca "\"" }
+  ' > "$CERTS/tls-private-ca.toml"
+PGMASK_LOG=info ./target/release/pgmask "$CERTS/tls-private-ca.toml" \
+  > /tmp/pgmask-tls-private-ca.log 2>&1 &
+PROXY_PID=$!
+if ! await_listener "$PROXY_PORT"; then
+  echo "pgmask could not resolve the catalog through the private CA:"
+  cat /tmp/pgmask-tls-private-ca.log
+  exit 1
+fi
+kill "$PROXY_PID" 2>/dev/null
+wait "$PROXY_PID" 2>/dev/null
+unset PROXY_PID
 
 PGMASK_LOG=info ./target/release/pgmask "$CERTS/tls.toml" > /tmp/pgmask-tls.log 2>&1 &
 PROXY_PID=$!

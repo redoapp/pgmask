@@ -45,6 +45,7 @@ struct ProcessIdentity {
     listen: String,
     backend: String,
     catalog_dsn: String,
+    backend_ca: Option<String>,
     metrics_listen: Option<String>,
 }
 
@@ -54,6 +55,7 @@ impl ProcessIdentity {
             listen: config.listen.clone(),
             backend: config.backend.clone(),
             catalog_dsn: config.catalog_dsn.clone(),
+            backend_ca: config.backend_ca.clone(),
             metrics_listen: config.metrics_listen.clone(),
         }
     }
@@ -68,6 +70,9 @@ impl ProcessIdentity {
         }
         if config.catalog_dsn != self.catalog_dsn {
             names.push("catalog_dsn");
+        }
+        if config.backend_ca != self.backend_ca {
+            names.push("backend_ca");
         }
         if config.metrics_listen != self.metrics_listen {
             names.push("metrics_listen");
@@ -296,7 +301,7 @@ impl Policy {
                 if !report.restart_required.is_empty() {
                     tracing::warn!(
                         ignored = ?report.restart_required,
-                        "config reload applied policy; listen/backend/catalog_dsn/metrics_listen still need a restart"
+                        "config reload applied policy; listen/backend/catalog_dsn/backend_ca/metrics_listen still need a restart"
                     );
                 } else {
                     tracing::info!(
@@ -334,7 +339,14 @@ impl Policy {
         let restart_required = self.identity.mismatches(config);
         let tls = tls_from_config(config)?;
         let previous = self.live.load_full();
-        let live = live_from_config(config, previous.rate_limit.as_ref())?;
+        let mut live = live_from_config(config, previous.rate_limit.as_ref())?;
+        // The CA path is shared with the independently refreshed catalog
+        // connection and is captured by Catalog at startup. Re-reading the PEM
+        // at the same path is supported; changing the path needs a restart so
+        // the session and catalog legs cannot silently trust different roots.
+        if config.backend_ca != self.identity.backend_ca {
+            live.backend_ca = self.identity.backend_ca.clone();
+        }
         let rules: Vec<ColumnRule> = config.column_rules().cloned().collect();
         let catalog_re_resolved = !self.catalog.spec_matches(&rules, &config.semantic_type);
         let key_changed =
@@ -1017,6 +1029,7 @@ pub(crate) mod test_support {
                 listen: "127.0.0.1:0".into(),
                 backend: "127.0.0.1:1".into(),
                 catalog_dsn: String::new(),
+                backend_ca: None,
                 metrics_listen: None,
             },
             epoch: AtomicU64::new(0),
@@ -1319,6 +1332,25 @@ unclassified = "allow"
             report.restart_required
         );
         assert_eq!(policy.unclassified(), Unclassified::Mask);
+    }
+
+    #[tokio::test]
+    async fn backend_ca_path_change_waits_for_restart_on_both_backend_paths() {
+        let mut config = minimal_config(Unclassified::Allow);
+        config.backend_tls = BackendTls::VerifyFull;
+        config.backend_ca = Some("/run/secrets/old-ca.pem".into());
+        let policy = Policy::from_config(&config, Arc::new(Catalog::default())).unwrap();
+        let mut next = config.clone();
+        next.backend_ca = Some("/run/secrets/new-ca.pem".into());
+
+        let report = policy.apply_config(&next).await.unwrap();
+
+        assert!(report.restart_required.contains(&"backend_ca"));
+        assert_eq!(
+            policy.backend_ca().as_deref(),
+            Some("/run/secrets/old-ca.pem"),
+            "sessions and catalog refreshes must keep using the same CA path until restart"
+        );
     }
 
     #[test]
