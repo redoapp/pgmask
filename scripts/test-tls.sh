@@ -73,15 +73,28 @@ await_pg "initial boot"
 
 echo "==> generating the backend cert inside the container"
 # Postgres refuses a key that is group- or world-readable, and refuses one it
-# does not own. Generating in place as the postgres user sidesteps both.
+# does not own. Generate a real CA and a separately signed server leaf in place
+# as the postgres user. A self-signed server certificate is also a CA, which
+# rustls correctly refuses as an end entity (CaUsedAsEndEntity).
 "$CONTAINER_ENGINE" exec -u postgres "$CONTAINER" bash -c '
   cd /var/lib/postgresql/data &&
-  openssl req -new -x509 -days 1 -nodes -text \
-    -out server.crt -keyout server.key -subj "/CN=localhost" \
-    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null &&
+  openssl req -new -x509 -days 1 -nodes \
+    -out test-ca.crt -keyout test-ca.key -subj "/CN=pgmask-test-ca" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null &&
+  openssl req -new -nodes -out server.csr -keyout server.key \
+    -subj "/CN=localhost" 2>/dev/null &&
+  printf "%s\n" \
+    "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+    "basicConstraints=critical,CA:FALSE" \
+    "keyUsage=critical,digitalSignature,keyEncipherment" \
+    "extendedKeyUsage=serverAuth" > server.ext &&
+  openssl x509 -req -days 1 -sha256 -in server.csr \
+    -CA test-ca.crt -CAkey test-ca.key -CAcreateserial \
+    -out server.crt -extfile server.ext 2>/dev/null &&
   chmod 600 server.key
 ' || { echo "could not generate backend cert"; exit 1; }
-"$CONTAINER_ENGINE" cp "$CONTAINER:/var/lib/postgresql/data/server.crt" \
+"$CONTAINER_ENGINE" cp "$CONTAINER:/var/lib/postgresql/data/test-ca.crt" \
   "$CERTS/backend.crt" || { echo "could not copy backend CA"; exit 1; }
 "$CONTAINER_ENGINE" exec -u postgres "$CONTAINER" psql -U postgres -c "ALTER SYSTEM SET ssl = on" >/dev/null ||
   { echo "FATAL: could not set ssl = on"; exit 1; }
