@@ -563,7 +563,13 @@ async fn start_proxy_at_full(
     };
     let column_rules: Vec<_> = config.column_rules().cloned().collect();
     let catalog = Arc::new(
-        Catalog::resolve(&column_rules, &config.semantic_type, &config.catalog_dsn).await?,
+        Catalog::resolve(
+            &column_rules,
+            &config.semantic_type,
+            &config.catalog_dsn,
+            config.backend_ca.as_deref(),
+        )
+        .await?,
     );
     let policy = Arc::new(Policy::from_config(&config, catalog.clone())?);
     tokio::spawn(catalog.run_refresher());

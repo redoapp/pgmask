@@ -56,9 +56,14 @@ async fn main() -> Result<()> {
     // with a half-loaded catalog is a proxy with unknown coverage.
     let column_rules: Vec<_> = config.column_rules().cloned().collect();
     let catalog = Arc::new(
-        Catalog::resolve(&column_rules, &config.semantic_type, &config.catalog_dsn)
-            .await
-            .context("resolving the column catalog")?,
+        Catalog::resolve(
+            &column_rules,
+            &config.semantic_type,
+            &config.catalog_dsn,
+            config.backend_ca.as_deref(),
+        )
+        .await
+        .context("resolving the column catalog")?,
     );
 
     let policy = Arc::new(Policy::from_config(&config, catalog.clone())?);

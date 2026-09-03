@@ -82,7 +82,7 @@ bytes that were parsed, not a later re-read.
 unknown-OID nudge or a later reload that turns the timer back on. The
 `catalog_refresh_min_seconds` floor still applies.
 
-`listen`, `backend`, `catalog_dsn`, and `metrics_listen` cannot change in
+`listen`, `backend`, `catalog_dsn`, `backend_ca`, and `metrics_listen` cannot change in
 process. A reload that edits those still applies every other setting and logs
 that a restart is required for the bind-time ones.
 

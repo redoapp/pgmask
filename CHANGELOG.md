@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.11 — private-CA catalog TLS
+
+- Apply `backend_ca` to the startup and refresh catalog connections as well as
+  proxied backend sessions. A private-CA `verify-full` deployment previously
+  failed before binding because catalog resolution hardcoded public roots.
+- Treat the `backend_ca` path as process identity: replacing the PEM at the same
+  path is picked up, while changing paths is reported as restart-required so
+  catalog and session connections cannot silently diverge.
 ## 0.2.10 — production packaging
 
 - Speed up GitHub Actions. `permissions: contents: read` had cleared
