@@ -34,12 +34,6 @@ The image runs as uid 10001, drops all capabilities, and is read-only. The
 catalog is bind-mounted. Do not publish Postgres to the host; the compose file
 does not.
 
-Release tags publish the amd64 runtime image to
-`260890374087.dkr.ecr.us-east-1.amazonaws.com/redoci/artifact/pgmaskruntime`.
-The workflow builds and validates the image before assuming its repository-only
-AWS publisher role. Deploy using the ECR digest printed in the workflow summary,
-not a mutable tag alone.
-
 ## Metrics
 
 Leave `metrics_listen` unset unless a scraper needs it. If you set it, bind
