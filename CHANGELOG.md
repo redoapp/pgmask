@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.11 — private-CA catalog TLS and ECR images
+
+- Apply `backend_ca` to the startup and refresh catalog connections as well as
+  proxied backend sessions. A private-CA `verify-full` deployment previously
+  failed before binding because catalog resolution hardcoded public roots.
+- Treat the `backend_ca` path as process identity: replacing the PEM at the same
+  path is picked up, while changing paths is reported as restart-required so
+  catalog and session connections cannot silently diverge.
+- Publish release-tag runtime images to Redo's ECR repository through a
+  tag-restricted, repository-only AWS role. The workflow validates the non-root,
+  read-only runtime contract before assuming AWS credentials.
+- Pin both container base images and install the native build dependencies and
+  runtime tools required by the production sidecar contract explicitly.
+
 ## 0.2.10 — production packaging
 
 - Speed up GitHub Actions. `permissions: contents: read` had cleared

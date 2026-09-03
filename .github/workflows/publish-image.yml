@@ -1,0 +1,95 @@
+name: Publish runtime image
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-runtime-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: 260890374087.dkr.ecr.us-east-1.amazonaws.com/redoci/artifact/pgmaskruntime
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: source
+        name: Validate release source
+        env:
+          REQUESTED_REF: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "ref must be a version tag, got: $REQUESTED_REF" >&2
+            exit 1
+          fi
+          if [[ "$(git tag --points-at HEAD --list "$REQUESTED_REF")" != "$REQUESTED_REF" ]]; then
+            echo "checked-out commit is not tagged $REQUESTED_REF" >&2
+            exit 1
+          fi
+          echo "version=$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image without AWS credentials
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: docker build --pull --file deploy/Dockerfile --tag "pgmask:$VERSION" .
+
+      - name: Validate runtime contract
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="pgmask:$VERSION"
+          docker run --rm --read-only --cap-drop ALL --entrypoint /bin/sh "$image" -ec '
+            test "$(id -u)" = 10001
+            for tool in awk base64 grep seq wc; do command -v "$tool" >/dev/null; done
+          '
+          test "$(docker run --rm --read-only --cap-drop ALL "$image" --version)" = "pgmask ${VERSION#v}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8 # v5.1.0
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::260890374087:role/RedoCi-PgmaskPublisher
+
+      - name: Push image
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          VERSION: ${{ steps.source.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          registry="${ECR_REPOSITORY%%/*}"
+          repository_name="${ECR_REPOSITORY#*/}"
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$registry"
+
+          docker tag "pgmask:$VERSION" "$ECR_REPOSITORY:$VERSION"
+          docker tag "pgmask:$VERSION" "$ECR_REPOSITORY:$SOURCE_SHA"
+          docker push "$ECR_REPOSITORY:$VERSION"
+          docker push "$ECR_REPOSITORY:$SOURCE_SHA"
+
+          digest="$(aws ecr describe-images \
+            --repository-name "$repository_name" \
+            --image-ids "imageTag=$VERSION" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          test "$digest" != None
+          printf 'Published `%s:%s@%s`\n' "$ECR_REPOSITORY" "$VERSION" "$digest" >> "$GITHUB_STEP_SUMMARY"
