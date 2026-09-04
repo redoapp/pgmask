@@ -1597,10 +1597,14 @@ enum CoverageChange {
 /// this file already carries two column-name maps that must not drift into each
 /// other. And building it from `names` leaves the duplicate-name tie-break
 /// exactly where it was — arbitrary. `validate_unique_column_rules` refuses two
-/// rules for one column, so a duplicate display name needs a dot inside a schema
-/// or column name (`"a.b"."c"` and `"a"."b.c"` both display as `a.b.c`): it is
-/// reachable, and has never been seen. An index built in rule order would have
-/// silently promoted that to "the last rule wins".
+/// rules for one column, so a duplicate display name needs a dot inside a
+/// column name: `relation = "public.t", column = "a.b"` and
+/// `relation = "public.t.a", column = "b"` are distinct keys that both display
+/// as `public.t.a.b`. Two spellings of the *relation* alone cannot do it — the
+/// relation is one unquoted `schema.table` string, so they collapse to the same
+/// key and `validate_unique_column_rules` refuses them. It is reachable, and has
+/// never been seen. An index built in rule order would have silently promoted
+/// that to "the last rule wins".
 fn display_index(names: &HashMap<(u32, i16), String>) -> HashMap<&str, (u32, i16)> {
     names
         .iter()
@@ -3142,8 +3146,70 @@ json = [
         );
     }
 
-    /// The diff is only worth anything if it is on the install path, and only
-    /// the swap it guards makes the previous snapshot the one to diff against.
+    /// `coverage lost` is the log `docs/operations.md` tells operators to alert
+    /// on: it is the shape of a silent unmasking. Every other test here calls
+    /// `coverage_changes` directly, so all of them stay green if the diff is
+    /// deleted from `install_snapshot` entirely — measured, not assumed. This
+    /// one reads the emitted log instead, so it fails when the wiring goes.
+    #[test]
+    fn installing_a_snapshot_warns_that_coverage_was_lost() {
+        #[derive(Clone, Default)]
+        struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let logs = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+
+        let catalog =
+            Catalog::from_snapshot_for_test(snapshot_of(&[(1, 1, "demo.customers.email")]));
+        let spec = CatalogSpec {
+            rules: vec![redact_rule("demo.customers", "email")],
+            types: HashMap::new(),
+        };
+
+        // The relation is gone, so the rule resolves to nothing: those values
+        // are now unclassified.
+        {
+            // Thread-local, so this stays parallel-safe under nextest.
+            let _guard = tracing::subscriber::set_default(subscriber);
+            catalog.install_snapshot(&spec, snapshot_of(&[]));
+        }
+
+        let emitted = String::from_utf8(logs.0.lock().expect("log buffer poisoned").clone())
+            .expect("log output was not utf-8");
+        assert!(
+            emitted.contains("coverage lost for demo.customers.email"),
+            "install_snapshot emitted no coverage-lost warning; got: {emitted}"
+        );
+    }
+
+    /// Only the swap makes the previous snapshot the one to diff against, so
+    /// the ordering is the thing under test here. That the diff is *wired into*
+    /// `install_snapshot` at all is covered by
+    /// `installing_a_snapshot_warns_that_coverage_was_lost`, which reads the
+    /// emitted log rather than calling `coverage_changes` itself.
     #[test]
     fn installing_a_snapshot_diffs_it_swaps_it_and_counts_a_refresh() {
         let catalog =
