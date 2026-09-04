@@ -33,6 +33,19 @@ inspection benchmark measures **40.1 µs/result set**, versus **140.5 µs** for
 the former repeated calls on the same representative join/CTE/window query — a
 **3.5× speedup**. This does not change per-row masking cost.
 
+The catalog refresh diff is measured the same database-free way, by
+`measure_the_refresh_diff_against_the_shape_it_replaced` in `catalog.rs`:
+
+```text
+cargo test -p pgmask --release -- --ignored --nocapture the_refresh_diff
+```
+
+On a 15,809-rule catalog it costs **13.5 ms**, against **18.4 s** for the
+per-rule scan of the names map it replaced (0.2.12; 28 ms against 25.5 s in a
+debug build). That is per *refresh*, not per result set, and it does not change
+per-row masking cost — but the refresher shares a core with session serving,
+and at that catalog size the diff dominated the refresh.
+
 ## How it got there
 
 The first working version cost **3.98 µs/row**. The benchmark existed before the
