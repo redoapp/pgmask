@@ -40,7 +40,7 @@ pub fn backend_dsn(db: &str) -> String {
 /// The Postgres address, or fail the test.
 ///
 /// **This used to `return Ok(())`.** `test-all.sh` runs `cargo test` without
-/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 62
+/// `PGMASK_TEST_PG` and does not run `scripts/test-integration.sh`, so all 64
 /// tests behind this macro — every raw-wire adversarial test and every
 /// resilience test, including `negative_control_the_harness_can_see_a_leak` —
 /// reported PASS on every release gate having asserted nothing.
@@ -402,6 +402,7 @@ struct TestPolicy {
     roles: Vec<pgmask::catalog::Role>,
     lineage: Lineage,
     posture: pgmask::catalog::Posture,
+    system_catalogs: SystemCatalogs,
 }
 
 impl Default for TestPolicy {
@@ -412,6 +413,7 @@ impl Default for TestPolicy {
             roles: Vec::new(),
             lineage: Lineage::Refuse,
             posture: pgmask::catalog::Posture::Default,
+            system_catalogs: SystemCatalogs::Refuse,
         }
     }
 }
@@ -522,6 +524,22 @@ pub async fn start_proxy_hostile(db: &str, rules: Vec<ColumnRule>) -> Result<Pro
     .await
 }
 
+/// GUI clients need the catalog metadata path. Beekeeper Studio's connect
+/// sequence (`CURRENT_SCHEMA()`, `version()`, `getTypes()`) is the canary.
+pub async fn start_proxy_gui(db: &str, rules: Vec<ColumnRule>) -> Result<ProxyHandle> {
+    let backend = backend_addr().context("PGMASK_TEST_PG")?;
+    start_proxy_at_full(
+        &backend,
+        db,
+        rules,
+        TestPolicy {
+            system_catalogs: SystemCatalogs::Allow,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 async fn start_proxy_at_full(
     backend: &str,
     db: &str,
@@ -554,7 +572,7 @@ async fn start_proxy_at_full(
         metrics_interval_seconds: 0,
         summaries: pgmask::catalog::Summaries::Allow,
         posture: policy.posture,
-        system_catalogs: SystemCatalogs::Refuse,
+        system_catalogs: policy.system_catalogs,
         lineage: policy.lineage,
         metrics_listen: None,
         rate_limit_per_minute: 0,

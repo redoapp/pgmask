@@ -9,6 +9,39 @@ system_catalogs = "allow"
 
 The default is `refuse`. No driver or connection-string option is required.
 
+## Beekeeper Studio
+
+Beekeeper Studio fails to connect when that setting is off, with:
+
+```
+pgmask: output column "schema" has no column provenance, so it cannot be classified
+```
+
+The first query after TCP connect is `SELECT CURRENT_SCHEMA() AS schema`. That
+call has no table OID — it is a session context function, not a stored column —
+so default opaque policy refuses it unless the rescue path identifies it. Current
+pgmask rescues `CURRENT_SCHEMA()` / `current_schema()` the same way it rescues
+`now()` and `current_database()`, including over node-postgres's unnamed
+extended protocol.
+
+Connect does not stop there. Beekeeper then loads types:
+
+```sql
+SELECT n.nspname as schema, t.typname as typename, t.oid::integer as typeid
+FROM pg_type t
+LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+...
+```
+
+`oid::integer` has no provenance. That field is named `typeid`, and it is why
+`system_catalogs = "allow"` is required: the metadata path releases the whole
+result once every named relation is an approved catalog. After connect, the
+sidebar's `information_schema.schemata` / `information_schema.tables` reads
+need the same setting.
+
+Use the [GUI example catalog](../examples/demo/catalog-gui.toml) as a starting
+point (`system_catalogs = "allow"` is already set there).
+
 ## Supported behavior
 
 The metadata path is tested with:
@@ -19,10 +52,11 @@ The metadata path is tested with:
 | Harlequin 2.8 with psycopg 3 | Catalog tree compared with a direct connection |
 | node-postgres and Knex | Introspection queries compared with a direct connection |
 | DBeaver | Reconstructed bootstrap query shapes |
+| Beekeeper Studio | Connect sequence (`CURRENT_SCHEMA()`, `version()`, `pg_type` types, `information_schema.schemata`) driven on the wire |
 
-DBeaver, DataGrip, and Beekeeper Studio have not been driven as complete desktop
-applications. Their ordinary table views work when they issue a plain
-`SELECT`; generated expressions still follow normal pgmask policy.
+DBeaver and DataGrip have not been driven as complete desktop applications.
+Their ordinary table views work when they issue a plain `SELECT`; generated
+expressions still follow normal pgmask policy.
 
 ## Release rule
 
@@ -37,7 +71,9 @@ The two checks prevent an unqualified user table such as `public.pg_database`
 from being mistaken for the real catalog. Unparseable SQL, multiple statements,
 unknown catalog relations, and user tables fail closed.
 
-`SHOW` statements use the same metadata path.
+`SHOW` statements use the same metadata path. Zero-argument session context
+functions (`CURRENT_SCHEMA()`, `current_database()`, `version()`, `now()`) are
+rescued independently of it: they cannot carry a stored column.
 
 ## Blocked catalogs
 

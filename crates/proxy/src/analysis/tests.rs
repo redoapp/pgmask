@@ -303,6 +303,31 @@ fn harlequin_schema_query_is_metadata_only() {
 }
 
 #[test]
+fn beekeeper_bootstrap_queries_are_metadata_only() {
+    // Beekeeper Studio's connect path after `CURRENT_SCHEMA()`: load types so
+    // the grid can decode OIDs. `t.oid::integer` has no provenance, so this
+    // has to take the catalog path rather than the rescue path.
+    // Lifted from apps/studio/src/lib/db/clients/postgresql.ts `getTypes()`.
+    let types = r#"
+        SELECT n.nspname as schema, t.typname as typename, t.oid::integer as typeid
+        FROM pg_type t
+        LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+        WHERE (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid))
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid)
+    "#;
+    assert!(reads_only_server_metadata(types), "{types}");
+    assert!(!calls_untrusted_function(types));
+
+    let schemas = r#"
+        SELECT schema_name
+        FROM information_schema.schemata
+        ORDER BY schema_name
+    "#;
+    assert!(reads_only_server_metadata(schemas));
+}
+
+#[test]
 fn harlequin_relation_description_is_metadata_only() {
     // Reduced from Harlequin's `Describe Relation` action. `string_agg` may
     // combine catalog metadata here, but must stay untrusted over user tables.
@@ -600,10 +625,39 @@ fn literals_are_provably_column_free() {
 #[test]
 fn context_functions_are_provably_column_free() {
     assert!(is_safe("SELECT now()"));
+    assert!(is_safe("SELECT pg_catalog.now()"));
     assert!(is_safe("SELECT current_database()"));
     assert!(is_safe("SELECT version()"));
     assert!(is_safe("SELECT CURRENT_TIMESTAMP"));
     assert!(is_safe("SELECT CURRENT_USER"));
+}
+
+/// Beekeeper Studio's connect path runs this before any catalog query.
+/// `CURRENT_SCHEMA` is a SQL-value keyword; the parenthesised form is a
+/// function call. Both must be rescued — a miss is `output column "schema"
+/// has no column provenance` and the GUI never finishes connecting.
+#[test]
+fn beekeeper_current_schema_is_provably_column_free() {
+    for sql in [
+        "SELECT CURRENT_SCHEMA() AS schema",
+        "SELECT current_schema() AS schema",
+        "SELECT CURRENT_SCHEMA AS schema",
+        "SELECT pg_catalog.current_schema() AS schema",
+    ] {
+        assert!(
+            is_safe(sql),
+            "{sql} must be rescued; got {:?}",
+            safety(sql, 1)
+        );
+        assert!(
+            StatementInspection::new(sql).is_parseable(),
+            "{sql} must parse"
+        );
+    }
+    assert!(
+        !is_safe("SELECT myschema.current_schema() AS schema"),
+        "a user-schema wrapper is not the pg_catalog builtin"
+    );
 }
 
 #[test]

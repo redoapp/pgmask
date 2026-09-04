@@ -11,8 +11,9 @@ unclassified = "mask"
 # A result set containing any field with no provenance is refused outright.
 opaque = "reject"
 
-# Harlequin, DBeaver and psql's \d read pg_catalog before showing anything.
-# Without this the catalog tree comes back empty. See docs/gui-clients.md.
+# Harlequin, DBeaver, Beekeeper Studio and psql's \d read pg_catalog before
+# showing anything. Without this Beekeeper cannot finish connecting (getTypes
+# casts oid to integer, which has no provenance). See docs/gui-clients.md.
 system_catalogs = "allow"
 
 # Release expressions whose base columns are all released, so aggregates and

@@ -12,7 +12,7 @@ Use the shortest document that answers your question.
 - [JSON and JSONB masking](json-masking.md): pointer policies, array wildcards,
   type placeholders, and how to inspect large documents.
 - [Policy ownership](responsibilities.md): catalog review and team responsibilities.
-- [GUI clients](gui-clients.md): DBeaver, DataGrip, pgAdmin, and `psql` metadata.
+- [GUI clients](gui-clients.md): Beekeeper Studio, DBeaver, DataGrip, pgAdmin, and `psql` metadata.
 - [Engine notes](engines.md): PostgreSQL and CockroachDB differences.
 - [Benchmarks](benchmarks.md): performance method and results.
 

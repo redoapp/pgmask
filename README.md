@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.2.12**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.2.13**. Licensed under the [MIT License](LICENSE).
 
 ## Install
 
@@ -251,8 +251,9 @@ now also requires the output expression to be a closed shape (no scalar
 subquery in the field). A masked column named anywhere in the statement,
 including as `u&"…"`, still blocks release.
 
-`system_catalogs = "allow"` is required for most GUI clients. pgmask still
-rejects catalog relations that may contain user values or SQL text. See
+`system_catalogs = "allow"` is required for most GUI clients, including
+Beekeeper Studio's connect sequence. pgmask still rejects catalog relations
+that may contain user values or SQL text. See
 [GUI clients](docs/gui-clients.md).
 
 ### Masks

@@ -223,16 +223,26 @@ pub(crate) const PURE_SCALARS: &[&str] = &[
     "float8",
 ];
 
-/// The bare function name, rejecting anything schema-qualified.
+/// The function name, accepting only an unqualified name or `pg_catalog.*`.
 ///
-/// `pg_catalog.now()` is the same function, but `myschema.now()` is not, and
-/// telling them apart means resolving search_path. Refusing qualified names
-/// costs a little utility and removes the question.
+/// `pg_catalog.now()` is the same builtin as `now()`. `myschema.now()` is not,
+/// and telling those apart through `search_path` is not something this layer
+/// can do, so any other schema is unrecognized.
 pub(crate) fn function_name(parts: &[pg_query::protobuf::Node]) -> Option<String> {
-    let [only] = parts else {
-        return None;
+    let name = match parts {
+        [only] => only,
+        [schema, name] => {
+            let NodeEnum::String(schema) = schema.node.as_ref()? else {
+                return None;
+            };
+            if !schema.sval.eq_ignore_ascii_case("pg_catalog") {
+                return None;
+            }
+            name
+        }
+        _ => return None,
     };
-    match only.node.as_ref()? {
+    match name.node.as_ref()? {
         NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
         _ => None,
     }
