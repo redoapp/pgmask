@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.13 — Beekeeper Studio connect
+
+- Rescue `pg_catalog`-qualified context functions the same way as the
+  unqualified builtins. `function_name` used to reject every qualified spelling,
+  so `pg_catalog.now()` and `pg_catalog.current_schema()` were opaque even
+  though the frontend already trusted those calls. Beekeeper Studio's first
+  query is `SELECT CURRENT_SCHEMA() AS schema`; that field has no table OID,
+  and a miss is `output column "schema" has no column provenance`. The
+  parenthesised form, the SQL-value keyword, and the `pg_catalog` spelling are
+  now all rescued, including over node-postgres's unnamed extended protocol.
+- Drive Beekeeper's connect sequence on the wire. `CURRENT_SCHEMA()` is served
+  under default-deny; `getTypes()` (`oid::integer AS typeid`) still needs
+  `system_catalogs = "allow"`, because a cast of a catalog OID is not a context
+  function. Document that split in [GUI clients](docs/gui-clients.md).
+- Release the post-connect GUI shapes that have no catalog `RangeVar`:
+  Beekeeper's view SQL (`SELECT pg_get_viewdef($1::regclass, true)`), its
+  table-properties mix of size functions with `obj_description`, and JDBC
+  `getSQLKeywords` (`pg_get_keywords()` as a `FROM` SRF). These stay behind
+  `system_catalogs = "allow"` — they look up catalog objects, they are not
+  session context. `query_to_xml` / `pg_read_file` / a user-schema wrapper
+  of the same names still fail closed.
+
 ## 0.2.12 — linear catalog refresh diff
 
 - Make the refresh coverage diff linear in the size of the catalog. It located
