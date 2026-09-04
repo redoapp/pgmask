@@ -367,6 +367,28 @@ fn beekeeper_and_jdbc_catalog_lookups_without_a_from_are_metadata_only() {
     assert!(!reads_only_server_metadata(
         "SELECT myschema.pg_get_viewdef($1::regclass, true)"
     ));
+
+    // The no-FROM path is a catalog lookup, not "any helper". Context
+    // functions stay on Safety; aggregates that share the helper list for
+    // SELECT-list use beside a RangeVar do not open it; VALUES / UNION are
+    // a different statement shape.
+    assert!(!reads_only_server_metadata("SELECT now()"));
+    assert!(!reads_only_server_metadata("SELECT string_agg('a', ',')"));
+    assert!(!reads_only_server_metadata("SELECT format_type(25, -1)"));
+    assert!(!reads_only_server_metadata(
+        "VALUES (pg_get_viewdef('pg_class'::regclass))"
+    ));
+    assert!(!reads_only_server_metadata(
+        "SELECT pg_get_viewdef('pg_class'::regclass) UNION SELECT pg_get_viewdef('pg_type'::regclass)"
+    ));
+
+    // A numeric generator still needs a catalog RangeVar.
+    assert!(!reads_only_server_metadata(
+        "SELECT * FROM generate_series(1, 3)"
+    ));
+    assert!(reads_only_server_metadata(
+        "SELECT word FROM pg_catalog.pg_get_keywords()"
+    ));
 }
 
 #[test]
@@ -490,14 +512,6 @@ fn data_bearing_set_returning_functions_do_not_get_the_metadata_fast_path() {
     assert!(reads_only_server_metadata(
         "SELECT n.nspname, c.relname FROM pg_catalog.pg_class c \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
-    ));
-    // A numeric generator still needs a catalog RangeVar. A catalog-helper
-    // SRF *is* the catalog read (JDBC getSQLKeywords).
-    assert!(!reads_only_server_metadata(
-        "SELECT * FROM generate_series(1, 3)"
-    ));
-    assert!(reads_only_server_metadata(
-        "SELECT word FROM pg_catalog.pg_get_keywords()"
     ));
 }
 

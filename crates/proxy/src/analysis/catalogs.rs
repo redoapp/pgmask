@@ -108,6 +108,7 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
     });
 
     let mut saw_relation = false;
+    let mut saw_catalog_lookup = false;
     let mut disqualified = false;
     walk_parsed(parsed, &mut |node| {
         if disqualified {
@@ -164,11 +165,9 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
                         let Some(NodeEnum::FuncCall(call)) = &element.node else {
                             continue;
                         };
-                        // `function_name` accepts unqualified or `pg_catalog.*`.
-                        // `myschema.generate_series` used to pass on the last
-                        // name component; the FuncCall arm still refused it,
-                        // but the generator check should not be the looser of
-                        // the two.
+                        // Unqualified or `pg_catalog.*` only. Matching on the
+                        // last name component used to let `myschema.generate_series`
+                        // through this arm (the FuncCall arm still refused it).
                         let Some(name) = function_name(&call.funcname) else {
                             disqualified = true;
                             return;
@@ -194,8 +193,19 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
             // (pageinspect, `pg_sleep`, `set_config`, …) and skips
             // untrusted. Helpers / trusted names / FROM-generators keep
             // the fast path; the escape list still wins if both match.
-            Some(NodeEnum::FuncCall(call)) if !func_call_is_catalog_safe(call) => {
-                disqualified = true;
+            Some(NodeEnum::FuncCall(call)) => {
+                if !func_call_is_catalog_safe(call) {
+                    disqualified = true;
+                    return;
+                }
+                // The no-FROM exception only needs this flag when there is no
+                // catalog RangeVar. Skip the extra name parse once we have one.
+                if saw_relation || saw_catalog_lookup {
+                    return;
+                }
+                if let Some(name) = function_name(&call.funcname) {
+                    saw_catalog_lookup = is_catalog_object_lookup(&name);
+                }
             }
             _ => {}
         }
@@ -216,17 +226,14 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
     // its table-properties pane mixes size functions with `obj_description`.
     // Distinct from "we saw no relation" — `WITH f AS (SELECT * FROM f) SELECT
     // * FROM f` still has a FROM. `SELECT now()` is a context function, not a
-    // catalog lookup, and stays on the Safety rescue.
-    cte_names.is_empty() && catalog_lookups_without_from(parsed)
+    // catalog lookup, and stays on the Safety rescue. The lookup flag comes
+    // from the walk above; this only checks the statement shape.
+    cte_names.is_empty() && saw_catalog_lookup && is_simple_empty_from_select(parsed)
 }
 
-/// Beekeeper (and TablePlus-style comment fetches) call catalog helpers with
-/// no `FROM`. Those helpers look up an object by OID / `regclass`; they do
-/// not read a user table. Aggregates and text helpers that also live on
-/// [`CATALOG_HELPER_FUNCTIONS`] for SELECT-list use beside a catalog
-/// RangeVar (`string_agg`, `quote_ident`) do not qualify on their own —
-/// they are already [`is_trusted_function_name`].
-fn catalog_lookups_without_from(parsed: &pg_query::ParseResult) -> bool {
+/// Single `SELECT` of expressions: no `FROM`, no `VALUES`, no set operation.
+/// The catalog-lookup exception is this shape plus [`is_catalog_object_lookup`].
+fn is_simple_empty_from_select(parsed: &pg_query::ParseResult) -> bool {
     let Some(NodeEnum::SelectStmt(select)) = parsed
         .protobuf
         .stmts
@@ -236,28 +243,9 @@ fn catalog_lookups_without_from(parsed: &pg_query::ParseResult) -> bool {
     else {
         return false;
     };
-    if select.op() != pg_query::protobuf::SetOperation::SetopNone {
-        return false;
-    }
-    if !select.from_clause.is_empty() {
-        return false;
-    }
-    let mut saw_lookup = false;
-    walk_parsed(parsed, &mut |node| {
-        if saw_lookup {
-            return;
-        }
-        let Some(NodeEnum::FuncCall(call)) = node.node.as_ref() else {
-            return;
-        };
-        let Some(name) = function_name(&call.funcname) else {
-            return;
-        };
-        if CATALOG_HELPER_FUNCTIONS.contains(&name.as_str()) && !is_trusted_function_name(&name) {
-            saw_lookup = true;
-        }
-    });
-    saw_lookup
+    select.op() == pg_query::protobuf::SetOperation::SetopNone
+        && select.from_clause.is_empty()
+        && select.values_lists.is_empty()
 }
 
 /// Whether the engine's per-field provenance can be believed at all.
@@ -367,4 +355,21 @@ pub(crate) fn func_call_is_catalog_safe(call: &pg_query::protobuf::FuncCall) -> 
     is_trusted_function_name(name)
         || GENERATORS_IN_FROM.contains(&name)
         || CATALOG_HELPER_FUNCTIONS.contains(&name)
+}
+
+/// Catalog-object lookup issued with no `FROM`: view SQL, function SQL, comments.
+///
+/// [`CATALOG_HELPER_FUNCTIONS`] also lists formatters and aggregates so they
+/// may appear in a SELECT list *beside* a catalog RangeVar. Those must not
+/// open this path on their own — `SELECT string_agg('a', ',')` is not a
+/// catalog read. FROM-generator helpers (`pg_get_keywords`) use the
+/// RangeFunction arm instead.
+fn is_catalog_object_lookup(name: &str) -> bool {
+    if GENERATORS_IN_FROM.contains(&name) {
+        return false;
+    }
+    matches!(
+        name,
+        "obj_description" | "shobj_description" | "col_description"
+    ) || (name.starts_with("pg_get_") && CATALOG_HELPER_FUNCTIONS.contains(&name))
 }
