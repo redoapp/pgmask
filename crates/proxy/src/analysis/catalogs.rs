@@ -21,7 +21,7 @@ use pg_query::protobuf::node::Node as NodeEnum;
 
 use super::catalog_surface::range_var_is_leaky_catalog;
 use super::names::{
-    func_call_name_parts, is_trusted_function_name, CATALOG_ESCAPE_FUNCTIONS,
+    func_call_name_parts, function_name, is_trusted_function_name, CATALOG_ESCAPE_FUNCTIONS,
     CATALOG_HELPER_FUNCTIONS, GENERATORS_IN_FROM,
 };
 use super::walk::{tree_any, walk_parsed};
@@ -65,10 +65,14 @@ pub(crate) fn touches_leaky_system_catalog_inspected(inspection: &StatementInspe
 /// cannot cover: relations that appear in the statement without surfacing as an
 /// output field, and functions that take SQL as a string.
 ///
-/// Fails closed everywhere: an unparseable statement, a statement that names no
-/// relation at all, a CTE reference that is not declared locally, a target-list
-/// function that is not a catalog helper / trusted name / FROM-generator, and
-/// any function on `CATALOG_ESCAPE_FUNCTIONS` all return `false`.
+/// Fails closed everywhere: an unparseable statement, a CTE reference that is
+/// not declared locally, a target-list function that is not a catalog helper /
+/// trusted name / FROM-generator, and any function on
+/// `CATALOG_ESCAPE_FUNCTIONS` all return `false`. A statement that names no
+/// relation is not a catalog query unless it is a catalog-object lookup with
+/// no `FROM` (`pg_get_viewdef`, `obj_description`) — Beekeeper issues those
+/// as the entire query. `SELECT now()` stays off this path so the Safety
+/// rescue, not `system_catalogs`, remains what serves it.
 pub fn reads_only_server_metadata(sql: &str) -> bool {
     StatementInspection::new(sql).reads_only_server_metadata()
 }
@@ -160,18 +164,25 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
                         let Some(NodeEnum::FuncCall(call)) = &element.node else {
                             continue;
                         };
-                        let safe = call
-                            .funcname
-                            .last()
-                            .and_then(|n| n.node.as_ref())
-                            .and_then(|n| match n {
-                                NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
-                                _ => None,
-                            })
-                            .is_some_and(|name| GENERATORS_IN_FROM.contains(&name.as_str()));
-                        if !safe {
+                        // `function_name` accepts unqualified or `pg_catalog.*`.
+                        // `myschema.generate_series` used to pass on the last
+                        // name component; the FuncCall arm still refused it,
+                        // but the generator check should not be the looser of
+                        // the two.
+                        let Some(name) = function_name(&call.funcname) else {
                             disqualified = true;
                             return;
+                        };
+                        if !GENERATORS_IN_FROM.contains(&name.as_str()) {
+                            disqualified = true;
+                            return;
+                        }
+                        // `generate_series` still needs a catalog RangeVar —
+                        // it is not itself a catalog. A helper SRF
+                        // (`pg_get_keywords`, `pg_options_to_table`) *is* the
+                        // catalog read, so it supplies the relation marker.
+                        if CATALOG_HELPER_FUNCTIONS.contains(&name.as_str()) {
+                            saw_relation = true;
                         }
                     }
                 }
@@ -192,11 +203,61 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
     if disqualified {
         return false;
     }
+    if saw_relation {
+        return true;
+    }
 
     // A statement naming no relation is not a catalog query, and pg_query has a
     // known bug where a self-referencing CTE yields an empty table list. Either
     // way, releasing on an empty set would release on absence of evidence.
-    saw_relation
+    //
+    // The exception is a catalog-object lookup with no FROM and no CTE:
+    // Beekeeper's view SQL is `SELECT pg_get_viewdef($1::regclass, true)` and
+    // its table-properties pane mixes size functions with `obj_description`.
+    // Distinct from "we saw no relation" — `WITH f AS (SELECT * FROM f) SELECT
+    // * FROM f` still has a FROM. `SELECT now()` is a context function, not a
+    // catalog lookup, and stays on the Safety rescue.
+    cte_names.is_empty() && catalog_lookups_without_from(parsed)
+}
+
+/// Beekeeper (and TablePlus-style comment fetches) call catalog helpers with
+/// no `FROM`. Those helpers look up an object by OID / `regclass`; they do
+/// not read a user table. Aggregates and text helpers that also live on
+/// [`CATALOG_HELPER_FUNCTIONS`] for SELECT-list use beside a catalog
+/// RangeVar (`string_agg`, `quote_ident`) do not qualify on their own —
+/// they are already [`is_trusted_function_name`].
+fn catalog_lookups_without_from(parsed: &pg_query::ParseResult) -> bool {
+    let Some(NodeEnum::SelectStmt(select)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    else {
+        return false;
+    };
+    if select.op() != pg_query::protobuf::SetOperation::SetopNone {
+        return false;
+    }
+    if !select.from_clause.is_empty() {
+        return false;
+    }
+    let mut saw_lookup = false;
+    walk_parsed(parsed, &mut |node| {
+        if saw_lookup {
+            return;
+        }
+        let Some(NodeEnum::FuncCall(call)) = node.node.as_ref() else {
+            return;
+        };
+        let Some(name) = function_name(&call.funcname) else {
+            return;
+        };
+        if CATALOG_HELPER_FUNCTIONS.contains(&name.as_str()) && !is_trusted_function_name(&name) {
+            saw_lookup = true;
+        }
+    });
+    saw_lookup
 }
 
 /// Whether the engine's per-field provenance can be believed at all.

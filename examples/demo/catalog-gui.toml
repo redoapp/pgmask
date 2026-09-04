@@ -13,7 +13,9 @@ opaque = "reject"
 
 # Harlequin, DBeaver, Beekeeper Studio and psql's \d read pg_catalog before
 # showing anything. Without this Beekeeper cannot finish connecting (getTypes
-# casts oid to integer, which has no provenance). See docs/gui-clients.md.
+# casts oid to integer, which has no provenance) and cannot open view SQL or
+# table properties (pg_get_viewdef / obj_description with no FROM). See
+# docs/gui-clients.md.
 system_catalogs = "allow"
 
 # Release expressions whose base columns are all released, so aggregates and

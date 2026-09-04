@@ -328,6 +328,74 @@ fn beekeeper_bootstrap_queries_are_metadata_only() {
 }
 
 #[test]
+fn beekeeper_and_jdbc_catalog_lookups_without_a_from_are_metadata_only() {
+    // Beekeeper's "SQL: Create" for a view. No RangeVar, so the relation
+    // marker used to fail closed even though `pg_get_viewdef` is a catalog
+    // helper. Lifted from apps/studio/src/lib/db/clients/postgresql.ts
+    // `getViewCreateScript`.
+    let view_sql = "SELECT pg_get_viewdef($1::regclass, true)";
+    assert!(reads_only_server_metadata(view_sql), "{view_sql}");
+    assert!(!calls_untrusted_function(view_sql));
+    assert!(reads_only_server_metadata(
+        "SELECT pg_catalog.pg_get_viewdef($1::regclass, true)"
+    ));
+
+    // Beekeeper's table-properties pane. Size functions are already
+    // Safety-releasable; `obj_description` is not, and opaque=reject
+    // refuses the whole row when one field is unknown.
+    let properties = "
+        SELECT pg_indexes_size('\"canary\".\"subjects\"') as index_size,
+               pg_relation_size('\"canary\".\"subjects\"') as table_size,
+               obj_description('\"canary\".\"subjects\"'::regclass) as description
+    ";
+    assert!(reads_only_server_metadata(properties), "{properties}");
+    assert!(!calls_untrusted_function(properties));
+
+    // JDBC DatabaseMetaData.getSQLKeywords — DBeaver and DataGrip call this
+    // on connect. `pg_get_keywords` is a FROM SRF, not a catalog RangeVar.
+    let keywords = "
+        select string_agg(word, ',') from pg_catalog.pg_get_keywords()
+        where word <> ALL ('{all,and,as}')
+    ";
+    assert!(reads_only_server_metadata(keywords), "{keywords}");
+    assert!(!calls_untrusted_function(keywords));
+
+    // A user-schema wrapper of the same name is not the builtin.
+    assert!(!reads_only_server_metadata(
+        "SELECT pg_get_viewdef($1::regclass, true) FROM myschema.pg_get_keywords()"
+    ));
+    assert!(!reads_only_server_metadata(
+        "SELECT myschema.pg_get_viewdef($1::regclass, true)"
+    ));
+}
+
+#[test]
+fn beekeeper_list_columns_is_metadata_only() {
+    // CASE concatenations plus `col_description(format(...)::regclass, …)`
+    // over `information_schema.columns`. Lifted from Beekeeper
+    // `listTableColumns`.
+    let sql = r#"
+        SELECT
+            table_schema,
+            table_name,
+            column_name,
+            CASE
+                WHEN character_maximum_length is not null and udt_name != 'text'
+                THEN udt_name || '(' || character_maximum_length::varchar(255) || ')'
+                ELSE udt_name
+            END as data_type,
+            pg_catalog.col_description(
+                format('%I.%I', table_schema, table_name)::regclass::oid,
+                ordinal_position
+            ) as column_comment
+        FROM information_schema.columns
+        ORDER BY table_schema, table_name, ordinal_position
+    "#;
+    assert!(reads_only_server_metadata(sql), "{sql}");
+    assert!(!calls_untrusted_function(sql));
+}
+
+#[test]
 fn harlequin_relation_description_is_metadata_only() {
     // Reduced from Harlequin's `Describe Relation` action. `string_agg` may
     // combine catalog metadata here, but must stay untrusted over user tables.
@@ -422,6 +490,14 @@ fn data_bearing_set_returning_functions_do_not_get_the_metadata_fast_path() {
     assert!(reads_only_server_metadata(
         "SELECT n.nspname, c.relname FROM pg_catalog.pg_class c \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+    ));
+    // A numeric generator still needs a catalog RangeVar. A catalog-helper
+    // SRF *is* the catalog read (JDBC getSQLKeywords).
+    assert!(!reads_only_server_metadata(
+        "SELECT * FROM generate_series(1, 3)"
+    ));
+    assert!(reads_only_server_metadata(
+        "SELECT word FROM pg_catalog.pg_get_keywords()"
     ));
 }
 

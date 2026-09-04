@@ -14,6 +14,13 @@
   under default-deny; `getTypes()` (`oid::integer AS typeid`) still needs
   `system_catalogs = "allow"`, because a cast of a catalog OID is not a context
   function. Document that split in [GUI clients](docs/gui-clients.md).
+- Release the post-connect GUI shapes that have no catalog `RangeVar`:
+  Beekeeper's view SQL (`SELECT pg_get_viewdef($1::regclass, true)`), its
+  table-properties mix of size functions with `obj_description`, and JDBC
+  `getSQLKeywords` (`pg_get_keywords()` as a `FROM` SRF). These stay behind
+  `system_catalogs = "allow"` — they look up catalog objects, they are not
+  session context. `query_to_xml` / `pg_read_file` / a user-schema wrapper
+  of the same names still fail closed.
 
 ## 0.2.12 — linear catalog refresh diff
 

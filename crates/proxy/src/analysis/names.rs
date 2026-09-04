@@ -172,14 +172,21 @@ pub(crate) const RANKING_WINDOWS: &[&str] = &[
 /// `generate_series` in `FROM`; without it, describing a table stops working
 /// on four of five Postgres versions, which is the whole reason
 /// `system_catalogs = "allow"` exists. `pg_options_to_table` / `aclexplode`
-/// are the same `\d` shape for reloptions and ACLs. Do not put catalog-browser
-/// helpers here — a helper as a FROM SRF is a different shape than `\d`.
+/// are the same `\d` shape for reloptions and ACLs.
+///
+/// `pg_get_keywords` is the JDBC `DatabaseMetaData.getSQLKeywords` SRF
+/// (DBeaver, DataGrip, any pgjdbc GUI). It is also on
+/// [`CATALOG_HELPER_FUNCTIONS`]; a FROM generator that is a catalog helper
+/// counts as the relation marker, so this query does not need a dummy
+/// `pg_class` join. Do not add other catalog-browser helpers here just
+/// because they appear in a SELECT list — that is a different shape.
 pub(crate) const GENERATORS_IN_FROM: &[&str] = &[
     "generate_series",
     "generate_subscripts",
     "unnest",
     "pg_options_to_table",
     "aclexplode",
+    "pg_get_keywords",
 ];
 
 /// Pure scalar functions that compute from their arguments and nothing else.

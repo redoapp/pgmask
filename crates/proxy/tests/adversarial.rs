@@ -3686,6 +3686,20 @@ async fn beekeeper_studio_bootstrap_is_served_with_catalog_access() -> Result<()
                 "listSchemas",
                 "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
             ),
+            SqlCase::served(
+                "getViewCreateScript",
+                "SELECT pg_get_viewdef('canary.subject_view'::regclass, true)",
+            ),
+            SqlCase::served(
+                "getTableProperties",
+                "SELECT pg_indexes_size('canary.subjects') as index_size, \
+                 pg_relation_size('canary.subjects') as table_size, \
+                 obj_description('canary.subjects'::regclass) as description",
+            ),
+            SqlCase::served(
+                "getSQLKeywords",
+                "select string_agg(word, ',') from pg_catalog.pg_get_keywords()",
+            ),
         ],
     )
     .await?;
@@ -3718,6 +3732,16 @@ async fn beekeeper_gettypes_needs_catalog_access() -> Result<()> {
         "the unprovenanced cast is typeid, not schema: {}",
         types.text()
     );
+
+    // View SQL is a catalog lookup, not a context function. Without
+    // `system_catalogs = "allow"` it must still fail closed — unlike
+    // CURRENT_SCHEMA(), which the rescue path serves here.
+    let viewdef = simple_query_round(
+        &mut client,
+        "SELECT pg_get_viewdef('canary.subject_view'::regclass, true)",
+    )
+    .await?;
+    assert_refused_bytes(&viewdef.received, "getViewCreateScript without catalogs");
     Ok(())
 }
 
