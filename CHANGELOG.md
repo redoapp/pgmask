@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.12 — linear catalog refresh diff
+
+- Make the refresh coverage diff linear in the size of the catalog. It located
+  each rule by scanning every classified name, once per snapshot, with
+  `rule.display()` formatted *inside* the comparison — so it allocated once per
+  name examined rather than once per rule. A deployment that grew its policy
+  from 475 to 15,809 column rules saw the periodic refresh go from ~4s to ~74s,
+  pegging a 500m CPU limit and starving session serving. Measured back to back
+  on that catalog size: 25.5 s per diff before against 28 ms after in a debug
+  build, 18.4 s against 13.5 ms in release.
+- Assert the diff rather than the speedup alone. The arms an operator alerts on
+  — `moved`, `coverage lost`, `coverage restored`, and the silence of an
+  unchanged column — are unchanged, and a differential test runs the keyed
+  lookup and the scan it replaced over every combination of per-rule states and
+  requires them to agree. `coverage lost` is the documented signature of a
+  silent unmasking, so a diff that quietly stops firing is the failure worth
+  guarding against. The scale test is a wall-clock ceiling because the old
+  shape was correct, only quadratic: nothing else tells the two apart.
+- Duplicate display names remain an arbitrary choice, deliberately. Two rules
+  for one column are refused at load, so a duplicate needs a dot inside a schema
+  or column name (`"a.b"."c"` and `"a"."b.c"` both display as `a.b.c`) — it is
+  reachable and has never been seen. The index is built from the same map the
+  scan walked, so which of the two wins is as arbitrary as it was; an index
+  keyed in rule order would have silently promoted it to "the last rule wins".
+
 ## 0.2.11 — private-CA catalog TLS
 
 - Apply `backend_ca` to the startup and refresh catalog connections as well as

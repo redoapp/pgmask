@@ -1442,36 +1442,33 @@ impl Catalog {
 
     fn install_snapshot(&self, spec: &CatalogSpec, next: Snapshot) {
         let previous = self.snapshot();
-        for rule in &spec.rules {
-            let locate = |snap: &Snapshot| {
-                snap.names
-                    .iter()
-                    .find(|(_, name)| **name == rule.display())
-                    .map(|(key, _)| *key)
-            };
-            match (locate(&previous), locate(&next)) {
-                (Some(b), Some(a)) if b != a => tracing::info!(
+        for change in coverage_changes(&spec.rules, &previous, &next) {
+            match change {
+                CoverageChange::Moved {
+                    column,
+                    before: b,
+                    after: a,
+                } => tracing::info!(
                     "catalog: {} moved (oid.attnum {}.{} -> {}.{}) — relation recreated, classification restored",
-                    rule.display(),
+                    column,
                     b.0,
                     b.1,
                     a.0,
                     a.1
                 ),
                 // Warn, not info: this is the shape of a silent unmasking.
-                (Some(b), None) => tracing::warn!(
+                CoverageChange::Lost { column, before: b } => tracing::warn!(
                     "catalog: coverage lost for {} (was oid.attnum {}.{}) — the relation or column no longer exists; those values are now unclassified",
-                    rule.display(),
+                    column,
                     b.0,
                     b.1
                 ),
-                (None, Some(a)) => tracing::info!(
+                CoverageChange::Restored { column, after: a } => tracing::info!(
                     "catalog: coverage restored for {} (oid.attnum {}.{})",
-                    rule.display(),
+                    column,
                     a.0,
                     a.1
                 ),
-                _ => {}
             }
         }
 
@@ -1570,6 +1567,88 @@ impl Catalog {
             let _ = self.refresh().await;
         }
     }
+}
+
+/// One rule's coverage difference between two snapshots, as the refresh diff
+/// reports it.
+///
+/// Split out from the `tracing` calls so the arms can be asserted directly.
+/// `Lost` is the documented signature of a silent unmasking — `docs/operations.md`
+/// tells operators to alert on it — and a diff that quietly stops firing looks
+/// exactly like a catalog that never changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CoverageChange {
+    /// Same name, new `(oid, attnum)`: the relation was recreated.
+    Moved {
+        column: String,
+        before: (u32, i16),
+        after: (u32, i16),
+    },
+    /// Classified before, not now. The values are unclassified from here on.
+    Lost { column: String, before: (u32, i16) },
+    /// Unresolved before, classified now.
+    Restored { column: String, after: (u32, i16) },
+}
+
+/// Reverse of [`Snapshot::names`]: display name -> `(oid, attnum)`.
+///
+/// Derived per diff rather than stored on `Snapshot`, for two reasons. A stored
+/// field is a second copy of `names` that every writer has to keep in step, and
+/// this file already carries two column-name maps that must not drift into each
+/// other. And building it from `names` leaves the duplicate-name tie-break
+/// exactly where it was — arbitrary. `validate_unique_column_rules` refuses two
+/// rules for one column, so a duplicate display name needs a dot inside a
+/// column name: `relation = "public.t", column = "a.b"` and
+/// `relation = "public.t.a", column = "b"` are distinct keys that both display
+/// as `public.t.a.b`. Two spellings of the *relation* alone cannot do it — the
+/// relation is one unquoted `schema.table` string, so they collapse to the same
+/// key and `validate_unique_column_rules` refuses them. It is reachable, and has
+/// never been seen. An index built in rule order would have silently promoted
+/// that to "the last rule wins".
+fn display_index(names: &HashMap<(u32, i16), String>) -> HashMap<&str, (u32, i16)> {
+    names
+        .iter()
+        .map(|(key, name)| (name.as_str(), *key))
+        .collect()
+}
+
+/// Which rules changed coverage between two snapshots.
+///
+/// Linear in rules plus classified columns. It used to scan all of `names` for
+/// every rule, once per snapshot, with `rule.display()` formatted *inside* the
+/// comparison — an allocation per name examined, not per rule. A 15,809-rule
+/// catalog paid on the order of 10^8 allocate-and-compare operations per
+/// refresh: 25.5 s per diff here against 28 ms keyed, and in production a
+/// refresh that had taken ~4 s at 475 rules took ~74 s at 15,809, pegging a
+/// 500m CPU limit and starving session serving. Keep the lookups keyed. This
+/// runs on every refresh, and the catalogs that most need coverage logging are
+/// the largest ones.
+fn coverage_changes(
+    rules: &[ColumnRule],
+    previous: &Snapshot,
+    next: &Snapshot,
+) -> Vec<CoverageChange> {
+    let before = display_index(&previous.names);
+    let after = display_index(&next.names);
+    let mut changes = Vec::new();
+    for rule in rules {
+        let column = rule.display();
+        let located = (
+            before.get(column.as_str()).copied(),
+            after.get(column.as_str()).copied(),
+        );
+        match located {
+            (Some(b), Some(a)) if b != a => changes.push(CoverageChange::Moved {
+                column,
+                before: b,
+                after: a,
+            }),
+            (Some(b), None) => changes.push(CoverageChange::Lost { column, before: b }),
+            (None, Some(a)) => changes.push(CoverageChange::Restored { column, after: a }),
+            _ => {}
+        }
+    }
+    changes
 }
 
 /// Fold a semantic type and a column rule into one classification.
@@ -2921,6 +3000,349 @@ json = [
         let names = snapshot.classified_column_names();
         assert!(names.contains("email"));
         assert!(!names.contains("public.customers.email"));
+    }
+
+    fn redact_rule(relation: &str, column: &str) -> ColumnRule {
+        ColumnRule {
+            relation: relation.to_string(),
+            column: column.to_string(),
+            semantic_type: None,
+            mask: Some(Mask::Redact),
+            params: MaskParams::default(),
+            by_role: HashMap::new(),
+        }
+    }
+
+    fn snapshot_of(entries: &[(u32, i16, &str)]) -> Snapshot {
+        let mut snapshot = Snapshot::default();
+        for &(oid, attnum, name) in entries {
+            snapshot.insert_for_test(oid, attnum, Mask::Redact, name);
+        }
+        snapshot
+    }
+
+    /// A catalog the size of the one that found the quadratic diff, with one
+    /// rule of each arm planted in it and the rest unchanged.
+    fn production_scale_diff() -> (Vec<ColumnRule>, Snapshot, Snapshot, Vec<CoverageChange>) {
+        const RULES: u32 = 15_809;
+        let rules: Vec<ColumnRule> = (0..RULES)
+            .map(|i| redact_rule(&format!("demo.t{i}"), "email"))
+            .collect();
+        let mut previous = Snapshot::default();
+        let mut next = Snapshot::default();
+        for i in 0..RULES {
+            let name = format!("demo.t{i}.email");
+            match i {
+                // Recreated relation: same name, new OID.
+                0 => {
+                    previous.insert_for_test(i, 1, Mask::Redact, &name);
+                    next.insert_for_test(RULES + i, 1, Mask::Redact, &name);
+                }
+                // Dropped column.
+                1 => previous.insert_for_test(i, 1, Mask::Redact, &name),
+                // Added back.
+                2 => next.insert_for_test(i, 1, Mask::Redact, &name),
+                _ => {
+                    previous.insert_for_test(i, 1, Mask::Redact, &name);
+                    next.insert_for_test(i, 1, Mask::Redact, &name);
+                }
+            }
+        }
+        let expected = vec![
+            CoverageChange::Moved {
+                column: "demo.t0.email".to_string(),
+                before: (0, 1),
+                after: (RULES, 1),
+            },
+            CoverageChange::Lost {
+                column: "demo.t1.email".to_string(),
+                before: (1, 1),
+            },
+            CoverageChange::Restored {
+                column: "demo.t2.email".to_string(),
+                after: (2, 1),
+            },
+        ];
+        (rules, previous, next, expected)
+    }
+
+    /// The shape this replaced: a linear scan of every classified name, per
+    /// rule, per snapshot, formatting the rule's display name inside the
+    /// comparison. Kept so the measurement below is a back-to-back pair on one
+    /// machine rather than a remembered number, and so the equivalence is
+    /// asserted rather than asserted about.
+    fn coverage_changes_quadratic(
+        rules: &[ColumnRule],
+        previous: &Snapshot,
+        next: &Snapshot,
+    ) -> Vec<CoverageChange> {
+        let mut changes = Vec::new();
+        for rule in rules {
+            let locate = |snap: &Snapshot| {
+                snap.names
+                    .iter()
+                    .find(|(_, name)| **name == rule.display())
+                    .map(|(key, _)| *key)
+            };
+            match (locate(previous), locate(next)) {
+                (Some(b), Some(a)) if b != a => changes.push(CoverageChange::Moved {
+                    column: rule.display(),
+                    before: b,
+                    after: a,
+                }),
+                (Some(b), None) => changes.push(CoverageChange::Lost {
+                    column: rule.display(),
+                    before: b,
+                }),
+                (None, Some(a)) => changes.push(CoverageChange::Restored {
+                    column: rule.display(),
+                    after: a,
+                }),
+                _ => {}
+            }
+        }
+        changes
+    }
+
+    #[test]
+    fn the_refresh_diff_reports_one_change_per_arm() {
+        let rules = [
+            redact_rule("demo.moved", "email"),
+            redact_rule("demo.lost", "email"),
+            redact_rule("demo.restored", "email"),
+            redact_rule("demo.same", "email"),
+            redact_rule("demo.never", "email"),
+        ];
+        let previous = snapshot_of(&[
+            (1, 1, "demo.moved.email"),
+            (2, 1, "demo.lost.email"),
+            (4, 1, "demo.same.email"),
+        ]);
+        let next = snapshot_of(&[
+            (7, 2, "demo.moved.email"),
+            (3, 1, "demo.restored.email"),
+            (4, 1, "demo.same.email"),
+        ]);
+
+        // Rule order, one entry per changed rule: a column that did not move
+        // and a rule that never resolved are both silent.
+        assert_eq!(
+            coverage_changes(&rules, &previous, &next),
+            vec![
+                CoverageChange::Moved {
+                    column: "demo.moved.email".to_string(),
+                    before: (1, 1),
+                    after: (7, 2),
+                },
+                CoverageChange::Lost {
+                    column: "demo.lost.email".to_string(),
+                    before: (2, 1),
+                },
+                CoverageChange::Restored {
+                    column: "demo.restored.email".to_string(),
+                    after: (3, 1),
+                },
+            ]
+        );
+    }
+
+    /// `coverage lost` is the log `docs/operations.md` tells operators to alert
+    /// on: it is the shape of a silent unmasking. Every other test here calls
+    /// `coverage_changes` directly, so all of them stay green if the diff is
+    /// deleted from `install_snapshot` entirely — measured, not assumed. This
+    /// one reads the emitted log instead, so it fails when the wiring goes.
+    #[test]
+    fn installing_a_snapshot_warns_that_coverage_was_lost() {
+        #[derive(Clone, Default)]
+        struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let logs = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+
+        let catalog =
+            Catalog::from_snapshot_for_test(snapshot_of(&[(1, 1, "demo.customers.email")]));
+        let spec = CatalogSpec {
+            rules: vec![redact_rule("demo.customers", "email")],
+            types: HashMap::new(),
+        };
+
+        // The relation is gone, so the rule resolves to nothing: those values
+        // are now unclassified.
+        {
+            // Thread-local, so this stays parallel-safe under nextest.
+            let _guard = tracing::subscriber::set_default(subscriber);
+            catalog.install_snapshot(&spec, snapshot_of(&[]));
+        }
+
+        let emitted = String::from_utf8(logs.0.lock().expect("log buffer poisoned").clone())
+            .expect("log output was not utf-8");
+        assert!(
+            emitted.contains("coverage lost for demo.customers.email"),
+            "install_snapshot emitted no coverage-lost warning; got: {emitted}"
+        );
+    }
+
+    /// Only the swap makes the previous snapshot the one to diff against, so
+    /// the ordering is the thing under test here. That the diff is *wired into*
+    /// `install_snapshot` at all is covered by
+    /// `installing_a_snapshot_warns_that_coverage_was_lost`, which reads the
+    /// emitted log rather than calling `coverage_changes` itself.
+    #[test]
+    fn installing_a_snapshot_diffs_it_swaps_it_and_counts_a_refresh() {
+        let catalog =
+            Catalog::from_snapshot_for_test(snapshot_of(&[(1, 1, "demo.customers.email")]));
+        let spec = CatalogSpec {
+            rules: vec![redact_rule("demo.customers", "email")],
+            types: HashMap::new(),
+        };
+        // A recreated relation: the rule resolves to a new OID.
+        let next = snapshot_of(&[(9, 1, "demo.customers.email")]);
+        assert_eq!(
+            coverage_changes(&spec.rules, &catalog.snapshot(), &next),
+            vec![CoverageChange::Moved {
+                column: "demo.customers.email".to_string(),
+                before: (1, 1),
+                after: (9, 1),
+            }]
+        );
+
+        catalog.install_snapshot(&spec, next);
+
+        assert_eq!(catalog.generation(), 1);
+        assert!(catalog.snapshot().lookup(9, 1).is_some());
+        assert!(catalog.snapshot().lookup(1, 1).is_none());
+    }
+
+    /// Differential against the shape it replaced, over every combination of
+    /// per-rule states. The arms are a match on a pair of `Option`s, so the
+    /// combinations *are* the behaviour — and the diff is what an operator
+    /// alerts on, so "same messages, same conditions" has to be asserted
+    /// rather than reviewed.
+    #[test]
+    fn the_keyed_diff_agrees_with_the_scan_it_replaced() {
+        // Per rule: unresolved in both, unchanged, moved, dropped, added.
+        const STATES: usize = 5;
+        const COLUMNS: usize = 3;
+        let rules: Vec<ColumnRule> = (0..COLUMNS)
+            .map(|i| redact_rule(&format!("demo.t{i}"), "email"))
+            .collect();
+        for combination in 0..STATES.pow(COLUMNS as u32) {
+            let mut previous = Snapshot::default();
+            let mut next = Snapshot::default();
+            for (i, rule) in rules.iter().enumerate() {
+                let name = rule.display();
+                let oid = i as u32 + 1;
+                let classify = |snapshot: &mut Snapshot, attnum| {
+                    snapshot.insert_for_test(oid, attnum, Mask::Redact, &name);
+                };
+                match (combination / STATES.pow(i as u32)) % STATES {
+                    0 => {}
+                    1 => {
+                        classify(&mut previous, 1);
+                        classify(&mut next, 1);
+                    }
+                    2 => {
+                        classify(&mut previous, 1);
+                        classify(&mut next, 2);
+                    }
+                    3 => classify(&mut previous, 1),
+                    _ => classify(&mut next, 1),
+                }
+            }
+            assert_eq!(
+                coverage_changes(&rules, &previous, &next),
+                coverage_changes_quadratic(&rules, &previous, &next),
+                "combination {combination}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_catalog_reports_nothing() {
+        let rules = [redact_rule("demo.customers", "email")];
+        let snapshot = || snapshot_of(&[(1, 1, "demo.customers.email")]);
+        assert!(coverage_changes(&rules, &snapshot(), &snapshot()).is_empty());
+    }
+
+    /// A wall-clock assertion, because the shape this replaced was correct —
+    /// only quadratic — so nothing else tells the two apart.
+    ///
+    /// Measured on this catalog by
+    /// `measure_the_refresh_diff_against_the_shape_it_replaced`: 28 ms keyed
+    /// against 25.5 s scanned in a debug build, 13.5 ms against 18.4 s in
+    /// release. The ceiling sits between them with room for a runner several
+    /// times slower than that one in either direction. The `ci` nextest
+    /// profile would also kill the scan at 120 s, but well after it had spent
+    /// the CPU this test exists to notice.
+    #[test]
+    fn the_refresh_diff_is_linear_in_the_catalog_size() {
+        let (rules, previous, next, expected) = production_scale_diff();
+        let start = Instant::now();
+        let changes = coverage_changes(&rules, &previous, &next);
+        let elapsed = start.elapsed();
+        assert_eq!(changes, expected);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "diffing {} rules took {elapsed:?}; a per-rule scan of the names map is back",
+            rules.len()
+        );
+    }
+
+    /// The before/after behind that ceiling, back-to-back on one machine:
+    ///
+    /// ```text
+    /// cargo test -p pgmask --release -- --ignored --nocapture the_refresh_diff
+    /// ```
+    ///
+    /// Ignored because the quadratic reference is the cost being removed —
+    /// running it on every `cargo test` would reintroduce it.
+    #[test]
+    #[ignore = "measurement: runs the quadratic shape it replaced"]
+    fn measure_the_refresh_diff_against_the_shape_it_replaced() {
+        let (rules, previous, next, expected) = production_scale_diff();
+
+        let start = Instant::now();
+        let linear = coverage_changes(&rules, &previous, &next);
+        let linear_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        let quadratic = coverage_changes_quadratic(&rules, &previous, &next);
+        let quadratic_elapsed = start.elapsed();
+
+        assert_eq!(linear, expected);
+        assert_eq!(quadratic, expected, "the two shapes must agree");
+        println!(
+            "rules={} keyed={linear_elapsed:?} scanned={quadratic_elapsed:?}",
+            rules.len()
+        );
+        assert!(
+            quadratic_elapsed > linear_elapsed * 50,
+            "keyed {linear_elapsed:?} vs scanned {quadratic_elapsed:?}: \
+             the scan is no longer the slow one, so this measurement proves nothing"
+        );
     }
 
     #[test]
