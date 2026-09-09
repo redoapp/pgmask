@@ -303,6 +303,121 @@ fn harlequin_schema_query_is_metadata_only() {
 }
 
 #[test]
+fn beekeeper_bootstrap_queries_are_metadata_only() {
+    // Beekeeper Studio's connect path after `CURRENT_SCHEMA()`: load types so
+    // the grid can decode OIDs. `t.oid::integer` has no provenance, so this
+    // has to take the catalog path rather than the rescue path.
+    // Lifted from apps/studio/src/lib/db/clients/postgresql.ts `getTypes()`.
+    let types = r#"
+        SELECT n.nspname as schema, t.typname as typename, t.oid::integer as typeid
+        FROM pg_type t
+        LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+        WHERE (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid))
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid)
+    "#;
+    assert!(reads_only_server_metadata(types), "{types}");
+    assert!(!calls_untrusted_function(types));
+
+    let schemas = r#"
+        SELECT schema_name
+        FROM information_schema.schemata
+        ORDER BY schema_name
+    "#;
+    assert!(reads_only_server_metadata(schemas));
+}
+
+#[test]
+fn beekeeper_and_jdbc_catalog_lookups_without_a_from_are_metadata_only() {
+    // Beekeeper's "SQL: Create" for a view. No RangeVar, so the relation
+    // marker used to fail closed even though `pg_get_viewdef` is a catalog
+    // helper. Lifted from apps/studio/src/lib/db/clients/postgresql.ts
+    // `getViewCreateScript`.
+    let view_sql = "SELECT pg_get_viewdef($1::regclass, true)";
+    assert!(reads_only_server_metadata(view_sql), "{view_sql}");
+    assert!(!calls_untrusted_function(view_sql));
+    assert!(reads_only_server_metadata(
+        "SELECT pg_catalog.pg_get_viewdef($1::regclass, true)"
+    ));
+
+    // Beekeeper's table-properties pane. Size functions are already
+    // Safety-releasable; `obj_description` is not, and opaque=reject
+    // refuses the whole row when one field is unknown.
+    let properties = "
+        SELECT pg_indexes_size('\"canary\".\"subjects\"') as index_size,
+               pg_relation_size('\"canary\".\"subjects\"') as table_size,
+               obj_description('\"canary\".\"subjects\"'::regclass) as description
+    ";
+    assert!(reads_only_server_metadata(properties), "{properties}");
+    assert!(!calls_untrusted_function(properties));
+
+    // JDBC DatabaseMetaData.getSQLKeywords — DBeaver and DataGrip call this
+    // on connect. `pg_get_keywords` is a FROM SRF, not a catalog RangeVar.
+    let keywords = "
+        select string_agg(word, ',') from pg_catalog.pg_get_keywords()
+        where word <> ALL ('{all,and,as}')
+    ";
+    assert!(reads_only_server_metadata(keywords), "{keywords}");
+    assert!(!calls_untrusted_function(keywords));
+
+    // A user-schema wrapper of the same name is not the builtin.
+    assert!(!reads_only_server_metadata(
+        "SELECT pg_get_viewdef($1::regclass, true) FROM myschema.pg_get_keywords()"
+    ));
+    assert!(!reads_only_server_metadata(
+        "SELECT myschema.pg_get_viewdef($1::regclass, true)"
+    ));
+
+    // The no-FROM path is a catalog lookup, not "any helper". Context
+    // functions stay on Safety; aggregates that share the helper list for
+    // SELECT-list use beside a RangeVar do not open it; VALUES / UNION are
+    // a different statement shape.
+    assert!(!reads_only_server_metadata("SELECT now()"));
+    assert!(!reads_only_server_metadata("SELECT string_agg('a', ',')"));
+    assert!(!reads_only_server_metadata("SELECT format_type(25, -1)"));
+    assert!(!reads_only_server_metadata(
+        "VALUES (pg_get_viewdef('pg_class'::regclass))"
+    ));
+    assert!(!reads_only_server_metadata(
+        "SELECT pg_get_viewdef('pg_class'::regclass) UNION SELECT pg_get_viewdef('pg_type'::regclass)"
+    ));
+
+    // A numeric generator still needs a catalog RangeVar.
+    assert!(!reads_only_server_metadata(
+        "SELECT * FROM generate_series(1, 3)"
+    ));
+    assert!(reads_only_server_metadata(
+        "SELECT word FROM pg_catalog.pg_get_keywords()"
+    ));
+}
+
+#[test]
+fn beekeeper_list_columns_is_metadata_only() {
+    // CASE concatenations plus `col_description(format(...)::regclass, …)`
+    // over `information_schema.columns`. Lifted from Beekeeper
+    // `listTableColumns`.
+    let sql = r#"
+        SELECT
+            table_schema,
+            table_name,
+            column_name,
+            CASE
+                WHEN character_maximum_length is not null and udt_name != 'text'
+                THEN udt_name || '(' || character_maximum_length::varchar(255) || ')'
+                ELSE udt_name
+            END as data_type,
+            pg_catalog.col_description(
+                format('%I.%I', table_schema, table_name)::regclass::oid,
+                ordinal_position
+            ) as column_comment
+        FROM information_schema.columns
+        ORDER BY table_schema, table_name, ordinal_position
+    "#;
+    assert!(reads_only_server_metadata(sql), "{sql}");
+    assert!(!calls_untrusted_function(sql));
+}
+
+#[test]
 fn harlequin_relation_description_is_metadata_only() {
     // Reduced from Harlequin's `Describe Relation` action. `string_agg` may
     // combine catalog metadata here, but must stay untrusted over user tables.
@@ -600,10 +715,39 @@ fn literals_are_provably_column_free() {
 #[test]
 fn context_functions_are_provably_column_free() {
     assert!(is_safe("SELECT now()"));
+    assert!(is_safe("SELECT pg_catalog.now()"));
     assert!(is_safe("SELECT current_database()"));
     assert!(is_safe("SELECT version()"));
     assert!(is_safe("SELECT CURRENT_TIMESTAMP"));
     assert!(is_safe("SELECT CURRENT_USER"));
+}
+
+/// Beekeeper Studio's connect path runs this before any catalog query.
+/// `CURRENT_SCHEMA` is a SQL-value keyword; the parenthesised form is a
+/// function call. Both must be rescued — a miss is `output column "schema"
+/// has no column provenance` and the GUI never finishes connecting.
+#[test]
+fn beekeeper_current_schema_is_provably_column_free() {
+    for sql in [
+        "SELECT CURRENT_SCHEMA() AS schema",
+        "SELECT current_schema() AS schema",
+        "SELECT CURRENT_SCHEMA AS schema",
+        "SELECT pg_catalog.current_schema() AS schema",
+    ] {
+        assert!(
+            is_safe(sql),
+            "{sql} must be rescued; got {:?}",
+            safety(sql, 1)
+        );
+        assert!(
+            StatementInspection::new(sql).is_parseable(),
+            "{sql} must parse"
+        );
+    }
+    assert!(
+        !is_safe("SELECT myschema.current_schema() AS schema"),
+        "a user-schema wrapper is not the pg_catalog builtin"
+    );
 }
 
 #[test]

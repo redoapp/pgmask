@@ -21,7 +21,7 @@ use pg_query::protobuf::node::Node as NodeEnum;
 
 use super::catalog_surface::range_var_is_leaky_catalog;
 use super::names::{
-    func_call_name_parts, is_trusted_function_name, CATALOG_ESCAPE_FUNCTIONS,
+    func_call_name_parts, function_name, is_trusted_function_name, CATALOG_ESCAPE_FUNCTIONS,
     CATALOG_HELPER_FUNCTIONS, GENERATORS_IN_FROM,
 };
 use super::walk::{tree_any, walk_parsed};
@@ -65,10 +65,14 @@ pub(crate) fn touches_leaky_system_catalog_inspected(inspection: &StatementInspe
 /// cannot cover: relations that appear in the statement without surfacing as an
 /// output field, and functions that take SQL as a string.
 ///
-/// Fails closed everywhere: an unparseable statement, a statement that names no
-/// relation at all, a CTE reference that is not declared locally, a target-list
-/// function that is not a catalog helper / trusted name / FROM-generator, and
-/// any function on `CATALOG_ESCAPE_FUNCTIONS` all return `false`.
+/// Fails closed everywhere: an unparseable statement, a CTE reference that is
+/// not declared locally, a target-list function that is not a catalog helper /
+/// trusted name / FROM-generator, and any function on
+/// `CATALOG_ESCAPE_FUNCTIONS` all return `false`. A statement that names no
+/// relation is not a catalog query unless it is a catalog-object lookup with
+/// no `FROM` (`pg_get_viewdef`, `obj_description`) — Beekeeper issues those
+/// as the entire query. `SELECT now()` stays off this path so the Safety
+/// rescue, not `system_catalogs`, remains what serves it.
 pub fn reads_only_server_metadata(sql: &str) -> bool {
     StatementInspection::new(sql).reads_only_server_metadata()
 }
@@ -104,6 +108,7 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
     });
 
     let mut saw_relation = false;
+    let mut saw_catalog_lookup = false;
     let mut disqualified = false;
     walk_parsed(parsed, &mut |node| {
         if disqualified {
@@ -160,18 +165,23 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
                         let Some(NodeEnum::FuncCall(call)) = &element.node else {
                             continue;
                         };
-                        let safe = call
-                            .funcname
-                            .last()
-                            .and_then(|n| n.node.as_ref())
-                            .and_then(|n| match n {
-                                NodeEnum::String(s) => Some(s.sval.to_ascii_lowercase()),
-                                _ => None,
-                            })
-                            .is_some_and(|name| GENERATORS_IN_FROM.contains(&name.as_str()));
-                        if !safe {
+                        // Unqualified or `pg_catalog.*` only. Matching on the
+                        // last name component used to let `myschema.generate_series`
+                        // through this arm (the FuncCall arm still refused it).
+                        let Some(name) = function_name(&call.funcname) else {
                             disqualified = true;
                             return;
+                        };
+                        if !GENERATORS_IN_FROM.contains(&name.as_str()) {
+                            disqualified = true;
+                            return;
+                        }
+                        // `generate_series` still needs a catalog RangeVar —
+                        // it is not itself a catalog. A helper SRF
+                        // (`pg_get_keywords`, `pg_options_to_table`) *is* the
+                        // catalog read, so it supplies the relation marker.
+                        if CATALOG_HELPER_FUNCTIONS.contains(&name.as_str()) {
+                            saw_relation = true;
                         }
                     }
                 }
@@ -183,8 +193,19 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
             // (pageinspect, `pg_sleep`, `set_config`, …) and skips
             // untrusted. Helpers / trusted names / FROM-generators keep
             // the fast path; the escape list still wins if both match.
-            Some(NodeEnum::FuncCall(call)) if !func_call_is_catalog_safe(call) => {
-                disqualified = true;
+            Some(NodeEnum::FuncCall(call)) => {
+                if !func_call_is_catalog_safe(call) {
+                    disqualified = true;
+                    return;
+                }
+                // The no-FROM exception only needs this flag when there is no
+                // catalog RangeVar. Skip the extra name parse once we have one.
+                if saw_relation || saw_catalog_lookup {
+                    return;
+                }
+                if let Some(name) = function_name(&call.funcname) {
+                    saw_catalog_lookup = is_catalog_object_lookup(&name);
+                }
             }
             _ => {}
         }
@@ -192,11 +213,39 @@ pub(crate) fn reads_only_server_metadata_inspected(inspection: &StatementInspect
     if disqualified {
         return false;
     }
+    if saw_relation {
+        return true;
+    }
 
     // A statement naming no relation is not a catalog query, and pg_query has a
     // known bug where a self-referencing CTE yields an empty table list. Either
     // way, releasing on an empty set would release on absence of evidence.
-    saw_relation
+    //
+    // The exception is a catalog-object lookup with no FROM and no CTE:
+    // Beekeeper's view SQL is `SELECT pg_get_viewdef($1::regclass, true)` and
+    // its table-properties pane mixes size functions with `obj_description`.
+    // Distinct from "we saw no relation" — `WITH f AS (SELECT * FROM f) SELECT
+    // * FROM f` still has a FROM. `SELECT now()` is a context function, not a
+    // catalog lookup, and stays on the Safety rescue. The lookup flag comes
+    // from the walk above; this only checks the statement shape.
+    cte_names.is_empty() && saw_catalog_lookup && is_simple_empty_from_select(parsed)
+}
+
+/// Single `SELECT` of expressions: no `FROM`, no `VALUES`, no set operation.
+/// The catalog-lookup exception is this shape plus [`is_catalog_object_lookup`].
+fn is_simple_empty_from_select(parsed: &pg_query::ParseResult) -> bool {
+    let Some(NodeEnum::SelectStmt(select)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    else {
+        return false;
+    };
+    select.op() == pg_query::protobuf::SetOperation::SetopNone
+        && select.from_clause.is_empty()
+        && select.values_lists.is_empty()
 }
 
 /// Whether the engine's per-field provenance can be believed at all.
@@ -306,4 +355,21 @@ pub(crate) fn func_call_is_catalog_safe(call: &pg_query::protobuf::FuncCall) -> 
     is_trusted_function_name(name)
         || GENERATORS_IN_FROM.contains(&name)
         || CATALOG_HELPER_FUNCTIONS.contains(&name)
+}
+
+/// Catalog-object lookup issued with no `FROM`: view SQL, function SQL, comments.
+///
+/// [`CATALOG_HELPER_FUNCTIONS`] also lists formatters and aggregates so they
+/// may appear in a SELECT list *beside* a catalog RangeVar. Those must not
+/// open this path on their own — `SELECT string_agg('a', ',')` is not a
+/// catalog read. FROM-generator helpers (`pg_get_keywords`) use the
+/// RangeFunction arm instead.
+fn is_catalog_object_lookup(name: &str) -> bool {
+    if GENERATORS_IN_FROM.contains(&name) {
+        return false;
+    }
+    matches!(
+        name,
+        "obj_description" | "shobj_description" | "col_description"
+    ) || (name.starts_with("pg_get_") && CATALOG_HELPER_FUNCTIONS.contains(&name))
 }

@@ -861,7 +861,8 @@ impl Session {
                 // A result set of nothing but expressions gives the OID
                 // check no purchase, so it is only trusted when the parse
                 // tree named every relation with an explicit schema. `SHOW`
-                // reads no relation at all and is handled there.
+                // and no-FROM catalog lookups (`pg_get_viewdef`) name none,
+                // so every_relation_is_qualified is vacuously true.
                 !mentions_user_relation
                     && all_system
                     && (provenanced > 0
@@ -2434,6 +2435,69 @@ mod tests {
         assert!(
             out.to_client.windows(1).any(|w| w == b"1"),
             "a simple query's own row must be served"
+        );
+    }
+
+    /// Beekeeper Studio's first query after TCP connect. `CURRENT_SCHEMA()` is
+    /// a context function: no stored column, no provenance. Production defaults
+    /// (`opaque = reject`, `lineage = refuse`, `system_catalogs = refuse`) must
+    /// still rescue it, or the GUI never finishes connecting.
+    #[test]
+    fn beekeeper_current_schema_is_served_under_default_policy() {
+        let mut session = Session::new(policy(Unclassified::Mask, Opaque::Reject));
+        session.handle_frontend(
+            Message::new(
+                protocol::F_QUERY,
+                Bytes::from_static(b"SELECT CURRENT_SCHEMA() AS schema\0"),
+            ),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        session.handle_backend(row_description(&[("schema", 0, 0, 19)]), &mut out);
+        assert!(
+            !String::from_utf8_lossy(&out.to_client).contains("no column provenance"),
+            "Beekeeper's connect query must be rescued: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+        session.handle_backend(
+            protocol::build_data_row(&[Some(Bytes::from_static(b"public"))]),
+            &mut out,
+        );
+        assert!(
+            out.to_client.windows(6).any(|w| w == b"public"),
+            "the current schema name must reach the client: {:?}",
+            String::from_utf8_lossy(&out.to_client)
+        );
+    }
+
+    /// node-postgres sends Parse/Describe of the unnamed statement, not Query.
+    /// The rescue has to find the SQL on that path too.
+    #[test]
+    fn beekeeper_current_schema_is_served_over_the_unnamed_extended_protocol() {
+        let mut session = Session::new(policy(Unclassified::Mask, Opaque::Reject));
+        session.handle_frontend(
+            Message::new(
+                protocol::F_PARSE,
+                parse_body(b"\0SELECT CURRENT_SCHEMA() AS schema\0"),
+            ),
+            &mut Batch::default(),
+        );
+        session.handle_frontend(
+            Message::new(protocol::F_DESCRIBE, Bytes::from_static(b"S\0")),
+            &mut Batch::default(),
+        );
+
+        let mut out = Batch::default();
+        session.handle_backend(
+            Message::new(protocol::B_PARSE_COMPLETE, Bytes::new()),
+            &mut out,
+        );
+        session.handle_backend(row_description(&[("schema", 0, 0, 19)]), &mut out);
+        assert!(
+            !String::from_utf8_lossy(&out.to_client).contains("no column provenance"),
+            "unnamed Parse/Describe must still rescue CURRENT_SCHEMA(): {:?}",
+            String::from_utf8_lossy(&out.to_client)
         );
     }
 

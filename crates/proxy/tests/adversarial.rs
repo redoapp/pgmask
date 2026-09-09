@@ -3641,6 +3641,10 @@ async fn provably_column_free_expressions_are_served() -> Result<()> {
             SqlCase::served("integer literal", "SELECT 1"),
             SqlCase::served("now()", "SELECT now()"),
             SqlCase::served("current_database()", "SELECT current_database()"),
+            SqlCase::served(
+                "Beekeeper CURRENT_SCHEMA()",
+                "SELECT CURRENT_SCHEMA() AS schema",
+            ),
             SqlCase::served("count(*)", "SELECT count(*) FROM canary.subjects"),
             SqlCase::served(
                 "count grouped by released column",
@@ -3649,6 +3653,95 @@ async fn provably_column_free_expressions_are_served() -> Result<()> {
         ],
     )
     .await?;
+    Ok(())
+}
+
+/// Beekeeper Studio connects by running `CURRENT_SCHEMA()`, `version()`, then
+/// a `pg_type` join whose `oid::integer` has no provenance. That last query
+/// is why `system_catalogs = "allow"` is required: the schema name is rescued
+/// as a context function even under default-deny, but the type catalog is not.
+const BEEKEEPER_GET_TYPES: &str = "
+SELECT n.nspname as schema, t.typname as typename, t.oid::integer as typeid
+FROM pg_type t
+LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+WHERE (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid))
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid)
+";
+
+#[tokio::test]
+async fn beekeeper_studio_bootstrap_is_served_with_catalog_access() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy_gui(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    assert_sql_cases(
+        &mut client,
+        &[
+            SqlCase::served("getSchema", "SELECT CURRENT_SCHEMA() AS schema"),
+            SqlCase::served("getVersion", "select version()"),
+            SqlCase::served("getTypes", BEEKEEPER_GET_TYPES),
+            SqlCase::served(
+                "listSchemas",
+                "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
+            ),
+            SqlCase::served(
+                "getViewCreateScript",
+                "SELECT pg_get_viewdef('canary.subject_view'::regclass, true)",
+            ),
+            SqlCase::served(
+                "getTableProperties",
+                "SELECT pg_indexes_size('canary.subjects') as index_size, \
+                 pg_relation_size('canary.subjects') as table_size, \
+                 obj_description('canary.subjects'::regclass) as description",
+            ),
+            SqlCase::served(
+                "getSQLKeywords",
+                "select string_agg(word, ',') from pg_catalog.pg_get_keywords()",
+            ),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Without the metadata path, Beekeeper's type catalog hits `oid::integer` and
+/// fails closed on `typeid` — not on `schema`. The connect error naming
+/// `schema` is the earlier `CURRENT_SCHEMA()` query, which the rescue path
+/// serves even here.
+#[tokio::test]
+async fn beekeeper_gettypes_needs_catalog_access() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    let proxy = start_proxy(DB, default_rules()).await?;
+    let mut client = RawClient::connect(proxy.addr, DB).await?;
+
+    let schema = simple_query_round(&mut client, "SELECT CURRENT_SCHEMA() AS schema").await?;
+    assert_served(&schema.messages, "CURRENT_SCHEMA without catalogs");
+    assert!(
+        !schema.text().contains("no column provenance"),
+        "getSchema must not be the one that fails: {}",
+        schema.text()
+    );
+
+    let types = simple_query_round(&mut client, BEEKEEPER_GET_TYPES).await?;
+    assert_refused_bytes(&types.received, "getTypes without catalogs");
+    assert!(
+        types.text().contains("typeid") && types.text().contains("no column provenance"),
+        "the unprovenanced cast is typeid, not schema: {}",
+        types.text()
+    );
+
+    // View SQL is a catalog lookup, not a context function. Without
+    // `system_catalogs = "allow"` it must still fail closed — unlike
+    // CURRENT_SCHEMA(), which the rescue path serves here.
+    let viewdef = simple_query_round(
+        &mut client,
+        "SELECT pg_get_viewdef('canary.subject_view'::regclass, true)",
+    )
+    .await?;
+    assert_refused_bytes(&viewdef.received, "getViewCreateScript without catalogs");
     Ok(())
 }
 

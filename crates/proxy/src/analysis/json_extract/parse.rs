@@ -318,17 +318,5 @@ fn operator_name(parts: &[Node]) -> Option<String> {
 /// Unqualified `jsonb_extract_path`, or `pg_catalog.jsonb_extract_path`.
 /// Any other schema is a user function and must not inherit this allowlist.
 fn catalog_function_name(parts: &[Node]) -> Option<String> {
-    match parts {
-        [name] => function_name(std::slice::from_ref(name)),
-        [schema, name] => {
-            let NodeEnum::String(schema) = schema.node.as_ref()? else {
-                return None;
-            };
-            if !schema.sval.eq_ignore_ascii_case("pg_catalog") {
-                return None;
-            }
-            function_name(std::slice::from_ref(name))
-        }
-        _ => None,
-    }
+    function_name(parts)
 }

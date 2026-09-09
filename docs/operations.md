@@ -169,3 +169,11 @@ Run the full repository gate before release:
 
 A skipped suite fails the gate. Focused real-database and engine checks are
 listed in the [README](../README.md#test-and-benchmark).
+
+Publishing a release tag runs `dist`, which builds the archives, and then
+`publish-image.yml`, which turns that release's own
+`pgmask-x86_64-unknown-linux-gnu.tar.xz` into `ghcr.io/redoapp/pgmask:<version>`
+after checking it against the published `.sha256`. The image is a copy of the
+release, not a rebuild of it, so `sha256sum /usr/local/bin/pgmask` inside the
+image equals the binary in the archive — check that rather than trusting the
+tag. The run summary prints the `name:version@sha256:...` reference to pin.
