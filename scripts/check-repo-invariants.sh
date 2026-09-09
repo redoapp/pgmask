@@ -190,6 +190,21 @@ if grep -q 'generate-sboms' dist-workspace.toml; then
     note "dist extra-artifacts name generate-sboms.sh, which is missing or not executable"
 fi
 
+# cargo-dist regenerates release.yml. Keep its token read-only for PR planning
+# and artifact builds; only the host job creates a GitHub Release. A top-level
+# contents:write gives every job a release-capable token, including the job that
+# evaluates pull-request-controlled dist configuration.
+grep -q '^  "contents": "read"$' .github/workflows/release.yml ||
+  note "release.yml must default to contents:read"
+host_permissions=$(sed -n '/^  host:/,/^  announce:/p' .github/workflows/release.yml)
+grep -q '^      "contents": "write"$' <<<"$host_permissions" ||
+  note "release.yml host job needs contents:write to publish releases"
+
+# SECURITY.md tells reporters to use a private advisory. Put that route on the
+# issue chooser too, where someone about to disclose a bug publicly will see it.
+grep -q 'security/advisories/new' .github/ISSUE_TEMPLATE/config.yml ||
+  note "the issue chooser does not link to private vulnerability reporting"
+
 [ "$fail" = 0 ] &&
   echo "repo invariants ok: v$cargo_version, $total entries, descending, seeds tracked"
 exit "$fail"
