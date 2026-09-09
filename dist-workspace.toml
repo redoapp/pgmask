@@ -5,6 +5,10 @@ members = ["cargo:."]
 # crates.io library). `packages` plus per-crate `dist = true` still ships
 # the operator binaries on GitHub Releases.
 [dist]
+# release.yml deliberately narrows cargo-dist's workflow-wide contents:write
+# to the host job that publishes the release. Keep CI generation unmanaged so
+# `dist plan` accepts that security boundary and `dist init` cannot erase it.
+allow-dirty = ["ci"]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
 # CI backends to support

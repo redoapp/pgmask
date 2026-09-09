@@ -199,6 +199,8 @@ grep -q '^  "contents": "read"$' .github/workflows/release.yml ||
 host_permissions=$(sed -n '/^  host:/,/^  announce:/p' .github/workflows/release.yml)
 grep -q '^      "contents": "write"$' <<<"$host_permissions" ||
   note "release.yml host job needs contents:write to publish releases"
+grep -q '^allow-dirty = \["ci"\]$' dist-workspace.toml ||
+  note 'dist must allow the intentional release.yml permission hardening'
 
 # SECURITY.md tells reporters to use a private advisory. Put that route on the
 # issue chooser too, where someone about to disclose a bug publicly will see it.
