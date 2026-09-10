@@ -120,8 +120,9 @@ pub use safety::{analyze, Relaxations, Safety};
 pub(crate) use lineage_shape::output_lineage_is_closed;
 
 use catalogs::{
-    every_relation_is_qualified_inspected, provenance_is_trustworthy_inspected,
-    reads_only_server_metadata_inspected, touches_leaky_system_catalog_inspected,
+    every_relation_is_qualified_inspected, every_relation_is_unambiguous_inspected,
+    provenance_is_trustworthy_inspected, reads_only_server_metadata_inspected,
+    touches_leaky_system_catalog_inspected,
 };
 use frontend::{
     calls_untrusted_function_inspected, is_sql_prepare_or_cursor_inspected,
@@ -347,6 +348,10 @@ impl<'sql> StatementInspection<'sql> {
 
     pub fn every_relation_is_qualified(&self) -> bool {
         every_relation_is_qualified_inspected(self)
+    }
+
+    pub fn every_relation_is_unambiguous(&self) -> bool {
+        every_relation_is_unambiguous_inspected(self)
     }
 
     pub fn is_write_statement(&self) -> bool {

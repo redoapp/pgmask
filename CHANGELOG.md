@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.2.14 — Beekeeper Studio on CockroachDB
+
+Two defects, both CockroachDB-only, both found by driving Beekeeper Studio's
+connect sequence against a CockroachDB 25.4 running the real production schema.
+Postgres reports real table OIDs for its catalogs; CockroachDB's are virtual,
+and that difference is what five Postgres majors of testing could not show.
+
+- Accept a bare metadata-safe catalog name on the all-expressions metadata path.
+  The path is trusted when every provenanced field is a system relation, *or*,
+  when no field has provenance, when the parse tree named every relation
+  unambiguously. That second term required an explicit schema. A cast of a
+  virtual table's OID (`t.oid::integer`) has no provenance, so Beekeeper's
+  `getTypes` — `FROM pg_type t LEFT JOIN pg_catalog.pg_namespace n` — reached
+  the name check alone and was refused for the bare `pg_type`. A bare name the
+  vanilla catalog classifies metadata-safe is already unambiguous: `pg_catalog`
+  is implicitly searched before the rest of the path, so `pg_type` cannot
+  resolve to a user table. `every_relation_is_qualified` keeps its contract for
+  the callers that need the stronger claim; the metadata path now asks the
+  weaker `every_relation_is_unambiguous`. An unknown `pg_`-prefixed name and a
+  bare user table are still refused.
+- Keep CockroachDB's virtual schemas out of the user-relation set. The column
+  loader excluded `pg_catalog`, `information_schema` and `pg_toast`; the view
+  loader already excluded `crdb_internal` and `pg_extension` too. So 113 engine
+  tables — `crdb_internal.tables`, `.ranges`, `.jobs`, `.zones`, `.databases` —
+  were user relations, and the `system_catalogs = "allow"` backstop matches
+  bare names lexically. The token `tables` in `information_schema.tables`, or
+  an alias `AS ranges`, closed the metadata path and every column of the
+  sidebar's table list came back masked. One `not_user_schemas!` list now feeds
+  every user-relation query. Those schemas are *not* added to the system-OID
+  set either: an engine table's provenance must fail the OID check, not pass
+  it. The backstop distrusts the `crdb_internal` token instead, so an engine
+  table hidden in a tree-walk gap still loses the fast path; `pg_extension` is
+  left out of that because it is also the name of the vanilla catalog table
+  every GUI reads to list extensions.
+- `scripts/test-cockroach.sh` gains a `system_catalogs = "allow"` section that
+  drives both shapes, the alias collision, and the closed `crdb_internal`
+  paths, on the wire. The suite had also stopped running: its fixture step
+  stripped the demo view and orders rules by matching `[[column]]` blocks, the
+  catalog had since moved to `[columns."demo.orders"]` tables, and pgmask
+  refused to start on eleven columns the fixture lacks — before the first
+  check. It matches the current shape now. [Engines](docs/engines.md) and
+  [GUI clients](docs/gui-clients.md) record the virtual-catalog differences.
+
 ## 0.2.13 — Beekeeper Studio connect
 
 - Rescue `pg_catalog`-qualified context functions the same way as the

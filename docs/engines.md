@@ -62,6 +62,8 @@ simple and extended protocols.
 | `ROLLUP`, `CUBE`, grouping sets | Supported | Unsupported in the tested version |
 | Declarative partition syntax | PostgreSQL form | Different syntax |
 | Some catalog helpers | Available | Missing, including `pg_size_pretty` |
+| Catalog tables | Real relations with real OIDs | Virtual; `RowDescription` reports an OID above 2³¹, and a cast of one (`oid::integer`) has no provenance |
+| Engine schemas | `pg_catalog`, `information_schema`, `pg_toast` | Also `crdb_internal` (113 tables) and `pg_extension`; neither is a user relation nor a system catalog, and the metadata path refuses them |
 
 Fixtures use explicit integer widths so both binary decoding paths are tested.
 Portable generated corpora exclude unsupported grouping syntax and assert that

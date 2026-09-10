@@ -1003,6 +1003,15 @@ impl Snapshot {
     /// through. Over-refusal is possible — a catalog query whose alias happens
     /// to match a user relation's name loses the fast path — and costs a GUI
     /// client one refused introspection query, not a disclosure.
+    ///
+    /// That over-refusal is exactly why the engine's own schemas must stay out
+    /// of `relation_columns` (see `not_user_schemas!`): CockroachDB ships
+    /// `crdb_internal.tables`, `.ranges`, `.jobs`, `.zones`, `.databases`, and
+    /// the bare token `tables` occurs in every sidebar query there is. Those
+    /// schemas are distrusted here by their *schema* token instead, which no
+    /// catalog query spells and every reference to them must — bar a
+    /// `search_path` pointed at `crdb_internal`, where the bare name is not
+    /// `pg_`-prefixed and `reads_only_server_metadata` refuses it anyway.
     pub fn statement_mentions_user_relation(&self, sql: &str) -> bool {
         let inspection = crate::analysis::StatementInspection::new(sql);
         self.inspection_mentions_user_relation(&inspection)
@@ -1016,11 +1025,12 @@ impl Snapshot {
             return true;
         };
         identifiers.iter().any(|identifier| {
-            self.relation_columns.keys().any(|relation| {
-                relation
-                    .rsplit_once('.')
-                    .is_some_and(|(_, n)| n == identifier)
-            })
+            ENGINE_INTERNAL_SCHEMA_TOKENS.contains(&identifier.as_str())
+                || self.relation_columns.keys().any(|relation| {
+                    relation
+                        .rsplit_once('.')
+                        .is_some_and(|(_, n)| n == identifier)
+                })
         })
     }
 
@@ -1908,6 +1918,36 @@ async fn resolve_snapshot_retrying(
     }
 }
 
+/// Schemas that hold no user relation, spelled for a SQL `NOT IN`.
+///
+/// One list, because every user-relation query below must agree on it. The
+/// `crdb_internal` and `pg_extension` entries are CockroachDB's virtual schemas,
+/// and they used to be missing from the column loader (the view loader already
+/// excluded them). That put 113 engine tables into `relation_columns`, and the
+/// `system_catalogs = "allow"` backstop matches *bare* names lexically — so the
+/// token `tables` in `information_schema.tables`, or an alias `ranges`, named
+/// `crdb_internal.tables` / `crdb_internal.ranges` and closed the metadata path.
+/// Every column Beekeeper Studio's sidebar read from `information_schema.tables`
+/// came back masked, on CockroachDB only.
+///
+/// These schemas are also *not* added to the system-relation OID set: a field
+/// whose provenance is `crdb_internal.cluster_queries` should fail the OID
+/// check, not pass it. Neither set is the safe place for an engine table, and
+/// `reads_only_server_metadata` refuses the explicit schema on top of that.
+macro_rules! not_user_schemas {
+    () => {
+        "'pg_catalog', 'information_schema', 'pg_toast', 'crdb_internal', 'pg_extension'"
+    };
+}
+
+/// Engine-internal schemas the metadata-path backstop distrusts by *schema*
+/// token rather than by bare relation name (see [`not_user_schemas!`]).
+///
+/// `pg_extension` is deliberately absent: it is also the name of a vanilla
+/// `pg_catalog` table every GUI reads to list extensions, so the token proves
+/// nothing. Its three relations are PostGIS reference metadata.
+const ENGINE_INTERNAL_SCHEMA_TOKENS: &[&str] = &["crdb_internal"];
+
 async fn resolve_snapshot(
     rules: &[ColumnRule],
     types: &HashMap<String, SemanticType>,
@@ -1971,7 +2011,8 @@ async fn resolve_snapshot(
     let mut column_not_null: HashMap<(u32, i16), bool> = HashMap::new();
     for row in client
         .query(
-            "WITH RECURSIVE user_columns AS (
+            concat!(
+                "WITH RECURSIVE user_columns AS (
                  SELECT n.nspname || '.' || c.relname AS relation,
                         a.attname AS column_name,
                         c.oid::int8 AS oid,
@@ -1981,7 +2022,9 @@ async fn resolve_snapshot(
                    FROM pg_class c
                    JOIN pg_namespace n ON n.oid = c.relnamespace
                    JOIN pg_attribute a ON a.attrelid = c.oid
-                  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                  WHERE n.nspname NOT IN (",
+                not_user_schemas!(),
+                ")
                     AND n.nspname NOT LIKE 'pg_temp%'
                     AND a.attnum > 0
                     AND NOT a.attisdropped
@@ -2004,7 +2047,8 @@ async fn resolve_snapshot(
                     bool_or(not_null) AS not_null
                FROM column_types
               GROUP BY relation, column_name, oid, attnum
-              ORDER BY relation, attnum",
+              ORDER BY relation, attnum"
+            ),
             &[],
         )
         .await
@@ -2031,14 +2075,17 @@ async fn resolve_snapshot(
     let mut view_defs: HashMap<String, Option<String>> = HashMap::new();
     for row in client
         .query(
-            "SELECT n.nspname || '.' || c.relname AS relation,
+            concat!(
+                "SELECT n.nspname || '.' || c.relname AS relation,
                     pg_get_viewdef(c.oid)         AS def
                FROM pg_class c
                JOIN pg_namespace n ON n.oid = c.relnamespace
               WHERE c.relkind IN ('v', 'm')
-                AND n.nspname NOT IN ('pg_catalog', 'information_schema',
-                                      'pg_toast', 'crdb_internal', 'pg_extension')
-                AND n.nspname NOT LIKE 'pg_temp%'",
+                AND n.nspname NOT IN (",
+                not_user_schemas!(),
+                ")
+                AND n.nspname NOT LIKE 'pg_temp%'"
+            ),
             &[],
         )
         .await
@@ -2103,7 +2150,8 @@ async fn resolve_snapshot(
     let mut unique_keys: Vec<Vec<String>> = Vec::new();
     for row in client
         .query(
-            "SELECT string_agg(DISTINCT k.col, ',') AS columns
+            concat!(
+                "SELECT string_agg(DISTINCT k.col, ',') AS columns
                FROM (
                  SELECT i.indexrelid, a.attname AS col
                    FROM pg_index i
@@ -2112,7 +2160,9 @@ async fn resolve_snapshot(
                    CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS u(attnum, ord)
                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = u.attnum
                   WHERE i.indisunique
-                    AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                    AND n.nspname NOT IN (",
+                not_user_schemas!(),
+                ")
                  UNION
                  SELECT i.indexrelid, a.attname AS col
                    FROM pg_index i
@@ -2124,9 +2174,12 @@ async fn resolve_snapshot(
                     AND d.refobjsubid > 0
                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = d.refobjsubid
                   WHERE i.indisunique AND i.indpred IS NULL AND i.indexprs IS NOT NULL
-                    AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                    AND n.nspname NOT IN (",
+                not_user_schemas!(),
+                ")
                ) k
-              GROUP BY k.indexrelid",
+              GROUP BY k.indexrelid"
+            ),
             &[],
         )
         .await
@@ -2487,6 +2540,53 @@ mod tests {
         ));
         // Unscannable text could name anything.
         assert!(snapshot.statement_mentions_user_relation("SELECT \u{0}"));
+    }
+
+    /// CockroachDB's `crdb_internal` is the engine's, not the operator's. Its
+    /// relations must not be in the user set — the backstop matches bare names,
+    /// and `crdb_internal.tables` / `.ranges` turned the token `tables` in
+    /// `information_schema.tables`, or an alias `ranges`, into a refusal that
+    /// masked every column of Beekeeper Studio's sidebar. The schema token is
+    /// what the backstop distrusts instead, so hiding an engine table in a
+    /// tree-walk gap still closes the fast path.
+    #[test]
+    fn an_engine_schema_is_distrusted_by_its_token_not_by_bare_names() {
+        let mut snapshot = Snapshot::default();
+        snapshot.relation_columns_for_test("public.customers", &["id", "email"]);
+
+        // What the loader now excludes: these must never be user relations.
+        assert!(!not_user_schemas!().contains("'public'"));
+        for schema in ["'crdb_internal'", "'pg_extension'", "'pg_toast'"] {
+            assert!(not_user_schemas!().contains(schema), "{schema}");
+        }
+
+        // The sidebar shapes, and the alias that named `crdb_internal.ranges`.
+        assert!(!snapshot.statement_mentions_user_relation(
+            "SELECT table_schema, table_name FROM information_schema.tables"
+        ));
+        assert!(!snapshot
+            .statement_mentions_user_relation("SELECT relname AS ranges FROM pg_catalog.pg_class"));
+        // `pg_extension` is a vanilla catalog table; its token proves nothing.
+        assert!(!snapshot
+            .statement_mentions_user_relation("SELECT extname FROM pg_catalog.pg_extension"));
+
+        // The engine schema itself, anywhere in the text, including where the
+        // tree walk does not look.
+        assert!(snapshot.statement_mentions_user_relation(
+            "SELECT relname FROM pg_catalog.pg_class \
+             WHERE EXISTS (SELECT 1 FROM crdb_internal.cluster_queries)"
+        ));
+        assert!(snapshot.statement_mentions_user_relation(
+            "SELECT relname, count(*) OVER (PARTITION BY (SELECT 1 FROM crdb_internal.ranges)) \
+             FROM pg_catalog.pg_class"
+        ));
+        assert!(snapshot.statement_mentions_user_relation(
+            "SELECT relname FROM pg_catalog.pg_class, \"CRDB_INTERNAL\".jobs"
+        ));
+        // And a user table still does.
+        assert!(snapshot.statement_mentions_user_relation(
+            "SELECT relname AS customers FROM pg_catalog.pg_class"
+        ));
     }
 
     #[test]

@@ -19,7 +19,7 @@
 
 use pg_query::protobuf::node::Node as NodeEnum;
 
-use super::catalog_surface::range_var_is_leaky_catalog;
+use super::catalog_surface::{range_var_is_leaky_catalog, relation_is_metadata_safe_pg};
 use super::names::{
     func_call_name_parts, function_name, is_trusted_function_name, CATALOG_ESCAPE_FUNCTIONS,
     CATALOG_HELPER_FUNCTIONS, GENERATORS_IN_FROM,
@@ -311,6 +311,34 @@ pub fn every_relation_is_qualified(sql: &str) -> bool {
 }
 
 pub(crate) fn every_relation_is_qualified_inspected(inspection: &StatementInspection<'_>) -> bool {
+    every_relation_is_named_unambiguously(inspection, false)
+}
+
+/// Whether every relation the statement names resolves to one relation.
+///
+/// Weaker than [`every_relation_is_qualified`] and used where that one is too
+/// strong: a bare name the vanilla catalog classifies metadata-safe is already
+/// unambiguous, because `pg_catalog` is implicitly searched before the rest of
+/// the path, so `pg_type` cannot resolve to a user table. A `pg_`-prefixed name
+/// the catalog does not define still can, and stays refused.
+///
+/// This exists because CockroachDB's catalog tables are virtual and report no
+/// table OID. A GUI's `oid::integer` therefore leaves the caller with zero
+/// provenanced fields, so the name check is the only term left, and requiring
+/// an explicit schema refused Beekeeper Studio's `getTypes` — `FROM pg_type t`
+/// beside `pg_catalog.pg_namespace` — so the client never finished connecting.
+/// Postgres reports real OIDs for the identical query, which is why five engine
+/// versions of testing never showed it.
+pub(crate) fn every_relation_is_unambiguous_inspected(
+    inspection: &StatementInspection<'_>,
+) -> bool {
+    every_relation_is_named_unambiguously(inspection, true)
+}
+
+fn every_relation_is_named_unambiguously(
+    inspection: &StatementInspection<'_>,
+    bare_catalog_is_unambiguous: bool,
+) -> bool {
     let Some(parsed) = inspection.parsed() else {
         return false;
     };
@@ -322,7 +350,14 @@ pub(crate) fn every_relation_is_qualified_inspected(inspection: &StatementInspec
     });
     !tree_any(parsed, |node| match node.node.as_ref() {
         Some(NodeEnum::RangeVar(v)) => {
-            v.schemaname.is_empty() && !cte_names.contains(&v.relname.to_ascii_lowercase())
+            if !v.schemaname.is_empty() {
+                return false;
+            }
+            let relation = v.relname.to_ascii_lowercase();
+            if cte_names.contains(&relation) {
+                return false;
+            }
+            !(bare_catalog_is_unambiguous && relation_is_metadata_safe_pg(&relation))
         }
         _ => false,
     })

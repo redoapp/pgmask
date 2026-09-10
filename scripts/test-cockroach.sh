@@ -119,8 +119,12 @@ t = t.replace('listen = "127.0.0.1:6432"', f'listen = "127.0.0.1:{proxy}"')
 t = t.replace('backend = "127.0.0.1:55432"', f'backend = "127.0.0.1:{crdb}"')
 t = t.replace('catalog_dsn = "postgres://postgres:demo@localhost:55432/demo"',
               f'catalog_dsn = "postgres://root@localhost:{crdb}/demo?sslmode=disable"')
-# The demo view and orders table are not part of this fixture.
-t = re.sub(r'\n\[\[column\]\]\nrelation = "demo\.(customer_directory|orders)"\n(?:.*\n)*?(?=\n\[\[|\Z)', '\n', t)
+# The demo view and orders table are not part of this fixture. The catalog
+# spells a relation as a `[columns."demo.orders"]` table; drop each such table
+# up to the next header. (This used to match the older `[[column]]` blocks and
+# silently matched nothing once the catalog changed shape, so pgmask refused to
+# start on eleven columns the fixture lacks and the suite never ran a check.)
+t = re.sub(r'(?ms)^\[columns\."demo\.(customer_directory|orders)"\]\n.*?(?=^\[|\Z)', '', t)
 pathlib.Path('/tmp/pgmask-crdb.toml').write_text(t)
 PY
 PGMASK_LOG=info ./target/release/pgmask /tmp/pgmask-crdb.toml >/tmp/pgmask-crdb.log 2>&1 &
@@ -240,6 +244,60 @@ for op in "UNION ALL" "UNION" "INTERSECT" "EXCEPT"; do
   refute "$op still does not leak under lineage" "user7@example.com" "$out"
   check  "$op is refused with the reason named" "derives from"      "$out"
 done
+
+# CockroachDB's catalogs are virtual. Two things follow that Postgres never
+# showed, and both broke Beekeeper Studio's connect on this engine only:
+#
+#   * a virtual table reports its OID in RowDescription, but a cast of one
+#     (`t.oid::integer`) has no provenance, so the metadata path's OID check
+#     has nothing to inspect and the parse-tree name check stands alone. It
+#     required every relation to be schema-qualified; Beekeeper's `getTypes`
+#     writes `FROM pg_type t`.
+#   * `crdb_internal` holds 113 engine tables named `tables`, `ranges`, `jobs`,
+#     `zones`, `databases`. Loaded as *user* relations, they made the lexical
+#     backstop refuse any catalog query spelling one of those tokens — which
+#     is every `information_schema.tables` read there is.
+echo
+echo "with system_catalogs = allow"
+echo "-----------------------"
+kill "$PROXY_PID" 2>/dev/null; sleep 1
+sed 's/^opaque = "reject"/opaque = "reject"\nsystem_catalogs = "allow"/; s/:'"$PROXY_PORT"'"/:'"$((PROXY_PORT+2))"'"/' \
+  /tmp/pgmask-crdb.toml > /tmp/pgmask-crdb-catalogs.toml
+grep -q '^system_catalogs = "allow"' /tmp/pgmask-crdb-catalogs.toml \
+  || { echo "FAIL: could not enable system_catalogs in the config"; exit 1; }
+./target/release/pgmask /tmp/pgmask-crdb-catalogs.toml >/tmp/pgmask-crdb-catalogs.log 2>&1 &
+PROXY_PID=$!
+P="postgresql://root@localhost:$((PROXY_PORT+2))/demo?sslmode=disable"
+proxy_await "$P" "cockroach catalogs" || { tail -5 /tmp/pgmask-crdb-catalogs.log; exit 1; }
+
+# Beekeeper's getTypes, verbatim shape: a bare `pg_type` beside a qualified
+# `pg_namespace`, and a cast that erases the only provenance there was.
+types="$(p "SELECT n.nspname AS schema, t.oid::integer AS typeid FROM pg_type t \
+  LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'int8'")"
+check  "bare pg_type beside a cast is served"  "pg_catalog"           "$types"
+refute "and is not refused for provenance"     "no column provenance" "$types"
+
+# The sidebar. Every column of this came back masked while
+# `crdb_internal.tables` was a user relation.
+check  "information_schema.tables is served" "customers" \
+  "$(p "SELECT table_name FROM information_schema.tables WHERE table_schema = 'demo'")"
+check  "information_schema.columns is served" "email" \
+  "$(p "SELECT column_name FROM information_schema.columns WHERE table_name = 'customers' AND column_name = 'email'")"
+# An alias that spells an engine table's bare name.
+check  "an alias named like crdb_internal.ranges is served" "customers" \
+  "$(p "SELECT relname AS ranges FROM pg_catalog.pg_class WHERE relname = 'customers'")"
+
+# The engine schema itself stays closed: not a user relation, not a system
+# catalog, and its token alone loses the metadata path.
+check  "CockroachDB really does answer crdb_internal" "demo" \
+  "$(d "SELECT database_name FROM crdb_internal.tables WHERE name = 'customers'")"
+refute "crdb_internal is not released"          "demo" \
+  "$(p "SELECT database_name FROM crdb_internal.tables WHERE name = 'customers'")"
+refute "crdb_internal hidden in a predicate closes the fast path" "customers" \
+  "$(p "SELECT relname FROM pg_catalog.pg_class WHERE relname = 'customers' AND EXISTS (SELECT 1 FROM crdb_internal.tables)")"
+# And the setting releases metadata, not data.
+refute "user columns stay masked under system_catalogs = allow" "user1@example.com" \
+  "$(p 'SELECT email FROM demo.customers WHERE id = 1')"
 
 echo
 echo "-----------------------"

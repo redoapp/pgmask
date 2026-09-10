@@ -66,6 +66,17 @@ read-only, and that call is not a catalog lookup.
 Use the [GUI example catalog](../examples/demo/catalog-gui.toml) as a starting
 point (`system_catalogs = "allow"` is already set there).
 
+### On CockroachDB
+
+CockroachDB's catalogs are virtual, and two things follow that Postgres never
+shows. `getTypes` casts a virtual table's OID, so no field has provenance and
+the parse-tree name check stands alone; a bare metadata-safe name such as
+`pg_type` is accepted there since 0.2.14. And `crdb_internal` holds engine
+tables named `tables`, `ranges`, `jobs`, `zones`, `databases`; since 0.2.14
+those are neither user relations nor system catalogs, so the token `tables` in
+`information_schema.tables` no longer closes the metadata path. Queries that
+name `crdb_internal` or `pg_extension` explicitly stay refused on it.
+
 ## Supported behavior
 
 The metadata path is tested with:
