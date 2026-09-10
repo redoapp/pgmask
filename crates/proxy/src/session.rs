@@ -860,14 +860,17 @@ impl Session {
                 });
                 // A result set of nothing but expressions gives the OID
                 // check no purchase, so it is only trusted when the parse
-                // tree named every relation with an explicit schema. `SHOW`
-                // and no-FROM catalog lookups (`pg_get_viewdef`) name none,
-                // so every_relation_is_qualified is vacuously true.
+                // tree named every relation unambiguously. `SHOW` and no-FROM
+                // catalog lookups (`pg_get_viewdef`) name none, so the check is
+                // vacuously true. A bare `pg_type` counts: `pg_catalog` is
+                // searched first, so it cannot be a user table. CockroachDB
+                // reports no OID for its virtual catalogs, which makes this the
+                // only term a GUI's `oid::integer` has left.
                 !mentions_user_relation
                     && all_system
                     && (provenanced > 0
                         || inspection.as_ref().is_some_and(
-                            analysis::StatementInspection::every_relation_is_qualified,
+                            analysis::StatementInspection::every_relation_is_unambiguous,
                         ))
             };
 

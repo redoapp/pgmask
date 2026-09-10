@@ -750,6 +750,43 @@ fn beekeeper_current_schema_is_provably_column_free() {
     );
 }
 
+/// Beekeeper's `getTypes`, the query right after connect, writes `FROM pg_type t`
+/// with `pg_catalog.pg_namespace` beside it. `t.oid::integer` has no provenance,
+/// and on CockroachDB neither does anything else in the row: its catalog tables
+/// are virtual and report no table OID. So the metadata path falls through to
+/// the name check, and requiring an explicit schema refused the whole result --
+/// the GUI never finished connecting. Postgres reports real OIDs for the
+/// identical query, which is why this only ever showed on CockroachDB.
+#[test]
+fn bare_metadata_safe_catalog_names_are_unambiguous() {
+    let beekeeper_get_types = "SELECT n.nspname AS schema, t.oid::integer AS typeid \
+         FROM pg_type t LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace";
+    assert!(StatementInspection::new(beekeeper_get_types).every_relation_is_unambiguous());
+    assert!(
+        StatementInspection::new("SELECT oid::integer FROM pg_class")
+            .every_relation_is_unambiguous()
+    );
+
+    // `pg_catalog` is searched before the rest of the path, so those cannot be
+    // a user table. A `pg_`-prefixed name the vanilla catalog does not define
+    // can be, and stays refused -- as does an ordinary unqualified relation.
+    assert!(
+        !StatementInspection::new("SELECT oid::integer FROM pg_not_a_real_catalog")
+            .every_relation_is_unambiguous()
+    );
+    assert!(
+        !StatementInspection::new("SELECT id::integer FROM customers")
+            .every_relation_is_unambiguous()
+    );
+
+    // The stricter predicate keeps its literal meaning: none of these names
+    // carry an explicit schema.
+    assert!(!every_relation_is_qualified(beekeeper_get_types));
+    assert!(!every_relation_is_qualified(
+        "SELECT oid::integer FROM pg_class"
+    ));
+}
+
 #[test]
 fn count_star_is_provably_column_free() {
     assert!(is_safe("SELECT count(*) FROM t"));
