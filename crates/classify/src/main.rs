@@ -417,83 +417,38 @@ fn mask_kind(name: &str) -> Option<pgmask::mask::Mask> {
     })
 }
 
-/// The type OID behind a `format_type(atttypid, NULL)` string, for the types
-/// the proxy's capability table knows how to answer for.
-///
-/// `None` for anything else — `boolean`, arrays, `money`, extension
-/// types. That is not "the proxy refuses these"; it is "this tool cannot vouch
-/// for them", and `mask_fits` treats the two the same way.
-fn type_oid(data_type: &str) -> Option<u32> {
-    use pgmask::mask::{
-        OID_BPCHAR, OID_CIDR, OID_DATE, OID_FLOAT4, OID_FLOAT8, OID_INET, OID_INT2, OID_INT4,
-        OID_INT8, OID_JSON, OID_JSONB, OID_NUMERIC, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_UUID,
-        OID_VARCHAR,
-    };
-    Some(match data_type {
-        // `mask.rs` only names constants for types *beyond* the text family;
-        // `text` and `name` live in `protocol.rs`'s TEXT_FAMILY_OIDS list, so
-        // their pg_type OIDs are written out here.
-        "text" => 25,
-        "name" => 19,
-        "character varying" => OID_VARCHAR,
-        "character" => OID_BPCHAR,
-        "uuid" => OID_UUID,
-        "date" => OID_DATE,
-        "timestamp without time zone" => OID_TIMESTAMP,
-        "timestamp with time zone" => OID_TIMESTAMPTZ,
-        "inet" => OID_INET,
-        "cidr" => OID_CIDR,
-        "smallint" => OID_INT2,
-        "integer" => OID_INT4,
-        "bigint" => OID_INT8,
-        "real" => OID_FLOAT4,
-        "double precision" => OID_FLOAT8,
-        "numeric" => OID_NUMERIC,
-        "json" => OID_JSON,
-        "jsonb" => OID_JSONB,
-        _ => return None,
-    })
-}
-
-/// Whether a proposed mask can actually apply to this column's type.
+/// Whether a proposed mask can actually apply to a column OID.
 ///
 /// Found by running this against TPC-DS, which has `c_birth_year` as an
 /// integer: the name matches the birth rule, but a date mask cannot decode an
 /// int4. A proposal that would fail at runtime is worse than no proposal, so
 /// the mismatch is surfaced as a review item rather than emitted.
 ///
-/// The answer is `MaskSpec::supports` — the same capability table the proxy
-/// consults at plan time — asked in text format, the only format classify ever
-/// deals in. This used to be a string-keyed copy of that table, and the copy
-/// drifted three ways: `inner`, `outer`, `range`, `hash` and `scrub` fell
-/// through to a permissive `_ => true`, so `--check` accepted any of them on
-/// an integer column and the proxy refused the result set at runtime — the
+/// This used to be a string-keyed copy of the proxy's capability table, and
+/// the copy drifted three ways: `inner`, `outer`, `range`, `hash` and `scrub`
+/// fell through to a permissive `_ => true`, so `--check` accepted any of them
+/// on an integer column and the proxy refused the result set at runtime — the
 /// outage this function exists to prevent, for five of the seven masks it
 /// applied to. The copy also called `numeric-bucket` fine on `money`, which
-/// the proxy has never supported. Delegating removes the copy, so the next
-/// drift cannot happen.
+/// the proxy has never supported.
 ///
-/// Anything unrecognised — a mask name pgmask does not define, a `data_type`
-/// with no OID mapping above — is `false`, never `true`. The permissive
-/// default was exactly how the `_ => true` bug worked: "unknown" quietly
-/// became "accepted", and the proxy disagreed at runtime. `false` costs a
-/// review item; `true` costs an outage. (Unknown mask names cannot reach here
-/// from a loaded catalog anyway — serde rejects them at load — so that arm is
-/// belt and braces.)
-fn mask_fits(mask: &str, data_type: &str) -> bool {
-    use pgmask::mask::{Mask, MaskSpec, FORMAT_TEXT};
+/// The answer comes directly from `MaskSpec::supports`, the same capability
+/// table the proxy consults at plan time. The schema walk reads `a.atttypid`
+/// from the server, so aliases, arrays, and future supported types do not need
+/// a second type-name mapping in this tool.
+fn mask_fits(mask: &str, oid: u32) -> bool {
+    use pgmask::mask::{MaskSpec, FORMAT_TEXT};
     let Some(kind) = mask_kind(mask) else {
         return false;
     };
-    // `null` withholds whatever it is and `none` passes it through; neither
-    // needs the type to be known, and `supports` says yes for every OID.
-    if matches!(kind, Mask::None | Mask::Null) {
-        return true;
-    }
-    let Some(oid) = type_oid(data_type) else {
-        return false;
-    };
     MaskSpec::new(kind).supports(oid, FORMAT_TEXT)
+}
+
+/// Automatic proposals remain scalar-only. Arrays require an operator to
+/// decide whether the elements share one semantic type; `--check` can then
+/// validate that explicit choice against the proxy's real capability table.
+fn proposal_mask_fits(mask: &str, column: &Column) -> bool {
+    !column.data_type.ends_with("[]") && mask_fits(mask, column.type_oid)
 }
 
 struct Column {
@@ -501,6 +456,7 @@ struct Column {
     table: String,
     name: String,
     data_type: String,
+    type_oid: u32,
     /// Declared max length for char/varchar, when there is one.
     max_length: Option<i32>,
 }
@@ -566,6 +522,7 @@ async fn main() -> Result<()> {
             // defence is worse than tooling that stays silent.
             "SELECT n.nspname, c.relname, a.attname,
                     format_type(a.atttypid, NULL) AS data_type,
+                    a.atttypid::bigint AS type_oid,
                     CASE WHEN a.atttypmod > 4 THEN a.atttypmod - 4 END AS max_length
                FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -587,7 +544,8 @@ async fn main() -> Result<()> {
             table: r.get(1),
             name: r.get(2),
             data_type: r.get(3),
-            max_length: r.get(4),
+            type_oid: u32::try_from(r.get::<_, i64>(4)).expect("PostgreSQL OIDs fit u32"),
+            max_length: r.get(5),
         })
         .collect();
 
@@ -629,7 +587,7 @@ async fn main() -> Result<()> {
                         // refuses that result set at runtime — the outage
                         // `mask_fits` exists to prevent, reintroduced by adding
                         // evidence. More sampling produced a worse proposal.
-                        let fits = mask_fits(proposal.mask, &proposal.column.data_type);
+                        let fits = proposal_mask_fits(proposal.mask, &proposal.column);
                         proposal.confidence = confidence_after_sampling(rate, fits);
                         let sampled = format!(
                             "{rate:.0}% of {checked} sampled values matched the {} shape",
@@ -782,7 +740,7 @@ async fn check(
     for t in &config.semantic_type {
         mask_of_type.insert(t.name.as_str(), &t.mask);
     }
-    let live_type: BTreeMap<(String, String), &str> = proposals
+    let live_type: BTreeMap<(String, String), (&str, u32)> = proposals
         .iter()
         .map(|p| {
             (
@@ -790,7 +748,7 @@ async fn check(
                     format!("{}.{}", p.column.schema, p.column.table),
                     p.column.name.clone(),
                 ),
-                p.column.data_type.as_str(),
+                (p.column.data_type.as_str(), p.column.type_oid),
             )
         })
         .collect();
@@ -798,7 +756,7 @@ async fn check(
     let mut incompatible: Vec<(String, String, String, String)> = Vec::new();
     for rule in config.column_rules() {
         let key = (rule.relation.clone(), rule.column.clone());
-        let Some(data_type) = live_type.get(&key) else {
+        let Some((data_type, type_oid)) = live_type.get(&key) else {
             continue; // reported as a stale rule below
         };
         let effective = rule.mask.as_ref().or_else(|| {
@@ -808,7 +766,7 @@ async fn check(
         });
         if let Some(mask) = effective {
             let name = mask_name(mask);
-            if !mask_fits(name, data_type) {
+            if !mask_fits(name, *type_oid) {
                 incompatible.push((
                     rule.relation.clone(),
                     rule.column.clone(),
@@ -1016,7 +974,7 @@ fn classify_by_name(rules: &[Rule], column: Column) -> Proposal {
     let lower = column.name.to_ascii_lowercase();
     let matched = rules.iter().find(|rule| rule.pattern.is_match(&lower));
 
-    let (mut semantic_type, mask, mut confidence, mut note) = match matched {
+    let (mut semantic_type, mut mask, mut confidence, mut note) = match matched {
         // The specific reason first: an ambiguous free_text rule should say why
         // it is ambiguous, not fall into the generic free-text arm.
         Some(rule) if rule.ambiguous.is_some() => (
@@ -1053,7 +1011,15 @@ fn classify_by_name(rules: &[Rule], column: Column) -> Proposal {
             column.max_length.unwrap_or(0)
         ));
         semantic_type = None;
-    } else if semantic_type.is_some() && !mask_fits(mask, &column.data_type) {
+    } else if semantic_type.is_some() && column.data_type.ends_with("[]") {
+        confidence = Confidence::NeedsReview;
+        note = Some(format!(
+            "name suggests {}, but arrays need an explicit element classification",
+            semantic_type.unwrap_or("?")
+        ));
+        semantic_type = None;
+        mask = "null";
+    } else if semantic_type.is_some() && !proposal_mask_fits(mask, &column) {
         confidence = Confidence::NeedsReview;
         note = Some(format!(
             "name suggests {}, but a `{mask}` mask cannot apply to {} — pick another",
@@ -1340,6 +1306,42 @@ mod tests {
     )]
     use super::*;
 
+    fn test_type_oid(data_type: &str) -> u32 {
+        match data_type {
+            "name" => 19,
+            "text" => 25,
+            "character" => pgmask::mask::OID_BPCHAR,
+            "character varying" => pgmask::mask::OID_VARCHAR,
+            "name[]" => 1003,
+            "text[]" => 1009,
+            "character[]" => 1014,
+            "character varying[]" => 1015,
+            "uuid" => pgmask::mask::OID_UUID,
+            "date" => pgmask::mask::OID_DATE,
+            "timestamp without time zone" => pgmask::mask::OID_TIMESTAMP,
+            "timestamp with time zone" => pgmask::mask::OID_TIMESTAMPTZ,
+            "inet" => pgmask::mask::OID_INET,
+            "cidr" => pgmask::mask::OID_CIDR,
+            "smallint" => pgmask::mask::OID_INT2,
+            "integer" => pgmask::mask::OID_INT4,
+            "bigint" => pgmask::mask::OID_INT8,
+            "real" => pgmask::mask::OID_FLOAT4,
+            "double precision" => pgmask::mask::OID_FLOAT8,
+            "numeric" => pgmask::mask::OID_NUMERIC,
+            "json" => pgmask::mask::OID_JSON,
+            "jsonb" => pgmask::mask::OID_JSONB,
+            "boolean" => 16,
+            "money" => 790,
+            "integer[]" => 1007,
+            "citext" => 999_999,
+            other => panic!("test OID missing for {other}"),
+        }
+    }
+
+    fn fits(mask: &str, data_type: &str) -> bool {
+        mask_fits(mask, test_type_oid(data_type))
+    }
+
     #[test]
     fn version_and_help_flags_are_recognised_without_a_dsn() {
         assert!(wants_version(&["classify".into(), "--version".into()]));
@@ -1396,6 +1398,7 @@ mod tests {
                 table: "t".into(),
                 name: name.into(),
                 data_type: data_type.into(),
+                type_oid: test_type_oid(data_type),
                 max_length,
             },
         )
@@ -1592,21 +1595,21 @@ mod tests {
         for mask in [
             "partial", "redact", "inner", "outer", "range", "hash", "scrub",
         ] {
-            assert!(mask_fits(mask, "text"), "{mask} on text");
-            assert!(mask_fits(mask, "character varying"), "{mask} on varchar");
+            assert!(fits(mask, "text"), "{mask} on text");
+            assert!(fits(mask, "character varying"), "{mask} on varchar");
             for wrong in ["integer", "bigint", "numeric", "uuid", "inet", "date"] {
                 assert!(
-                    !mask_fits(mask, wrong),
+                    !fits(mask, wrong),
                     "{mask} must not be proposed for {wrong}"
                 );
             }
         }
         // The masks that legitimately reach beyond text.
-        assert!(mask_fits("pseudonym", "uuid"));
-        assert!(mask_fits("ip-prefix", "inet"));
-        assert!(mask_fits("null", "bigint"));
-        assert!(mask_fits("numeric-bucket", "numeric"));
-        assert!(!mask_fits("numeric-bucket", "text"));
+        assert!(fits("pseudonym", "uuid"));
+        assert!(fits("ip-prefix", "inet"));
+        assert!(fits("null", "bigint"));
+        assert!(fits("numeric-bucket", "numeric"));
+        assert!(!fits("numeric-bucket", "text"));
     }
 
     /// Every `format_type` string the OID mapping knows.
@@ -1615,6 +1618,10 @@ mod tests {
         "name",
         "character varying",
         "character",
+        "text[]",
+        "name[]",
+        "character varying[]",
+        "character[]",
         "uuid",
         "date",
         "timestamp without time zone",
@@ -1654,9 +1661,9 @@ mod tests {
         use pgmask::mask::{MaskSpec, FORMAT_TEXT};
         for mask in ALL_MASKS {
             for data_type in MAPPED_TYPES {
-                let oid = type_oid(data_type).expect("every mapped type has an OID");
+                let oid = test_type_oid(data_type);
                 assert_eq!(
-                    mask_fits(mask_name(mask), data_type),
+                    fits(mask_name(mask), data_type),
                     MaskSpec::new(*mask).supports(oid, FORMAT_TEXT),
                     "`{}` on {data_type}",
                     mask_name(mask),
@@ -1676,12 +1683,47 @@ mod tests {
     #[test]
     fn the_cases_the_old_string_table_got_wrong() {
         assert!(
-            !mask_fits("numeric-bucket", "money"),
+            !fits("numeric-bucket", "money"),
             "the proxy refuses money; accepting it here was the outage-shaped drift"
         );
         for mask in ["redact", "partial", "hash", "pseudonym", "scrub"] {
-            assert!(mask_fits(mask, "name"), "{mask} works on `name` at runtime");
+            assert!(fits(mask, "name"), "{mask} works on `name` at runtime");
         }
+    }
+
+    #[test]
+    fn explicit_string_array_masks_match_proxy_capabilities() {
+        for data_type in ["text[]", "name[]", "character varying[]", "character[]"] {
+            for mask in [
+                "redact",
+                "partial",
+                "inner",
+                "outer",
+                "range",
+                "hash",
+                "pseudonym",
+                "ip-prefix",
+                "scrub",
+            ] {
+                assert!(fits(mask, data_type), "{mask} on {data_type}");
+            }
+            assert!(!fits("date-year", data_type));
+            assert!(!fits("numeric-bucket", data_type));
+            assert!(!fits("json", data_type));
+        }
+        assert!(!fits("pseudonym", "integer[]"));
+    }
+
+    #[test]
+    fn array_names_stay_withheld_until_elements_are_classified_explicitly() {
+        let proposal = c("email", "text[]", None);
+        assert_eq!(proposal.mask, "null");
+        assert_eq!(proposal.confidence, Confidence::NeedsReview);
+        assert_eq!(proposal.semantic_type, None);
+        assert_eq!(
+            proposal.note.as_deref(),
+            Some("name suggests email, but arrays need an explicit element classification")
+        );
     }
 
     /// A type this tool cannot vouch for is a mismatch, not a pass.
@@ -1692,18 +1734,15 @@ mod tests {
     /// — except under `null` and `none`, which never touch the value.
     #[test]
     fn an_unknown_data_type_is_refused_not_waved_through() {
-        for data_type in ["boolean", "money", "text[]", "citext"] {
-            assert!(!mask_fits("redact", data_type), "redact on {data_type}");
-            assert!(
-                !mask_fits("date-year", data_type),
-                "date-year on {data_type}"
-            );
-            assert!(mask_fits("null", data_type), "null withholds anything");
-            assert!(mask_fits("none", data_type), "none touches nothing");
+        for data_type in ["boolean", "money", "integer[]", "citext"] {
+            assert!(!fits("redact", data_type), "redact on {data_type}");
+            assert!(!fits("date-year", data_type), "date-year on {data_type}");
+            assert!(fits("null", data_type), "null withholds anything");
+            assert!(fits("none", data_type), "none touches nothing");
         }
-        assert!(mask_fits("json", "json"));
-        assert!(mask_fits("json", "jsonb"));
-        assert!(!mask_fits("json", "text"));
+        assert!(fits("json", "json"));
+        assert!(fits("json", "jsonb"));
+        assert!(!fits("json", "text"));
     }
 
     /// A postcode's identifying half is its tail, which is what `partial` keeps.
