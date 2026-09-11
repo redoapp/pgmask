@@ -27,6 +27,7 @@ use sha2::Sha256;
 
 use crate::protocol::is_text_family;
 
+mod array;
 mod json;
 pub(crate) use crate::json_path::JsonPathNavigation;
 use json::JsonPolicyTrie;
@@ -482,6 +483,11 @@ impl MaskSpec {
         type_mod: i32,
         stable_name: Option<&str>,
     ) -> Self {
+        // Array policies require an explicit semantic classification; unknown
+        // containers remain withheld even when an element mask is supported.
+        if array::element_oid(type_oid).is_some() {
+            return Self::new(Mask::Null);
+        }
         for kind in [Mask::Pseudonym, Mask::DateYear, Mask::IpPrefix] {
             if !Self::new(kind).supports(type_oid, format) {
                 continue;
@@ -528,21 +534,20 @@ impl MaskSpec {
     /// Checked once per result set rather than per row, so a misconfiguration is
     /// a clean refusal up front rather than a stream that dies mid-flight.
     pub fn supports(&self, type_oid: u32, format: i16) -> bool {
+        let string_like = is_text_family(type_oid) || array::element_oid(type_oid).is_some();
         match self.kind {
             // Always safe: -1 length is format-independent.
             Mask::None | Mask::Null => true,
 
             // String rewrites. Text-family types only, where text and binary
             // encodings are the same bytes.
-            Mask::Redact | Mask::Partial | Mask::Inner | Mask::Outer | Mask::Range => {
-                is_text_family(type_oid)
-            }
+            Mask::Redact | Mask::Partial | Mask::Inner | Mask::Outer | Mask::Range => string_like,
 
-            Mask::Hash => is_text_family(type_oid),
+            Mask::Hash => string_like,
 
             // UUID is byte-shaped in binary and hyphen-shaped in text; both are
             // reproducible from a digest, so both are supported.
-            Mask::Pseudonym => is_text_family(type_oid) || type_oid == OID_UUID,
+            Mask::Pseudonym => string_like || type_oid == OID_UUID,
 
             Mask::DateYear | Mask::DateMonth => {
                 matches!(type_oid, OID_DATE | OID_TIMESTAMP | OID_TIMESTAMPTZ)
@@ -557,12 +562,11 @@ impl MaskSpec {
             },
 
             // Rewrites text in place, so text-family only.
-            Mask::Scrub => is_text_family(type_oid),
+            Mask::Scrub => string_like,
 
             // inet/cidr binary is a packed struct we do not decode.
             Mask::IpPrefix => {
-                is_text_family(type_oid)
-                    || (matches!(type_oid, OID_INET | OID_CIDR) && format == FORMAT_TEXT)
+                string_like || (matches!(type_oid, OID_INET | OID_CIDR) && format == FORMAT_TEXT)
             }
 
             // PostgreSQL's binary jsonb representation on the wire is a
@@ -588,7 +592,8 @@ impl MaskSpec {
                  mask = \"null\" otherwise."
             }
             Mask::Pseudonym => {
-                "pseudonym handles text-family types and uuid. Use mask = \"null\" otherwise."
+                "pseudonym handles text-family types, text-family arrays, and uuid. Use mask = \
+                 \"null\" otherwise."
             }
             Mask::Json => {
                 "json handles PostgreSQL json and jsonb columns. Use mask = \"null\" otherwise."
@@ -699,24 +704,45 @@ impl Masker {
         // SQL NULL stays NULL: masking must not invent a value where there was none.
         let Some(bytes) = value else { return Ok(None) };
 
-        let out = match spec.kind {
-            Mask::Redact => Bytes::from_static(b"***"),
-            Mask::Partial => text_op(&bytes, |t| partial(t, spec.keep as usize)),
-            Mask::Inner => text_op(&bytes, |t| inner(t, spec.keep as usize)),
-            Mask::Outer => text_op(&bytes, |t| outer(t, spec.keep as usize)),
-            Mask::Range => text_op(&bytes, |t| range(t, spec.start as usize, spec.end as usize)),
-            Mask::Hash => {
-                let mut out = String::with_capacity(32);
-                hex_into(&self.digest(spec, primed, &bytes)[..16], &mut out);
-                Bytes::from(out)
+        let out = if array::element_oid(type_oid).is_some() {
+            array::mask(
+                type_oid,
+                format,
+                &bytes,
+                |element_oid, element_format, element| {
+                    self.apply_primed(spec, primed, element_oid, element_format, Some(element))
+                        .and_then(|masked| {
+                            masked.ok_or(MaskError::Undecodable {
+                                type_oid: element_oid,
+                                format: element_format,
+                            })
+                        })
+                },
+            )?
+        } else {
+            match spec.kind {
+                Mask::Redact => Bytes::from_static(b"***"),
+                Mask::Partial => text_op(&bytes, |t| partial(t, spec.keep as usize)),
+                Mask::Inner => text_op(&bytes, |t| inner(t, spec.keep as usize)),
+                Mask::Outer => text_op(&bytes, |t| outer(t, spec.keep as usize)),
+                Mask::Range => {
+                    text_op(&bytes, |t| range(t, spec.start as usize, spec.end as usize))
+                }
+                Mask::Hash => {
+                    let mut out = String::with_capacity(32);
+                    hex_into(&self.digest(spec, primed, &bytes)[..16], &mut out);
+                    Bytes::from(out)
+                }
+                Mask::Pseudonym => self.pseudonym(spec, primed, type_oid, format, &bytes)?,
+                Mask::DateYear | Mask::DateMonth => {
+                    truncate_date(&bytes, type_oid, format, spec.kind)?
+                }
+                Mask::NumericBucket => bucket_number(&bytes, type_oid, format, spec.bucket)?,
+                Mask::IpPrefix => text_op(&bytes, ip_prefix),
+                Mask::Scrub => text_op(&bytes, scrub_free_text),
+                Mask::Json => self.mask_json(spec, projection, type_oid, format, &bytes)?,
+                Mask::None | Mask::Null => unreachable!("handled above"),
             }
-            Mask::Pseudonym => self.pseudonym(spec, primed, type_oid, format, &bytes)?,
-            Mask::DateYear | Mask::DateMonth => truncate_date(&bytes, type_oid, format, spec.kind)?,
-            Mask::NumericBucket => bucket_number(&bytes, type_oid, format, spec.bucket)?,
-            Mask::IpPrefix => text_op(&bytes, ip_prefix),
-            Mask::Scrub => text_op(&bytes, scrub_free_text),
-            Mask::Json => self.mask_json(spec, projection, type_oid, format, &bytes)?,
-            Mask::None | Mask::Null => unreachable!("handled above"),
         };
         Ok(Some(out))
     }
@@ -1317,6 +1343,12 @@ pub enum MaskError {
     Undecodable { type_oid: u32, format: i16 },
     /// JSON was refused before parsing because an operator limit was exceeded.
     JsonLimitExceeded { limit: JsonLimit, configured: usize },
+    /// A native array was refused before parsing or encoding because its byte
+    /// budget was exceeded.
+    ArrayLimitExceeded { configured: usize },
+    /// A native array declared more elements than pgmask will process in one
+    /// field value.
+    ArrayElementLimitExceeded { configured: usize },
 }
 
 impl std::fmt::Display for MaskError {
@@ -1352,6 +1384,12 @@ impl std::fmt::Display for MaskError {
                     JsonLimit::Depth => "depth",
                 }
             ),
+            MaskError::ArrayLimitExceeded { configured } => {
+                write!(f, "array exceeds configured byte limit {configured}")
+            }
+            MaskError::ArrayElementLimitExceeded { configured } => {
+                write!(f, "array exceeds configured element limit {configured}")
+            }
         }
     }
 }
@@ -1365,6 +1403,7 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
     use super::*;
+    use bytes::{Buf, BufMut};
 
     const TEXT: u32 = 25;
 
@@ -1387,6 +1426,87 @@ mod tests {
             .unwrap()
             .unwrap();
         String::from_utf8(out.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn string_array_pseudonyms_match_scalar_values_in_text_and_binary() {
+        let masker = masker();
+        let mut spec = spec(Mask::Pseudonym);
+        spec.domain = Some("shipment-tracker".into());
+        let scalar = masker
+            .apply(
+                &spec,
+                TEXT,
+                FORMAT_TEXT,
+                Some(Bytes::from_static(b"tracker-1")),
+            )
+            .unwrap()
+            .unwrap();
+        let scalar = String::from_utf8(scalar.to_vec()).unwrap();
+
+        let text = masker
+            .apply(
+                &spec,
+                array::OID_TEXT_ARRAY,
+                FORMAT_TEXT,
+                Some(Bytes::from_static(b"[0:2]={tracker-1,NULL,\"a,b\"}")),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(text.to_vec()).unwrap(),
+            format!(
+                "[0:2]={{\"{scalar}\",NULL,\"{}\"}}",
+                apply_text(&spec, "a,b")
+            )
+        );
+
+        let mut binary = BytesMut::new();
+        binary.put_i32(2);
+        binary.put_i32(1);
+        binary.put_u32(TEXT);
+        binary.put_i32(1);
+        binary.put_i32(-2);
+        binary.put_i32(2);
+        binary.put_i32(4);
+        binary.put_i32(9);
+        binary.extend_from_slice(b"tracker-1");
+        binary.put_i32(-1);
+        let masked = masker
+            .apply(
+                &spec,
+                array::OID_TEXT_ARRAY,
+                FORMAT_BINARY,
+                Some(binary.freeze()),
+            )
+            .unwrap()
+            .unwrap();
+        let mut masked = masked.as_ref();
+        assert_eq!(masked.get_i32(), 2);
+        assert_eq!(masked.get_i32(), 1);
+        assert_eq!(masked.get_u32(), TEXT);
+        assert_eq!((masked.get_i32(), masked.get_i32()), (1, -2));
+        assert_eq!((masked.get_i32(), masked.get_i32()), (2, 4));
+        assert_eq!(masked.get_i32(), 16);
+        assert_eq!(&masked[..16], scalar.as_bytes());
+        masked.advance(16);
+        assert_eq!(masked.get_i32(), -1);
+        assert!(masked.is_empty());
+    }
+
+    #[test]
+    fn unclassified_string_arrays_stay_null() {
+        for oid in [
+            array::OID_NAME_ARRAY,
+            array::OID_TEXT_ARRAY,
+            array::OID_BPCHAR_ARRAY,
+            array::OID_VARCHAR_ARRAY,
+        ] {
+            assert_eq!(
+                MaskSpec::for_unclassified(oid, FORMAT_TEXT, -1, Some("public.items.values")).kind,
+                Mask::Null
+            );
+        }
     }
 
     // --- Invariants that hold for every mask --------------------------------
