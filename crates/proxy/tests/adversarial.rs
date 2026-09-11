@@ -117,6 +117,138 @@ async fn negative_control_the_harness_can_see_a_leak() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn native_string_arrays_mask_elements_in_text_and_binary_formats() -> Result<()> {
+    require_pg!();
+    load_schema(DB).await?;
+    exec_direct(
+        DB,
+        "CREATE TABLE canary.native_arrays (
+            scalar_text text,
+            scalar_char char(64),
+            text_values text[],
+            varchar_values varchar(64)[],
+            char_values char(64)[],
+            name_values name[]
+         );
+         INSERT INTO canary.native_arrays VALUES (
+            'CANARY_EMAIL_a1b2c3',
+            'CANARY_EMAIL_a1b2c3',
+            '[0:1]={CANARY_EMAIL_a1b2c3,NULL}',
+            ARRAY['CANARY_EMAIL_a1b2c3', NULL]::varchar(64)[],
+            ARRAY['CANARY_EMAIL_a1b2c3', NULL]::char(64)[],
+            ARRAY['CANARY_EMAIL_a1b2c3', NULL]::name[]
+         )",
+    )
+    .await?;
+    let mut rules = default_rules();
+    for column in [
+        "scalar_text",
+        "scalar_char",
+        "text_values",
+        "varchar_values",
+        "char_values",
+        "name_values",
+    ] {
+        let mut array_rule = rule(
+            "canary.native_arrays",
+            column,
+            pgmask::mask::Mask::Pseudonym,
+        );
+        array_rule.params.domain = Some("shipment-tracker".into());
+        rules.push(array_rule);
+    }
+    let released_rules = [
+        "scalar_text",
+        "scalar_char",
+        "text_values",
+        "varchar_values",
+        "char_values",
+        "name_values",
+    ]
+    .into_iter()
+    .map(|column| rule("canary.native_arrays", column, pgmask::mask::Mask::None))
+    .collect();
+    let released = start_proxy(DB, released_rules).await?;
+    let mut released_client = RawClient::connect(released.addr, DB).await?;
+    released_client
+        .simple_query("SELECT text_values FROM canary.native_arrays")
+        .await?;
+    assert_canary_present(&released_client, CANARY_EMAIL);
+
+    let proxy = start_proxy(DB, rules).await?;
+
+    let mut text_client = RawClient::connect(proxy.addr, DB).await?;
+    let text_round = simple_query_round(
+        &mut text_client,
+        "SELECT scalar_text, scalar_char, text_values, varchar_values, char_values, name_values
+         FROM canary.native_arrays",
+    )
+    .await?;
+    assert_served(&text_round.messages, "native string arrays in text format");
+    assert_no_canary(&text_client, "native string arrays in text format");
+    let text_rows = text_round.text_rows()?;
+    let scalar = text_rows[0][0].as_deref().unwrap();
+    let scalar_char = text_rows[0][1].as_deref().unwrap();
+    let bounded_array = format!("[0:1]={{\"{scalar}\",NULL}}");
+    let ordinary_array = format!("{{\"{scalar}\",NULL}}");
+    let char_array = format!("{{\"{scalar_char}\",NULL}}");
+    assert_eq!(text_rows[0][2].as_deref(), Some(bounded_array.as_str()));
+    assert_eq!(text_rows[0][3].as_deref(), Some(ordinary_array.as_str()));
+    assert_eq!(text_rows[0][4].as_deref(), Some(char_array.as_str()));
+    assert_eq!(text_rows[0][5].as_deref(), Some(ordinary_array.as_str()));
+
+    for (label, sql) in [
+        (
+            "array subscript",
+            "SELECT text_values[0] FROM canary.native_arrays",
+        ),
+        (
+            "array slice",
+            "SELECT text_values[0:0] FROM canary.native_arrays",
+        ),
+        (
+            "unnest",
+            "SELECT unnest(text_values) FROM canary.native_arrays",
+        ),
+    ] {
+        let mut expression_client = RawClient::connect(proxy.addr, DB).await?;
+        let messages = expression_client.simple_query(sql).await?;
+        assert_exercised(&messages, &expression_client, label);
+        assert_no_canary(&expression_client, label);
+    }
+
+    let (binary_client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres dbname={DB}",
+            proxy.addr.port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let row = binary_client
+        .query_one(
+            "SELECT scalar_text, scalar_char, text_values, varchar_values, char_values, name_values
+             FROM canary.native_arrays",
+            &[],
+        )
+        .await?;
+    let scalar: String = row.get(0);
+    let scalar_char: String = row.get(1);
+    let text_values: Vec<Option<String>> = row.get(2);
+    let varchar_values: Vec<Option<String>> = row.get(3);
+    let char_values: Vec<Option<String>> = row.get(4);
+    let name_values: Vec<Option<String>> = row.get(5);
+    assert_eq!(text_values, vec![Some(scalar.clone()), None]);
+    assert_eq!(varchar_values, vec![Some(scalar.clone()), None]);
+    assert_eq!(name_values, vec![Some(scalar), None]);
+    assert_eq!(char_values, vec![Some(scalar_char), None]);
+    Ok(())
+}
+
 // --- The baseline -----------------------------------------------------------
 
 #[tokio::test]

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.15 — native string-array masking
+
+- Apply configured string masks element by element to native PostgreSQL
+  `text[]`, `varchar[]`, `char[]`, and `name[]` columns in both wire formats.
+  Dimensions, lower bounds, ordering, empty arrays, and SQL NULL elements are
+  preserved. Pseudonyms use the scalar element bytes and the configured domain,
+  so a scalar identifier and the same identifier inside an array remain
+  joinable.
+- Keep unclassified arrays at the conservative whole-column NULL default.
+  Malformed values, inconsistent shapes, mismatched binary element OIDs, and
+  arrays over the byte, dimension, or element budgets fail closed.
+
 ## 0.2.14 — Beekeeper Studio on CockroachDB
 
 Two defects, both CockroachDB-only, both found by driving Beekeeper Studio's

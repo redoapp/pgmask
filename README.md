@@ -12,7 +12,7 @@ classify safely.
 > adversarial client, and read the [security model](docs/security.md) before
 > deployment.
 
-Current version: **v0.2.14**. Licensed under the [MIT License](LICENSE).
+Current version: **v0.2.15**. Licensed under the [MIT License](LICENSE).
 
 ## Install
 
@@ -262,14 +262,14 @@ that may contain user values or SQL text. See
 |---|---|---|
 | `none` | Pass through unchanged | Any |
 | `null` | Type-correct `NULL` | Any |
-| `redact` | Constant `***` | Text |
-| `partial`, `inner`, `outer`, `range` | Keep selected characters | Text |
-| `hash` | Deterministic HMAC digest | Text |
-| `pseudonym` | Deterministic, shape-preserving pseudonym | Text, UUID |
+| `redact` | Constant `***` | Text and native string arrays |
+| `partial`, `inner`, `outer`, `range` | Keep selected characters | Text and native string arrays |
+| `hash` | Deterministic HMAC digest | Text and native string arrays |
+| `pseudonym` | Deterministic, shape-preserving pseudonym | Text, native string arrays, UUID |
 | `date-year`, `date-month` | Truncated date or timestamp | Date and timestamp types |
 | `numeric-bucket` | Floor to a configured bucket | Integers, floats, and text-format `numeric` |
-| `ip-prefix` | Remove the host portion | Text and text-format `inet` or `cidr` |
-| `scrub` | Replace recognized identifiers in free text | Text |
+| `ip-prefix` | Remove the host portion | Text, native string arrays, and text-format `inet` or `cidr` |
+| `scrub` | Replace recognized identifiers in free text | Text and native string arrays |
 | `json` | Recursively mask JSON Pointer policies; unlisted scalars follow `json_unlisted` | `json`, `jsonb` |
 
 `scrub` reveals all text it does not recognize. It does not reliably identify
@@ -303,7 +303,7 @@ mapping.
 - Plain classified columns use their catalog policy.
 - Unclassified text and UUID values become column-scoped pseudonyms; dates and
   timestamps reduce to a year; text-format IPs reduce to a network prefix.
-  Numeric, boolean, structured, binary, custom, and unsupported wire types
+  Native arrays, numeric, boolean, structured, binary, custom, and unsupported wire types
   become `NULL`. A value or format the chosen default mask cannot transform
   (an `infinity` timestamp, a non-ISO `DateStyle`, a binary-bound IP), a column
   the catalog has not resolved yet, or a character column too narrow to hold a
